@@ -1,0 +1,54 @@
+# ============================================================
+# KinSim Cluster Configuration
+# Edit this file to change inputs/outputs for all cluster jobs.
+#
+# NOTE: Three values also appear in SLURM #SBATCH headers
+# (SLURM parses them before bash runs, so they can't use variables).
+# If you change these, update the headers in each slurm/*.slurm file too:
+#   - paths.log_dir   -> #SBATCH --output
+#   - slurm.mail_user -> #SBATCH --mail-user
+#   - conda_env       -> conda activate line
+# ============================================================
+
+# --- Environment ---
+conda_env: "kinsim_env"
+
+# --- Cluster paths ---
+paths:
+  log_dir: "/data/projects/p774_MARSD/NDutilleux/logs"
+
+# --- BAM extraction (bam_extract_mean) ---
+bam_extract:
+  bam_dir: "/data/projects/p774_MARSD/NDutilleux/training/Strepto/hifireads"
+  bam_glob: "*.bam"
+
+# --- BAM signal dump (parse_bam_signals) ---
+bam_signals:
+  bam_dir: "/data/projects/p774_MARSD/NDutilleux/training/LH2024"
+  bam_glob: "*.bam"
+
+# --- Genome simulation (fetch_genomes / PBSIM3) ---
+simulation:
+  workdir: "/data/projects/p774_MARSD/NDutilleux/references/kinsim_data"
+  pbsim3_model: "/home/ndutilleux/.conda/envs/kinsim_env/data/ERRHMM-SEQUEL.model"
+  depth: 50
+  strategy: "wgs"
+  method: "errhmm"
+  genomes:
+    - name: "ecoli"
+      url: "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/005/845/GCF_000005845.2_ASM584v2/GCF_000005845.2_ASM584v2_genomic.fna.gz"
+    - name: "hpylori"
+      url: "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/025/998/455/GCF_025998455.1_ASM2599845v1/GCF_025998455.1_ASM2599845v1_genomic.fna.gz"
+
+# --- SLURM defaults (for reference; also in #SBATCH headers) ---
+slurm:
+  partition: "pshort_el8"
+  mail_user: "nicolas.dutilleux@unifr.ch"
+  mail_type: "FAIL"
+
+# --- Output filenames (all relative to cluster/output/) ---
+output:
+  bam_extract_list: "bam_extract_files.txt"
+  bam_signals_list: "bam_signals_files.txt"
+  stats_csv: "strains_stats.csv"
+  barplot_html: "strain_stats_barplot.html"
