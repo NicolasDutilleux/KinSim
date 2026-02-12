@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kinsim"
+version = "0.1.0"
+description = "PacBio kinetic signal simulator for metagenomic binning"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pysam",
+]
+
+[project.scripts]
+kinsim = "kinsim.__main__:main"
+
+[project.optional-dependencies]
+cluster = ["pyyaml"]
+
+[tool.setuptools.packages.find]
+include = ["kinsim*"]
