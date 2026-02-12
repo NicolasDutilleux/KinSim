@@ -1,0 +1,1254 @@
+------------------------------------------------
+FILE: kinsim/encoding.py
+------------------------------------------------
+"""11-mer bit-packing: encode/decode DNA k-mers as 22-bit integers."""
+
+import numpy as np
+
+K = 11
+KMER_BITS = 2 * K  # 22
+KMER_MASK = (1 << KMER_BITS) - 1
+
+BASE_MAP = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+INT_TO_BASE = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
+VALID_BASES = set('ACGT')
+
+METH_IDS = {'none': 0, 'm6A': 1, 'm4C': 2, 'm5C': 3}
+TOTAL_POSSIBLE_KMERS = 4 ** K  # 4,194,304
+
+
+def encode_kmer(seq):
+    """Encode an 11-mer string to a 22-bit integer."""
+    val = 0
+    for base in seq:
+        val = (val << 2) | BASE_MAP[base]
+    return val
+
+
+def decode_kmer(val):
+    """Decode a 22-bit integer back to an 11-mer string."""
+    bases = []
+    for _ in range(K):
+        bases.append(INT_TO_BASE[val & 3])
+        val >>= 2
+    return ''.join(reversed(bases))
+
+
+def get_ipd_stats(acc):
+    """Extract (mu_ipd, sigma_ipd) from accumulator [n, sum_ipd, sum_ipd2, sum_pw, sum_pw2]."""
+    n = acc[0]
+    if n < 1:
+        return 1.0, 0.1
+    mu = acc[1] / n
+    var = max(0, (acc[2] / n) - mu ** 2)
+    return mu, np.sqrt(var)
+
+
+def get_pw_stats(acc):
+    """Extract (mu_pw, sigma_pw) from accumulator [n, sum_ipd, sum_ipd2, sum_pw, sum_pw2]."""
+    n = acc[0]
+    if n < 1:
+        return 1.0, 0.1
+    mu = acc[3] / n
+    var = max(0, (acc[4] / n) - mu ** 2)
+    return mu, np.sqrt(var)
+
+
+------------------------------------------------
+FILE: kinsim/__init__.py
+------------------------------------------------
+"""KinSim: PacBio kinetic signal simulator for metagenomic binning."""
+
+__version__ = "0.1.0"
+
+
+------------------------------------------------
+FILE: kinsim/cgan/__init__.py
+------------------------------------------------
+"""KinSim cGAN mode: conditional GAN-based kinetic signal generation."""
+
+
+------------------------------------------------
+FILE: kinsim/cgan/parse_train.py
+------------------------------------------------
+"""Extract raw IPD/PW training samples from BAM files for cGAN training.
+
+Unlike dictionary mode (which stores running accumulators), cGAN mode
+collects individual (IPD, PW) observations per (11-mer, methylation_state).
+These raw samples are needed to train the conditional generator, which must
+learn the full distribution shape — not just mean and variance.
+
+Each shard is a dict[(int_kmer, meth_id)] -> np.ndarray of shape (N, 2),
+where columns are [IPD, PW]. Shards from multiple BAMs are concatenated
+during the merge step.
+
+The nDetected field from the motif string (4th field) is preserved in the
+output metadata for optional per-motif weighting during GAN training.
+"""
+
+import os
+import pickle
+import numpy as np
+import pysam
+from collections import defaultdict
+
+from ..encoding import BASE_MAP, KMER_MASK, K
+from ..motifs import parse_motifs, scan_sequence
+
+
+# ---------------------------------------------------------------------------
+# Training: extract raw samples from a single BAM
+# ---------------------------------------------------------------------------
+
+def train_single_bam(bam_path, motif_string, max_samples_per_key=10_000):
+    """Extract raw (IPD, PW) pairs from a BAM file for each 11-mer context.
+
+    For each read: extract sequence + fi/fp kinetic tags, scan methylation
+    motifs, then slide an 11-mer window collecting raw signal values.
+
+    Args:
+        bam_path:   Path to BAM file with fi/fp kinetic tags.
+        motif_string: Semicolon-delimited motif string (e.g. "m6A,GATC,2,3551").
+        max_samples_per_key: Cap per (kmer, meth_id) to limit memory usage.
+            Once a key reaches this count, new samples are randomly replaced
+            (reservoir sampling) to maintain an unbiased sample.
+
+    Returns:
+        dict[(int_kmer, meth_id)] -> list of [IPD, PW] pairs
+    """
+    mid = K // 2  # 5
+    motifs = parse_motifs(motif_string)
+    samples = defaultdict(list)
+    counts = defaultdict(int)  # total observations seen (for reservoir sampling)
+
+    with pysam.AlignmentFile(bam_path, "rb", check_sq=False) as bam:
+        for read in bam:
+            seq = read.query_sequence
+            if not (seq and len(seq) >= K and read.has_tag('fi')):
+                continue
+
+            ipds = read.get_tag('fi')
+            pws = read.get_tag('fp')
+            min_len = min(len(seq), len(ipds), len(pws))
+
+            # Scan methylation positions on the read sequence
+            meth_status = scan_sequence(seq[:min_len], motifs)
+
+            # Sliding window: encode 11-mers and collect raw signals
+            current_kmer = 0
+            for i in range(min_len):
+                base_val = BASE_MAP.get(seq[i], 0)
+                current_kmer = ((current_kmer << 2) | base_val) & KMER_MASK
+
+                if i >= K - 1:
+                    center = i - mid
+                    key = (current_kmer, int(meth_status[center]))
+                    ipd_val = float(ipds[center])
+                    pw_val = float(pws[center])
+
+                    counts[key] += 1
+                    n = counts[key]
+
+                    if n <= max_samples_per_key:
+                        # Still under the cap: append directly
+                        samples[key].append([ipd_val, pw_val])
+                    else:
+                        # Reservoir sampling: replace a random existing sample
+                        # with probability max_samples_per_key / n
+                        j = np.random.randint(0, n)
+                        if j < max_samples_per_key:
+                            samples[key][j] = [ipd_val, pw_val]
+
+    # Convert lists to numpy arrays for compact storage
+    result = {}
+    for key, vals in samples.items():
+        result[key] = np.array(vals, dtype=np.float32)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Merging: concatenate shards from multiple BAMs
+# ---------------------------------------------------------------------------
+
+def merge_shards(input_dir, output_file, max_samples_per_key=50_000):
+    """Merge multiple *_cgan.pkl shard files into one master training set.
+
+    Concatenates raw sample arrays per key. If a key exceeds
+    max_samples_per_key after concatenation, a random subsample is taken.
+
+    Args:
+        input_dir:  Directory containing *_cgan.pkl shard files.
+        output_file: Path for the merged output .pkl file.
+        max_samples_per_key: Maximum samples to keep per (kmer, meth_id).
+    """
+    import glob
+
+    master = defaultdict(list)  # key -> list of np.arrays to concatenate
+    pattern = os.path.join(input_dir, "*_cgan.pkl")
+    files = glob.glob(pattern)
+
+    if not files:
+        print(f"Error: no '*_cgan.pkl' files found in {input_dir}")
+        return
+
+    print(f"Merging {len(files)} cGAN shards from {input_dir}...")
+    for f_path in files:
+        with open(f_path, 'rb') as f:
+            shard = pickle.load(f)
+            for key, arr in shard.items():
+                master[key].append(arr)
+
+    # Concatenate and cap
+    result = {}
+    for key, arrays in master.items():
+        combined = np.concatenate(arrays, axis=0)
+        if len(combined) > max_samples_per_key:
+            indices = np.random.choice(len(combined), max_samples_per_key, replace=False)
+            combined = combined[indices]
+        result[key] = combined
+
+    with open(output_file, 'wb') as f:
+        pickle.dump(result, f)
+
+    total_keys = len(result)
+    total_samples = sum(len(v) for v in result.values())
+    print(f"Master cGAN dataset saved to {output_file}")
+    print(f"  {total_keys:,} unique contexts, {total_samples:,} total samples")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="kinsim cgan",
+        description="Extract raw IPD/PW training samples from BAM files for cGAN "
+                    "training, or merge multiple shards into a master training set.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # -- train subcommand --
+    p_train = sub.add_parser(
+        "train",
+        help="Extract raw (IPD, PW) samples from a single BAM file",
+        description="Collect individual IPD/PW observations per 11-mer + methylation "
+                    "state. Outputs a *_cgan.pkl shard with raw sample arrays.",
+    )
+    p_train.add_argument("bam", help="Input BAM file with fi/fp kinetic tags")
+    p_train.add_argument("motifs", help="Motif string: 'm6A,GATC,2,3551;m4C,CCWGG,1,922'")
+    p_train.add_argument("output", help="Output .pkl file for the cGAN shard")
+    p_train.add_argument("--max-samples", type=int, default=10_000,
+                         help="Max samples per (kmer, meth_id) via reservoir sampling "
+                              "(default: 10000)")
+
+    # -- merge subcommand --
+    p_merge = sub.add_parser(
+        "merge",
+        help="Merge multiple *_cgan.pkl shards into one master training set",
+        description="Concatenate raw sample arrays from multiple shards. "
+                    "Looks for *_cgan.pkl files in the input directory.",
+    )
+    p_merge.add_argument("input_dir", help="Directory containing *_cgan.pkl shard files")
+    p_merge.add_argument("output", help="Output master training set .pkl file")
+    p_merge.add_argument("--max-samples", type=int, default=50_000,
+                         help="Max samples per (kmer, meth_id) after merging "
+                              "(default: 50000)")
+
+    args = parser.parse_args(argv)
+
+    if args.command == "merge":
+        merge_shards(args.input_dir, args.output,
+                     max_samples_per_key=args.max_samples)
+    else:
+        print(f"Extracting cGAN samples from {os.path.basename(args.bam)}...")
+        result = train_single_bam(args.bam, args.motifs,
+                                  max_samples_per_key=args.max_samples)
+        with open(args.output, 'wb') as f:
+            pickle.dump(result, f)
+        total_samples = sum(len(v) for v in result.values())
+        print(f"cGAN shard saved to {args.output} "
+              f"({len(result)} contexts, {total_samples:,} samples)")
+
+
+if __name__ == "__main__":
+    main()
+
+
+------------------------------------------------
+FILE: kinsim/__main__.py
+------------------------------------------------
+"""KinSim CLI entry point.
+
+Usage:
+    kinsim <command> [<args>]
+    python -m kinsim <command> [<args>]
+"""
+
+import difflib
+import sys
+
+COMMANDS = ["prepare", "motifs", "dictionary", "cgan"]
+DICT_COMMANDS = ["train", "merge", "inject", "analyze"]
+CGAN_COMMANDS = ["train", "merge"]
+
+USAGE = """\
+usage: kinsim <command> [<args>]
+
+KinSim — PacBio kinetic signal simulator for metagenomic binning.
+
+Shared commands:
+  prepare                Parse BAM + motifs.csv pairs into pipeline config
+  motifs                 Parse a single PacBio motifs.csv
+
+Dictionary mode:
+  dictionary train       Build a kinetic dictionary shard from a BAM file
+  dictionary merge       Merge .pkl shards into a master dictionary
+  dictionary inject      Inject IPD/PW signals into PBSIM3 reads
+  dictionary analyze     Analyze dictionary coverage statistics
+
+cGAN mode:
+  cgan train             Extract raw IPD/PW samples from a BAM file
+  cgan merge             Merge cGAN shards into a master training set
+
+Use 'kinsim <command> -h' for help on a specific command.
+"""
+
+DICT_USAGE = """\
+usage: kinsim dictionary <command> [<args>]
+
+Dictionary mode — statistical 11-mer kinetic lookup tables.
+
+Commands:
+  train       Build a kinetic dictionary shard from a BAM file
+  merge       Merge .pkl shards into a master dictionary
+  inject      Inject IPD/PW signals into PBSIM3 reads
+  analyze     Analyze dictionary coverage statistics
+
+Use 'kinsim dictionary <command> -h' for help on a specific command.
+"""
+
+
+CGAN_USAGE = """\
+usage: kinsim cgan <command> [<args>]
+
+cGAN mode — conditional GAN-based kinetic signal generation.
+
+Commands:
+  train       Extract raw (IPD, PW) samples from a BAM file
+  merge       Merge *_cgan.pkl shards into a master training set
+
+Use 'kinsim cgan <command> -h' for help on a specific command.
+"""
+
+
+def _suggest(word, candidates, n=1, cutoff=0.6):
+    """Return close matches for typo suggestions."""
+    return difflib.get_close_matches(word, candidates, n=n, cutoff=cutoff)
+
+
+def main(argv=None):
+    args = argv if argv is not None else sys.argv[1:]
+
+    if not args or args[0] in ("-h", "--help"):
+        print(USAGE)
+        sys.exit(0)
+
+    cmd, rest = args[0], args[1:]
+
+    if cmd == "prepare":
+        from .prepare import main as run
+        run(rest)
+
+    elif cmd == "motifs":
+        from .motifs import main as run
+        run(rest)
+
+    elif cmd == "dictionary":
+        if not rest or rest[0] in ("-h", "--help"):
+            print(DICT_USAGE)
+            sys.exit(0)
+
+        subcmd, subrest = rest[0], rest[1:]
+
+        if subcmd == "train":
+            from .dictionary.train import main as run
+            run(["train"] + subrest)
+
+        elif subcmd == "merge":
+            from .dictionary.train import main as run
+            run(["merge"] + subrest)
+
+        elif subcmd == "inject":
+            from .dictionary.inject import main as run
+            run(subrest)
+
+        elif subcmd == "analyze":
+            from .dictionary.analyze import main as run
+            run(subrest)
+
+        else:
+            msg = f"Unknown dictionary command: {subcmd}"
+            hint = _suggest(subcmd, DICT_COMMANDS)
+            if hint:
+                msg += f"\n\nDid you mean: kinsim dictionary {hint[0]}?"
+            print(msg)
+            print(DICT_USAGE)
+            sys.exit(1)
+
+    elif cmd == "cgan":
+        if not rest or rest[0] in ("-h", "--help"):
+            print(CGAN_USAGE)
+            sys.exit(0)
+
+        subcmd, subrest = rest[0], rest[1:]
+
+        if subcmd == "train":
+            from .cgan.parse_train import main as run
+            run(["train"] + subrest)
+
+        elif subcmd == "merge":
+            from .cgan.parse_train import main as run
+            run(["merge"] + subrest)
+
+        else:
+            msg = f"Unknown cgan command: {subcmd}"
+            hint = _suggest(subcmd, CGAN_COMMANDS)
+            if hint:
+                msg += f"\n\nDid you mean: kinsim cgan {hint[0]}?"
+            print(msg)
+            print(CGAN_USAGE)
+            sys.exit(1)
+
+    else:
+        msg = f"Unknown command: {cmd}"
+        hint = _suggest(cmd, COMMANDS)
+        if hint:
+            msg += f"\n\nDid you mean: kinsim {hint[0]}?"
+        print(msg)
+        print(USAGE)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+
+------------------------------------------------
+FILE: kinsim/prepare.py
+------------------------------------------------
+"""Prepare config files for KinSim pipeline (dictionary and cGAN modes).
+
+Reads a text file with alternating lines:
+  - Odd lines:  absolute path to a BAM file
+  - Even lines: absolute path to the corresponding motifs.csv
+
+Outputs a new text file with the same structure, but the CSV paths are
+replaced by compact one-liner motif strings parsed from the CSV.
+
+The output format is compatible with both:
+  - kinsim.dictionary.train (uses first 3 fields: type,motif,pos)
+  - kinsim.cgan (uses all 4 fields: type,motif,pos,nDetected)
+"""
+
+import sys
+import os
+
+from .motifs import parse_motifs_csv
+
+
+def prepare_config(input_file, output_file, min_fraction=0.40, min_detected=20):
+    """Read BAM+CSV pairs and write BAM+motif-string pairs.
+
+    Args:
+        input_file:  path to text file with alternating BAM / motifs.csv lines
+        output_file: path to output config (alternating BAM / motif-string lines)
+        min_fraction: minimum fraction threshold for motif filtering
+        min_detected: minimum nDetected threshold for motif filtering
+    """
+    with open(input_file, 'r') as f:
+        lines = [l.strip() for l in f if l.strip()]
+
+    if len(lines) % 2 != 0:
+        print(f"ERROR: input file must have an even number of non-empty lines "
+              f"(got {len(lines)})", file=sys.stderr)
+        sys.exit(1)
+
+    n_pairs = len(lines) // 2
+    output_lines = []
+    skipped = 0
+
+    for i in range(n_pairs):
+        bam_path = lines[i * 2]
+        csv_path = lines[i * 2 + 1]
+        label = os.path.basename(bam_path)
+
+        if not os.path.isfile(csv_path):
+            print(f"  WARN: CSV not found: {csv_path} — skipping pair", file=sys.stderr)
+            skipped += 1
+            continue
+
+        motif_string = parse_motifs_csv(csv_path, min_fraction=min_fraction,
+                                        min_detected=min_detected)
+
+        if not motif_string:
+            print(f"  WARN: no motifs passed filter for {label} — skipping pair",
+                  file=sys.stderr)
+            skipped += 1
+            continue
+
+        output_lines.append(bam_path)
+        output_lines.append(motif_string)
+
+    with open(output_file, 'w') as f:
+        f.write('\n'.join(output_lines) + '\n')
+
+    kept = n_pairs - skipped
+    print(f"Prepared {kept}/{n_pairs} strain pairs -> {output_file}")
+
+
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="kinsim prepare",
+        description="Parse BAM + motifs.csv pairs into a config file for KinSim pipeline. "
+                    "Filters motifs by fraction and nDetected, resolves modification types.",
+        epilog="Input format (alternating lines):\n"
+               "  /path/to/strain1.bam\n"
+               "  /path/to/strain1/motifs.csv\n"
+               "  /path/to/strain2.bam\n"
+               "  /path/to/strain2/motifs.csv\n\n"
+               "Output format (alternating lines):\n"
+               "  /path/to/strain1.bam\n"
+               "  m6A,GCCGATC,5,3551;m6A,CTGAAG,5,2891",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("input", help="Text file with alternating BAM / motifs.csv lines")
+    parser.add_argument("output", help="Output config file (BAM / motif-string lines)")
+    parser.add_argument("--min-fraction", type=float, default=0.40,
+                        help="Minimum fraction threshold (default: 0.40)")
+    parser.add_argument("--min-detected", type=int, default=20,
+                        help="Minimum nDetected threshold (default: 20)")
+    args = parser.parse_args(argv)
+    prepare_config(args.input, args.output,
+                   min_fraction=args.min_fraction, min_detected=args.min_detected)
+
+
+if __name__ == "__main__":
+    main()
+
+
+------------------------------------------------
+FILE: kinsim/motifs.py
+------------------------------------------------
+"""IUPAC motif parsing, regex compilation, and methylation scanning."""
+
+import sys
+import csv
+import re
+import numpy as np
+from .encoding import METH_IDS
+
+IUPAC_TO_REGEX = {
+    'A': 'A', 'C': 'C', 'G': 'G', 'T': 'T', 'N': '.',
+    'R': '[AG]', 'Y': '[CT]', 'S': '[GC]', 'W': '[AT]',
+    'K': '[GT]', 'M': '[AC]', 'B': '[CGT]', 'D': '[AGT]',
+    'H': '[ACT]', 'V': '[ACG]'
+}
+
+COMPLEMENT = {
+    'A': 'T', 'C': 'G', 'G': 'C', 'T': 'A', 'N': 'N',
+    'Y': 'R', 'R': 'Y', 'S': 'S', 'W': 'W', 'K': 'M', 'M': 'K',
+    'B': 'V', 'V': 'B', 'D': 'H', 'H': 'D'
+}
+
+
+def iupac_to_re(motif):
+    """Convert an IUPAC motif string to a regex pattern string.
+    Example: GYCAGCYC → G[CT]CAG[CT]C
+    """
+    return "".join(IUPAC_TO_REGEX.get(b, b) for b in motif)
+
+
+def reverse_complement(seq):
+    """Reverse complement supporting IUPAC ambiguity codes."""
+    return "".join(COMPLEMENT.get(base, base) for base in reversed(seq))
+
+
+def parse_motifs(motif_string):
+    """Parse a motif string and compile regex for forward + reverse complement.
+
+    Input format: "m6A,GATC,2;m4C,CCWGG,1;m5C,RGATCY,4"
+    Each entry: MOD_TYPE,IUPAC_MOTIF,MOD_POS[,extra] separated by semicolons.
+    A 4th comma-separated field (e.g. nDetected) is accepted and ignored.
+
+    Returns list of dicts with keys: 'pattern' (compiled regex with lookahead),
+    'id' (methylation type int), 'pos' (modified base offset within match).
+    Both forward and reverse complement patterns are generated.
+    """
+    motifs = []
+    if not motif_string:
+        return motifs
+    for entry in motif_string.split(';'):
+        if not entry or ',' not in entry:
+            continue
+        parts = entry.split(',')
+        m_type, seq, pos = parts[0], parts[1], parts[2]
+        m_id = METH_IDS.get(m_type, 0)
+        p = int(pos)
+
+        for s, offset in [(seq, p), (reverse_complement(seq), len(seq) - 1 - p)]:
+            regex_pattern = re.compile(f'(?=({iupac_to_re(s)}))')
+            motifs.append({'pattern': regex_pattern, 'id': m_id, 'pos': offset})
+    return motifs
+
+
+def scan_sequence(seq, motifs):
+    """Scan a DNA sequence for methylation motifs.
+
+    Returns an int8 numpy array of length len(seq), where each position
+    holds the methylation type ID (0 = unmethylated).
+    """
+    status = np.zeros(len(seq), dtype=np.int8)
+    for m in motifs:
+        for match in m['pattern'].finditer(seq):
+            target_pos = match.start() + m['pos']
+            if target_pos < len(seq):
+                status[target_pos] = m['id']
+    return status
+
+
+# ---------------------------------------------------------------------------
+# PacBio motifs.csv parser
+# ---------------------------------------------------------------------------
+
+# Resolve "modified_base" to a concrete type based on the base at centerPos
+_BASE_TO_METH = {'A': 'm6A', 'C': 'm4C'}
+
+
+def parse_motifs_csv(csv_path, min_fraction=0.40, min_detected=20):
+    """Parse a PacBio motifs.csv and return a KinSim motif string.
+
+    Logic:
+      1. Skip rows where fraction < min_fraction OR nDetected < min_detected.
+      2. If modificationType is already m6A / m4C / m5C, use it directly.
+      3. If modificationType is "modified_base", resolve by looking at the
+         base at motifString[centerPos]: A → m6A, C → m4C.
+         Rows that can't be resolved are skipped with a warning.
+      4. Clean: strip whitespace from motifString, ensure centerPos is int.
+
+    Returns:
+        A semicolon-delimited motif string with 4 fields per entry:
+        "m6A,GCCGATC,5,3551;m6A,CTGAAG,5,2891"
+        Fields: MOD_TYPE,MOTIF,POS,nDetected
+        The 4th field (nDetected) is used by cGAN mode and ignored by dictionary mode.
+    """
+    entries = []
+    with open(csv_path, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            fraction = float(row['fraction'])
+            n_detected = int(row['nDetected'])
+            if fraction < min_fraction or n_detected < min_detected:
+                continue
+
+            motif_seq = row['motifString'].strip()
+            center_pos = int(row['centerPos'])
+            mod_type = row['modificationType'].strip()
+
+            # Resolve modification type
+            if mod_type == 'modified_base':
+                if center_pos >= len(motif_seq):
+                    print(f"  WARN: centerPos {center_pos} out of bounds "
+                          f"for {motif_seq} — skipped", file=sys.stderr)
+                    continue
+                base = motif_seq[center_pos].upper()
+                resolved = _BASE_TO_METH.get(base)
+                if resolved is None:
+                    print(f"  WARN: cannot resolve modified_base at "
+                          f"{motif_seq}[{center_pos}]='{base}' — skipped",
+                          file=sys.stderr)
+                    continue
+                mod_type = resolved
+
+            # Validate mod_type is known
+            if mod_type not in METH_IDS:
+                print(f"  WARN: unknown mod type '{mod_type}' for "
+                      f"{motif_seq} — skipped", file=sys.stderr)
+                continue
+
+            entries.append(f"{mod_type},{motif_seq},{center_pos},{n_detected}")
+
+    return ";".join(entries)
+
+
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="kinsim motifs",
+        description="Parse a single PacBio motifs.csv and print the KinSim motif string. "
+                    "Filters by fraction and nDetected thresholds, resolves ambiguous "
+                    "'modified_base' types (A->m6A, C->m4C).",
+    )
+    parser.add_argument("csv", help="Path to PacBio motifs.csv file")
+    parser.add_argument("--min-fraction", type=float, default=0.40,
+                        help="Minimum fraction threshold (default: 0.40)")
+    parser.add_argument("--min-detected", type=int, default=20,
+                        help="Minimum nDetected threshold (default: 20)")
+    args = parser.parse_args(argv)
+    result = parse_motifs_csv(args.csv, min_fraction=args.min_fraction,
+                              min_detected=args.min_detected)
+    if result:
+        print(result)
+    else:
+        print("No motifs passed the filter.", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
+
+
+------------------------------------------------
+FILE: kinsim/dictionary/train.py
+------------------------------------------------
+"""Build 11-mer kinetic dictionary from BAM files, or merge .pkl shards."""
+
+import sys
+import os
+import pickle
+import glob
+import numpy as np
+import pysam
+from collections import defaultdict
+
+from ..encoding import BASE_MAP, KMER_MASK, K, KMER_BITS
+from ..motifs import parse_motifs, scan_sequence
+
+
+def train_single_bam(bam_path, motif_string):
+    """Process a single BAM file and return the lookup dictionary.
+
+    For each read: extract sequence + fi/fp tags, scan methylation motifs,
+    then slide an 11-mer window accumulating (n, sum_ipd, sum_ipd², sum_pw, sum_pw²).
+
+    Returns dict[(int_kmer, meth_id)] -> np.array([n, sum_ipd, sum_ipd2, sum_pw, sum_pw2])
+    """
+    mid = K // 2  # 5
+    motifs = parse_motifs(motif_string)
+    lookup = defaultdict(lambda: np.zeros(5, dtype=np.float64))
+
+    with pysam.AlignmentFile(bam_path, "rb", check_sq=False) as bam:
+        for read in bam:
+            seq = read.query_sequence
+            if not (seq and len(seq) >= K and read.has_tag('fi')):
+                continue
+
+            ipds = read.get_tag('fi')
+            pws = read.get_tag('fp')
+            min_len = min(len(seq), len(ipds), len(pws))
+
+            # Scan methylation positions
+            meth_status = scan_sequence(seq[:min_len], motifs)
+
+            # Sliding window bit-packing
+            current_kmer = 0
+            for i in range(min_len):
+                base_val = BASE_MAP.get(seq[i], 0)
+                current_kmer = ((current_kmer << 2) | base_val) & KMER_MASK
+                if i >= K - 1:
+                    center = i - mid
+                    key = (current_kmer, int(meth_status[center]))
+                    acc = lookup[key]
+                    ipd_val = float(ipds[center])
+                    pw_val = float(pws[center])
+                    acc[0] += 1
+                    acc[1] += ipd_val
+                    acc[2] += ipd_val ** 2
+                    acc[3] += pw_val
+                    acc[4] += pw_val ** 2
+
+    return dict(lookup)
+
+
+def merge_shards(input_dir, output_file):
+    """Merge multiple *_binary.pkl shard files into one master dictionary."""
+    master = defaultdict(lambda: np.zeros(5, dtype=np.float64))
+    pattern = os.path.join(input_dir, "*_binary.pkl")
+    files = glob.glob(pattern)
+
+    if not files:
+        print(f"Error: no '*_binary.pkl' files found in {input_dir}")
+        return
+
+    print(f"Merging {len(files)} shards from {input_dir}...")
+    for f_path in files:
+        with open(f_path, 'rb') as f:
+            shard = pickle.load(f)
+            for key, data in shard.items():
+                master[key] += data
+
+    with open(output_file, 'wb') as f:
+        pickle.dump(dict(master), f)
+    print(f"Master dictionary saved to {output_file}")
+
+
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="kinsim dictionary",
+        description="Build an 11-mer kinetic dictionary from a BAM file, or merge "
+                    "multiple .pkl shards into a master dictionary.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # -- train subcommand --
+    p_train = sub.add_parser(
+        "train",
+        help="Train a dictionary shard from a single BAM file",
+        description="Extract IPD/PW accumulators from a BAM file for each 11-mer + "
+                    "methylation state. Outputs a .pkl shard.",
+    )
+    p_train.add_argument("bam", help="Input BAM file with fi/fp kinetic tags")
+    p_train.add_argument("motifs", help="Motif string: 'm6A,GATC,2;m4C,CCWGG,1'")
+    p_train.add_argument("output", help="Output .pkl file for the dictionary shard")
+
+    # -- merge subcommand --
+    p_merge = sub.add_parser(
+        "merge",
+        help="Merge multiple *_binary.pkl shards into one master dictionary",
+        description="Combine .pkl shard files by summing their accumulators. "
+                    "Looks for *_binary.pkl files in the input directory.",
+    )
+    p_merge.add_argument("input_dir", help="Directory containing *_binary.pkl shard files")
+    p_merge.add_argument("output", help="Output master dictionary .pkl file")
+
+    args = parser.parse_args(argv)
+
+    if args.command == "merge":
+        merge_shards(args.input_dir, args.output)
+    else:
+        print(f"Training on {os.path.basename(args.bam)}...")
+        lookup = train_single_bam(args.bam, args.motifs)
+        with open(args.output, 'wb') as f:
+            pickle.dump(lookup, f)
+        print(f"Dictionary saved to {args.output} ({len(lookup)} entries)")
+
+
+if __name__ == "__main__":
+    main()
+
+
+------------------------------------------------
+FILE: kinsim/dictionary/__init__.py
+------------------------------------------------
+"""KinSim Dictionary mode: statistical 11-mer kinetic lookup tables."""
+
+
+------------------------------------------------
+FILE: kinsim/dictionary/inject.py
+------------------------------------------------
+"""Inject IPD/PW kinetic signals into PBSIM3 simulated reads.
+
+Uses a trained 11-mer dictionary + the PBSIM3 .maf alignment to resolve
+reference context for edge bases (first/last 5 positions of each read).
+Outputs an unaligned BAM with fi (IPD) and fp (PW) tags.
+"""
+
+import sys
+import os
+import gzip
+import pickle
+import array
+import numpy as np
+import pysam
+
+from ..encoding import BASE_MAP, KMER_MASK, K, get_ipd_stats, get_pw_stats
+from ..motifs import parse_motifs, scan_sequence
+
+MID = K // 2  # 5
+
+
+# ---------------------------------------------------------------------------
+# Reference loader
+# ---------------------------------------------------------------------------
+
+def load_reference(ref_path):
+    """Load a FASTA file (.ref or .fna) into {name: sequence} dict.
+
+    Handles both plain and gzip-compressed files.
+    """
+    open_func = gzip.open if ref_path.endswith('.gz') else open
+    seqs = {}
+    current_name = None
+    parts = []
+    with open_func(ref_path, 'rt') as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith('>'):
+                if current_name:
+                    seqs[current_name] = ''.join(parts)
+                current_name = line[1:].split()[0]
+                parts = []
+            else:
+                parts.append(line.upper())
+    if current_name:
+        seqs[current_name] = ''.join(parts)
+    return seqs
+
+
+# ---------------------------------------------------------------------------
+# MAF parser
+# ---------------------------------------------------------------------------
+
+def parse_maf(maf_path):
+    """Parse PBSIM3 .maf.gz to extract read-to-reference mapping.
+
+    Returns dict[read_name] -> (ref_name, ref_start, ref_strand, ref_src_size)
+
+    MAF 's' line format:
+      s name start size strand srcSize alignment
+    Each alignment block has a reference line (1st 's') and read line (2nd 's').
+    """
+    mapping = {}
+    open_func = gzip.open if maf_path.endswith('.gz') else open
+    with open_func(maf_path, 'rt') as f:
+        lines_in_block = []
+        for line in f:
+            line = line.strip()
+            if line.startswith('a'):
+                lines_in_block = []
+            elif line.startswith('s'):
+                lines_in_block.append(line)
+                if len(lines_in_block) == 2:
+                    # Parse reference line
+                    ref_parts = lines_in_block[0].split()
+                    ref_name = ref_parts[1]
+                    ref_start = int(ref_parts[2])
+                    ref_strand = ref_parts[4]
+                    ref_src_size = int(ref_parts[5])
+
+                    # Parse read line
+                    read_parts = lines_in_block[1].split()
+                    read_name = read_parts[1]
+
+                    mapping[read_name] = (ref_name, ref_start, ref_strand, ref_src_size)
+    return mapping
+
+
+# ---------------------------------------------------------------------------
+# Reference context extraction
+# ---------------------------------------------------------------------------
+
+def get_extended_context(ref_seq, ref_start, read_len, circular=True):
+    """Get the reference sequence context for a read, extended by MID on each side.
+
+    For edge bases of a read, we need reference context beyond the read boundaries.
+    For circular genomes (bacteria), wraps around. Otherwise pads with 'N'.
+
+    Returns a string of length (read_len + 2*MID) representing the reference context
+    from (ref_start - MID) to (ref_start + read_len + MID).
+    """
+    ref_len = len(ref_seq)
+    start = ref_start - MID
+    end = ref_start + read_len + MID
+
+    if circular and ref_len > 0:
+        # Circular extraction: wrap around
+        context = []
+        for i in range(start, end):
+            context.append(ref_seq[i % ref_len])
+        return ''.join(context)
+    else:
+        # Linear: pad with N
+        context = []
+        for i in range(start, end):
+            if 0 <= i < ref_len:
+                context.append(ref_seq[i])
+            else:
+                context.append('N')
+        return ''.join(context)
+
+
+# ---------------------------------------------------------------------------
+# Signal sampling
+# ---------------------------------------------------------------------------
+
+def sample_signal(mu, sigma):
+    """Sample a non-negative kinetic value from N(mu, sigma), clamped to [0, 255]."""
+    val = max(0, np.random.normal(mu, sigma))
+    return min(int(round(val)), 255)
+
+
+# ---------------------------------------------------------------------------
+# Main injection
+# ---------------------------------------------------------------------------
+
+def inject_signals(fastq_path, maf_path, ref_path, pkl_path,
+                   motif_string, output_bam, circular=True):
+    """Inject IPD/PW signals into PBSIM3 reads.
+
+    Pipeline:
+      1. Load reference genome
+      2. Load trained dictionary
+      3. Parse .maf alignment mapping
+      4. For each read in .fq.gz:
+         a. Get reference context (extended by 5bp each side) via .maf
+         b. Scan motifs on the extended reference context
+         c. Encode 11-mers and sample IPD/PW from dictionary
+      5. Write unaligned BAM with fi/fp tags
+    """
+    print(f"Loading reference: {ref_path}")
+    ref_seqs = load_reference(ref_path)
+
+    print(f"Loading dictionary: {pkl_path}")
+    with open(pkl_path, 'rb') as f:
+        lookup = pickle.load(f)
+
+    print(f"Parsing MAF: {maf_path}")
+    maf_mapping = parse_maf(maf_path)
+
+    motifs = parse_motifs(motif_string)
+
+    # Fallback stats for unfknown kmers (global mean of unmethylated entries)
+    default_acc = np.zeros(5, dtype=np.float64)
+
+    print(f"Injecting signals into reads from {fastq_path}...")
+    n_reads = 0
+    n_mapped = 0
+    n_unmapped = 0
+
+    # Write unaligned BAM
+    header = pysam.AlignmentHeader.from_dict({
+        'HD': {'VN': '1.6', 'SO': 'unknown'}
+    })
+
+    open_func = gzip.open if fastq_path.endswith('.gz') else open
+    with pysam.AlignmentFile(output_bam, "wb", header=header) as bam_out, \
+         open_func(fastq_path, 'rt') as fq:
+
+        while True:
+            hdr_line = fq.readline()
+            if not hdr_line:
+                break
+            seq_line = fq.readline()
+            fq.readline()  # +
+            qual_line = fq.readline()
+
+            read_name = hdr_line.strip()[1:].split()[0]
+            seq = seq_line.strip()
+            qual_str = qual_line.strip()
+            read_len = len(seq)
+            n_reads += 1
+
+            # Look up reference mapping from MAF
+            maf_info = maf_mapping.get(read_name)
+
+            if maf_info and maf_info[0] in ref_seqs:
+                ref_name, ref_start, ref_strand, ref_src_size = maf_info
+                ref_seq = ref_seqs[ref_name]
+
+                # Get extended context: MID extra bases on each side
+                ext_context = get_extended_context(ref_seq, ref_start, read_len, circular)
+
+                # Scan motifs on the extended context
+                meth_status = scan_sequence(ext_context, motifs)
+
+                # Encode 11-mers from the extended context and sample signals
+                ipd_vals = []
+                pw_vals = []
+                current_kmer = 0
+
+                for i in range(len(ext_context)):
+                    base_val = BASE_MAP.get(ext_context[i], 0)
+                    current_kmer = ((current_kmer << 2) | base_val) & KMER_MASK
+
+                    if i >= K - 1:
+                        # Position in read = i - MID - (K-1-MID) = i - (K-1)
+                        read_pos = i - (K - 1)
+                        if 0 <= read_pos < read_len:
+                            center = i - MID
+
+
+                            context_window = ext_context[i-(K-1) : i+1]
+                            if 'N' in context_window:
+                                # Signal par défaut (1.0 avec un petit sigma)
+                                ipd_vals.append(sample_signal(1.0, 0.1))
+                                pw_vals.append(sample_signal(1.0, 0.1))
+                            else:
+                                key = (current_kmer, int(meth_status[center]))
+                                acc = lookup.get(key, default_acc)
+
+                                mu_ipd, sig_ipd = get_ipd_stats(acc)
+                                mu_pw, sig_pw = get_pw_stats(acc)
+
+                                ipd_vals.append(sample_signal(mu_ipd, sig_ipd))
+                                pw_vals.append(sample_signal(mu_pw, sig_pw))
+
+                n_mapped += 1
+            else:
+                # No MAF info: fall back to read-only context (edge bases get defaults)
+                meth_status = scan_sequence(seq, motifs)
+                ipd_vals = []
+                pw_vals = []
+                current_kmer = 0
+
+                for i in range(read_len):
+                    base_val = BASE_MAP.get(seq[i], 0)
+                    current_kmer = ((current_kmer << 2) | base_val) & KMER_MASK
+
+                    if i < K - 1:
+                        # Not enough context yet — use defaults
+                        ipd_vals.append(sample_signal(1.0, 0.1))
+                        pw_vals.append(sample_signal(1.0, 0.1))
+                    else:
+                        center = i - MID
+                        key = (current_kmer, int(meth_status[center]))
+                        acc = lookup.get(key, default_acc)
+
+                        mu_ipd, sig_ipd = get_ipd_stats(acc)
+                        mu_pw, sig_pw = get_pw_stats(acc)
+
+                        ipd_vals.append(sample_signal(mu_ipd, sig_ipd))
+                        pw_vals.append(sample_signal(mu_pw, sig_pw))
+
+                n_unmapped += 1
+
+            # Build pysam AlignedSegment
+            seg = pysam.AlignedSegment(header)
+            seg.query_name = read_name
+            seg.flag = 4  # unmapped
+            seg.query_sequence = seq
+            seg.query_qualities = pysam.qualitystring_to_array(qual_str)
+            seg.set_tag('fi', array.array('B', ipd_vals), 'B')
+            seg.set_tag('fp', array.array('B', pw_vals), 'B')
+            bam_out.write(seg)
+
+    print(f"Done. {n_reads} reads processed ({n_mapped} with ref context, {n_unmapped} without).")
+    print(f"Output: {output_bam}")
+
+
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="kinsim dictionary inject",
+        description="Inject IPD/PW kinetic signals into PBSIM3 simulated reads. "
+                    "Uses a trained 11-mer dictionary and the .maf alignment to resolve "
+                    "reference context for edge bases. Outputs an unaligned BAM with "
+                    "fi (IPD) and fp (PW) tags.",
+    )
+    parser.add_argument("fastq", help="PBSIM3 simulated reads (.fq or .fq.gz)")
+    parser.add_argument("maf", help="PBSIM3 alignment file (.maf or .maf.gz)")
+    parser.add_argument("ref", help="Reference genome FASTA (.fna, .fa, or .gz)")
+    parser.add_argument("pkl", help="Trained kinetic dictionary (.pkl)")
+    parser.add_argument("motifs", help="Motif string: 'm6A,GATC,2;m4C,CCWGG,1'")
+    parser.add_argument("output", help="Output unaligned BAM file")
+    parser.add_argument("--linear", action="store_true",
+                        help="Treat genome as linear (default: circular wrapping for bacteria)")
+    args = parser.parse_args(argv)
+    inject_signals(
+        fastq_path=args.fastq,
+        maf_path=args.maf,
+        ref_path=args.ref,
+        pkl_path=args.pkl,
+        motif_string=args.motifs,
+        output_bam=args.output,
+        circular=not args.linear,
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+
+------------------------------------------------
+FILE: kinsim/dictionary/analyze.py
+------------------------------------------------
+"""Analyze a trained 11-mer kinetic dictionary (.pkl) for coverage stats."""
+
+import sys
+import pickle
+import numpy as np
+
+from ..encoding import TOTAL_POSSIBLE_KMERS, METH_IDS
+
+
+def analyze_dict(pkl_path):
+    """Load a .pkl dictionary and print coverage statistics.
+
+    Splits entries by methylation status (unmethylated vs each meth type)
+    and reports: entry count, % of 4^11 covered, mean/median/min/max sample count.
+    """
+    with open(pkl_path, 'rb') as f:
+        lookup = pickle.load(f)
+
+    if not lookup:
+        print("Dictionary is empty.")
+        return
+
+    # Partition entries by methylation id
+    groups = {}  # meth_id -> list of sample counts (n)
+    for (kmer, meth_id), acc in lookup.items():
+        n = acc[0]
+        if meth_id not in groups:
+            groups[meth_id] = []
+        groups[meth_id].append(n)
+
+    # Reverse map: id -> name
+    id_to_name = {v: k for k, v in METH_IDS.items()}
+
+    total_entries = len(lookup)
+    total_samples = sum(acc[0] for acc in lookup.values())
+
+    print(f"Dictionary: {pkl_path}")
+    print(f"Total entries: {total_entries:,}")
+    print(f"Total samples: {total_samples:,.0f}")
+    print(f"Possible 11-mer contexts: {TOTAL_POSSIBLE_KMERS:,}")
+    print("-" * 60)
+
+    for meth_id in sorted(groups.keys()):
+        counts = np.array(groups[meth_id])
+        name = id_to_name.get(meth_id, f"id={meth_id}")
+        label = "Unmethylated" if meth_id == 0 else f"Methylated ({name})"
+        n_entries = len(counts)
+        coverage = 100.0 * n_entries / TOTAL_POSSIBLE_KMERS
+
+        print(f"\n{label}:")
+        print(f"  Unique 11-mers : {n_entries:,} / {TOTAL_POSSIBLE_KMERS:,} ({coverage:.2f}%)")
+        print(f"  Sample count   : mean={np.mean(counts):.1f}  median={np.median(counts):.1f}"
+              f"  min={np.min(counts):.0f}  max={np.max(counts):.0f}")
+        print(f"  Total samples  : {np.sum(counts):,.0f}")
+
+    # Aggregate methylated view
+    meth_counts = []
+    for mid, cnts in groups.items():
+        if mid != 0:
+            meth_counts.extend(cnts)
+
+    if meth_counts:
+        meth_counts = np.array(meth_counts)
+        meth_entries = len(meth_counts)
+        print(f"\nAll methylated (combined):")
+        print(f"  Unique 11-mers : {meth_entries:,}")
+        print(f"  Sample count   : mean={np.mean(meth_counts):.1f}  median={np.median(meth_counts):.1f}"
+              f"  min={np.min(meth_counts):.0f}  max={np.max(meth_counts):.0f}")
+
+
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="kinsim dictionary analyze",
+        description="Analyze a trained 11-mer kinetic dictionary for coverage statistics. "
+                    "Reports per-methylation-state: percent of 4^11 possible 11-mers covered, "
+                    "mean/median/min/max sample counts.",
+    )
+    parser.add_argument("pkl", help="Path to the trained dictionary (.pkl file)")
+    args = parser.parse_args(argv)
+    analyze_dict(args.pkl)
+
+
+if __name__ == "__main__":
+    main()
+
+

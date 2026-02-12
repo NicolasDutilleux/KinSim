@@ -160,7 +160,7 @@ def inject_signals(fastq_path, maf_path, ref_path, pkl_path,
 
     motifs = parse_motifs(motif_string)
 
-    # Fallback stats for unknown kmers (global mean of unmethylated entries)
+    # Fallback stats for unfknown kmers (global mean of unmethylated entries)
     default_acc = np.zeros(5, dtype=np.float64)
 
     print(f"Injecting signals into reads from {fastq_path}...")
@@ -218,14 +218,22 @@ def inject_signals(fastq_path, maf_path, ref_path, pkl_path,
                         read_pos = i - (K - 1)
                         if 0 <= read_pos < read_len:
                             center = i - MID
-                            key = (current_kmer, int(meth_status[center]))
-                            acc = lookup.get(key, default_acc)
 
-                            mu_ipd, sig_ipd = get_ipd_stats(acc)
-                            mu_pw, sig_pw = get_pw_stats(acc)
 
-                            ipd_vals.append(sample_signal(mu_ipd, sig_ipd))
-                            pw_vals.append(sample_signal(mu_pw, sig_pw))
+                            context_window = ext_context[i-(K-1) : i+1]
+                            if 'N' in context_window:
+                                # Signal par défaut (1.0 avec un petit sigma)
+                                ipd_vals.append(sample_signal(1.0, 0.1))
+                                pw_vals.append(sample_signal(1.0, 0.1))
+                            else:
+                                key = (current_kmer, int(meth_status[center]))
+                                acc = lookup.get(key, default_acc)
+
+                                mu_ipd, sig_ipd = get_ipd_stats(acc)
+                                mu_pw, sig_pw = get_pw_stats(acc)
+
+                                ipd_vals.append(sample_signal(mu_ipd, sig_ipd))
+                                pw_vals.append(sample_signal(mu_pw, sig_pw))
 
                 n_mapped += 1
             else:

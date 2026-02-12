@@ -124,11 +124,11 @@ def main(argv=None):
         subcmd, subrest = rest[0], rest[1:]
 
         if subcmd == "train":
-            from .cgan.train import main as run
+            from .cgan.parse_train import main as run
             run(["train"] + subrest)
 
         elif subcmd == "merge":
-            from .cgan.train import main as run
+            from .cgan.parse_train import main as run
             run(["merge"] + subrest)
 
         else:
