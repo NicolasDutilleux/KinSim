@@ -1,0 +1,11 @@
+feat: kinsim dictionary, restructure, -h, install
+
+- Add kinsim/cgan/parse_train.py for raw IPD/PW extraction (reservoir sampling included)
+- Implement kinsim/prepare.py to parse motifs.csv into one-liner configs
+- Enhance kinsim/motifs.py with IUPAC regex support and modified_base resolution
+- Reorganize SLURM scripts into slurm_kinsim/ for production use
+- Migrate legacy scripts and test data to cluster_tests/
+- Update README.md with full pipeline overview and usage instructions
+- Add .gitignore to manage cluster artifacts and local configs
+- Add -h to the kinsim tool for easy use
+- Add kinsim dictionary mode [First "easy" technique tried]
