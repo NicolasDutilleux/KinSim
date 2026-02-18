@@ -9,19 +9,24 @@ import pysam
 from collections import defaultdict
 
 from ..encoding import BASE_MAP, KMER_MASK, K, KMER_BITS
-from ..motifs import parse_motifs, scan_sequence
+from ..motifs import parse_motifs, scan_sequence, load_motif_string
 
 
-def train_single_bam(bam_path, motif_string):
+def train_single_bam(bam_path, motif_string, revcomp=True):
     """Process a single BAM file and return the lookup dictionary.
 
     For each read: extract sequence + fi/fp tags, scan methylation motifs,
     then slide an 11-mer window accumulating (n, sum_ipd, sum_ipd², sum_pw, sum_pw²).
 
+    Args:
+        bam_path: Path to BAM file with fi/fp kinetic tags.
+        motif_string: Semicolon-delimited motif string.
+        revcomp: Generate reverse complement motif patterns (default True).
+
     Returns dict[(int_kmer, meth_id)] -> np.array([n, sum_ipd, sum_ipd2, sum_pw, sum_pw2])
     """
     mid = K // 2  # 5
-    motifs = parse_motifs(motif_string)
+    motifs = parse_motifs(motif_string, revcomp=revcomp)
     lookup = defaultdict(lambda: np.zeros(5, dtype=np.float64))
 
     with pysam.AlignmentFile(bam_path, "rb", check_sq=False) as bam:
@@ -34,7 +39,9 @@ def train_single_bam(bam_path, motif_string):
             pws = read.get_tag('fp')
             min_len = min(len(seq), len(ipds), len(pws))
 
-            # Scan methylation positions
+            # Scan methylation positions using in-memory regex.
+            # (fuzznuc is used only for reference-level pre-scanning in inject.py;
+            # per-read subprocess calls would be prohibitively slow here)
             meth_status = scan_sequence(seq[:min_len], motifs)
 
             # Sliding window bit-packing
@@ -96,8 +103,17 @@ def main(argv=None):
                     "methylation state. Outputs a .pkl shard.",
     )
     p_train.add_argument("bam", help="Input BAM file with fi/fp kinetic tags")
-    p_train.add_argument("motifs", help="Motif string: 'm6A,GATC,2;m4C,CCWGG,1'")
+    p_train.add_argument("motifs",
+                         help="Motif source: KinSim string ('m6A,GATC,1'), "
+                              "PacBio motifs.csv, or REBASE file (auto-detected)")
     p_train.add_argument("output", help="Output .pkl file for the dictionary shard")
+    p_train.add_argument("--no-revcomp", action="store_true",
+                         help="Do not scan reverse complement strand for motifs "
+                              "(use when motif source already includes both orientations)")
+    p_train.add_argument("--min-fraction", type=float, default=0.40,
+                         help="Minimum fraction threshold for PacBio CSV (default: 0.40)")
+    p_train.add_argument("--min-detected", type=int, default=20,
+                         help="Minimum nDetected threshold for PacBio CSV (default: 20)")
 
     # -- merge subcommand --
     p_merge = sub.add_parser(
@@ -114,8 +130,14 @@ def main(argv=None):
     if args.command == "merge":
         merge_shards(args.input_dir, args.output)
     else:
+        motif_string = load_motif_string(args.motifs,
+                                         min_fraction=args.min_fraction,
+                                         min_detected=args.min_detected)
+        if not motif_string:
+            print("ERROR: no motifs found from the provided source.", file=sys.stderr)
+            sys.exit(1)
         print(f"Training on {os.path.basename(args.bam)}...")
-        lookup = train_single_bam(args.bam, args.motifs)
+        lookup = train_single_bam(args.bam, motif_string, revcomp=not args.no_revcomp)
         with open(args.output, 'wb') as f:
             pickle.dump(lookup, f)
         print(f"Dictionary saved to {args.output} ({len(lookup)} entries)")

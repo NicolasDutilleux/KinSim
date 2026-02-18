@@ -5,7 +5,7 @@
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/kinsim_train_%A_%a.log
+#SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/kinsim_train_%A_%a.log
 #SBATCH --mail-user=nicolas.dutilleux@unifr.ch
 #SBATCH --mail-type=FAIL
 

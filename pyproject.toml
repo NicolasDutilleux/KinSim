@@ -18,6 +18,7 @@ kinsim = "kinsim.__main__:main"
 
 [project.optional-dependencies]
 cluster = ["pyyaml"]
+cgan = ["torch>=2.0", "tensorboard"]
 
 [tool.setuptools.packages.find]
 include = ["kinsim*"]
