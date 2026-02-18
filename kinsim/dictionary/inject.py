@@ -3,6 +3,20 @@
 Uses a trained 11-mer dictionary + the PBSIM3 .maf alignment to resolve
 reference context for edge bases (first/last 5 positions of each read).
 Outputs an unaligned BAM with fi (IPD) and fp (PW) tags.
+
+Motif input (auto-detected):
+  - KinSim motif string  — "m6A,GATC,1;m4C,CCWGG,1"
+  - PacBio motifs.csv    — file path ending in .csv
+  - REBASE file          — any other file path
+
+Signal context design note:
+  For edge bases (first/last 5 positions of each read), the polymerase
+  experienced the full genomic 11-mer context even though those flanking
+  bases are not part of the synthetic read.  We therefore use the .maf
+  alignment to extend each read 5 bp into the reference on both sides,
+  ensuring correct kinetic signal sampling for all positions.  Use
+  --no-context to disable this and fall back to in-read context only
+  (edge bases get default signals).
 """
 
 import sys
@@ -14,7 +28,7 @@ import numpy as np
 import pysam
 
 from ..encoding import BASE_MAP, KMER_MASK, K, get_ipd_stats, get_pw_stats
-from ..motifs import parse_motifs, scan_sequence
+from ..motifs import load_motif_string, parse_motifs, scan_sequence, build_reference_meth_map
 
 MID = K // 2  # 5
 
@@ -71,53 +85,41 @@ def parse_maf(maf_path):
             elif line.startswith('s'):
                 lines_in_block.append(line)
                 if len(lines_in_block) == 2:
-                    # Parse reference line
-                    ref_parts = lines_in_block[0].split()
-                    ref_name = ref_parts[1]
-                    ref_start = int(ref_parts[2])
+                    ref_parts  = lines_in_block[0].split()
+                    ref_name   = ref_parts[1]
+                    ref_start  = int(ref_parts[2])
                     ref_strand = ref_parts[4]
                     ref_src_size = int(ref_parts[5])
 
-                    # Parse read line
                     read_parts = lines_in_block[1].split()
-                    read_name = read_parts[1]
+                    read_name  = read_parts[1]
 
                     mapping[read_name] = (ref_name, ref_start, ref_strand, ref_src_size)
     return mapping
 
 
 # ---------------------------------------------------------------------------
-# Reference context extraction
+# Reference context extraction (for 11-mer kmer building at edge bases)
 # ---------------------------------------------------------------------------
 
 def get_extended_context(ref_seq, ref_start, read_len, circular=True):
     """Get the reference sequence context for a read, extended by MID on each side.
 
-    For edge bases of a read, we need reference context beyond the read boundaries.
-    For circular genomes (bacteria), wraps around. Otherwise pads with 'N'.
+    Returns a string of length (read_len + 2*MID) representing the reference
+    context from (ref_start - MID) to (ref_start + read_len + MID).
 
-    Returns a string of length (read_len + 2*MID) representing the reference context
-    from (ref_start - MID) to (ref_start + read_len + MID).
+    This extended context is used only for 11-mer kmer encoding at edge bases.
+    Methylation status is looked up from the pre-computed reference meth_map.
     """
     ref_len = len(ref_seq)
     start = ref_start - MID
-    end = ref_start + read_len + MID
+    end   = ref_start + read_len + MID
 
     if circular and ref_len > 0:
-        # Circular extraction: wrap around
-        context = []
-        for i in range(start, end):
-            context.append(ref_seq[i % ref_len])
-        return ''.join(context)
+        return ''.join(ref_seq[i % ref_len] for i in range(start, end))
     else:
-        # Linear: pad with N
-        context = []
-        for i in range(start, end):
-            if 0 <= i < ref_len:
-                context.append(ref_seq[i])
-            else:
-                context.append('N')
-        return ''.join(context)
+        return ''.join(ref_seq[i] if 0 <= i < ref_len else 'N'
+                       for i in range(start, end))
 
 
 # ---------------------------------------------------------------------------
@@ -135,21 +137,39 @@ def sample_signal(mu, sigma):
 # ---------------------------------------------------------------------------
 
 def inject_signals(fastq_path, maf_path, ref_path, pkl_path,
-                   motif_string, output_bam, circular=True):
+                   motif_string, output_bam,
+                   circular=True, revcomp=True, no_fuzznuc=False):
     """Inject IPD/PW signals into PBSIM3 reads.
 
     Pipeline:
       1. Load reference genome
-      2. Load trained dictionary
-      3. Parse .maf alignment mapping
-      4. For each read in .fq.gz:
-         a. Get reference context (extended by 5bp each side) via .maf
-         b. Scan motifs on the extended reference context
+      2. Pre-scan reference for methylation sites (fuzznuc primary, regex fallback)
+      3. Load trained dictionary
+      4. Parse .maf alignment mapping
+      5. For each read in .fq.gz:
+         a. Get extended reference context via .maf (for kmer building at edges)
+         b. Look up methylation status from pre-computed reference map
          c. Encode 11-mers and sample IPD/PW from dictionary
-      5. Write unaligned BAM with fi/fp tags
+      6. Write unaligned BAM with fi/fp tags
+
+    Args:
+        circular:   Treat genome as circular (default True for bacteria).
+        revcomp:    Scan reverse complement strand for motifs (default True).
+        no_fuzznuc: Force Python regex for reference scanning; skip fuzznuc.
+                    By default fuzznuc is tried first, falling back to regex
+                    automatically if EMBOSS is not installed.
     """
     print(f"Loading reference: {ref_path}")
     ref_seqs = load_reference(ref_path)
+
+    backend = "regex (forced)" if no_fuzznuc else "fuzznuc (primary, regex fallback)"
+    print(f"Pre-scanning reference for methylation sites ({backend})...")
+    meth_map = build_reference_meth_map(ref_seqs, motif_string,
+                                        revcomp=revcomp,
+                                        no_fuzznuc=no_fuzznuc)
+
+    # Keep regex-parsed motifs for fallback (unmapped reads)
+    fallback_motifs = parse_motifs(motif_string, revcomp=revcomp)
 
     print(f"Loading dictionary: {pkl_path}")
     with open(pkl_path, 'rb') as f:
@@ -158,17 +178,13 @@ def inject_signals(fastq_path, maf_path, ref_path, pkl_path,
     print(f"Parsing MAF: {maf_path}")
     maf_mapping = parse_maf(maf_path)
 
-    motifs = parse_motifs(motif_string)
-
-    # Fallback stats for unfknown kmers (global mean of unmethylated entries)
     default_acc = np.zeros(5, dtype=np.float64)
 
     print(f"Injecting signals into reads from {fastq_path}...")
-    n_reads = 0
-    n_mapped = 0
+    n_reads   = 0
+    n_mapped  = 0
     n_unmapped = 0
 
-    # Write unaligned BAM
     header = pysam.AlignmentHeader.from_dict({
         'HD': {'VN': '1.6', 'SO': 'unknown'}
     })
@@ -181,32 +197,30 @@ def inject_signals(fastq_path, maf_path, ref_path, pkl_path,
             hdr_line = fq.readline()
             if not hdr_line:
                 break
-            seq_line = fq.readline()
+            seq_line  = fq.readline()
             fq.readline()  # +
             qual_line = fq.readline()
 
             read_name = hdr_line.strip()[1:].split()[0]
-            seq = seq_line.strip()
-            qual_str = qual_line.strip()
-            read_len = len(seq)
-            n_reads += 1
+            seq       = seq_line.strip()
+            qual_str  = qual_line.strip()
+            read_len  = len(seq)
+            n_reads  += 1
 
-            # Look up reference mapping from MAF
             maf_info = maf_mapping.get(read_name)
 
             if maf_info and maf_info[0] in ref_seqs:
+                # --- Mapped read: use extended reference context ---
                 ref_name, ref_start, ref_strand, ref_src_size = maf_info
-                ref_seq = ref_seqs[ref_name]
+                ref_seq  = ref_seqs[ref_name]
+                ref_len  = len(ref_seq)
+                ref_meth = meth_map[ref_name]
 
-                # Get extended context: MID extra bases on each side
-                ext_context = get_extended_context(ref_seq, ref_start, read_len, circular)
+                ext_context = get_extended_context(ref_seq, ref_start,
+                                                   read_len, circular)
 
-                # Scan motifs on the extended context
-                meth_status = scan_sequence(ext_context, motifs)
-
-                # Encode 11-mers from the extended context and sample signals
                 ipd_vals = []
-                pw_vals = []
+                pw_vals  = []
                 current_kmer = 0
 
                 for i in range(len(ext_context)):
@@ -214,33 +228,42 @@ def inject_signals(fastq_path, maf_path, ref_path, pkl_path,
                     current_kmer = ((current_kmer << 2) | base_val) & KMER_MASK
 
                     if i >= K - 1:
-                        # Position in read = i - MID - (K-1-MID) = i - (K-1)
                         read_pos = i - (K - 1)
                         if 0 <= read_pos < read_len:
-                            center = i - MID
-
-
-                            context_window = ext_context[i-(K-1) : i+1]
+                            # Check for N in the 11-mer window
+                            context_window = ext_context[i - (K - 1): i + 1]
                             if 'N' in context_window:
-                                # Signal par défaut (1.0 avec un petit sigma)
                                 ipd_vals.append(sample_signal(1.0, 0.1))
                                 pw_vals.append(sample_signal(1.0, 0.1))
                             else:
-                                key = (current_kmer, int(meth_status[center]))
+                                # Methylation status from pre-computed map
+                                # center in ext_context = ref_start + read_pos (on reference)
+                                ref_pos = ref_start + read_pos
+                                if circular:
+                                    meth_id = int(ref_meth[ref_pos % ref_len])
+                                elif 0 <= ref_pos < ref_len:
+                                    meth_id = int(ref_meth[ref_pos])
+                                else:
+                                    meth_id = 0
+
+                                key = (current_kmer, meth_id)
                                 acc = lookup.get(key, default_acc)
 
                                 mu_ipd, sig_ipd = get_ipd_stats(acc)
-                                mu_pw, sig_pw = get_pw_stats(acc)
+                                mu_pw,  sig_pw  = get_pw_stats(acc)
 
                                 ipd_vals.append(sample_signal(mu_ipd, sig_ipd))
-                                pw_vals.append(sample_signal(mu_pw, sig_pw))
+                                pw_vals.append(sample_signal(mu_pw,  sig_pw))
 
                 n_mapped += 1
+
             else:
-                # No MAF info: fall back to read-only context (edge bases get defaults)
-                meth_status = scan_sequence(seq, motifs)
+                # --- Unmapped read: fall back to read-only context ---
+                # Per-read regex scanning (fuzznuc is only used for the reference
+                # pre-scan above; subprocess calls per read would be prohibitively slow)
+                meth_status = scan_sequence(seq, fallback_motifs)
                 ipd_vals = []
-                pw_vals = []
+                pw_vals  = []
                 current_kmer = 0
 
                 for i in range(read_len):
@@ -248,7 +271,6 @@ def inject_signals(fastq_path, maf_path, ref_path, pkl_path,
                     current_kmer = ((current_kmer << 2) | base_val) & KMER_MASK
 
                     if i < K - 1:
-                        # Not enough context yet — use defaults
                         ipd_vals.append(sample_signal(1.0, 0.1))
                         pw_vals.append(sample_signal(1.0, 0.1))
                     else:
@@ -257,24 +279,24 @@ def inject_signals(fastq_path, maf_path, ref_path, pkl_path,
                         acc = lookup.get(key, default_acc)
 
                         mu_ipd, sig_ipd = get_ipd_stats(acc)
-                        mu_pw, sig_pw = get_pw_stats(acc)
+                        mu_pw,  sig_pw  = get_pw_stats(acc)
 
                         ipd_vals.append(sample_signal(mu_ipd, sig_ipd))
-                        pw_vals.append(sample_signal(mu_pw, sig_pw))
+                        pw_vals.append(sample_signal(mu_pw,  sig_pw))
 
                 n_unmapped += 1
 
-            # Build pysam AlignedSegment
             seg = pysam.AlignedSegment(header)
-            seg.query_name = read_name
-            seg.flag = 4  # unmapped
+            seg.query_name     = read_name
+            seg.flag           = 4  # unmapped
             seg.query_sequence = seq
             seg.query_qualities = pysam.qualitystring_to_array(qual_str)
             seg.set_tag('fi', array.array('B', ipd_vals), 'B')
-            seg.set_tag('fp', array.array('B', pw_vals), 'B')
+            seg.set_tag('fp', array.array('B', pw_vals),  'B')
             bam_out.write(seg)
 
-    print(f"Done. {n_reads} reads processed ({n_mapped} with ref context, {n_unmapped} without).")
+    print(f"Done. {n_reads} reads processed "
+          f"({n_mapped} with ref context, {n_unmapped} without).")
     print(f"Output: {output_bam}")
 
 
@@ -282,28 +304,56 @@ def main(argv=None):
     import argparse
     parser = argparse.ArgumentParser(
         prog="kinsim dictionary inject",
-        description="Inject IPD/PW kinetic signals into PBSIM3 simulated reads. "
-                    "Uses a trained 11-mer dictionary and the .maf alignment to resolve "
-                    "reference context for edge bases. Outputs an unaligned BAM with "
-                    "fi (IPD) and fp (PW) tags.",
+        description=(
+            "Inject IPD/PW kinetic signals into PBSIM3 simulated reads.\n\n"
+            "Uses a trained 11-mer dictionary and the .maf alignment to resolve\n"
+            "reference context for edge bases.  The reference is pre-scanned once\n"
+            "for methylation sites; subsequent per-read lookups are O(1).\n\n"
+            "Outputs an unaligned BAM with fi (IPD) and fp (PW) tags."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("fastq", help="PBSIM3 simulated reads (.fq or .fq.gz)")
-    parser.add_argument("maf", help="PBSIM3 alignment file (.maf or .maf.gz)")
-    parser.add_argument("ref", help="Reference genome FASTA (.fna, .fa, or .gz)")
-    parser.add_argument("pkl", help="Trained kinetic dictionary (.pkl)")
-    parser.add_argument("motifs", help="Motif string: 'm6A,GATC,2;m4C,CCWGG,1'")
+    parser.add_argument("fastq",  help="PBSIM3 simulated reads (.fq or .fq.gz)")
+    parser.add_argument("maf",    help="PBSIM3 alignment file (.maf or .maf.gz)")
+    parser.add_argument("ref",    help="Reference genome FASTA (.fna, .fa, or .gz)")
+    parser.add_argument("pkl",    help="Trained kinetic dictionary (.pkl)")
+    parser.add_argument("motifs",
+                        help="Motif source: KinSim string ('m6A,GATC,1'), "
+                             "PacBio motifs.csv, or REBASE file (auto-detected)")
     parser.add_argument("output", help="Output unaligned BAM file")
     parser.add_argument("--linear", action="store_true",
-                        help="Treat genome as linear (default: circular wrapping for bacteria)")
+                        help="Treat genome as linear (default: circular for bacteria)")
+    parser.add_argument("--no-revcomp", action="store_true",
+                        help="Do not scan reverse complement strand for motifs "
+                             "(use when motif source already includes both orientations)")
+    parser.add_argument("--no-fuzznuc", action="store_true",
+                        help="Force Python regex for reference methylation scanning. "
+                             "By default, EMBOSS fuzznuc is tried first as the primary "
+                             "backend and falls back to regex automatically if fuzznuc "
+                             "is not installed.")
+    parser.add_argument("--min-fraction", type=float, default=0.40,
+                        help="Minimum fraction threshold (PacBio CSV only, default: 0.40)")
+    parser.add_argument("--min-detected", type=int, default=20,
+                        help="Minimum nDetected threshold (PacBio CSV only, default: 20)")
     args = parser.parse_args(argv)
+
+    motif_string = load_motif_string(args.motifs,
+                                     min_fraction=args.min_fraction,
+                                     min_detected=args.min_detected)
+    if not motif_string:
+        print("ERROR: no motifs found from the provided source.", file=sys.stderr)
+        sys.exit(1)
+
     inject_signals(
         fastq_path=args.fastq,
         maf_path=args.maf,
         ref_path=args.ref,
         pkl_path=args.pkl,
-        motif_string=args.motifs,
+        motif_string=motif_string,
         output_bam=args.output,
         circular=not args.linear,
+        revcomp=not args.no_revcomp,
+        no_fuzznuc=args.no_fuzznuc,
     )
 
 

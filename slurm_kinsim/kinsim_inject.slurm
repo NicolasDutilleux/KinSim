@@ -5,7 +5,7 @@
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
 #SBATCH --time=04:00:00
-#SBATCH --output=logs/kinsim_inject_%A_%a.log
+#SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/kinsim_inject_%A_%a.log
 #SBATCH --mail-user=nicolas.dutilleux@unifr.ch
 #SBATCH --mail-type=FAIL
 
@@ -65,6 +65,10 @@ fi
 # ---- Environment ----
 source ~/.bashrc
 conda activate kinsim_env
+# Note: fuzznuc (EMBOSS) is used by default for reference methylation scanning.
+# Ensure EMBOSS is installed in kinsim_env: conda install -c bioconda emboss
+# KinSim falls back to Python regex automatically if fuzznuc is unavailable.
+# Add --no-fuzznuc to the kinsim command below to force regex mode.
 
 # ---- Config ----
 CONFIG_FILE="$1"

@@ -14,20 +14,21 @@ output metadata for optional per-motif weighting during GAN training.
 """
 
 import os
+import sys
 import pickle
 import numpy as np
 import pysam
 from collections import defaultdict
 
 from ..encoding import BASE_MAP, KMER_MASK, K
-from ..motifs import parse_motifs, scan_sequence
+from ..motifs import parse_motifs, scan_sequence, load_motif_string
 
 
 # ---------------------------------------------------------------------------
 # Training: extract raw samples from a single BAM
 # ---------------------------------------------------------------------------
 
-def train_single_bam(bam_path, motif_string, max_samples_per_key=10_000):
+def extract_samples_from_bam(bam_path, motif_string, max_samples_per_key=10_000, revcomp=True):
     """Extract raw (IPD, PW) pairs from a BAM file for each 11-mer context.
 
     For each read: extract sequence + fi/fp kinetic tags, scan methylation
@@ -39,12 +40,13 @@ def train_single_bam(bam_path, motif_string, max_samples_per_key=10_000):
         max_samples_per_key: Cap per (kmer, meth_id) to limit memory usage.
             Once a key reaches this count, new samples are randomly replaced
             (reservoir sampling) to maintain an unbiased sample.
+        revcomp: Generate reverse complement motif patterns (default True).
 
     Returns:
         dict[(int_kmer, meth_id)] -> list of [IPD, PW] pairs
     """
     mid = K // 2  # 5
-    motifs = parse_motifs(motif_string)
+    motifs = parse_motifs(motif_string, revcomp=revcomp)
     samples = defaultdict(list)
     counts = defaultdict(int)  # total observations seen (for reservoir sampling)
 
@@ -58,7 +60,9 @@ def train_single_bam(bam_path, motif_string, max_samples_per_key=10_000):
             pws = read.get_tag('fp')
             min_len = min(len(seq), len(ipds), len(pws))
 
-            # Scan methylation positions on the read sequence
+            # Scan methylation positions using in-memory regex.
+            # (fuzznuc is used only for reference-level pre-scanning in generate.py;
+            # per-read subprocess calls would be prohibitively slow here)
             meth_status = scan_sequence(seq[:min_len], motifs)
 
             # Sliding window: encode 11-mers and collect raw signals
@@ -157,19 +161,28 @@ def main(argv=None):
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # -- train subcommand --
+    # -- extract subcommand --
     p_train = sub.add_parser(
-        "train",
+        "extract",
         help="Extract raw (IPD, PW) samples from a single BAM file",
         description="Collect individual IPD/PW observations per 11-mer + methylation "
                     "state. Outputs a *_cgan.pkl shard with raw sample arrays.",
     )
     p_train.add_argument("bam", help="Input BAM file with fi/fp kinetic tags")
-    p_train.add_argument("motifs", help="Motif string: 'm6A,GATC,2,3551;m4C,CCWGG,1,922'")
+    p_train.add_argument("motifs",
+                         help="Motif source: KinSim string ('m6A,GATC,1,3551'), "
+                              "PacBio motifs.csv, or REBASE file (auto-detected)")
     p_train.add_argument("output", help="Output .pkl file for the cGAN shard")
     p_train.add_argument("--max-samples", type=int, default=10_000,
                          help="Max samples per (kmer, meth_id) via reservoir sampling "
                               "(default: 10000)")
+    p_train.add_argument("--no-revcomp", action="store_true",
+                         help="Do not scan reverse complement strand for motifs "
+                              "(use when motif source already includes both orientations)")
+    p_train.add_argument("--min-fraction", type=float, default=0.40,
+                         help="Minimum fraction threshold for PacBio CSV (default: 0.40)")
+    p_train.add_argument("--min-detected", type=int, default=20,
+                         help="Minimum nDetected threshold for PacBio CSV (default: 20)")
 
     # -- merge subcommand --
     p_merge = sub.add_parser(
@@ -190,9 +203,16 @@ def main(argv=None):
         merge_shards(args.input_dir, args.output,
                      max_samples_per_key=args.max_samples)
     else:
+        motif_string = load_motif_string(args.motifs,
+                                         min_fraction=args.min_fraction,
+                                         min_detected=args.min_detected)
+        if not motif_string:
+            print("ERROR: no motifs found from the provided source.", file=sys.stderr)
+            sys.exit(1)
         print(f"Extracting cGAN samples from {os.path.basename(args.bam)}...")
-        result = train_single_bam(args.bam, args.motifs,
-                                  max_samples_per_key=args.max_samples)
+        result = extract_samples_from_bam(args.bam, motif_string,
+                                         max_samples_per_key=args.max_samples,
+                                         revcomp=not args.no_revcomp)
         with open(args.output, 'wb') as f:
             pickle.dump(result, f)
         total_samples = sum(len(v) for v in result.values())
