@@ -12,13 +12,16 @@
 # ============================================================
 # KinSim cGAN — Extract raw samples + merge (two-phase SLURM job)
 #
-# This script handles BOTH phases:
+# This script handles BOTH phases automatically:
 #   Phase 1 (array job):  Extract raw (IPD, PW) samples from one BAM
 #   Phase 2 (single job): Merge all shards into master_cgan_data.pkl
+#                         — submitted automatically by the last array task
 #
-# Usage (two-step submission):
-#   EXTRACT=$(sbatch --parsable --array=1-N kinsim_cgan_extract.slurm <config> <shards_dir> <master_output>)
-#   sbatch --dependency=afterok:$EXTRACT kinsim_cgan_extract.slurm <config> <shards_dir> <master_output>
+# Usage:
+#   sbatch --array=1-N kinsim_cgan_extract.slurm <config> <shards_dir> <master_output>
+#
+# The merge job is submitted automatically when all array tasks finish.
+# No second command needed.
 #
 # Arguments:
 #   $1  Config file (alternating lines: BAM path / motif string)
@@ -26,13 +29,8 @@
 #   $2  Directory for *_cgan.pkl shards (intermediate files)
 #   $3  Path for the final merged training data (e.g. /data/kinsim/master_cgan_data.pkl)
 #
-# How it works:
-#   - When SLURM_ARRAY_TASK_ID is set  → extracts samples from one BAM into $2
-#   - When SLURM_ARRAY_TASK_ID is unset → merges $2/*_cgan.pkl into $3
-#
 # Example:
-#   EXTRACT=$(sbatch --parsable --array=1-53 kinsim_cgan_extract.slurm config_strains.txt cgan_shards/ /data/kinsim/master_cgan_data.pkl)
-#   sbatch --dependency=afterok:$EXTRACT kinsim_cgan_extract.slurm config_strains.txt cgan_shards/ /data/kinsim/master_cgan_data.pkl
+#   sbatch --array=1-57 kinsim_cgan_extract.slurm config_strains.txt cgan_shards/ master_cgan_data.pkl
 #
 # Expected directory structure:
 #   project/
@@ -52,9 +50,7 @@
 
 # ---- Usage check ----
 if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then
-    echo "Usage:"
-    echo "  EXTRACT=\$(sbatch --parsable --array=1-N kinsim_cgan_extract.slurm <config> <shards_dir> <master_output>)"
-    echo "  sbatch --dependency=afterok:\$EXTRACT kinsim_cgan_extract.slurm <config> <shards_dir> <master_output>"
+    echo "Usage: sbatch --array=1-N kinsim_cgan_extract.slurm <config> <shards_dir> <master_output>"
     echo ""
     echo "Arguments:"
     echo "  config             Alternating lines: BAM path / motif string"
@@ -62,12 +58,8 @@ if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then
     echo "  shards_dir         Directory for intermediate *_cgan.pkl shard files"
     echo "  master_output      Path for the final merged training data (.pkl)"
     echo ""
-    echo "Expected structure:"
-    echo "  project/"
-    echo "    config_strains.txt"
-    echo "    cgan_shards/        <- intermediate shards"
-    echo "    master_cgan_data.pkl  <- final merged output"
-    echo "    logs/"
+    echo "Example:"
+    echo "  sbatch --array=1-57 kinsim_cgan_extract.slurm config_strains.txt cgan_shards/ master_cgan_data.pkl"
     exit 1
 fi
 
@@ -97,11 +89,19 @@ if [ -n "$SLURM_ARRAY_TASK_ID" ]; then
     OUTPUT_PKL="${SHARDS_DIR}/${BASENAME}_cgan.pkl"
 
     echo "=== PHASE 1: Extract ==="
-    echo "Task $SLURM_ARRAY_TASK_ID: $BAM_PATH"
+    echo "Task $SLURM_ARRAY_TASK_ID / $SLURM_ARRAY_TASK_MAX: $BAM_PATH"
     echo "Motifs: $MOTIFS"
     echo "Output: $OUTPUT_PKL"
 
     kinsim cgan extract "$BAM_PATH" "$MOTIFS" "$OUTPUT_PKL"
+
+    # The last array task submits the merge job automatically
+    if [ "$SLURM_ARRAY_TASK_ID" -eq "$SLURM_ARRAY_TASK_MAX" ]; then
+        echo ""
+        echo "Last array task — submitting merge job (dependency: afterok:${SLURM_ARRAY_JOB_ID})..."
+        sbatch --dependency=afterok:"${SLURM_ARRAY_JOB_ID}" \
+            "$0" "$CONFIG_FILE" "$SHARDS_DIR" "$MASTER_OUTPUT"
+    fi
 else
     # ============ PHASE 2: Merge all shards ============
     echo "=== PHASE 2: Merge ==="
