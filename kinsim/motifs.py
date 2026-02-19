@@ -18,7 +18,9 @@ Motif scanning backends:
 
 Motif string format:
   "m6A,GATC,1;m4C,CCWGG,1;m5C,RGATCY,4"
-  Each entry: MOD_TYPE,IUPAC_MOTIF,0-based_MOD_POS[,nDetected]
+  Each entry: MOD_TYPE,IUPAC_MOTIF,0-based_MOD_POS[,nDetected[,fraction]]
+  Fields 4 (nDetected) and 5 (fraction) are optional metadata from PacBio CSV.
+  They are ignored by train/inject/generate logic but preserved for traceability.
 """
 
 import sys
@@ -83,7 +85,8 @@ def parse_motifs(motif_string, revcomp=True):
     primary backend.
 
     Input format: "m6A,GATC,1;m4C,CCWGG,1;m5C,RGATCY,4"
-    Each entry: MOD_TYPE,IUPAC_MOTIF,MOD_POS[,extra] — semicolon-delimited.
+    Each entry: MOD_TYPE,IUPAC_MOTIF,MOD_POS[,nDetected[,fraction]] — semicolon-delimited.
+    Fields beyond index 2 are optional metadata (ignored here, preserved for traceability).
 
     Args:
         motif_string: Semicolon-delimited motif entries.
@@ -153,9 +156,10 @@ def parse_motifs_csv(csv_path, min_fraction=0.40, min_detected=20):
       4. Rows that can't be resolved are skipped with a warning.
 
     Returns:
-        A semicolon-delimited motif string with 4 fields per entry:
-        "m6A,GCCGATC,5,3551;m6A,CTGAAG,5,2891"
-        Fields: MOD_TYPE,MOTIF,POS,nDetected
+        A semicolon-delimited motif string with 5 fields per entry:
+        "m6A,GCCGATC,5,3551,0.998;m6A,CTGAAG,5,2891,1.0"
+        Fields: MOD_TYPE,MOTIF,POS,nDetected,fraction
+        (fraction preserved for reference; not used by train/inject/cGAN logic)
     """
     entries = []
     with open(csv_path, 'r') as f:
@@ -189,7 +193,7 @@ def parse_motifs_csv(csv_path, min_fraction=0.40, min_detected=20):
                       f"{motif_seq} — skipped", file=sys.stderr)
                 continue
 
-            entries.append(f"{mod_type},{motif_seq},{center_pos},{n_detected}")
+            entries.append(f"{mod_type},{motif_seq},{center_pos},{n_detected},{fraction:.6g}")
 
     return ";".join(entries)
 

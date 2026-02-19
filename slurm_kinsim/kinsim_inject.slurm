@@ -92,8 +92,32 @@ MOTIFS=$(echo "$LINE" | cut -d'|' -f5)
 BASENAME=$(basename "$FASTQ_IN" .fq.gz)
 BAM_OUT="${OUTPUT_DIR}/${BASENAME}_kinsim.bam"
 
-echo "Task $SLURM_ARRAY_TASK_ID: $FASTQ_IN"
+echo "=== Task $SLURM_ARRAY_TASK_ID ==="
+echo "FASTQ: $FASTQ_IN"
+echo "MAF:   $MAF_IN"
+echo "Ref:   $REF_IN"
+echo "Dict:  $PKL_IN"
+echo "Motifs: $MOTIFS"
 echo "Output: $BAM_OUT"
+echo ""
+
+# ---- Verify inputs ----
+if [ ! -f "$FASTQ_IN" ]; then
+    echo "ERROR: FASTQ file not found: $FASTQ_IN"
+    exit 1
+fi
+if [ ! -f "$MAF_IN" ]; then
+    echo "ERROR: MAF file not found: $MAF_IN"
+    exit 1
+fi
+if [ ! -f "$REF_IN" ]; then
+    echo "ERROR: Reference file not found: $REF_IN"
+    exit 1
+fi
+if [ ! -f "$PKL_IN" ]; then
+    echo "ERROR: Dictionary file not found: $PKL_IN"
+    exit 1
+fi
 
 # ---- Run ----
 kinsim dictionary inject "$FASTQ_IN" "$MAF_IN" "$REF_IN" "$PKL_IN" "$MOTIFS" "$BAM_OUT"
