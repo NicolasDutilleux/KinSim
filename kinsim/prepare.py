@@ -11,14 +11,18 @@ Supported motif source formats (auto-detected):
 
 Outputs a new text file with the same BAM-path lines, but the motif source
 lines are replaced by compact KinSim motif strings:
-  "m6A,GCCGATC,5,3551;m6A,CTGAAG,5,2891"
+  "m6A,GCCGATC,5,3551,0.998;m6A,CTGAAG,5,2891,1.0"
 
-The output format is compatible with both:
-  - kinsim.dictionary.train (uses first 3 fields: type,motif,pos)
-  - kinsim.cgan (uses all 4 fields: type,motif,pos,nDetected)
+Field layout per semicolon-delimited entry:
+  1. MOD_TYPE     — m6A, m4C, or m5C
+  2. IUPAC_MOTIF  — recognition sequence
+  3. POS          — 0-based position of modified base
+  4. nDetected    — number of detected occurrences (PacBio CSV only)
+  5. fraction     — methylation fraction 0.0-1.0  (PacBio CSV only)
 
-Note: nDetected is only present in PacBio CSV output.  REBASE-derived entries
-do not include a 4th field; cGAN mode will treat missing nDetected as 0.
+Fields 4 and 5 are absent for REBASE-derived entries. Downstream tools
+(train, inject, generate) only read the first 3 fields. nDetected is
+additionally used by cGAN mode for optional per-motif weighting.
 """
 
 import sys
@@ -100,7 +104,8 @@ def main(argv=None):
             "  /path/to/strain2/rebase_motifs.txt   # or an inline motif string\n\n"
             "Output format (alternating lines):\n"
             "  /path/to/strain1.bam\n"
-            "  m6A,GCCGATC,5,3551;m6A,CTGAAG,5,2891"
+            "  m6A,GCCGATC,5,3551,0.998;m6A,CTGAAG,5,2891,1.0\n"
+            "  (fields: MOD_TYPE,MOTIF,POS,nDetected,fraction)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
