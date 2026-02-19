@@ -4,7 +4,15 @@ Uses a trained 11-mer dictionary + the PBSIM3 .maf alignment to resolve
 reference context for edge bases (first/last 5 positions of each read).
 Outputs an unaligned BAM with fi (IPD) and fp (PW) tags.
 
-Motif input (auto-detected):
+Two calling modes (auto-detected):
+  Directory mode:   kinsim dictionary inject <pbsim3_dir> <dict.pkl> <motifs> <output_dir>
+  Per-genome mode:  kinsim dictionary inject <fq.gz> <maf.gz> <ref.fna> <dict.pkl> <motifs> <out.bam>
+
+In directory mode, all .fq.gz files in pbsim3_dir are processed. Matching
+.maf.gz and .fna files must share the same basename (e.g. genome1.fq.gz,
+genome1.maf.gz, genome1.fna). Also accepts .fq/.maf/.fa/.fasta extensions.
+
+Motif input (auto-detected in both modes):
   - KinSim motif string  — "m6A,GATC,1;m4C,CCWGG,1"
   - PacBio motifs.csv    — file path ending in .csv
   - REBASE file          — any other file path
@@ -21,6 +29,7 @@ Signal context design note:
 
 import sys
 import os
+import glob
 import gzip
 import pickle
 import array
@@ -133,13 +142,13 @@ def sample_signal(mu, sigma):
 
 
 # ---------------------------------------------------------------------------
-# Main injection
+# Main injection (single genome)
 # ---------------------------------------------------------------------------
 
 def inject_signals(fastq_path, maf_path, ref_path, pkl_path,
                    motif_string, output_bam,
                    circular=True, revcomp=True, no_fuzznuc=False):
-    """Inject IPD/PW signals into PBSIM3 reads.
+    """Inject IPD/PW signals into PBSIM3 reads for a single genome.
 
     Pipeline:
       1. Load reference genome
@@ -181,8 +190,8 @@ def inject_signals(fastq_path, maf_path, ref_path, pkl_path,
     default_acc = np.zeros(5, dtype=np.float64)
 
     print(f"Injecting signals into reads from {fastq_path}...")
-    n_reads   = 0
-    n_mapped  = 0
+    n_reads    = 0
+    n_mapped   = 0
     n_unmapped = 0
 
     header = pysam.AlignmentHeader.from_dict({
@@ -300,16 +309,168 @@ def inject_signals(fastq_path, maf_path, ref_path, pkl_path,
     print(f"Output: {output_bam}")
 
 
+# ---------------------------------------------------------------------------
+# Directory mode helpers
+# ---------------------------------------------------------------------------
+
+def _find_pbsim3_files(pbsim3_dir):
+    """Discover all PBSIM3 genome sets in a directory.
+
+    Each genome set consists of three files sharing the same basename:
+      <basename>.fq.gz   (or .fq)    — simulated reads
+      <basename>.maf.gz  (or .maf)   — read-to-reference alignment
+      <basename>.fna     (or .fa, .fasta) — reference genome
+
+    Returns a sorted list of (fq_path, maf_path, ref_path, basename) tuples.
+    Skips any genome where .maf or .fna cannot be found (prints a warning).
+    """
+    fq_files = sorted(glob.glob(os.path.join(pbsim3_dir, '*.fq.gz')))
+    if not fq_files:
+        fq_files = sorted(glob.glob(os.path.join(pbsim3_dir, '*.fq')))
+
+    results = []
+    for fq_path in fq_files:
+        basename = os.path.basename(fq_path)
+        stem = basename[:-len('.fq.gz')] if basename.endswith('.fq.gz') else basename[:-len('.fq')]
+
+        # Find .maf.gz or .maf
+        maf_path = os.path.join(pbsim3_dir, stem + '.maf.gz')
+        if not os.path.isfile(maf_path):
+            maf_path = os.path.join(pbsim3_dir, stem + '.maf')
+        if not os.path.isfile(maf_path):
+            print(f"  WARN: no .maf.gz/.maf for '{stem}' — skipping", file=sys.stderr)
+            continue
+
+        # Find .fna, .fa, or .fasta
+        ref_path = None
+        for ext in ('.fna', '.fa', '.fasta'):
+            candidate = os.path.join(pbsim3_dir, stem + ext)
+            if os.path.isfile(candidate):
+                ref_path = candidate
+                break
+        if ref_path is None:
+            print(f"  WARN: no .fna/.fa/.fasta for '{stem}' — skipping", file=sys.stderr)
+            continue
+
+        results.append((fq_path, maf_path, ref_path, stem))
+
+    return results
+
+
+def inject_directory(pbsim3_dir, pkl_path, motif_source, output_dir,
+                     circular=True, revcomp=True, no_fuzznuc=False,
+                     min_fraction=0.40, min_detected=20):
+    """Inject signals into all genomes found in pbsim3_dir.
+
+    Discovers all .fq.gz files and matches them with .maf.gz and .fna by
+    basename. Applies the same motif source to every genome. Output BAMs
+    are written to output_dir as <basename>_kinsim.bam.
+    """
+    genomes = _find_pbsim3_files(pbsim3_dir)
+    if not genomes:
+        print(f"ERROR: No .fq.gz files with matching .maf.gz/.fna found in {pbsim3_dir}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    motif_string = load_motif_string(motif_source,
+                                     min_fraction=min_fraction,
+                                     min_detected=min_detected)
+    if not motif_string:
+        print("ERROR: no motifs found from the provided source.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Found {len(genomes)} genome(s) in {pbsim3_dir}")
+
+    for fq_path, maf_path, ref_path, stem in genomes:
+        out_bam = os.path.join(output_dir, stem + '_kinsim.bam')
+        print(f"\n--- {stem} ---")
+        inject_signals(fq_path, maf_path, ref_path, pkl_path, motif_string, out_bam,
+                       circular=circular, revcomp=revcomp, no_fuzznuc=no_fuzznuc)
+
+    print(f"\nAll done. {len(genomes)} BAM(s) written to: {output_dir}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main(argv=None):
+    import argparse
+
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # Auto-detect mode: directory (4 positional args) vs per-genome (6 positional args)
+    if argv and os.path.isdir(argv[0]):
+        _main_directory(argv)
+    else:
+        _main_per_genome(argv)
+
+
+def _main_directory(argv):
+    """CLI for directory mode: processes all genomes in pbsim3_dir."""
     import argparse
     parser = argparse.ArgumentParser(
         prog="kinsim dictionary inject",
         description=(
-            "Inject IPD/PW kinetic signals into PBSIM3 simulated reads.\n\n"
+            "Inject IPD/PW kinetic signals into all PBSIM3 genomes in a directory.\n\n"
+            "Discovers all .fq.gz files in pbsim3_dir and matches them with\n"
+            ".maf.gz and .fna by basename. Outputs <basename>_kinsim.bam files.\n\n"
+            "Per-genome mode (single genome):\n"
+            "  kinsim dictionary inject <fq.gz> <maf.gz> <ref.fna> <dict.pkl> <motifs> <out.bam>"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("pbsim3_dir",
+                        help="Directory containing .fq.gz, .maf.gz, and .fna files "
+                             "(same basename per genome)")
+    parser.add_argument("dict",
+                        help="Trained kinetic dictionary (.pkl)")
+    parser.add_argument("motifs",
+                        help="Motif source: KinSim string ('m6A,GATC,1'), "
+                             "PacBio motifs.csv, or REBASE file (applied to all genomes)")
+    parser.add_argument("output_dir",
+                        help="Output directory for injected BAM files")
+    parser.add_argument("--linear", action="store_true",
+                        help="Treat genomes as linear (default: circular for bacteria)")
+    parser.add_argument("--no-revcomp", action="store_true",
+                        help="Do not scan reverse complement strand for motifs")
+    parser.add_argument("--no-fuzznuc", action="store_true",
+                        help="Force Python regex for reference methylation scanning "
+                             "(by default fuzznuc is tried first, regex as fallback)")
+    parser.add_argument("--min-fraction", type=float, default=0.40,
+                        help="Minimum fraction threshold (PacBio CSV only, default: 0.40)")
+    parser.add_argument("--min-detected", type=int, default=20,
+                        help="Minimum nDetected threshold (PacBio CSV only, default: 20)")
+    args = parser.parse_args(argv)
+
+    inject_directory(
+        pbsim3_dir=args.pbsim3_dir,
+        pkl_path=args.dict,
+        motif_source=args.motifs,
+        output_dir=args.output_dir,
+        circular=not args.linear,
+        revcomp=not args.no_revcomp,
+        no_fuzznuc=args.no_fuzznuc,
+        min_fraction=args.min_fraction,
+        min_detected=args.min_detected,
+    )
+
+
+def _main_per_genome(argv):
+    """CLI for per-genome mode: processes a single .fq.gz file."""
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="kinsim dictionary inject",
+        description=(
+            "Inject IPD/PW kinetic signals into a single PBSIM3 genome.\n\n"
             "Uses a trained 11-mer dictionary and the .maf alignment to resolve\n"
             "reference context for edge bases.  The reference is pre-scanned once\n"
             "for methylation sites; subsequent per-read lookups are O(1).\n\n"
-            "Outputs an unaligned BAM with fi (IPD) and fp (PW) tags."
+            "Directory mode (all genomes at once):\n"
+            "  kinsim dictionary inject <pbsim3_dir> <dict.pkl> <motifs> <output_dir>"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
