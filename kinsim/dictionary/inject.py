@@ -1,5 +1,4 @@
-"""Inject IPD/PW kinetic signals into PBSIM3 simulated reads.
-
+"""Inject IPD/PW kinetic signals into PBSIM3 simulated reads
 Uses a trained 11-mer dictionary + the PBSIM3 .maf alignment to resolve
 reference context for edge bases (first/last 5 positions of each read).
 Outputs an unaligned BAM with fi (IPD) and fp (PW) tags.
@@ -300,8 +299,8 @@ def inject_signals(fastq_path, maf_path, ref_path, pkl_path,
             seg.flag           = 4  # unmapped
             seg.query_sequence = seq
             seg.query_qualities = pysam.qualitystring_to_array(qual_str)
-            seg.set_tag('fi', array.array('B', ipd_vals), 'B')
-            seg.set_tag('fp', array.array('B', pw_vals),  'B')
+            seg.set_tag('fi', ipd_vals)
+            seg.set_tag('fp', pw_vals)
             bam_out.write(seg)
 
     print(f"Done. {n_reads} reads processed "
