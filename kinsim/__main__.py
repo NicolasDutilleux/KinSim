@@ -9,7 +9,7 @@ import difflib
 import sys
 
 COMMANDS = ["prepare", "motifs", "rebase", "dictionary", "cgan"]
-DICT_COMMANDS = ["train", "merge", "inject", "analyze"]
+DICT_COMMANDS = ["train", "merge", "inject", "analyze", "metagenome"]
 CGAN_COMMANDS = ["extract", "merge", "train", "generate"]
 
 REBASE_COMMANDS = ["parse", "patterns"]
@@ -39,7 +39,8 @@ Shared commands:
 Dictionary mode:
   dictionary train       Build a kinetic dictionary shard from a BAM file
   dictionary merge       Merge .pkl shards into a master dictionary
-  dictionary inject      Inject IPD/PW signals into PBSIM3 reads
+  dictionary inject      Inject IPD/PW signals into PBSIM3 reads (single or directory)
+  dictionary metagenome  Pool all species into one BAM with @RG tags (metagenomic mode)
   dictionary analyze     Analyze dictionary coverage statistics
 
 cGAN mode:
@@ -59,7 +60,8 @@ Dictionary mode — statistical 11-mer kinetic lookup tables.
 Commands:
   train       Build a kinetic dictionary shard from a BAM file
   merge       Merge .pkl shards into a master dictionary
-  inject      Inject IPD/PW signals into PBSIM3 reads
+  inject      Inject IPD/PW signals into PBSIM3 reads (single or directory)
+  metagenome  Pool all species into one BAM with @RG tags (metagenomic mode)
   analyze     Analyze dictionary coverage statistics
 
 Use 'kinsim dictionary <command> -h' for help on a specific command.
@@ -144,6 +146,10 @@ def main(argv=None):
 
         elif subcmd == "analyze":
             from .dictionary.analyze import main as run
+            run(subrest)
+
+        elif subcmd == "metagenome":
+            from .dictionary.inject import metagenome_main as run
             run(subrest)
 
         else:
