@@ -19,8 +19,8 @@ Two generation modes are available:
 
 | Mode | Status | Method |
 |---|---|---|
-| **Dictionary** | ✅ Implemented | Gaussian sampling from per-kmer accumulators |
-| **cGAN** | ✅ Implemented | Conditional WGAN-GP for non-Gaussian distributions |
+| **Dictionary** | Implemented | Gaussian sampling from per-kmer accumulators |
+| **cGAN** | Implemented | Conditional WGAN-GP for non-Gaussian distributions |
 
 Both modes share the same **prepare** step and motif format.
 
@@ -48,10 +48,13 @@ flowchart TD
     MERGE --> MASTER["master_dict.pkl"]
 
     REF --> PBSIM3
-    PBSIM3 --> FQ[".fq.gz + .maf.gz"]
+    PBSIM3 --> PBSIM3OUT["pbsim3_output/\n(species subdirs)"]
 
-    MASTER & FQ & REF --> INJECT["kinsim dictionary inject"]
-    INJECT --> OUTPUT["Unaligned BAM\nwith fi/fp tags"]
+    MASTER & PBSIM3OUT --> INJECT["kinsim dictionary inject\n(directory mode)"]
+    INJECT --> OUTPUT["Per-species BAMs\nwith fi/fp tags"]
+
+    MASTER & PBSIM3OUT --> METAGENOME["kinsim dictionary metagenome"]
+    METAGENOME --> METABAM["meta_community.bam\n(pooled, @RG tags)"]
 
     MASTER --> ANALYZE["kinsim dictionary analyze"]
     ANALYZE --> STATS["Coverage statistics\nreport"]
@@ -80,10 +83,10 @@ flowchart TD
     TRAIN --> CKPT["checkpoint.pt\n(trained Generator)"]
 
     REF --> PBSIM3
-    PBSIM3 --> FQ[".fq.gz + .maf.gz"]
+    PBSIM3 --> PBSIM3OUT["pbsim3_output/\n(species subdirs)"]
 
-    CKPT & FQ & REF --> GENERATE["kinsim cgan generate"]
-    GENERATE --> OUTPUT["Unaligned BAM\nwith fi/fp tags"]
+    CKPT & PBSIM3OUT --> GENERATE["kinsim cgan generate\n(directory mode)"]
+    GENERATE --> CGANOUT["Per-species BAMs\nwith fi/fp tags"]
 ```
 
 ## Installation
@@ -133,6 +136,7 @@ kinsim dictionary -h
 kinsim dictionary train -h
 kinsim dictionary merge -h
 kinsim dictionary inject -h
+kinsim dictionary metagenome -h
 kinsim dictionary analyze -h
 kinsim cgan -h
 kinsim cgan extract -h
@@ -143,13 +147,13 @@ kinsim cgan generate -h
 
 ### Optional dependencies
 
-- **cGAN mode**: `pip install -e .[cgan]` — Adds PyTorch (≥2.0) and TensorBoard
+- **cGAN mode**: `pip install -e .[cgan]` — Adds PyTorch (>=2.0) and TensorBoard
 - **Cluster config**: `pip install -e .[cluster]` — Adds PyYAML
 - **FuzzNuc** (recommended): install [EMBOSS](https://emboss.sourceforge.net/) for the primary reference scanning backend. KinSim falls back to Python regex automatically if not installed. Use `--no-fuzznuc` to force regex mode.
 
 ---
 
-## Part 1 — Shared tools (all modes)
+## Part 1 - Shared tools (all modes)
 
 ### Motif sources (auto-detected everywhere)
 
@@ -158,8 +162,8 @@ All tools that accept a `motifs` argument support three interchangeable formats,
 | Source | Detection | Description |
 |--------|-----------|-------------|
 | **PacBio motifs.csv** | file ending in `.csv` | SMRT Link output, filtered by `--min-fraction` / `--min-detected` |
-| **REBASE file** | any other file path | Simplified two-column or Format #19 (withrefm) — auto-detected |
-| **KinSim string** | not a file path | `"m6A,GATC,1;m4C,CCWGG,1"` — used as-is |
+| **REBASE file** | any other file path | Simplified two-column or Format #19 (withrefm) - auto-detected |
+| **KinSim string** | not a file path | `"m6A,GATC,1;m4C,CCWGG,1"` - used as-is |
 
 ### REBASE format
 
@@ -185,11 +189,11 @@ MS   2(6mA);
 
 X(Y) position notation (both formats):
 - **X** = 1-based position within the recognition sequence
-  - Positive X → forward strand; negative X → complementary strand from its 5' end
-  - Conversion: positive X → `pos = X-1` (0-based); negative X → `pos = len(seq)-|X|`
+  - Positive X -> forward strand; negative X -> complementary strand from its 5' end
+  - Conversion: positive X -> `pos = X-1` (0-based); negative X -> `pos = len(seq)-|X|`
 - **Y** (simple format) = `6` (m6A), `5` (m5C), `4` (m4C)
 - **type** (Format #19 MS field) = `6mA`, `5mC`, `N4mC`
-- Multiple sites per motif → separate with commas: `2(6),-1(4)`
+- Multiple sites per motif -> separate with commas: `2(6),-1(4)`
 - Records with `?` in RS or MS are skipped
 
 Download REBASE data from ftp://ftp.neb.com/pub/rebase/ (withrefm files are Format #19).
@@ -224,7 +228,7 @@ kinsim prepare pairs.txt config_strains.txt
 This resolves all motif sources, filters PacBio CSV entries (`fraction >= 0.40`, `nDetected >= 20`), and outputs:
 ```
 /path/to/strain1.bam
-m6A,GCCGATC,5,3551;m6A,CTGAAG,5,2891
+m6A,GCCGATC,5,3551,0.998;m6A,CTGAAG,5,2891,1.0
 /path/to/strain2.bam
 m6A,GATC,1;m6A,GCWGC,1
 ```
@@ -238,22 +242,23 @@ kinsim motifs "m6A,GATC,1;m4C,CCWGG,1"   # inline string
 
 ### Motif string format (internal)
 
-Semicolon-delimited entries: `MOD_TYPE,IUPAC_MOTIF,POS[,nDetected]`
+Semicolon-delimited entries: `MOD_TYPE,IUPAC_MOTIF,POS[,nDetected[,fraction]]`
 
 ```
-m6A,GCCGATC,5,3551;m4C,CCWGG,1,922;m5C,RGATCY,4,1138
+m6A,GCCGATC,5,3551,0.998;m4C,CCWGG,1,922,0.92;m5C,RGATCY,4,1138,0.76
 ```
 
 - **MOD_TYPE**: `m6A`, `m4C`, or `m5C`
 - **IUPAC_MOTIF**: supports ambiguity codes (R, Y, W, S, K, M, B, D, H, V, N)
 - **POS**: 0-based position of modified base within the motif
-- **nDetected**: optional 4th field, used by cGAN mode, ignored by dictionary mode
+- **nDetected**: optional 4th field (PacBio CSV only); used by cGAN mode for weighting
+- **fraction**: optional 5th field (PacBio CSV only); preserved for traceability, not used by pipeline logic
 
 Both forward and reverse-complement strands are scanned automatically.
 
 ---
 
-## Part 2 — Dictionary mode
+## Part 2 - Dictionary mode
 
 The dictionary mode uses a statistical approach: for each 11-mer + methylation state, it stores a running accumulator `[n, sum_ipd, sum_ipd2, sum_pw, sum_pw2]` from which mean and variance are derived. Signal injection samples from a Gaussian distribution.
 
@@ -276,33 +281,79 @@ kinsim dictionary merge /path/to/shards/ master_dict.pkl
 
 ### Inject: paint signals onto synthetic reads
 
-Requires PBSIM3 output (`.fq.gz`, `.maf.gz`) and the reference genome.
+Two modes - auto-detected by whether the first argument is a directory:
 
-The reference genome is **pre-scanned once** for all methylation sites before processing any reads, which is significantly faster than per-read regex scanning for large datasets.
+#### Directory mode (recommended - process all species at once)
 
 ```bash
-# With a motif string (fuzznuc is tried first by default; regex fallback if not installed)
+# Species-subdirectory layout (created by pbsim3_simulate.slurm):
+#   pbsim3_output/
+#     Ecoli/         reads.fq.gz  reads.maf.gz  Ecoli.fna
+#     Salmonella/    reads.fq.gz  reads.maf.gz  Salmonella.fna
+kinsim dictionary inject pbsim3_output/ master_dict.pkl \
+    "m6A,GCCGATC,5,3551" injected/
+
+# Flat layout (all files in one dir, matched by basename):
+#   pbsim3_output/  Ecoli.fq.gz  Ecoli.maf.gz  Ecoli.fna  ...
+kinsim dictionary inject pbsim3_output/ master_dict.pkl \
+    /path/to/motifs.csv injected/
+
+# Per-species motifs file (lines: "Ecoli|m6A,GATC,1"):
+kinsim dictionary inject pbsim3_output/ master_dict.pkl \
+    species_motifs.txt injected/
+```
+
+Output: one `<species>_kinsim.bam` per species in `injected/`.
+
+#### Per-genome mode (single species)
+
+```bash
 kinsim dictionary inject \
     reads.fq.gz reads.maf.gz ref.fna master_dict.pkl \
     "m6A,GCCGATC,5,3551" output.bam
-
-# With a PacBio motifs.csv
-kinsim dictionary inject \
-    reads.fq.gz reads.maf.gz ref.fna master_dict.pkl \
-    /path/to/motifs.csv output.bam
-
-# With a REBASE file (simplified or Format #19 — auto-detected)
-kinsim dictionary inject \
-    reads.fq.gz reads.maf.gz ref.fna master_dict.pkl \
-    /path/to/withrefm.txt output.bam
-
-# Force Python regex instead of fuzznuc (useful if EMBOSS not installed on cluster)
-kinsim dictionary inject \
-    reads.fq.gz reads.maf.gz ref.fna master_dict.pkl \
-    "m6A,GCCGATC,5,3551" output.bam --no-fuzznuc
 ```
 
-Add `--linear` for non-circular genomes. Output is an unaligned BAM with `fi` (IPD) and `fp` (PW) tags.
+**Options:** `--linear` (non-circular genomes), `--no-fuzznuc` (force regex), `--no-revcomp`.
+
+### Metagenome mode: pool all species into one BAM
+
+For metagenomic binning experiments, pool all species into a single BAM with `@RG` (read group) tags. The dictionary is loaded **once** for all species.
+
+Required directory structure (one subdirectory per species):
+```
+metagenome_root/
+  Ecoli/
+    genome.fna        <- reference genome (.fna / .fa / .fasta)
+    reads.fq.gz       <- PBSIM3 simulated reads
+    reads.maf.gz      <- PBSIM3 alignment
+    motifs.csv        <- PacBio motif summary
+  Salmonella/
+    genome.fna
+    reads.fq.gz
+    reads.maf.gz
+    motifs.csv
+```
+
+```bash
+kinsim dictionary metagenome metagenome_root/ master_dict.pkl output/
+```
+
+Output: `output/meta_community.bam` - queryname-sorted BAM with `fi`/`fp` tags and `RG:Z:Ecoli`, `RG:Z:Salmonella` etc. on each read.
+
+**Options:**
+- `--linear` - treat genomes as linear
+- `--no-fuzznuc` - force Python regex
+- `--keep-species` - keep per-species intermediate BAMs (deleted by default)
+- `--min-fraction` / `--min-detected` - filter thresholds for `motifs.csv` (defaults: 0.40 / 20)
+
+**Next steps for binning:**
+```bash
+# 1. Align to a concatenated reference catalog
+minimap2 -a -x map-hifi catalog.fna meta_community.bam | samtools sort -o aligned.bam
+# 2. Index
+samtools index aligned.bam
+# 3. Bin with MetaBAT2 or SemiBin
+```
 
 ### Analyze: inspect dictionary coverage
 
@@ -314,15 +365,15 @@ Reports per-methylation-state: % of 4^11 possible 11-mers covered, mean/median/m
 
 ---
 
-## Part 3 — cGAN mode
+## Part 3 - cGAN mode
 
 Uses a Conditional Wasserstein GAN with Gradient Penalty (WGAN-GP) to generate kinetic signals for non-Gaussian distributions. The Generator learns the full IPD/PW distribution per 11-mer context, conditioned on kmer and methylation state.
 
 ### Architecture
 - **Model**: WGAN-GP with conditional embeddings
-- **Generator**: [noise(32) + kmer_embed(64) + meth_embed(8)] → 128 → 128 → 2 (IPD, PW)
-- **Discriminator**: [signal(2) + kmer_embed(64) + meth_embed(8)] → 128 → 128 → 1
-- **Training**: Adam (β=0.0, 0.9), n_critic=5, λ_GP=10, batch_size=4096
+- **Generator**: [noise(32) + kmer_embed(64) + meth_embed(8)] -> 128 -> 128 -> 2 (IPD, PW)
+- **Discriminator**: [signal(2) + kmer_embed(64) + meth_embed(8)] -> 128 -> 128 -> 1
+- **Training**: Adam (beta=0.0, 0.9), n_critic=5, lambda_GP=10, batch_size=4096
 - **Transform**: Log1p for training stability, expm1 for generation
 - **Memory**: ~1 GB (64-dim embeddings), ~0.5 GB with `--kmer-embed-dim 32`
 
@@ -363,9 +414,9 @@ kinsim cgan train master_cgan_data.pkl ./checkpoints/ \
 ```
 
 Training outputs:
-- `model_config.json` — Architecture hyperparameters
-- `checkpoint_epoch{N}.pt` — Model weights + optimizer state
-- `runs/` — TensorBoard logs (or `training_log.csv` if TensorBoard unavailable)
+- `model_config.json` - Architecture hyperparameters
+- `checkpoint_epoch{N}.pt` - Model weights + optimizer state
+- `runs/` - TensorBoard logs (or `training_log.csv` if TensorBoard unavailable)
 
 Monitor with TensorBoard:
 ```bash
@@ -374,46 +425,48 @@ tensorboard --logdir ./checkpoints/runs
 
 ### Generate: inject GAN-sampled signals into reads
 
+Two modes - auto-detected by whether the first argument is a directory:
+
+#### Directory mode
+
 ```bash
-# With a motif string (fuzznuc is tried first by default; regex fallback if not installed)
+kinsim cgan generate pbsim3_output/ ./checkpoints/checkpoint_epoch100.pt \
+    "m6A,GCCGATC,5,3551" generated/ \
+    --device cuda --batch-reads 1000
+```
+
+Output: one `<species>_cgan.bam` per species in `generated/`.
+
+#### Per-genome mode (single species)
+
+```bash
 kinsim cgan generate \
     reads.fq.gz reads.maf.gz ref.fna \
     ./checkpoints/checkpoint_epoch100.pt \
     "m6A,GCCGATC,5,3551" output.bam \
-    --device cuda \
-    --batch-reads 1000
-
-# With a PacBio motifs.csv or REBASE file (Format #19 or simplified — auto-detected)
-kinsim cgan generate \
-    reads.fq.gz reads.maf.gz ref.fna \
-    ./checkpoints/checkpoint_epoch100.pt \
-    /path/to/motifs.csv output.bam \
-    --device cuda
-
-# Force Python regex instead of fuzznuc
-kinsim cgan generate ... --no-fuzznuc
+    --device cuda --batch-reads 1000
 ```
 
-Like `dictionary inject`, this uses the MAF alignment and pre-computes reference methylation positions once before processing any reads.
+**Options:** `--linear`, `--no-fuzznuc`, `--no-revcomp`, `--device cpu` (if no GPU), `--batch-reads N`.
 
-Add `--linear` for non-circular genomes, `--device cpu` if GPU unavailable, `--no-revcomp` if needed.
+Like `dictionary inject`, this uses the MAF alignment and pre-computes reference methylation positions once before processing any reads.
 
 ---
 
 ## FuzzNuc integration (EMBOSS)
 
-KinSim uses [EMBOSS](https://emboss.sourceforge.net/) `fuzznuc` as the **primary** reference-genome methylation scanner. It is recommended but not required — KinSim falls back to pure-Python regex automatically.
+KinSim uses [EMBOSS](https://emboss.sourceforge.net/) `fuzznuc` as the **primary** reference-genome methylation scanner. It is recommended but not required - KinSim falls back to pure-Python regex automatically.
 
 **Why fuzznuc is the primary backend:**
-- **Native IUPAC support** — handles all ambiguity codes (R, Y, W, S, K, M, B, D, H, V, N) natively
-- **Scientific credibility** — EMBOSS is an established, published bioinformatics suite
-- **C-optimized performance** — significantly faster than pure-Python regex on large genomes
+- **Native IUPAC support** - handles all ambiguity codes (R, Y, W, S, K, M, B, D, H, V, N) natively
+- **Scientific credibility** - EMBOSS is an established, published bioinformatics suite
+- **C-optimized performance** - significantly faster than pure-Python regex on large genomes
 
 **Architecture:**
 - `fuzznuc` is called **once** per reference genome with a named pattern file (`@patterns.txt`)
 - All motifs are scanned in a single subprocess call (not one per motif)
 - GFF output is parsed; pattern names in the attributes column identify which motif matched and at what offset
-- Strand-aware position arithmetic: `+` strand → `meth_pos = (Start-1) + mod_pos`; `-` strand → `meth_pos = (End-1) - mod_pos`
+- Strand-aware position arithmetic: `+` strand -> `meth_pos = (Start-1) + mod_pos`; `-` strand -> `meth_pos = (End-1) - mod_pos`
 - Regex is used as automatic fallback, and always for per-read scanning during training
 
 **Install EMBOSS:**
@@ -428,7 +481,7 @@ conda install -c bioconda emboss
 **Usage:**
 ```bash
 # fuzznuc is used by default (falls back to regex automatically if not installed)
-kinsim dictionary inject reads.fq.gz reads.maf.gz ref.fna dict.pkl "m6A,GATC,1" out.bam
+kinsim dictionary inject pbsim3_output/ dict.pkl "m6A,GATC,1" out/
 
 # Force Python regex (e.g. on a cluster without EMBOSS, or for debugging)
 kinsim dictionary inject ... --no-fuzznuc
@@ -447,76 +500,89 @@ kinsim rebase patterns "m6A,GATC,1;m4C,CCWGG,1" patterns.txt
 
 All SLURM scripts are in `slurm_kinsim/`. Logs are written to `/data/projects/p774_MARSD/NDutilleux/logs/`.
 
-### Quick start — full pipeline in one command
+### Step 0: Simulate reads with PBSIM3
+
+Before running KinSim injection, generate synthetic reads with PBSIM3. The SLURM script creates one species subdirectory per genome, matching the input format expected by `kinsim dictionary inject` and `kinsim dictionary metagenome`:
+
+```bash
+# Count genomes
+N=$(ls genomes/*.fna | wc -l)
+
+# Run PBSIM3 (one array task per genome)
+sbatch --array=1-${N} slurm_kinsim/pbsim3_simulate.slurm \
+    genomes/ pbsim3_output/ /path/to/QSHMM-PACBIO-CCS.model
+```
+
+This creates:
+```
+pbsim3_output/
+  Ecoli/
+    genome.fna      reads.fq.gz   reads.maf.gz
+  Salmonella/
+    genome.fna      reads.fq.gz   reads.maf.gz
+```
+
+Then place a `motifs.csv` in each species subdirectory before running metagenome mode.
+
+### Quick start - full pipeline in one command
 
 ```bash
 # Dictionary mode (53 strains, 10 genomes to inject)
 bash slurm_kinsim/kinsim_pipeline.sh dictionary \
     pairs.txt 53 config_strains.txt \
     shards/ master_dict.pkl \
-    config_inject.txt 10 injected/
+    pbsim3_output/ "m6A,GATC,1;m4C,CCWGG,1" 10 injected/
 
-# cGAN mode (53 strains, 10 genomes to generate)
+# cGAN mode (53 strains, 10 genomes to generate, default 100 epochs)
 bash slurm_kinsim/kinsim_pipeline.sh cgan \
     pairs.txt 53 config_strains.txt \
     cgan_shards/ master_cgan_data.pkl \
-    config_generate.txt 10 generated/ \
+    pbsim3_output/ "m6A,GATC,1;m4C,CCWGG,1" 10 generated/ \
     checkpoints/
 ```
 
 `kinsim_pipeline.sh` is run from the **login node** (not submitted). It uses `sbatch --parsable` and `--dependency=afterok` to chain all steps automatically.
 
-### Dictionary pipeline — step by step
-
-The train script is submitted twice: once as an array job (one task per BAM) and once without `--array` (which triggers the merge phase, detected via `$SLURM_ARRAY_TASK_ID`).
+### Dictionary pipeline - step by step
 
 ```bash
-# Step 1: Prepare — resolve all motif sources into a compact config
+# Step 1: Prepare - resolve all motif sources into a compact config
 sbatch slurm_kinsim/kinsim_prepare.slurm pairs.txt config_strains.txt
 
 # Step 2: Train shards (array, one task per BAM)
-TRAIN=$(sbatch --parsable --array=1-53 \
-    slurm_kinsim/kinsim_train.slurm config_strains.txt shards/ master_dict.pkl)
+# The last array task auto-submits the merge job — no second command needed.
+sbatch --array=1-53 \
+    slurm_kinsim/kinsim_train.slurm config_strains.txt shards/ master_dict.pkl
 
-# Step 3: Merge all shards into master dictionary (same script, no --array)
-MERGE=$(sbatch --parsable --dependency=afterok:$TRAIN \
-    slurm_kinsim/kinsim_train.slurm config_strains.txt shards/ master_dict.pkl)
+# Step 3: Inject signals (array, one task per genome)
+# Run after merge completes. Auto-detects flat / species-subdir layout.
+sbatch --array=1-10 \
+    slurm_kinsim/kinsim_inject.slurm \
+    pbsim3_output/ master_dict.pkl "m6A,GATC,1;m4C,CCWGG,1" injected/
 
-# Step 4: Inject signals into PBSIM3 reads (array, one task per genome)
-sbatch --array=1-10 --dependency=afterok:$MERGE \
-    slurm_kinsim/kinsim_inject.slurm config_inject.txt injected/
-
-# Step 5: Analyze dictionary coverage (runs in parallel with inject)
-sbatch --dependency=afterok:$MERGE \
-    slurm_kinsim/kinsim_analyze.slurm master_dict.pkl
+# Step 4: Analyze dictionary coverage (optional, single job)
+sbatch slurm_kinsim/kinsim_analyze.slurm master_dict.pkl
 ```
 
-### cGAN pipeline — step by step
-
-The extract script follows the same two-phase pattern as the train script.
+### cGAN pipeline - step by step
 
 ```bash
 # Step 1: Prepare
 sbatch slurm_kinsim/kinsim_prepare.slurm pairs.txt config_strains.txt
 
 # Step 2: Extract raw samples (array, one task per BAM)
-EXTRACT=$(sbatch --parsable --array=1-53 \
-    slurm_kinsim/kinsim_cgan_extract.slurm config_strains.txt cgan_shards/ master_cgan_data.pkl)
+# The last array task auto-submits the merge job.
+sbatch --array=1-53 \
+    slurm_kinsim/kinsim_cgan_extract.slurm config_strains.txt cgan_shards/ master_cgan_data.pkl
 
-# Step 3: Merge shards (same script, no --array)
-MERGE=$(sbatch --parsable --dependency=afterok:$EXTRACT \
-    slurm_kinsim/kinsim_cgan_extract.slurm config_strains.txt cgan_shards/ master_cgan_data.pkl)
+# Step 3: Train the GAN (single GPU; --epochs, --resume, etc. passed through)
+sbatch slurm_kinsim/kinsim_cgan_train.slurm master_cgan_data.pkl checkpoints/ --epochs 100
 
-# Step 4: Train the GAN (single GPU)
-TRAIN=$(sbatch --parsable --dependency=afterok:$MERGE \
-    slurm_kinsim/kinsim_cgan_train.slurm master_cgan_data.pkl checkpoints/ --epochs 100)
-
-# Resume training from a checkpoint:
-# sbatch ... kinsim_cgan_train.slurm master_cgan_data.pkl checkpoints/ --resume checkpoints/checkpoint_epoch50.pt
-
-# Step 5: Generate signals (array, one task per genome)
-sbatch --array=1-10 --dependency=afterok:$TRAIN \
-    slurm_kinsim/kinsim_cgan_generate.slurm config_generate.txt generated/
+# Step 4: Generate signals (array, one task per genome)
+sbatch --array=1-10 \
+    slurm_kinsim/kinsim_cgan_generate.slurm \
+    pbsim3_output/ checkpoints/checkpoint_epoch100.pt \
+    "m6A,GATC,1;m4C,CCWGG,1" generated/
 ```
 
 ### SLURM dependency chains
@@ -525,7 +591,7 @@ sbatch --array=1-10 --dependency=afterok:$TRAIN \
 flowchart LR
     subgraph dict ["Dictionary pipeline"]
         P1["kinsim_prepare.slurm\n(single)"] -->|afterok| T["kinsim_train.slurm\n(array 1-N)"]
-        T -->|afterok| M["kinsim_train.slurm\n(no array = merge)"]
+        T -->|auto-submit| M["kinsim_train.slurm\n(no array = merge)"]
         M -->|afterok| I["kinsim_inject.slurm\n(array 1-M)"]
         M -->|afterok| A["kinsim_analyze.slurm\n(single)"]
     end
@@ -535,11 +601,13 @@ flowchart LR
 flowchart LR
     subgraph cgan ["cGAN pipeline"]
         P2["kinsim_prepare.slurm\n(single)"] -->|afterok| E["kinsim_cgan_extract.slurm\n(array 1-N)"]
-        E -->|afterok| EM["kinsim_cgan_extract.slurm\n(no array = merge)"]
+        E -->|auto-submit| EM["kinsim_cgan_extract.slurm\n(no array = merge)"]
         EM -->|afterok| CT["kinsim_cgan_train.slurm\n(single GPU)"]
         CT -->|afterok| G["kinsim_cgan_generate.slurm\n(array 1-M)"]
     end
 ```
+
+> **Note on auto-submit:** When running standalone (`sbatch --array=1-N ...`), the last array task automatically submits the merge job. When using `kinsim_pipeline.sh`, `KINSIM_NO_AUTOMERGE=1` is set to suppress this, and the pipeline script submits the merge explicitly to obtain its job ID for dependency chaining.
 
 To merge two existing master dictionaries (e.g. adding new training data):
 ```bash
@@ -566,29 +634,26 @@ kinsim/                     Python package
   motifs.py                 Shared: IUPAC/CSV parsing, regex (per-read) + fuzznuc (reference)
   rebase_parser.py          Shared: REBASE Format #19 + simplified parser, fuzznuc pattern file
   prepare.py                Shared: BAM + motif-source pairs -> config file
-  dictionary/               Dictionary mode ✅
+  dictionary/               Dictionary mode
     train.py                Build dictionary from BAM + merge shards
-    inject.py               Inject signals using MAF + reference pre-scan
+    inject.py               Inject signals (directory, per-genome, and metagenome modes)
     analyze.py              Dictionary coverage statistics
-  cgan/                     cGAN mode ✅
+  cgan/                     cGAN mode
     parse_train.py          Extract raw samples + merge shards
     model.py                Generator + Discriminator (WGAN-GP)
     train.py                WGAN-GP training loop with TensorBoard
-    generate.py             GAN-based signal injection with reference pre-scan
+    generate.py             GAN-based signal injection (directory + per-genome modes)
 
-slurm_kinsim/                   SLURM job scripts
-  kinsim_pipeline.sh            General: full pipeline with dependency chain
-  kinsim_prepare.slurm          Single job: prepare config_strains.txt
-  kinsim_train.slurm            Dictionary: two-phase array train + merge
-  kinsim_inject.slurm           Dictionary: array injection
-  kinsim_analyze.slurm          Dictionary: coverage statistics
-  kinsim_cgan_extract.slurm     cGAN: two-phase array extract + merge
-  kinsim_cgan_train.slurm       cGAN: single GPU training
-  kinsim_cgan_generate.slurm    cGAN: array generation
-
-cluster/                    HPC infrastructure (legacy)
-  config.yaml               Central cluster paths
-  Tests/                    Legacy scripts, test data, development artifacts
+slurm_kinsim/               SLURM job scripts
+  kinsim_pipeline.sh        General: full pipeline with dependency chain (login node)
+  pbsim3_simulate.slurm     PBSIM3: simulate reads (array, one task per genome)
+  kinsim_prepare.slurm      Single job: prepare config_strains.txt
+  kinsim_train.slurm        Dictionary: two-phase array train + auto-merge
+  kinsim_inject.slurm       Dictionary: array injection (per species)
+  kinsim_analyze.slurm      Dictionary: coverage statistics
+  kinsim_cgan_extract.slurm cGAN: two-phase array extract + auto-merge
+  kinsim_cgan_train.slurm   cGAN: single GPU training
+  kinsim_cgan_generate.slurm cGAN: array generation (per species)
 ```
 
 ## Requirements
@@ -600,10 +665,10 @@ cluster/                    HPC infrastructure (legacy)
 - PBSIM3 (external, for read simulation)
 
 **Optional dependencies:**
-- `torch >= 2.0` — For cGAN mode (`pip install -e .[cgan]`)
-- `tensorboard` — For training visualization (`pip install -e .[cgan]`)
-- `pyyaml` — For cluster config parsing (`pip install -e .[cluster]`)
-- EMBOSS `fuzznuc` — Primary reference scanning backend (system package, not pip; auto-fallback to regex if absent)
+- `torch >= 2.0` - For cGAN mode (`pip install -e .[cgan]`)
+- `tensorboard` - For training visualization (`pip install -e .[cgan]`)
+- `pyyaml` - For cluster config parsing (`pip install -e .[cluster]`)
+- EMBOSS `fuzznuc` - Primary reference scanning backend (system package, not pip; auto-fallback to regex if absent)
 
 ## License
 

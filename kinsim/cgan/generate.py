@@ -3,10 +3,19 @@
 Mirrors dictionary/inject.py but uses the Generator for signal synthesis.
 Batches generation across multiple reads for GPU efficiency.
 
+Two calling modes (auto-detected):
+  Directory mode:   kinsim cgan generate <pbsim3_dir> <checkpoint.pt> <motifs> <output_dir>
+  Per-genome mode:  kinsim cgan generate <fq.gz> <maf.gz> <ref.fna> <ckpt.pt> <motifs> <out.bam>
+
+Directory mode supports the same two layouts as dictionary inject (auto-detected):
+  - Species subdirectories: pbsim3_dir/Ecoli/, pbsim3_dir/Salmonella/, ...
+  - Flat layout: all files directly in pbsim3_dir, matched by basename.
+
 Motif input (auto-detected):
-  - KinSim motif string  — "m6A,GATC,1;m4C,CCWGG,1"
-  - PacBio motifs.csv    — file path ending in .csv
-  - REBASE file          — any other file path
+  - KinSim motif string       — "m6A,GATC,1;m4C,CCWGG,1"  (applied to all species)
+  - Per-species mapping file  — text file with "species_name|motif_string" per line
+  - PacBio motifs.csv         — file path ending in .csv
+  - REBASE file               — any other file path
 
 The reference genome is pre-scanned once for methylation sites using EMBOSS
 fuzznuc as the primary backend (falls back to Python regex automatically if
@@ -29,7 +38,8 @@ from ..motifs import (load_motif_string, parse_motifs, scan_sequence,
                       build_reference_meth_map)
 
 # Reuse from dictionary.inject (no code duplication)
-from ..dictionary.inject import load_reference, parse_maf, get_extended_context, MID
+from ..dictionary.inject import (load_reference, parse_maf, get_extended_context, MID,
+                                  _find_pbsim3_files, _resolve_motifs_for_species)
 
 
 # ---------------------------------------------------------------------------
@@ -300,10 +310,127 @@ def _process_batch(batch, ref_seqs, maf_mapping, meth_map, fallback_motifs,
 
 
 # ---------------------------------------------------------------------------
+# Directory mode
+# ---------------------------------------------------------------------------
+
+def generate_directory(pbsim3_dir, checkpoint_path, motif_source, output_dir,
+                       circular=True, revcomp=True,
+                       device='cuda', batch_reads=1000,
+                       no_fuzznuc=False,
+                       min_fraction=0.40, min_detected=20):
+    """Generate signals for all species found under pbsim3_dir.
+
+    Supports the same two directory layouts as dictionary inject (auto-detected):
+      - Species subdirectories: pbsim3_dir/Ecoli/, pbsim3_dir/Salmonella/, ...
+      - Flat layout: all files directly in pbsim3_dir, matched by basename.
+
+    Output BAMs are written to output_dir as <species_name>_cgan.bam.
+    """
+    genomes = _find_pbsim3_files(pbsim3_dir)
+    if not genomes:
+        print(f"ERROR: No genome sets found in {pbsim3_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Found {len(genomes)} species in {pbsim3_dir}")
+
+    for fq_path, maf_path, ref_path, species in genomes:
+        motif_string = _resolve_motifs_for_species(motif_source, species,
+                                                   min_fraction, min_detected)
+        if not motif_string:
+            print(f"ERROR: no motifs found for species '{species}'.", file=sys.stderr)
+            sys.exit(1)
+
+        out_bam = os.path.join(output_dir, species + '_cgan.bam')
+        print(f"\n--- {species} ---")
+        generate_signals(fq_path, maf_path, ref_path, checkpoint_path, motif_string, out_bam,
+                         circular=circular, revcomp=revcomp,
+                         device=device, batch_reads=batch_reads,
+                         no_fuzznuc=no_fuzznuc)
+
+    print(f"\nAll done. {len(genomes)} BAM(s) written to: {output_dir}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if argv and os.path.isdir(argv[0]):
+        _main_directory(argv)
+    else:
+        _main_per_genome(argv)
+
+
+def _main_directory(argv):
+    """CLI for directory mode: processes all species in pbsim3_dir."""
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="kinsim cgan generate",
+        description=(
+            "Generate GAN kinetic signals for all PBSIM3 species in a directory.\n\n"
+            "Supports two directory layouts (auto-detected):\n\n"
+            "  Species subdirectories (recommended):\n"
+            "    pbsim3_dir/\n"
+            "      Ecoli/          <- species name = subdir name\n"
+            "        reads.fq.gz\n"
+            "        reads.maf.gz\n"
+            "        Ecoli.fna\n"
+            "      Salmonella/\n"
+            "        ...\n\n"
+            "  Flat layout (files matched by basename):\n"
+            "    pbsim3_dir/\n"
+            "      Ecoli.fq.gz   Ecoli.maf.gz   Ecoli.fna\n"
+            "      Salmonella.fq.gz ...\n\n"
+            "Per-genome mode (single genome):\n"
+            "  kinsim cgan generate <fq.gz> <maf.gz> <ref.fna> <ckpt.pt> <motifs> <out.bam>"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("pbsim3_dir",
+                        help="Directory containing species subdirs or flat .fq.gz files")
+    parser.add_argument("checkpoint", help="Trained GAN checkpoint (.pt)")
+    parser.add_argument("motifs",
+                        help="Motifs: KinSim string (applied to all), PacBio .csv, "
+                             "REBASE file, or per-species file ('species|motif_string' per line)")
+    parser.add_argument("output_dir",
+                        help="Output directory for generated BAM files")
+    parser.add_argument("--linear", action="store_true",
+                        help="Treat genomes as linear (default: circular for bacteria)")
+    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"],
+                        help="Device to use (default: cuda)")
+    parser.add_argument("--batch-reads", type=int, default=1000,
+                        help="Number of reads to batch for GPU inference (default: 1000)")
+    parser.add_argument("--no-revcomp", action="store_true",
+                        help="Do not scan reverse complement strand for motifs")
+    parser.add_argument("--no-fuzznuc", action="store_true",
+                        help="Force Python regex for reference methylation scanning")
+    parser.add_argument("--min-fraction", type=float, default=0.40,
+                        help="Minimum fraction threshold (PacBio CSV only, default: 0.40)")
+    parser.add_argument("--min-detected", type=int, default=20,
+                        help="Minimum nDetected threshold (PacBio CSV only, default: 20)")
+    args = parser.parse_args(argv)
+
+    generate_directory(
+        pbsim3_dir=args.pbsim3_dir,
+        checkpoint_path=args.checkpoint,
+        motif_source=args.motifs,
+        output_dir=args.output_dir,
+        circular=not args.linear,
+        revcomp=not args.no_revcomp,
+        device=args.device,
+        batch_reads=args.batch_reads,
+        no_fuzznuc=args.no_fuzznuc,
+        min_fraction=args.min_fraction,
+        min_detected=args.min_detected,
+    )
+
+
+def _main_per_genome(argv):
+    """CLI for per-genome mode: processes a single .fq.gz file."""
     import argparse
     parser = argparse.ArgumentParser(
         prog="kinsim cgan generate",
