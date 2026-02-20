@@ -8,9 +8,23 @@ Usage:
 import difflib
 import sys
 
-COMMANDS = ["prepare", "motifs", "dictionary", "cgan"]
-DICT_COMMANDS = ["train", "merge", "inject", "analyze"]
-CGAN_COMMANDS = ["train", "merge"]
+COMMANDS = ["prepare", "motifs", "rebase", "dictionary", "cgan"]
+DICT_COMMANDS = ["train", "merge", "inject", "analyze", "metagenome"]
+CGAN_COMMANDS = ["extract", "merge", "train", "generate"]
+
+REBASE_COMMANDS = ["parse", "patterns"]
+
+REBASE_USAGE = """\
+usage: kinsim rebase <command> [<args>]
+
+REBASE file parsing and fuzznuc pattern file generation.
+
+Commands:
+  parse       Parse a REBASE file and print the KinSim motif string
+  patterns    Convert a motif source into a fuzznuc @pattern file
+
+Use 'kinsim rebase <command> -h' for help on a specific command.
+"""
 
 USAGE = """\
 usage: kinsim <command> [<args>]
@@ -19,17 +33,21 @@ KinSim — PacBio kinetic signal simulator for metagenomic binning.
 
 Shared commands:
   prepare                Parse BAM + motifs.csv pairs into pipeline config
-  motifs                 Parse a single PacBio motifs.csv
+  motifs                 Parse a motif source (CSV, REBASE, or string)
+  rebase                 Parse REBASE files / generate fuzznuc pattern files
 
 Dictionary mode:
   dictionary train       Build a kinetic dictionary shard from a BAM file
   dictionary merge       Merge .pkl shards into a master dictionary
-  dictionary inject      Inject IPD/PW signals into PBSIM3 reads
+  dictionary inject      Inject IPD/PW signals into PBSIM3 reads (single or directory)
+  dictionary metagenome  Pool all species into one BAM with @RG tags (metagenomic mode)
   dictionary analyze     Analyze dictionary coverage statistics
 
 cGAN mode:
-  cgan train             Extract raw IPD/PW samples from a BAM file
+  cgan extract           Extract raw IPD/PW samples from a BAM file
   cgan merge             Merge cGAN shards into a master training set
+  cgan train             Train the conditional GAN model (WGAN-GP)
+  cgan generate          Generate kinetic signals for PBSIM3 reads
 
 Use 'kinsim <command> -h' for help on a specific command.
 """
@@ -42,7 +60,8 @@ Dictionary mode — statistical 11-mer kinetic lookup tables.
 Commands:
   train       Build a kinetic dictionary shard from a BAM file
   merge       Merge .pkl shards into a master dictionary
-  inject      Inject IPD/PW signals into PBSIM3 reads
+  inject      Inject IPD/PW signals into PBSIM3 reads (single or directory)
+  metagenome  Pool all species into one BAM with @RG tags (metagenomic mode)
   analyze     Analyze dictionary coverage statistics
 
 Use 'kinsim dictionary <command> -h' for help on a specific command.
@@ -55,8 +74,10 @@ usage: kinsim cgan <command> [<args>]
 cGAN mode — conditional GAN-based kinetic signal generation.
 
 Commands:
-  train       Extract raw (IPD, PW) samples from a BAM file
+  extract     Extract raw (IPD, PW) samples from a BAM file
   merge       Merge *_cgan.pkl shards into a master training set
+  train       Train the conditional GAN model (WGAN-GP)
+  generate    Generate kinetic signals for PBSIM3 reads
 
 Use 'kinsim cgan <command> -h' for help on a specific command.
 """
@@ -84,6 +105,26 @@ def main(argv=None):
         from .motifs import main as run
         run(rest)
 
+    elif cmd == "rebase":
+        if not rest or rest[0] in ("-h", "--help"):
+            print(REBASE_USAGE)
+            sys.exit(0)
+
+        subcmd, subrest = rest[0], rest[1:]
+
+        if subcmd in ("parse", "patterns"):
+            from .rebase_parser import main as run
+            run(rest)
+
+        else:
+            msg = f"Unknown rebase command: {subcmd}"
+            hint = _suggest(subcmd, REBASE_COMMANDS)
+            if hint:
+                msg += f"\n\nDid you mean: kinsim rebase {hint[0]}?"
+            print(msg)
+            print(REBASE_USAGE)
+            sys.exit(1)
+
     elif cmd == "dictionary":
         if not rest or rest[0] in ("-h", "--help"):
             print(DICT_USAGE)
@@ -107,6 +148,10 @@ def main(argv=None):
             from .dictionary.analyze import main as run
             run(subrest)
 
+        elif subcmd == "metagenome":
+            from .dictionary.inject import metagenome_main as run
+            run(subrest)
+
         else:
             msg = f"Unknown dictionary command: {subcmd}"
             hint = _suggest(subcmd, DICT_COMMANDS)
@@ -123,13 +168,21 @@ def main(argv=None):
 
         subcmd, subrest = rest[0], rest[1:]
 
-        if subcmd == "train":
+        if subcmd == "extract":
             from .cgan.parse_train import main as run
-            run(["train"] + subrest)
+            run(["extract"] + subrest)
 
         elif subcmd == "merge":
             from .cgan.parse_train import main as run
             run(["merge"] + subrest)
+
+        elif subcmd == "train":
+            from .cgan.train import main as run
+            run(subrest)
+
+        elif subcmd == "generate":
+            from .cgan.generate import main as run
+            run(subrest)
 
         else:
             msg = f"Unknown cgan command: {subcmd}"

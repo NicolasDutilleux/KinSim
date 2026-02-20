@@ -5,20 +5,23 @@
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/kinsim_train_%A_%a.log
+#SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/kinsim_train_%A_%a.log
 #SBATCH --mail-user=nicolas.dutilleux@unifr.ch
 #SBATCH --mail-type=FAIL
 
 # ============================================================
 # KinSim Dictionary — Train shards + merge (two-phase SLURM job)
 #
-# This script handles BOTH phases:
+# This script handles BOTH phases automatically:
 #   Phase 1 (array job):  Train one .pkl shard per BAM
 #   Phase 2 (single job): Merge all shards into master_dict.pkl
+#                         — submitted automatically by the last array task
 #
-# Usage (two-step submission):
-#   TRAIN=$(sbatch --parsable --array=1-N kinsim_train.slurm <config> <shards_dir> <master_output>)
-#   sbatch --dependency=afterok:$TRAIN kinsim_train.slurm <config> <shards_dir> <master_output>
+# Usage:
+#   sbatch --array=1-N kinsim_train.slurm <config> <shards_dir> <master_output>
+#
+# The merge job is submitted automatically when all array tasks finish.
+# No second command needed.
 #
 # Arguments:
 #   $1  Config file (alternating lines: BAM path / motif string)
@@ -26,13 +29,8 @@
 #   $2  Directory for .pkl shards (intermediate files)
 #   $3  Path for the final merged dictionary (e.g. /data/kinsim/master_dict.pkl)
 #
-# How it works:
-#   - When SLURM_ARRAY_TASK_ID is set  → trains one shard into $2
-#   - When SLURM_ARRAY_TASK_ID is unset → merges $2/*.pkl into $3
-#
 # Example:
-#   TRAIN=$(sbatch --parsable --array=1-53 kinsim_train.slurm config_strains.txt shards/ /data/kinsim/master_dict.pkl)
-#   sbatch --dependency=afterok:$TRAIN kinsim_train.slurm config_strains.txt shards/ /data/kinsim/master_dict.pkl
+#   sbatch --array=1-57 kinsim_train.slurm config_strains.txt shards/ master_dict.pkl
 #
 # Expected directory structure:
 #   project/
@@ -49,9 +47,7 @@
 
 # ---- Usage check ----
 if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then
-    echo "Usage:"
-    echo "  TRAIN=\$(sbatch --parsable --array=1-N kinsim_train.slurm <config> <shards_dir> <master_output>)"
-    echo "  sbatch --dependency=afterok:\$TRAIN kinsim_train.slurm <config> <shards_dir> <master_output>"
+    echo "Usage: sbatch --array=1-N kinsim_train.slurm <config> <shards_dir> <master_output>"
     echo ""
     echo "Arguments:"
     echo "  config             Alternating lines: BAM path / motif string"
@@ -59,12 +55,8 @@ if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then
     echo "  shards_dir         Directory for intermediate .pkl shard files"
     echo "  master_output      Path for the final merged dictionary (.pkl)"
     echo ""
-    echo "Expected structure:"
-    echo "  project/"
-    echo "    config_strains.txt"
-    echo "    shards/             <- intermediate shards"
-    echo "    master_dict.pkl     <- final merged output"
-    echo "    logs/"
+    echo "Example:"
+    echo "  sbatch --array=1-57 kinsim_train.slurm config_strains.txt shards/ master_dict.pkl"
     exit 1
 fi
 
@@ -94,11 +86,21 @@ if [ -n "$SLURM_ARRAY_TASK_ID" ]; then
     OUTPUT_PKL="${SHARDS_DIR}/${BASENAME}_binary.pkl"
 
     echo "=== PHASE 1: Train ==="
-    echo "Task $SLURM_ARRAY_TASK_ID: $BAM_PATH"
+    echo "Task $SLURM_ARRAY_TASK_ID / $SLURM_ARRAY_TASK_MAX: $BAM_PATH"
     echo "Motifs: $MOTIFS"
     echo "Output: $OUTPUT_PKL"
 
     kinsim dictionary train "$BAM_PATH" "$MOTIFS" "$OUTPUT_PKL"
+
+    # The last array task auto-submits the merge job.
+    # Suppressed when KINSIM_NO_AUTOMERGE=1 (used by kinsim_pipeline.sh, which
+    # submits the merge explicitly so it can chain further dependency jobs).
+    if [ "$SLURM_ARRAY_TASK_ID" -eq "$SLURM_ARRAY_TASK_MAX" ] && [ -z "${KINSIM_NO_AUTOMERGE}" ]; then
+        echo ""
+        echo "Last array task — submitting merge job (dependency: afterok:${SLURM_ARRAY_JOB_ID})..."
+        sbatch --dependency=afterok:"${SLURM_ARRAY_JOB_ID}" \
+            "$0" "$CONFIG_FILE" "$SHARDS_DIR" "$MASTER_OUTPUT"
+    fi
 else
     # ============ PHASE 2: Merge all shards ============
     echo "=== PHASE 2: Merge ==="

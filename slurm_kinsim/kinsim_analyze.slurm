@@ -2,9 +2,10 @@
 #SBATCH --job-name=KinSim_Analyze
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=8G
+#SBATCH --account=p774
 #SBATCH --partition=pshort_el8
 #SBATCH --time=00:30:00
-#SBATCH --output=logs/kinsim_analyze_%j.log
+#SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/kinsim_analyze_%j.log
 #SBATCH --mail-user=nicolas.dutilleux@unifr.ch
 #SBATCH --mail-type=FAIL
 
