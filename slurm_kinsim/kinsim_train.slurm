@@ -92,8 +92,10 @@ if [ -n "$SLURM_ARRAY_TASK_ID" ]; then
 
     kinsim dictionary train "$BAM_PATH" "$MOTIFS" "$OUTPUT_PKL"
 
-    # The last array task submits the merge job automatically
-    if [ "$SLURM_ARRAY_TASK_ID" -eq "$SLURM_ARRAY_TASK_MAX" ]; then
+    # The last array task auto-submits the merge job.
+    # Suppressed when KINSIM_NO_AUTOMERGE=1 (used by kinsim_pipeline.sh, which
+    # submits the merge explicitly so it can chain further dependency jobs).
+    if [ "$SLURM_ARRAY_TASK_ID" -eq "$SLURM_ARRAY_TASK_MAX" ] && [ -z "${KINSIM_NO_AUTOMERGE}" ]; then
         echo ""
         echo "Last array task — submitting merge job (dependency: afterok:${SLURM_ARRAY_JOB_ID})..."
         sbatch --dependency=afterok:"${SLURM_ARRAY_JOB_ID}" \
