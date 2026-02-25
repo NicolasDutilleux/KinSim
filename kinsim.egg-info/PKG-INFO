@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: kinsim
+Version: 0.1.0
+Summary: PacBio kinetic signal simulator for metagenomic binning
+License-Expression: MIT
+Requires-Python: >=3.10
+License-File: LICENSE
+Requires-Dist: numpy
+Requires-Dist: pysam
+Provides-Extra: cluster
+Requires-Dist: pyyaml; extra == "cluster"
+Dynamic: license-file
