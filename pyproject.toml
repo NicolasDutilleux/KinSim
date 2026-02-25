@@ -19,6 +19,7 @@ kinsim = "kinsim.__main__:main"
 [project.optional-dependencies]
 cluster = ["pyyaml"]
 cgan = ["torch>=2.0", "tensorboard"]
+analyze = ["plotly>=5.0"]
 
 [tool.setuptools.packages.find]
 include = ["kinsim*"]
