@@ -10,14 +10,15 @@
 #   bash kinsim_pipeline.sh <mode> <pairs_file> <N> <config_out> \
 #       <shards_dir> <master_pkl> \
 #       <pbsim3_dir> <motifs> <M> <output_dir> \
-#       [checkpoint_dir]   # cgan mode only
+#       [checkpoint_dir]   # cgan / mlp mode only
 #
 # Modes:
 #   dictionary   — prepare -> train+merge -> inject -> analyze
 #   cgan         — prepare -> extract+merge -> train -> generate
+#   mlp          — prepare -> extract+merge -> train -> generate  (same data prep as cgan)
 #
 # Arguments:
-#   mode              Pipeline mode: 'dictionary' or 'cgan'
+#   mode              Pipeline mode: 'dictionary', 'cgan', or 'mlp'
 #   pairs_file        Input for prepare (alternating BAM / motif-source lines)
 #   N                 Number of BAM/motif pairs (array size for train/extract)
 #   config_out        Output config from prepare (consumed by train/extract)
@@ -28,7 +29,7 @@
 #                     or per-species mapping file (lines: "species|motif_string")
 #   M                 Number of genomes to inject/generate (array size)
 #   output_dir        Directory for output BAM files
-#   checkpoint_dir    [cgan only] Output directory for GAN checkpoints and logs
+#   checkpoint_dir    [cgan / mlp] Output directory for checkpoints and logs
 #
 # Example — Dictionary mode:
 #   bash kinsim_pipeline.sh dictionary \
@@ -42,6 +43,13 @@
 #       cgan_shards/ master_cgan_data.pkl \
 #       pbsim3_output/ "m6A,GATC,1;m4C,CCWGG,1" 10 generated/ \
 #       checkpoints/
+#
+# Example — MLP mode (uses the same data prep as cGAN):
+#   bash kinsim_pipeline.sh mlp \
+#       pairs.txt 53 config_strains.txt \
+#       cgan_shards/ master_cgan_data.pkl \
+#       pbsim3_output/ "m6A,GATC,1;m4C,CCWGG,1" 10 generated_mlp/ \
+#       checkpoints_mlp/
 #
 # Expected directory structure:
 #   project/
@@ -99,13 +107,18 @@ NUM_GENOMES="$9"
 OUTPUT_DIR="${10}"
 CHECKPOINT_DIR="${11:-}"
 
-if [ "$MODE" != "dictionary" ] && [ "$MODE" != "cgan" ]; then
-    echo "ERROR: mode must be 'dictionary' or 'cgan' (got '$MODE')"
+if [ "$MODE" != "dictionary" ] && [ "$MODE" != "cgan" ] && [ "$MODE" != "mlp" ]; then
+    echo "ERROR: mode must be 'dictionary', 'cgan', or 'mlp' (got '$MODE')"
     exit 1
 fi
 
 if [ "$MODE" = "cgan" ] && [ -z "$CHECKPOINT_DIR" ]; then
     echo "ERROR: cgan mode requires an 11th argument: checkpoint_dir"
+    exit 1
+fi
+
+if [ "$MODE" = "mlp" ] && [ -z "$CHECKPOINT_DIR" ]; then
+    echo "ERROR: mlp mode requires an 11th argument: checkpoint_dir"
     exit 1
 fi
 
@@ -123,7 +136,7 @@ echo "  PBSIM3 dir:         $PBSIM3_DIR"
 echo "  Motifs:             $MOTIFS"
 echo "  M genomes (array):  $NUM_GENOMES"
 echo "  Output dir:         $OUTPUT_DIR"
-if [ "$MODE" = "cgan" ]; then
+if [ "$MODE" = "cgan" ] || [ "$MODE" = "mlp" ]; then
     echo "  Checkpoint dir:     $CHECKPOINT_DIR"
 fi
 echo ""
@@ -252,5 +265,66 @@ elif [ "$MODE" = "cgan" ]; then
     echo "  Checkpoints:   $CHECKPOINT_DIR"
     echo "  Expected ckpt: $CKPT_FILE"
     echo "  Monitor GAN:   tensorboard --logdir $CHECKPOINT_DIR/runs"
+
+# ============================================================
+# MLP MODE
+# ============================================================
+elif [ "$MODE" = "mlp" ]; then
+
+    # STEP 2 — Extract shards (array, depends on prepare)
+    # Reuses kinsim_cgan_extract.slurm — data format is identical.
+    # KINSIM_NO_AUTOMERGE=1 prevents double-merge (see dictionary mode comment above)
+    echo "[2/5] Submitting: kinsim cgan extract (array 1-$NUM_STRAINS)"
+    JOB_EXTRACT=$(sbatch --parsable \
+        --array="1-${NUM_STRAINS}" \
+        --dependency="afterok:${JOB_PREPARE}" \
+        --export="KINSIM_NO_AUTOMERGE=1,ALL" \
+        "$SCRIPT_DIR/kinsim_cgan_extract.slurm" \
+        "$CONFIG_OUT" "$SHARDS_DIR" "$MASTER_PKL")
+    echo "      Job ID: $JOB_EXTRACT"
+
+    # STEP 3 — Merge shards (single, depends on all extract tasks)
+    echo "[3/5] Submitting: kinsim cgan merge"
+    JOB_MERGE=$(sbatch --parsable \
+        --dependency="afterok:${JOB_EXTRACT}" \
+        "$SCRIPT_DIR/kinsim_cgan_extract.slurm" \
+        "$CONFIG_OUT" "$SHARDS_DIR" "$MASTER_PKL")
+    echo "      Job ID: $JOB_MERGE"
+
+    # STEP 4 — Train MLP (single GPU, depends on merge)
+    echo "[4/5] Submitting: kinsim mlp train"
+    JOB_TRAIN=$(sbatch --parsable \
+        --dependency="afterok:${JOB_MERGE}" \
+        "$SCRIPT_DIR/kinsim_mlp_train.slurm" \
+        "$MASTER_PKL" "$CHECKPOINT_DIR")
+    echo "      Job ID: $JOB_TRAIN"
+
+    # STEP 5 — Generate signals (array, depends on train)
+    # Default 50 training epochs -> checkpoint_epoch50.pt
+    # If you use --epochs N, the checkpoint will be checkpoint_epochN.pt
+    CKPT_FILE="${CHECKPOINT_DIR}/checkpoint_epoch50.pt"
+    echo "[5/5] Submitting: kinsim mlp generate (array 1-$NUM_GENOMES)"
+    JOB_GENERATE=$(sbatch --parsable \
+        --array="1-${NUM_GENOMES}" \
+        --dependency="afterok:${JOB_TRAIN}" \
+        "$SCRIPT_DIR/kinsim_mlp_generate.slurm" \
+        "$PBSIM3_DIR" "$CKPT_FILE" "$MOTIFS" "$OUTPUT_DIR")
+    echo "      Job ID: $JOB_GENERATE"
+
+    echo ""
+    echo "============================================================"
+    echo "  MLP pipeline submitted"
+    echo "============================================================"
+    echo "  prepare:   $JOB_PREPARE"
+    echo "  extract:   $JOB_EXTRACT  (array 1-$NUM_STRAINS)"
+    echo "  merge:     $JOB_MERGE"
+    echo "  train:     $JOB_TRAIN"
+    echo "  generate:  $JOB_GENERATE  (array 1-$NUM_GENOMES)"
+    echo ""
+    echo "  Monitor:       squeue -u \$USER"
+    echo "  Output BAMs:   $OUTPUT_DIR"
+    echo "  Checkpoints:   $CHECKPOINT_DIR"
+    echo "  Expected ckpt: $CKPT_FILE"
+    echo "  Monitor MLP:   tensorboard --logdir $CHECKPOINT_DIR/runs"
 
 fi

@@ -1,72 +1,23 @@
 """Train conditional GAN for kinetic signal generation using WGAN-GP.
 
-Dataset: Flattened {(kmer, meth): np.ndarray(N, 2)} from parse_train.py
-Training: WGAN-GP with gradient penalty, TensorBoard logging, checkpointing
+Dataset: Flattened {(kmer, meth): np.ndarray(N, 2)} from `kinsim data merge`.
+Training: WGAN-GP with gradient penalty, TensorBoard logging, checkpointing.
 """
 
+import csv
+import json
 import os
 import sys
-import json
-import pickle
-import csv
 from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
-from .model import Generator, Discriminator, log_transform
-
-
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-
-class KmerSignalDataset(Dataset):
-    """Dataset of raw (IPD, PW) samples keyed by (kmer_id, meth_id).
-
-    Loads the output of `kinsim cgan merge` and flattens into tensors.
-    Signals are log-transformed at load time.
-    """
-
-    def __init__(self, pkl_path):
-        """Load and flatten the training data.
-
-        Args:
-            pkl_path: Path to merged *_cgan.pkl file with structure:
-                dict[(kmer_id, meth_id)] -> np.ndarray(N, 2)
-        """
-        print(f"Loading training data from {pkl_path}...")
-        with open(pkl_path, 'rb') as f:
-            data_dict = pickle.load(f)
-
-        kmer_ids = []
-        meth_ids = []
-        signals = []
-
-        for (kmer_id, meth_id), samples in data_dict.items():
-            n = len(samples)
-            kmer_ids.extend([kmer_id] * n)
-            meth_ids.extend([meth_id] * n)
-            signals.append(samples)
-
-        # Concatenate all samples
-        self.kmer_ids = torch.tensor(kmer_ids, dtype=torch.long)
-        self.meth_ids = torch.tensor(meth_ids, dtype=torch.long)
-        self.signals = torch.from_numpy(np.concatenate(signals, axis=0)).float()
-
-        # Log-transform signals
-        self.signals = log_transform(self.signals)
-
-        print(f"Dataset loaded: {len(self)} samples, "
-              f"{len(data_dict)} unique (kmer, meth) contexts")
-
-    def __len__(self):
-        return len(self.kmer_ids)
-
-    def __getitem__(self, idx):
-        return self.kmer_ids[idx], self.meth_ids[idx], self.signals[idx]
+from ...common.dataset import KmerSignalDataset  # shared with MLP
+from .model import Discriminator, Generator
 
 
 # ---------------------------------------------------------------------------

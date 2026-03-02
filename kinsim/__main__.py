@@ -1,92 +1,85 @@
 """KinSim CLI entry point.
 
 Usage:
-    kinsim <command> [<args>]
-    python -m kinsim <command> [<args>]
+    kinsim [--version] <command> [<args>]
+    python -m kinsim [--version] <command> [<args>]
 """
 
 import difflib
 import sys
 
-COMMANDS = ["prepare", "motifs", "rebase", "dictionary", "cgan"]
-DICT_COMMANDS = ["train", "merge", "inject", "analyze", "metagenome"]
-CGAN_COMMANDS = ["extract", "merge", "train", "generate"]
+__version__ = "0.2.0"
 
-REBASE_COMMANDS = ["parse", "patterns"]
-
-REBASE_USAGE = """\
-usage: kinsim rebase <command> [<args>]
-
-REBASE file parsing and fuzznuc pattern file generation.
-
-Commands:
-  parse       Parse a REBASE file and print the KinSim motif string
-  patterns    Convert a motif source into a fuzznuc @pattern file
-
-Use 'kinsim rebase <command> -h' for help on a specific command.
-"""
+COMMANDS = ["prepare", "parse", "extract", "merge", "train", "generate", "analyze"]
 
 USAGE = """\
-usage: kinsim <command> [<args>]
+usage: kinsim [--version] <command> [<args>]
 
 KinSim — PacBio kinetic signal simulator for metagenomic binning.
 
-Shared commands:
-  prepare                Parse BAM + motifs.csv pairs into pipeline config
-  motifs                 Parse a motif source (CSV, REBASE, or string)
-  rebase                 Parse REBASE files / generate fuzznuc pattern files
-
-Dictionary mode:
-  dictionary train       Build a kinetic dictionary shard from a BAM file
-  dictionary merge       Merge .pkl shards into a master dictionary
-  dictionary inject      Inject IPD/PW signals into PBSIM3 reads (single or directory)
-  dictionary metagenome  Pool all species into one BAM with @RG tags (metagenomic mode)
-  dictionary analyze     Analyze dictionary coverage statistics
-
-cGAN mode:
-  cgan extract           Extract raw IPD/PW samples from a BAM file
-  cgan merge             Merge cGAN shards into a master training set
-  cgan train             Train the conditional GAN model (WGAN-GP)
-  cgan generate          Generate kinetic signals for PBSIM3 reads
-
-Use 'kinsim <command> -h' for help on a specific command.
-"""
-
-DICT_USAGE = """\
-usage: kinsim dictionary <command> [<args>]
-
-Dictionary mode — statistical 11-mer kinetic lookup tables.
-
 Commands:
-  train       Build a kinetic dictionary shard from a BAM file
-  merge       Merge .pkl shards into a master dictionary
-  inject      Inject IPD/PW signals into PBSIM3 reads (single or directory)
-  metagenome  Pool all species into one BAM with @RG tags (metagenomic mode)
-  analyze     Analyze dictionary coverage statistics
+  prepare     Validate BAM/motif pairs into a reusable config file
+  parse       Parse any motif source (PacBio CSV, REBASE, or inline string)
+  extract     Extract raw IPD/PW samples from a BAM file  (→ .pkl shard)
+  merge       Merge .pkl shards into a master training set
+  train       Train a kinetic model  (--model dictionary | mlp | cgan)
+  generate    Generate synthetic kinetic signals for PBSIM3 reads
+              (--model dictionary | mlp | cgan)
+  analyze     Report coverage and signal statistics for a dictionary .pkl
 
-Use 'kinsim dictionary <command> -h' for help on a specific command.
+Use 'kinsim <command> -h' for detailed help on a specific command.
+Use 'kinsim --version' to print the version number.
 """
 
 
-CGAN_USAGE = """\
-usage: kinsim cgan <command> [<args>]
-
-cGAN mode — conditional GAN-based kinetic signal generation.
-
-Commands:
-  extract     Extract raw (IPD, PW) samples from a BAM file
-  merge       Merge *_cgan.pkl shards into a master training set
-  train       Train the conditional GAN model (WGAN-GP)
-  generate    Generate kinetic signals for PBSIM3 reads
-
-Use 'kinsim cgan <command> -h' for help on a specific command.
-"""
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _suggest(word, candidates, n=1, cutoff=0.6):
     """Return close matches for typo suggestions."""
     return difflib.get_close_matches(word, candidates, n=n, cutoff=cutoff)
 
+
+def _pop_model(args):
+    """Remove --model <value> from an arg list.
+
+    Returns (model_str, remaining_args).
+    model_str is None when the flag is absent.
+
+    Supports both '--model mlp' and '--model=mlp' forms.
+    """
+    for i, arg in enumerate(args):
+        if arg == "--model" and i + 1 < len(args):
+            return args[i + 1], args[:i] + args[i + 2:]
+        if arg.startswith("--model="):
+            return arg[len("--model="):], args[:i] + args[i + 1:]
+    return None, args
+
+
+def _require_model(rest, command):
+    """Parse --model from rest; exit with a clear message if missing."""
+    model, subrest = _pop_model(rest)
+    if not model:
+        print(
+            f"ERROR: 'kinsim {command}' requires --model <dictionary|mlp|cgan>.\n"
+            f"  Example: kinsim {command} ... --model mlp",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if model not in ("dictionary", "mlp", "cgan"):
+        print(
+            f"ERROR: unknown model '{model}'. "
+            "Valid choices: dictionary, mlp, cgan",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return model, subrest
+
+
+# ---------------------------------------------------------------------------
+# Main dispatcher
+# ---------------------------------------------------------------------------
 
 def main(argv=None):
     args = argv if argv is not None else sys.argv[1:]
@@ -95,110 +88,155 @@ def main(argv=None):
         print(USAGE)
         sys.exit(0)
 
+    if args[0] in ("--version", "-V"):
+        print(f"kinsim {__version__}")
+        sys.exit(0)
+
     cmd, rest = args[0], args[1:]
 
+    # ── prepare ──────────────────────────────────────────────────────────────
     if cmd == "prepare":
         from .prepare import main as run
         run(rest)
+
+    # ── parse ─────────────────────────────────────────────────────────────────
+    # Unified entry for CSV, REBASE, and inline motif strings.
+    # Replaces the old 'kinsim motifs' and 'kinsim rebase parse/patterns'.
+    elif cmd == "parse":
+        from .motifs import main as run
+        run(rest)
+
+    # ── extract ───────────────────────────────────────────────────────────────
+    # Extract raw (IPD, PW) samples from a real PacBio BAM file.
+    # Replaces 'kinsim cgan extract'.
+    elif cmd == "extract":
+        from .common.extract import main as run
+        run(["extract"] + rest)
+
+    # ── merge ─────────────────────────────────────────────────────────────────
+    # Merge .pkl shards produced by 'kinsim extract' into one master file.
+    # Replaces 'kinsim cgan merge'.
+    elif cmd == "merge":
+        from .common.extract import main as run
+        run(["merge"] + rest)
+
+    # ── analyze ───────────────────────────────────────────────────────────────
+    # Coverage statistics and signal reports for a dictionary .pkl.
+    elif cmd == "analyze":
+        from .dictionary.analyze import main as run
+        run(rest)
+
+    # ── train ─────────────────────────────────────────────────────────────────
+    # Unified training command. --model selects the back-end.
+    elif cmd == "train":
+        model, subrest = _require_model(rest, "train")
+
+        if model == "dictionary":
+            from .dictionary.train import main as run
+            run(["train"] + subrest)
+
+        elif model == "mlp":
+            from .models.mlp.train import main as run
+            run(subrest)
+
+        elif model == "cgan":
+            from .models.cgan.train import main as run
+            run(subrest)
+
+    # ── generate ──────────────────────────────────────────────────────────────
+    # Unified generation command. --model selects the back-end.
+    elif cmd == "generate":
+        model, subrest = _require_model(rest, "generate")
+
+        if model == "dictionary":
+            from .dictionary.inject import main as run
+            run(subrest)
+
+        elif model == "mlp":
+            from .models.mlp.generate import main as run
+            run(subrest)
+
+        elif model == "cgan":
+            from .models.cgan.generate import main as run
+            run(subrest)
+
+    # ── backward-compat: legacy sub-command style ─────────────────────────────
+    # Old SLURM scripts and notebooks continue to work unchanged.
 
     elif cmd == "motifs":
         from .motifs import main as run
         run(rest)
 
     elif cmd == "rebase":
-        if not rest or rest[0] in ("-h", "--help"):
-            print(REBASE_USAGE)
-            sys.exit(0)
-
-        subcmd, subrest = rest[0], rest[1:]
-
-        if subcmd in ("parse", "patterns"):
-            from .rebase_parser import main as run
-            run(rest)
-
-        else:
-            msg = f"Unknown rebase command: {subcmd}"
-            hint = _suggest(subcmd, REBASE_COMMANDS)
-            if hint:
-                msg += f"\n\nDid you mean: kinsim rebase {hint[0]}?"
-            print(msg)
-            print(REBASE_USAGE)
-            sys.exit(1)
+        from .rebase_parser import main as run
+        run(rest)
 
     elif cmd == "dictionary":
         if not rest or rest[0] in ("-h", "--help"):
-            print(DICT_USAGE)
+            print("Tip: use 'kinsim train --model dictionary' and "
+                  "'kinsim generate --model dictionary'")
             sys.exit(0)
-
         subcmd, subrest = rest[0], rest[1:]
-
         if subcmd == "train":
             from .dictionary.train import main as run
             run(["train"] + subrest)
-
         elif subcmd == "merge":
             from .dictionary.train import main as run
             run(["merge"] + subrest)
-
         elif subcmd == "inject":
             from .dictionary.inject import main as run
             run(subrest)
-
-        elif subcmd == "analyze":
-            from .dictionary.analyze import main as run
-            run(subrest)
-
         elif subcmd == "metagenome":
             from .dictionary.inject import metagenome_main as run
             run(subrest)
-
+        elif subcmd == "analyze":
+            from .dictionary.analyze import main as run
+            run(subrest)
         else:
-            msg = f"Unknown dictionary command: {subcmd}"
-            hint = _suggest(subcmd, DICT_COMMANDS)
-            if hint:
-                msg += f"\n\nDid you mean: kinsim dictionary {hint[0]}?"
-            print(msg)
-            print(DICT_USAGE)
+            print(f"Unknown dictionary command: {subcmd}", file=sys.stderr)
             sys.exit(1)
 
     elif cmd == "cgan":
-        if not rest or rest[0] in ("-h", "--help"):
-            print(CGAN_USAGE)
+        if not rest:
             sys.exit(0)
-
         subcmd, subrest = rest[0], rest[1:]
-
         if subcmd == "extract":
-            from .cgan.parse_train import main as run
+            from .models.cgan.parse_train import main as run
             run(["extract"] + subrest)
-
         elif subcmd == "merge":
-            from .cgan.parse_train import main as run
+            from .models.cgan.parse_train import main as run
             run(["merge"] + subrest)
-
         elif subcmd == "train":
-            from .cgan.train import main as run
+            from .models.cgan.train import main as run
             run(subrest)
-
         elif subcmd == "generate":
-            from .cgan.generate import main as run
+            from .models.cgan.generate import main as run
             run(subrest)
-
         else:
-            msg = f"Unknown cgan command: {subcmd}"
-            hint = _suggest(subcmd, CGAN_COMMANDS)
-            if hint:
-                msg += f"\n\nDid you mean: kinsim cgan {hint[0]}?"
-            print(msg)
-            print(CGAN_USAGE)
+            print(f"Unknown cgan command: {subcmd}", file=sys.stderr)
             sys.exit(1)
 
+    elif cmd == "mlp":
+        if not rest:
+            sys.exit(0)
+        subcmd, subrest = rest[0], rest[1:]
+        if subcmd == "train":
+            from .models.mlp.train import main as run
+            run(subrest)
+        elif subcmd == "generate":
+            from .models.mlp.generate import main as run
+            run(subrest)
+        else:
+            print(f"Unknown mlp command: {subcmd}", file=sys.stderr)
+            sys.exit(1)
+
+    # ── unknown ───────────────────────────────────────────────────────────────
     else:
-        msg = f"Unknown command: {cmd}"
+        msg = f"Unknown command: '{cmd}'"
         hint = _suggest(cmd, COMMANDS)
         if hint:
-            msg += f"\n\nDid you mean: kinsim {hint[0]}?"
-        print(msg)
+            msg += f"\n\nDid you mean:  kinsim {hint[0]}"
+        print(msg, file=sys.stderr)
         print(USAGE)
         sys.exit(1)
 
