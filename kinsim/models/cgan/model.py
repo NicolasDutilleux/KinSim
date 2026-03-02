@@ -7,33 +7,9 @@ and methylation state. Uses WGAN-GP loss with gradient penalty.
 import torch
 import torch.nn as nn
 
-
-# ---------------------------------------------------------------------------
-# Transform utilities
-# ---------------------------------------------------------------------------
-
-def log_transform(x):
-    """Transform IPD/PW values to log1p space for training.
-
-    Args:
-        x: Raw signal values (typically in [0, 255])
-
-    Returns:
-        Log-transformed values: log(1 + x)
-    """
-    return torch.log1p(x)
-
-
-def inv_log_transform(x):
-    """Inverse transform from log1p space back to raw signals.
-
-    Args:
-        x: Log-transformed values
-
-    Returns:
-        Raw signals clamped to [0, 255]
-    """
-    return torch.clamp(torch.expm1(x), 0, 255)
+# Signal transforms live in common/ — re-exported here for backward compatibility
+# with any code that does `from kinsim.cgan.model import log_transform`.
+from ...common.dataset import log_transform, inv_log_transform  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
