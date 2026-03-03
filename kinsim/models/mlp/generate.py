@@ -76,7 +76,12 @@ def generate_signals_batch(
         np.ndarray of shape (N, 2) with raw [IPD, PW] values in [0, 255].
     """
     kmer_tensor = torch.tensor(kmer_ids, dtype=torch.long, device=device)
-    meth_tensor = torch.tensor(meth_ids, dtype=torch.long, device=device)
+
+    # Convert integer meth_ids → one-hot Float[N, 4] for the v2 Linear projection
+    meth_tensor = torch.nn.functional.one_hot(
+        torch.tensor(meth_ids, dtype=torch.long, device=device),
+        num_classes=4,
+    ).float()   # (N, 4)
 
     if deterministic:
         signals = model.predict_mean(kmer_tensor, meth_tensor)
@@ -122,14 +127,18 @@ def _load_model(checkpoint_path: str, device: torch.device) -> MLPPredictor:
         config = json.load(f)
     kmer_embed_dim = config["kmer_embed_dim"]
     hidden_dim     = config["hidden_dim"]
+    meth_proj_dim  = config.get("meth_proj_dim", 8)   # default 8 for old checkpoints
 
-    model = MLPPredictor(kmer_embed_dim=kmer_embed_dim,
-                         hidden_dim=hidden_dim).to(device)
+    model = MLPPredictor(
+        kmer_embed_dim=kmer_embed_dim,
+        hidden_dim=hidden_dim,
+        meth_proj_dim=meth_proj_dim,
+    ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
     print(f"  MLPPredictor loaded (kmer_embed_dim={kmer_embed_dim}, "
-          f"hidden_dim={hidden_dim})")
+          f"hidden_dim={hidden_dim}, meth_proj_dim={meth_proj_dim})")
     return model
 
 

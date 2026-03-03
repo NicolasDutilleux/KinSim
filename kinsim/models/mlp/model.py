@@ -2,30 +2,39 @@
 
 Architecture
 ------------
-The predictor takes two integer inputs — an 11-mer encoded as a 22-bit integer
-and a methylation state ID — and outputs the parameters of a Gaussian
+The predictor takes two inputs — an 11-mer encoded as a 22-bit integer and a
+methylation probability vector — and outputs the parameters of a Gaussian
 distribution over (IPD, PW) for that context.
 
-    11-mer (int)      → Embedding(4^11, kmer_embed_dim)  ─┐
-    meth_state (int)  → Embedding(4, 8)                   ├─ concat
-                                                           ↓
-                     Linear(kmer_embed_dim + 8 → hidden)
-                     LayerNorm  →  LeakyReLU(0.2)
-                     Linear(hidden → hidden)
-                     LayerNorm  →  LeakyReLU(0.2)
-                     Linear(hidden → 4)
-                           ↓
-              [μ_ipd, μ_pw, log_σ_ipd, log_σ_pw]  (log1p space)
+    11-mer (int)          → Embedding(4^11, kmer_embed_dim)  ─┐
+    meth_probs (float[4]) → Linear(4, meth_proj_dim)           ├─ concat
+                                                               ↓
+                         Linear(kmer_embed_dim + meth_proj_dim → hidden)
+                         LayerNorm  →  LeakyReLU(0.2)
+                         Linear(hidden → hidden)
+                         LayerNorm  →  LeakyReLU(0.2)
+                         Linear(hidden → 4)
+                               ↓
+                  [μ_ipd, μ_pw, log_σ_ipd, log_σ_pw]  (log1p space)
 
-All values are in log1p space during training. At inference time, the model
+The methylation input is a Float[4] probability vector [p_none, p_m6A, p_m4C,
+p_m5C] projected via a learned linear layer (no bias).  Using a linear
+projection rather than a discrete Embedding allows the model to interpolate
+between methylation states — useful for partial methylation or soft labels
+from a probabilistic methylation caller.
+
+During training the vector is one-hot (one known state per position).
+At inference time, soft probabilities can be passed directly.
+
+Methylation state mapping:
+    0 = unmethylated  →  one-hot [1, 0, 0, 0]
+    1 = m6A           →  one-hot [0, 1, 0, 0]
+    2 = m4C           →  one-hot [0, 0, 1, 0]
+    3 = m5C           →  one-hot [0, 0, 0, 1]
+
+All values are in log1p space during training.  At inference time the model
 samples from N(μ, σ²) then applies expm1 and clamps to [0, 255] to recover
 raw uint8 signals compatible with PacBio fi/fp BAM tags.
-
-Methylation state IDs (shared with cGAN mode):
-    0 = unmethylated
-    1 = m6A
-    2 = m4C
-    3 = m5C
 """
 
 import torch
@@ -37,40 +46,50 @@ from ...common.dataset import log_transform, inv_log_transform  # noqa: F401 (re
 # Total number of 11-mers: 4^11 = 4,194,304
 _NUM_KMERS = 4 ** 11
 
-# Number of methylation state categories
-_NUM_METH_STATES = 4
-
 
 class MLPPredictor(nn.Module):
     """Conditional MLP that predicts Gaussian parameters for (IPD, PW).
 
     The model outputs four values per context:
-        μ_ipd, μ_pw       — predicted mean of IPD and PW in log1p space
+        μ_ipd, μ_pw         — predicted mean of IPD and PW in log1p space
         log_σ_ipd, log_σ_pw — log standard deviation (learned variance)
 
     Learned variance is essential: different 11-mer contexts naturally have
     different signal spread (e.g., methylated sites vs. plain sequence).
-    Using a fixed σ would produce overconfident or under-dispersed signals.
+
+    The methylation input is a Float[4] probability vector projected via a
+    learned linear layer.  During training this is one-hot; at inference,
+    soft probabilities from a methylation caller are accepted unchanged.
 
     Args:
         kmer_embed_dim: Dimension of the 11-mer embedding table.
                         Use 32 to halve memory (~0.5 GB), 64 for full quality.
         hidden_dim:     Width of the two hidden layers.
+        meth_proj_dim:  Output dimension of the methylation linear projection
+                        (default 8).
     """
 
-    def __init__(self, kmer_embed_dim: int = 64, hidden_dim: int = 128):
+    def __init__(
+        self,
+        kmer_embed_dim: int = 64,
+        hidden_dim: int = 128,
+        meth_proj_dim: int = 8,
+    ):
         super().__init__()
 
         self.kmer_embed_dim = kmer_embed_dim
-        self.hidden_dim = hidden_dim
+        self.hidden_dim     = hidden_dim
+        self.meth_proj_dim  = meth_proj_dim
 
-        # Embedding tables
-        # kmer_embed: maps 4^11 possible 11-mers to dense vectors
+        # k-mer embedding: maps 4^11 possible 11-mers to dense vectors
         self.kmer_embed = nn.Embedding(_NUM_KMERS, kmer_embed_dim)
-        # meth_embed: maps {0,1,2,3} methylation states to dense vectors
-        self.meth_embed = nn.Embedding(_NUM_METH_STATES, 8)
 
-        input_dim = kmer_embed_dim + 8
+        # Methylation projection: Float[4] probability vector → Float[meth_proj_dim]
+        # No bias — the projection is purely linear so that a zero-probability
+        # state contributes nothing to the representation.
+        self.meth_proj = nn.Linear(4, meth_proj_dim, bias=False)
+
+        input_dim = kmer_embed_dim + meth_proj_dim
 
         # Two hidden layers with normalisation and residual-friendly width
         self.net = nn.Sequential(
@@ -93,7 +112,7 @@ class MLPPredictor(nn.Module):
     # ------------------------------------------------------------------
 
     def _init_weights(self) -> None:
-        """Xavier uniform for linear layers, small normal for embeddings."""
+        """Xavier uniform for linear layers, small normal for k-mer embedding."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -108,14 +127,17 @@ class MLPPredictor(nn.Module):
 
     def forward(
         self,
-        kmer_ids: torch.Tensor,
-        meth_ids: torch.Tensor,
+        kmer_ids:   torch.Tensor,
+        meth_probs: torch.Tensor,
     ) -> torch.Tensor:
         """Predict Gaussian parameters for a batch of contexts.
 
         Args:
-            kmer_ids: Long tensor of shape (batch,) with 22-bit encoded 11-mers.
-            meth_ids: Long tensor of shape (batch,) with methylation state IDs.
+            kmer_ids:   Long tensor of shape (batch,) with 22-bit encoded 11-mers.
+            meth_probs: Float tensor of shape (batch, 4) with methylation
+                        probability vector [p_none, p_m6A, p_m4C, p_m5C].
+                        During training this is one-hot; at inference, soft
+                        probabilities are accepted directly.
 
         Returns:
             Float tensor of shape (batch, 4):
@@ -124,8 +146,8 @@ class MLPPredictor(nn.Module):
                 [:, 2] = log_σ_ipd  (log std-dev of IPD)
                 [:, 3] = log_σ_pw   (log std-dev of PW)
         """
-        kmer_emb = self.kmer_embed(kmer_ids)   # (batch, kmer_embed_dim)
-        meth_emb = self.meth_embed(meth_ids)   # (batch, 8)
+        kmer_emb = self.kmer_embed(kmer_ids)    # (batch, kmer_embed_dim)
+        meth_emb = self.meth_proj(meth_probs)   # (batch, meth_proj_dim)
         x = torch.cat([kmer_emb, meth_emb], dim=1)
         return self.net(x)
 
@@ -136,8 +158,8 @@ class MLPPredictor(nn.Module):
     @torch.no_grad()
     def sample(
         self,
-        kmer_ids: torch.Tensor,
-        meth_ids: torch.Tensor,
+        kmer_ids:   torch.Tensor,
+        meth_probs: torch.Tensor,
     ) -> torch.Tensor:
         """Sample (IPD, PW) from the predicted Gaussian distribution.
 
@@ -145,22 +167,22 @@ class MLPPredictor(nn.Module):
         variability of real PacBio signals.
 
         Args:
-            kmer_ids: Long tensor of shape (batch,).
-            meth_ids: Long tensor of shape (batch,).
+            kmer_ids:   Long tensor of shape (batch,).
+            meth_probs: Float tensor of shape (batch, 4).
 
         Returns:
             Float tensor of shape (batch, 2) with raw [IPD, PW] in [0, 255].
         """
-        params = self.forward(kmer_ids, meth_ids)   # (batch, 4)
-        mu      = params[:, :2]                      # (batch, 2)
-        log_sig = params[:, 2:]                      # (batch, 2)
+        params  = self.forward(kmer_ids, meth_probs)   # (batch, 4)
+        mu      = params[:, :2]                         # (batch, 2)
+        log_sig = params[:, 2:]                         # (batch, 2)
 
         # Clamp log_σ for numerical stability (prevents σ → 0 or σ → ∞)
         log_sig = torch.clamp(log_sig, -6.0, 3.0)
-        sigma = torch.exp(log_sig)
+        sigma   = torch.exp(log_sig)
 
         # Reparameterisation: z ~ N(0,1), sample = μ + σ·z
-        z = torch.randn_like(mu)
+        z           = torch.randn_like(mu)
         sampled_log = mu + sigma * z
 
         return inv_log_transform(sampled_log)   # (batch, 2) in [0, 255]
@@ -168,8 +190,8 @@ class MLPPredictor(nn.Module):
     @torch.no_grad()
     def predict_mean(
         self,
-        kmer_ids: torch.Tensor,
-        meth_ids: torch.Tensor,
+        kmer_ids:   torch.Tensor,
+        meth_probs: torch.Tensor,
     ) -> torch.Tensor:
         """Return the predicted mean (IPD, PW) without sampling.
 
@@ -177,12 +199,12 @@ class MLPPredictor(nn.Module):
         Produces the same signal for every read at the same context.
 
         Args:
-            kmer_ids: Long tensor of shape (batch,).
-            meth_ids: Long tensor of shape (batch,).
+            kmer_ids:   Long tensor of shape (batch,).
+            meth_probs: Float tensor of shape (batch, 4).
 
         Returns:
             Float tensor of shape (batch, 2) with raw [IPD, PW] in [0, 255].
         """
-        params = self.forward(kmer_ids, meth_ids)
-        mu = params[:, :2]
+        params = self.forward(kmer_ids, meth_probs)
+        mu     = params[:, :2]
         return inv_log_transform(mu)

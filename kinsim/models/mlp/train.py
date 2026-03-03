@@ -1,8 +1,15 @@
 """Train the MLP predictor on merged raw kinetic samples.
 
-The training data is exactly the same format produced by `kinsim cgan extract`
-and `kinsim cgan merge`: a pickle file mapping (kmer_id, meth_id) → np.ndarray(N, 2).
-There is no separate extraction step for MLP.
+Input format
+------------
+A single merged .pkl file produced by the shared data pipeline:
+
+    kinsim extract <reads.bam> <motifs> <shard.pkl>   # one per BAM / SLURM task
+    kinsim merge   <shards_dir/> <master_data.pkl>     # combine all shards
+
+The .pkl maps (kmer_id: int, meth_id: int) → np.ndarray(N, 2) where columns
+are [IPD, PW] in raw uint8 space [0, 255] as read from BAM fi/fp tags.
+There is no separate extraction step for MLP — it reuses the cGAN pipeline.
 
 Loss function
 -------------
@@ -37,7 +44,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 
-from ...common.dataset import KmerSignalDataset
+from ...common.dataset import MLPSignalDataset
 from .model import MLPPredictor
 
 
@@ -114,12 +121,12 @@ def _compute_metrics(
     all_mu   = []
     all_true = []
 
-    for kmer_ids, meth_ids, signals in loader:
-        kmer_ids = kmer_ids.to(device)
-        meth_ids = meth_ids.to(device)
-        signals  = signals.to(device)
+    for kmer_ids, meth_probs, signals in loader:
+        kmer_ids   = kmer_ids.to(device)
+        meth_probs = meth_probs.to(device)
+        signals    = signals.to(device)
 
-        params = model(kmer_ids, meth_ids)
+        params = model(kmer_ids, meth_probs)
         mu     = params[:, :2]
 
         all_mu.append(mu.cpu())
@@ -159,6 +166,7 @@ def train_mlp(
     lr: float = 1e-3,
     kmer_embed_dim: int = 64,
     hidden_dim: int = 128,
+    meth_proj_dim: int = 8,
     loss_name: str = "gnll",
     val_fraction: float = 0.10,
     checkpoint_every: int = 10,
@@ -168,13 +176,14 @@ def train_mlp(
     """Train the MLPPredictor on merged raw kinetic samples.
 
     Args:
-        pkl_path:         Path to merged .pkl file (from `kinsim cgan merge`).
+        pkl_path:         Path to merged .pkl file (from `kinsim merge`).
         output_dir:       Directory for checkpoints, logs, and model config.
         epochs:           Total number of training epochs.
-        batch_size:       Mini-batch size.
+        batch_size:       Mini-batch size (= number of unique keys per step).
         lr:               Initial learning rate for Adam.
         kmer_embed_dim:   Dimension of the 11-mer embedding (32 or 64).
         hidden_dim:       Width of the two hidden MLP layers.
+        meth_proj_dim:    Output dimension of the methylation linear projection.
         loss_name:        Loss function: "gnll" | "mse" | "huber".
         val_fraction:     Fraction of data held out for validation.
         checkpoint_every: Save a checkpoint every N epochs (and at the final epoch).
@@ -190,7 +199,7 @@ def train_mlp(
     # ------------------------------------------------------------------
     # Data
     # ------------------------------------------------------------------
-    dataset = KmerSignalDataset(pkl_path)   # signals are log-transformed inside
+    dataset = MLPSignalDataset(pkl_path)    # random-shot, dynamic capping
 
     n_val   = max(1, int(len(dataset) * val_fraction))
     n_train = len(dataset) - n_val
@@ -214,12 +223,19 @@ def train_mlp(
         pin_memory=(device.type == "cuda"),
     )
 
-    print(f"Samples — train: {n_train:,}, val: {n_val:,}")
+    # n_train / n_val = number of unique (kmer, meth) keys in each split.
+    # Each step, the DataLoader draws one random signal per key from its pool,
+    # so the effective data volume grows over epochs without repeating any fixed order.
+    print(f"Keys (unique contexts) — train: {n_train:,}, val: {n_val:,}")
 
     # ------------------------------------------------------------------
     # Model, optimiser, scheduler
     # ------------------------------------------------------------------
-    model = MLPPredictor(kmer_embed_dim=kmer_embed_dim, hidden_dim=hidden_dim).to(device)
+    model = MLPPredictor(
+        kmer_embed_dim=kmer_embed_dim,
+        hidden_dim=hidden_dim,
+        meth_proj_dim=meth_proj_dim,
+    ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     # Halve LR when validation loss stops improving for 5 consecutive epochs.
@@ -258,6 +274,7 @@ def train_mlp(
     config = {
         "kmer_embed_dim": kmer_embed_dim,
         "hidden_dim":     hidden_dim,
+        "meth_proj_dim":  meth_proj_dim,
     }
     with open(output_dir / "model_config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -268,7 +285,8 @@ def train_mlp(
     # Training loop
     # ------------------------------------------------------------------
     print(f"\nStarting MLP training — {epochs} epochs, loss={loss_name}, lr={lr}")
-    print(f"  batch_size={batch_size}, embed_dim={kmer_embed_dim}, hidden={hidden_dim}")
+    print(f"  batch_size={batch_size}, embed_dim={kmer_embed_dim}, "
+          f"hidden={hidden_dim}, meth_proj_dim={meth_proj_dim}")
 
     csv_file = open(csv_path, "a", newline="")
     try:
@@ -288,13 +306,13 @@ def train_mlp(
             model.train()
             total_loss = 0.0
 
-            for kmer_ids, meth_ids, signals in train_loader:
-                kmer_ids = kmer_ids.to(device)
-                meth_ids = meth_ids.to(device)
-                signals  = signals.to(device)
+            for kmer_ids, meth_probs, signals in train_loader:
+                kmer_ids   = kmer_ids.to(device)
+                meth_probs = meth_probs.to(device)
+                signals    = signals.to(device)
 
                 optimizer.zero_grad()
-                params = model(kmer_ids, meth_ids)
+                params = model(kmer_ids, meth_probs)
                 loss   = loss_fn(params, signals)
                 loss.backward()
                 optimizer.step()
@@ -368,11 +386,12 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="kinsim mlp train",
         description=(
-            "Train an MLP predictor for kinetic signal generation.\n\n"
-            "Input data is the same format as cGAN training — use:\n"
-            "  kinsim cgan extract reads.bam motifs shard.pkl\n"
-            "  kinsim cgan merge shards/ master_data.pkl\n"
-            "Then pass master_data.pkl to this command."
+            "Train an MLPPredictor for kinetic signal generation.\n\n"
+            "Input: a merged .pkl from the shared extraction pipeline:\n"
+            "  kinsim extract reads.bam motifs shard.pkl   # repeat per BAM\n"
+            "  kinsim merge   shards/    master_data.pkl   # combine all shards\n\n"
+            "The .pkl maps (kmer_id, meth_id) -> np.ndarray(N, 2) [IPD, PW].\n"
+            "MLP and cGAN share the same data pipeline — no separate extraction."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -384,6 +403,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--lr",              type=float, default=1e-3,  help="Learning rate (default: 1e-3)")
     parser.add_argument("--kmer-embed-dim",  type=int,   default=64,    help="11-mer embedding dimension (default: 64; use 32 for ~0.5 GB RAM)")
     parser.add_argument("--hidden-dim",      type=int,   default=128,   help="Hidden layer width (default: 128)")
+    parser.add_argument("--meth-proj-dim",   type=int,   default=8,     help="Methylation linear projection output dim (default: 8)")
     parser.add_argument("--loss",            default="gnll",
                         choices=["gnll", "mse", "huber"],
                         help="Loss function: gnll=Gaussian NLL (default), mse, huber")
@@ -404,6 +424,7 @@ def main(argv: list[str] | None = None) -> None:
         lr               = args.lr,
         kmer_embed_dim   = args.kmer_embed_dim,
         hidden_dim       = args.hidden_dim,
+        meth_proj_dim    = args.meth_proj_dim,
         loss_name        = args.loss,
         val_fraction     = args.val_fraction,
         checkpoint_every = args.checkpoint_every,
