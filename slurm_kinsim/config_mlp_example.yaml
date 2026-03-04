@@ -1,0 +1,33 @@
+# ============================================================
+# KinSim MLP — Training configuration
+#
+# Usage:
+#   kinsim train --model mlp --config config_mlp.yaml
+#   sbatch kinsim_mlp_train.slurm --config config_mlp.yaml
+#
+# All values below are the defaults.  Remove a key to use the default.
+# Command-line flags always override YAML values.
+# ============================================================
+
+# ---- Input / output ----
+pkl:        /data/projects/p774/kinsim/master_data.pkl
+output_dir: /data/projects/p774/kinsim/checkpoints_mlp/
+
+# ---- Training ----
+epochs:          50        # total training epochs
+batch_size:      4096      # mini-batch size (number of unique keys per step)
+lr:              0.001     # initial Adam learning rate
+loss:            gnll      # loss function: gnll | mse | huber
+val_fraction:    0.10      # fraction of data held out for validation
+checkpoint_every: 10       # save a checkpoint every N epochs
+
+# ---- Architecture ----
+kmer_embed_dim: 64         # 11-mer embedding dimension (32 = ~0.5 GB, 64 = ~1 GB)
+hidden_dim:     128        # width of the two hidden MLP layers
+meth_proj_dim:  8          # methylation linear projection output dimension
+
+# ---- Device ----
+device: cuda               # cuda | cpu  (auto-falls-back to cpu if no GPU)
+
+# ---- Resume (optional) ----
+# resume: /data/projects/p774/kinsim/checkpoints_mlp/checkpoint_epoch25.pt
