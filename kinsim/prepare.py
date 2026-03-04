@@ -25,10 +25,13 @@ Fields 4 and 5 are absent for REBASE-derived entries. Downstream tools
 additionally used by cGAN mode for optional per-motif weighting.
 """
 
-import sys
+import logging
 import os
+import sys
 
 from .motifs import load_motif_string
+
+log = logging.getLogger(__name__)
 
 
 def prepare_config(input_file, output_file, min_fraction=0.40, min_detected=20):
@@ -46,8 +49,10 @@ def prepare_config(input_file, output_file, min_fraction=0.40, min_detected=20):
         lines = [l.strip() for l in f if l.strip()]
 
     if len(lines) % 2 != 0:
-        print(f"ERROR: input file must have an even number of non-empty lines "
-              f"(got {len(lines)})", file=sys.stderr)
+        log.error(
+            "Input file must have an even number of non-empty lines (got %d): %s",
+            len(lines), input_file,
+        )
         sys.exit(1)
 
     n_pairs = len(lines) // 2
@@ -62,8 +67,7 @@ def prepare_config(input_file, output_file, min_fraction=0.40, min_detected=20):
         # If motif_src looks like a file path, check it exists
         if os.sep in motif_src or motif_src.endswith('.csv') or motif_src.endswith('.txt'):
             if not os.path.isfile(motif_src):
-                print(f"  WARN: motif file not found: {motif_src} — skipping pair",
-                      file=sys.stderr)
+                log.warning("Motif file not found: %s — skipping pair", motif_src)
                 skipped += 1
                 continue
 
@@ -72,11 +76,11 @@ def prepare_config(input_file, output_file, min_fraction=0.40, min_detected=20):
                                          min_detected=min_detected)
 
         if not motif_string:
-            print(f"  WARN: no motifs found for {label} — skipping pair",
-                  file=sys.stderr)
+            log.warning("No motifs found for %s — skipping pair", label)
             skipped += 1
             continue
 
+        log.info("  %s → %s", label, motif_string[:60] + ("..." if len(motif_string) > 60 else ""))
         output_lines.append(bam_path)
         output_lines.append(motif_string)
 
@@ -84,11 +88,12 @@ def prepare_config(input_file, output_file, min_fraction=0.40, min_detected=20):
         f.write('\n'.join(output_lines) + '\n')
 
     kept = n_pairs - skipped
-    print(f"Prepared {kept}/{n_pairs} strain pairs -> {output_file}")
+    log.info("Prepared %d/%d strain pairs → %s", kept, n_pairs, output_file)
 
 
 def main(argv=None):
     import argparse
+    from .config import setup_logging
     parser = argparse.ArgumentParser(
         prog="kinsim prepare",
         description=(
@@ -117,7 +122,10 @@ def main(argv=None):
                         help="Minimum fraction threshold for PacBio CSV (default: 0.40)")
     parser.add_argument("--min-detected", type=int, default=20,
                         help="Minimum nDetected threshold for PacBio CSV (default: 20)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Enable DEBUG-level logging")
     args = parser.parse_args(argv)
+    setup_logging(verbose=args.verbose)
     prepare_config(args.input, args.output,
                    min_fraction=args.min_fraction,
                    min_detected=args.min_detected)

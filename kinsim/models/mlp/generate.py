@@ -25,7 +25,17 @@ fuzznuc is not installed).  Results are cached in O(1)-lookup arrays,
 avoiding repeated per-read scanning.
 
 Output BAMs use the suffix _mlp.bam and are structurally identical to cGAN
-output: unaligned BAM (flag=4) with fi:B:C (IPD) and fp:B:C (PW) tags.
+output: unaligned BAM (flag=4) with all four PacBio kinetic tags:
+  fi:B:C  — forward strand IPD (polymerase on template strand)
+  fp:B:C  — forward strand PW
+  ri:B:C  — reverse strand IPD (polymerase on complementary strand)
+  rp:B:C  — reverse strand PW
+
+For ri/rp, the kmer context is RC(forward_kmer_at_position_i): the polymerase
+reading the reverse strand encounters the reverse-complement sequence, so the
+11-mer it "sees" at each position is the RC of the forward 11-mer.
+The methylation state (meth_id) is shared: the meth_map (built with revcomp=True)
+already encodes both-strand methylation at each reference position.
 """
 
 import array
@@ -48,6 +58,27 @@ from ...dictionary.inject import (MID, _find_pbsim3_files,
                                    _resolve_motifs_for_species,
                                    get_extended_context, load_reference,
                                    parse_maf)
+
+
+# ---------------------------------------------------------------------------
+# RC kmer helper
+# ---------------------------------------------------------------------------
+
+def _rc_kmer(kmer_id: int) -> int:
+    """Reverse complement a 22-bit encoded 11-mer.
+
+    Encoding convention (big-endian): seq[0] occupies bits 21-20, seq[10]
+    occupies bits 1-0.  Complement maps A↔T (0↔3) and C↔G (1↔2), i.e.
+    XOR with 3 on each 2-bit unit.  Reversing bit-pair order yields the RC.
+
+    Example: encode_kmer("ACGT...") → _rc_kmer() → encode_kmer(reverse_complement("ACGT..."))
+    """
+    rc = 0
+    for _ in range(K):   # K = 11 iterations, one per base
+        base = kmer_id & 3
+        rc   = (rc << 2) | (base ^ 3)   # complement: 0↔3 (A↔T), 1↔2 (C↔G)
+        kmer_id >>= 2
+    return rc
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +201,7 @@ def generate_signals(
       5. For batches of reads in .fq.gz:
          a. Collect all (kmer_id, meth_id) contexts using the pre-computed map
          b. Generate signals in one batched forward pass
-         c. Write unaligned BAM with fi/fp tags
+         c. Write unaligned BAM with fi/fp/ri/rp tags
 
     Args:
         circular:      Treat genome as circular (default True for bacteria).
@@ -271,10 +302,11 @@ def _process_batch(
     Returns:
         Tuple (n_mapped, n_unmapped) — read counts for the batch.
     """
-    all_kmer_ids = []
-    all_meth_ids = []
-    is_n_context = []   # Per-position flag: True = N-context, use default signal
-    read_offsets = [0]
+    all_kmer_ids    = []
+    all_meth_ids    = []
+    all_rc_kmer_ids = []   # RC kmer IDs for ri/rp inference
+    is_n_context    = []   # Per-position flag: True = N-context, use default signal
+    read_offsets    = [0]
 
     n_mapped = n_unmapped = 0
 
@@ -311,6 +343,7 @@ def _process_batch(
                         if has_n:
                             # N positions get a placeholder; replaced with default (1,1) later
                             all_kmer_ids.append(0)
+                            all_rc_kmer_ids.append(0)
                             all_meth_ids.append(0)
                         else:
                             ref_pos = ref_start + read_pos
@@ -321,6 +354,7 @@ def _process_batch(
                             else:
                                 meth_id = 0
                             all_kmer_ids.append(current_kmer)
+                            all_rc_kmer_ids.append(_rc_kmer(current_kmer))
                             all_meth_ids.append(meth_id)
 
             n_mapped += 1
@@ -340,33 +374,45 @@ def _process_batch(
                     # First K-1 positions lack a full 11-mer window
                     is_n_context.append(True)
                     all_kmer_ids.append(0)
+                    all_rc_kmer_ids.append(0)
                     all_meth_ids.append(0)
                 else:
                     is_n_context.append(False)
                     center = i - MID
                     all_kmer_ids.append(current_kmer)
+                    all_rc_kmer_ids.append(_rc_kmer(current_kmer))
                     all_meth_ids.append(int(meth_status[center]))
 
             n_unmapped += 1
 
         read_offsets.append(len(all_kmer_ids))
 
-    # Batched MLP inference: one forward pass for all positions in the batch
+    # Batched MLP inference:
+    #   Pass 1 — forward kmers  → fi (IPD) and fp (PW)
+    #   Pass 2 — RC kmers       → ri (IPD) and rp (PW)
+    # Same meth_ids for both: the meth_map (built with revcomp=True) encodes
+    # both-strand methylation at each reference position.
     if len(all_kmer_ids) > 0:
-        all_signals = generate_signals_batch(model, all_kmer_ids, all_meth_ids,
-                                             device, deterministic)
+        all_signals    = generate_signals_batch(model, all_kmer_ids, all_meth_ids,
+                                                device, deterministic)
+        all_rc_signals = generate_signals_batch(model, all_rc_kmer_ids, all_meth_ids,
+                                                device, deterministic)
     else:
-        all_signals = np.zeros((0, 2), dtype=np.float32)
+        all_signals    = np.zeros((0, 2), dtype=np.float32)
+        all_rc_signals = np.zeros((0, 2), dtype=np.float32)
 
     # Split signals back to individual reads and write BAM records
     for idx, read_data in enumerate(batch):
-        start   = read_offsets[idx]
-        end     = read_offsets[idx + 1]
-        signals = all_signals[start:end]
-        is_n    = is_n_context[start:end]
+        start      = read_offsets[idx]
+        end        = read_offsets[idx + 1]
+        signals    = all_signals[start:end]
+        rc_signals = all_rc_signals[start:end]
+        is_n       = is_n_context[start:end]
 
-        ipd_vals = np.clip(signals[:, 0], 0, 255).astype(np.uint8)
-        pw_vals  = np.clip(signals[:, 1], 0, 255).astype(np.uint8)
+        ipd_vals = np.clip(signals[:, 0],    0, 255).astype(np.uint8)
+        pw_vals  = np.clip(signals[:, 1],    0, 255).astype(np.uint8)
+        ri_vals  = np.clip(rc_signals[:, 0], 0, 255).astype(np.uint8)
+        rp_vals  = np.clip(rc_signals[:, 1], 0, 255).astype(np.uint8)
 
         # N-context positions: replace with a safe default of 1 (not 0, which
         # could be mis-interpreted as a missing tag by downstream tools)
@@ -374,6 +420,8 @@ def _process_batch(
             if n_flag:
                 ipd_vals[pos_idx] = 1
                 pw_vals[pos_idx]  = 1
+                ri_vals[pos_idx]  = 1
+                rp_vals[pos_idx]  = 1
 
         seg = pysam.AlignedSegment(header)
         seg.query_name      = read_data["name"]
@@ -382,6 +430,8 @@ def _process_batch(
         seg.query_qualities = pysam.qualitystring_to_array(read_data["qual"])
         seg.set_tag("fi", array.array("B", ipd_vals.tolist()), "B")
         seg.set_tag("fp", array.array("B", pw_vals.tolist()),  "B")
+        seg.set_tag("ri", array.array("B", ri_vals.tolist()),  "B")
+        seg.set_tag("rp", array.array("B", rp_vals.tolist()),  "B")
         bam_out.write(seg)
 
     return n_mapped, n_unmapped

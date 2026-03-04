@@ -6,11 +6,12 @@ Usage:
 """
 
 import difflib
+import logging
 import sys
 
 __version__ = "0.2.0"
 
-COMMANDS = ["prepare", "parse", "extract", "merge", "train", "generate", "analyze"]
+COMMANDS = ["prepare", "manifest", "parse", "extract", "merge", "train", "generate", "analyze"]
 
 USAGE = """\
 usage: kinsim [--version] <command> [<args>]
@@ -19,6 +20,7 @@ KinSim — PacBio kinetic signal simulator for metagenomic binning.
 
 Commands:
   prepare     Validate BAM/motif pairs into a reusable config file
+  manifest    Inspect and validate a manifest CSV (count / validate / list)
   parse       Parse any motif source (PacBio CSV, REBASE, or inline string)
   extract     Extract raw IPD/PW samples from a BAM file  (→ .pkl shard)
   merge       Merge .pkl shards into a master training set
@@ -82,7 +84,13 @@ def _require_model(rest, command):
 # ---------------------------------------------------------------------------
 
 def main(argv=None):
+    from .config import setup_logging
     args = argv if argv is not None else sys.argv[1:]
+
+    # Set up logging early so all submodules emit timestamped output to SLURM logs.
+    # Individual commands may call setup_logging again with verbose=True if --verbose
+    # is passed; that call overrides this one (basicConfig is idempotent on first call).
+    setup_logging(verbose=False)
 
     if not args or args[0] in ("-h", "--help"):
         print(USAGE)
@@ -97,6 +105,12 @@ def main(argv=None):
     # ── prepare ──────────────────────────────────────────────────────────────
     if cmd == "prepare":
         from .prepare import main as run
+        run(rest)
+
+    # ── manifest ──────────────────────────────────────────────────────────────
+    # count / validate / list  — manifest CSV inspection utilities
+    elif cmd == "manifest":
+        from .manifest_cmd import main as run
         run(rest)
 
     # ── parse ─────────────────────────────────────────────────────────────────
@@ -225,6 +239,9 @@ def main(argv=None):
             run(subrest)
         elif subcmd == "generate":
             from .models.mlp.generate import main as run
+            run(subrest)
+        elif subcmd == "evaluate":
+            from .models.mlp.evaluate import main as run
             run(subrest)
         else:
             print(f"Unknown mlp command: {subcmd}", file=sys.stderr)

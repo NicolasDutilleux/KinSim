@@ -23,17 +23,18 @@ KinSim/
 │
 ├── kinsim/                         main Python package
 │   ├── __init__.py
-│   ├── __main__.py                 CLI router — all commands dispatched here
+│   ├── __main__.py                 CLI router — all commands dispatched here; sets up logging
 │   │
 │   ├── encoding.py                 11-mer bit-packing (no dependencies)
 │   ├── motifs.py                   IUPAC motif parsing, sequence scanning, meth maps
 │   ├── rebase_parser.py            REBASE → KinSim motif string conversion
 │   ├── prepare.py                  kinsim prepare — validates BAM/motif config files
+│   ├── config.py                   manifest CSV loader, YAML config, logging setup
 │   │
 │   ├── common/                     shared data pipeline (used by MLP and cGAN)
 │   │   ├── __init__.py
-│   │   ├── dataset.py              log_transform, inv_log_transform, KmerSignalDataset
-│   │   └── extract.py              BAM extraction + shard merging (kinsim cgan extract/merge)
+│   │   ├── dataset.py              log_transform, inv_log_transform, KmerSignalDataset, MLPSignalDataset
+│   │   └── extract.py              BAM extraction + shard merging; manifest mode; fail-fast validation
 │   │
 │   ├── dictionary/                 dictionary mode (no neural network)
 │   │   ├── __init__.py
@@ -121,8 +122,42 @@ parse_rebase_withrefm(filepath)     # Format #19 tagged fields (RS=, MS=)
 write_fuzznuc_pattern_file(motif_string, filepath) -> dict  # for EMBOSS fuzznuc
 ```
 
+### `kinsim/config.py`
+Manifest CSV parsing, YAML config loading, and logging setup.
+
+```python
+@dataclass
+class SampleEntry:
+    sample_id: str
+    bam_path:  str
+    motifs:    str    # KinSim string or path (resolved by load_motif_string)
+
+load_manifest(manifest_path) -> list[SampleEntry]
+    # reads manifest CSV (sample_id, bam_path, motifs)
+    # skips comment rows (#) and empty rows
+    # raises FileNotFoundError or ValueError on format errors
+
+load_yaml_config(path) -> dict
+    # loads YAML training config; requires PyYAML
+    # used by train.py --config flag
+
+setup_logging(verbose=False)
+    # configures root logger with timestamp format for SLURM logs
+    # format: "2026-03-03 14:32:01 [INFO]    kinsim.common.extract: ..."
+    # call once in main() of each CLI module
+```
+
+**Manifest CSV format**:
+```csv
+sample_id,bam_path,motifs
+strain1,/data/bams/strain1.bam,"m6A,GATC,1"
+strain2,/data/bams/strain2.bam,/data/motifs/strain2.csv
+```
+The `motifs` field accepts quoted KinSim strings (commas are fine) or file paths.
+
 ### `kinsim/common/dataset.py`
 The shared data contract between cGAN and MLP. Never import transforms from model files.
+Both dataset classes skip the `"__meta__"` string key automatically.
 
 ```python
 log_transform(x: Tensor) -> Tensor      # log1p — raw [0,255] → training space
@@ -132,30 +167,58 @@ class KmerSignalDataset(Dataset):
     # Input:  dict[(kmer_id, meth_id)] -> np.ndarray(N, 2)  raw IPD/PW
     # Output: (kmer_id: long, meth_id: long, signal: float32 in log1p)
     # log_transform applied once at load time, not per-epoch
+
+class MLPSignalDataset(Dataset):
+    # Input:  same dict format as above
+    # __len__ = number of unique (kmer_id, meth_id) keys
+    # __getitem__ draws ONE random (IPD, PW) per key (random-shot sampling)
+    # meth output = Float[4] one-hot vector (not integer id)
+    # dynamic capping: meth_id=0 → max 20 samples; meth_id∈{1,2,3} → max 100
 ```
 
 **Raw values are stored in .pkl files** (not log-transformed). The transform happens
-inside KmerSignalDataset. This allows inspection and different model-specific transforms.
+inside the dataset class. This allows inspection and different model-specific transforms.
 
 ### `kinsim/common/extract.py`
 The data preparation pipeline shared by all neural modes.
 
 ```python
-extract_samples_from_bam(bam_path, motif_string, output_pkl, max_samples_per_key=10000)
-    # reads BAM fi/fp tags
-    # sliding 11-mer window → encode_kmer() → kmer_id
-    # scan_sequence()  → meth_id per position
-    # reservoir sampling (capped at 10,000 per (kmer, meth) key)
-    # output: shard .pkl
+validate_bam_kinetics(bam_path, n_check=10)
+    # fail-fast: raises ValueError if BAM has no fi/fp kinetic tags
+    # call before starting extraction loop to avoid silent failures
 
-merge_shards(input_dir, output_path, glob_pattern="*_cgan.pkl", max_per_key=50000)
-    # loads all shards matching glob
-    # concatenates arrays per key
-    # optional subsampling
-    # output: master .pkl
+extract_samples_from_bam(bam_path, motif_string, max_samples_per_key=10000, revcomp=True)
+    # calls validate_bam_kinetics first
+    # sliding 11-mer window → encode_kmer() → kmer_id
+    # scan_sequence() → meth_id per position
+    # reservoir sampling (capped at max_samples_per_key per (kmer, meth) key)
+    # returns dict with (kmer_id, meth_id) tuple keys + "__meta__" provenance key
+
+merge_shards(input_dir, output_file, max_samples_per_key=50000, glob_pattern="auto")
+    # "auto" tries *_shard.pkl (new) then *_cgan.pkl (legacy)
+    # concatenates arrays per key; subsamples if needed
+    # includes merged "__meta__" with list of source BAMs
+
+extract_from_manifest_task(manifest_path, task_index, output_dir, ...)
+    # reads manifest CSV, picks row task_index (1-based = SLURM_ARRAY_TASK_ID)
+    # writes shards/<sample_id>_shard.pkl
 ```
 
-CLI: `kinsim cgan extract` and `kinsim cgan merge` (routed via parse_train.py shim).
+CLI (single-BAM mode — unchanged):
+```
+kinsim extract reads.bam "m6A,GATC,1" shard.pkl
+kinsim merge   shards/   master_data.pkl
+```
+
+CLI (manifest mode — recommended for SLURM):
+```
+kinsim extract --manifest manifest.csv --task $SLURM_ARRAY_TASK_ID --output-dir shards/
+kinsim merge   shards/ master_data.pkl
+```
+
+**Provenance in .pkl**: every shard and master file now contains a `"__meta__"` key
+(string, never a tuple) with `kinsim_version`, `source_bam`, `motifs`, `created` timestamp.
+Dataset classes automatically skip non-tuple keys.
 
 ### `kinsim/models/cgan/model.py`
 WGAN-GP Generator and Discriminator. Re-exports transforms for backward compatibility.
@@ -221,15 +284,18 @@ class MLPPredictor(nn.Module):
 `log_σ` is clamped to [-6, 3] in `sample()` for numerical stability.
 
 ### `kinsim/models/mlp/train.py`
-Supervised training with Gaussian NLL loss.
+Supervised training with Gaussian NLL loss. Supports `--config` YAML for reproducibility.
 
 ```python
 Loss = 0.5 * (2*log_σ + (target - μ)² / σ²)  # jointly learns μ and σ
 ```
 
 Alternatives: `--loss mse` or `--loss huber` (use μ head only, ignore variance).
-Scheduler: `ReduceLROnPlateau(factor=0.5, patience=5)`. LR drops printed manually.
-`model_config.json` keys: `kmer_embed_dim`, `hidden_dim`.
+Scheduler: `ReduceLROnPlateau(factor=0.5, patience=5)`. LR drops logged at INFO level.
+`model_config.json` keys: `kmer_embed_dim`, `hidden_dim`, `meth_proj_dim`.
+
+`--config config_mlp.yaml` overrides all default values; CLI flags override YAML.
+Example: `kinsim train --model mlp --config config_mlp.yaml --epochs 100`
 
 ### `kinsim/models/mlp/generate.py`
 Mirrors `cgan/generate.py`. Key difference: no noise vector.
@@ -248,26 +314,33 @@ Output files: `<species>_mlp.bam`.
 ## Data Flow
 
 ```
-Real PacBio BAMs
+Real PacBio BAMs + Manifest CSV (sample_id, bam_path, motifs)
       │
-      ▼  kinsim cgan extract <bam> <motif> <shard.pkl>
+      ▼  kinsim extract --manifest manifest.csv --task $TASK --output-dir shards/
       │  (common/extract.py)
+      │  validate_bam_kinetics() — fail-fast before extraction loop
       │  sliding 11-mer → encode_kmer → kmer_id
-      │  scan_sequence → meth_id per base
+      │  scan_sequence → meth_id per position
       │  reservoir sampling → cap 10,000 per (kmer, meth)
+      │  writes shards/<sample_id>_shard.pkl  (includes __meta__ provenance)
       ▼
-shard_001.pkl  shard_002.pkl  ...
+strain1_shard.pkl  strain2_shard.pkl  ...
       │
-      ▼  kinsim cgan merge <shards_dir/> <master.pkl>
+      ▼  kinsim merge <shards_dir/> <master.pkl>
+      │  auto-detects *_shard.pkl (new) or *_cgan.pkl (legacy)
       ▼
-master_data.pkl    ←  dict[(kmer_id, meth_id)] → np.ndarray(N, 2)  [IPD, PW] raw
+master_data.pkl
+    "__meta__": {kinsim_version, merged_from, created, ...}
+    (kmer_id, meth_id) → np.ndarray(N, 2)  [IPD, PW] raw
       │
-      ├──▶  kinsim mlp train  → checkpoint.pt + model_config.json
-      └──▶  kinsim cgan train → checkpoint.pt + model_config.json
+      ├──▶  kinsim train --model mlp  [--config config_mlp.yaml]
+      │         → checkpoint.pt + model_config.json + training_log.csv
+      └──▶  kinsim train --model cgan [--config config_cgan.yaml]
+                → checkpoint.pt + model_config.json + training_log.csv
 
 PBSIM3 reads (.fq.gz + .maf.gz) + reference (.fna) + checkpoint.pt
       │
-      ▼  kinsim mlp generate  / kinsim cgan generate
+      ▼  kinsim generate --model mlp  / kinsim generate --model cgan
       │  load_reference → pre-scan meth_map (O(1) lookup)
       │  parse_maf → read→reference alignment
       │  for each batch: encode kmer_ids + lookup meth_ids → model.sample()
@@ -304,12 +377,16 @@ from ...motifs import parse_motifs, scan_sequence, build_reference_meth_map
 from ...common.dataset import log_transform, inv_log_transform, KmerSignalDataset
 from ...common.extract import extract_samples_from_bam, merge_shards
 from ...dictionary.inject import load_reference, parse_maf, get_extended_context, MID
+from ...config import setup_logging, load_manifest, load_yaml_config
 from .model import ...      # within the same sub-package (1 dot)
 ```
 
 **Never import `log_transform`/`inv_log_transform` from `cgan/model.py`.**
 Always import from `common/dataset.py`. The re-export in `cgan/model.py` exists only for
 backward compatibility with old code.
+
+**Never use bare `print()` for operational output.**
+Always use `log = logging.getLogger(__name__)` and `log.info()`, `log.warning()`, `log.error()`.
 
 ---
 
@@ -362,10 +439,16 @@ Typo suggestions via `difflib.get_close_matches` in `__main__.py`.
 - Xavier uniform init for `nn.Linear`, small normal (`std=0.02`) for `nn.Embedding`.
 - Always write `model.eval()` before inference; `model.train()` at start of epoch.
 - `@torch.no_grad()` on all inference functions (`sample`, `predict_mean`, `generate_signals_batch`).
-- Use `ReduceLROnPlateau` — never `verbose=True` (removed in PyTorch ≥ 2.1). Print LR drops manually.
+- Use `ReduceLROnPlateau` — never `verbose=True` (removed in PyTorch ≥ 2.1). Log LR drops via `log.info(...)`.
 - Wrap training loops in `try/finally` to ensure CSV and TensorBoard are closed on crash.
 - Always save `model_config.json` **before** the first epoch, not after training.
 - Always include `"scheduler"` key in checkpoint dict for resume support.
+
+### Logging
+- Every module uses `log = logging.getLogger(__name__)`.
+- Never use bare `print()` for operational output — use `log.info()`, `log.warning()`, `log.error()`.
+- `setup_logging()` from `kinsim.config` is called once in each CLI `main()`.
+- Format: `"%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"` — timestamps for SLURM logs.
 
 ### Checkpoints
 ```python
@@ -382,11 +465,18 @@ torch.save({
 - **Training**: always in log1p space (`log_transform` applied by `KmerSignalDataset`).
 - **Inference**: model outputs in log1p space → `inv_log_transform` → uint8 [0, 255].
 - **Storage (.pkl)**: raw values (not transformed) — transforms are model-specific.
+- **Metadata**: every .pkl has a `"__meta__"` string key with provenance. Dataset classes skip it.
 
 ### SLURM Scripts
 - Array jobs for per-species tasks (`#SBATCH --array=1-N`).
+- Use `kinsim_extract.slurm` with manifest CSV for extract jobs (replaces `kinsim_cgan_extract.slurm`).
 - Auto-detect flat vs subdirectory layout in `generate.py` (not in SLURM scripts).
 - `kinsim_pipeline.sh` is the single source of truth for the full pipeline order.
+
+### Manifest CSV
+- Manifest columns: `sample_id`, `bam_path`, `motifs` (CSV with header, commas OK in quoted fields).
+- Count rows for `--array`: `N=$(tail -n +2 manifest.csv | grep -cv '^#')`.
+- Output shard naming: `shards/<sample_id>_shard.pkl` (derived from manifest `sample_id`).
 
 ---
 
@@ -412,7 +502,8 @@ torch.save({
 6. Add the new command to `kinsim/__main__.py` (COMMANDS list + routing block).
 7. Add a SLURM train + generate script under `slurm_kinsim/`.
 8. Add the new mode to `slurm_kinsim/kinsim_pipeline.sh`.
-9. Data prep reuses `kinsim cgan extract` + `kinsim cgan merge` — no separate extraction needed.
+9. Data prep reuses `kinsim extract` + `kinsim merge` — no separate extraction needed.
+10. Add a `--config` YAML example to `slurm_kinsim/config_<mode>_example.yaml`.
 
 ---
 
@@ -424,7 +515,10 @@ torch.save({
 | Total possible k-mers | 4,194,304 (4^11) | `encoding.py` |
 | Methylation states | 4 (none/m6A/m4C/m5C) | `encoding.py` |
 | MID (flanking bases) | 5 | `dictionary/inject.py` |
-| Reservoir cap | 10,000 per (kmer, meth) | `common/extract.py` |
+| Reservoir cap (extract) | 10,000 per (kmer, meth) | `common/extract.py` |
+| Reservoir cap (merge) | 50,000 per (kmer, meth) | `common/extract.py` |
+| MLPSignalDataset cap (unmeth) | 20 per key | `common/dataset.py` |
+| MLPSignalDataset cap (meth) | 100 per key | `common/dataset.py` |
 | BAM signal range | [0, 255] uint8 | all generate files |
 | N-context default signal | 1 (not 0) | all generate files |
 | log_σ clamp range | [-6, 3] | `models/mlp/model.py` |
@@ -433,3 +527,4 @@ torch.save({
 | MLP train/val split | 90% / 10% | `models/mlp/train.py` |
 | LR patience (MLP) | 5 epochs | `models/mlp/train.py` |
 | LR factor (MLP) | 0.5 | `models/mlp/train.py` |
+| meth_proj_dim (MLP V2) | 8 | `models/mlp/model.py` |

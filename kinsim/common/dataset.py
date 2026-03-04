@@ -82,7 +82,11 @@ class KmerSignalDataset(Dataset):
         meth_ids: list = []
         signals:  list = []
 
-        for (kmer_id, meth_id), samples in data_dict.items():
+        for key, samples in data_dict.items():
+            # Skip the provenance metadata key (string, not a tuple)
+            if not isinstance(key, tuple):
+                continue
+            kmer_id, meth_id = key
             n = len(samples)
             kmer_ids.extend([kmer_id] * n)
             meth_ids.extend([meth_id] * n)
@@ -176,7 +180,11 @@ class MLPSignalDataset(Dataset):
         n_subsampled = 0
         n_meth_counts = {0: 0, 1: 0, 2: 0, 3: 0}   # for the summary log
 
-        for (kmer_id, meth_id), samples in data_dict.items():
+        for key, samples in data_dict.items():
+            # Skip the provenance metadata key (string "__meta__", not a tuple)
+            if not isinstance(key, tuple):
+                continue
+            kmer_id, meth_id = key
             cap = max_unmeth if meth_id == 0 else max_meth
             if len(samples) > cap:
                 # Seeded subsampling: deterministic for the same .pkl across restarts
