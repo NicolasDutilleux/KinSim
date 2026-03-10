@@ -67,6 +67,11 @@ class MLPPredictor(nn.Module):
         hidden_dim:     Width of the two hidden layers.
         meth_proj_dim:  Output dimension of the methylation linear projection
                         (default 8).
+        dropout:        Dropout probability applied after each LeakyReLU
+                        (default 0.0 = disabled).  Enable (e.g. 0.1–0.3) when
+                        LayerNorm alone is insufficient to prevent overfitting
+                        on small datasets.  Dropout is inactive at inference
+                        (model.eval() mode).
     """
 
     def __init__(
@@ -74,12 +79,14 @@ class MLPPredictor(nn.Module):
         kmer_embed_dim: int = 64,
         hidden_dim: int = 128,
         meth_proj_dim: int = 8,
+        dropout: float = 0.0,
     ):
         super().__init__()
 
         self.kmer_embed_dim = kmer_embed_dim
         self.hidden_dim     = hidden_dim
         self.meth_proj_dim  = meth_proj_dim
+        self.dropout        = dropout
 
         # k-mer embedding: maps 4^11 possible 11-mers to dense vectors
         self.kmer_embed = nn.Embedding(_NUM_KMERS, kmer_embed_dim)
@@ -91,15 +98,19 @@ class MLPPredictor(nn.Module):
 
         input_dim = kmer_embed_dim + meth_proj_dim
 
-        # Two hidden layers with normalisation and residual-friendly width
+        # Two hidden layers with normalisation and optional dropout
+        # Layer order: Linear → LayerNorm → LeakyReLU → Dropout
+        # Dropout(0.0) is a no-op — safe to include unconditionally
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(0.2),
+            nn.Dropout(dropout),
 
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(0.2),
+            nn.Dropout(dropout),
 
             # Output: [μ_ipd, μ_pw, log_σ_ipd, log_σ_pw]
             nn.Linear(hidden_dim, 4),

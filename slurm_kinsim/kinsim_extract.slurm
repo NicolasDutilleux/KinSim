@@ -75,6 +75,25 @@ fi
 source ~/.bashrc
 conda activate kinsim_env
 
+# ---- Diagnostics ----
+START_TIME=$(date +%s)
+echo "========================================================"
+echo "  KinSim Extract"
+echo "========================================================"
+echo "Date:       $(date '+%Y-%m-%d %H:%M:%S')"
+echo "Host:       $(hostname)"
+echo "Job ID:     ${SLURM_JOB_ID:-local}"
+echo "Array ID:   ${SLURM_ARRAY_TASK_ID:-none}"
+echo "Partition:  ${SLURM_JOB_PARTITION:-unknown}"
+echo "CPUs:       ${SLURM_CPUS_PER_TASK:-1}"
+echo "Memory:     ${SLURM_MEM_PER_NODE:-unknown} MB"
+echo "Conda env:  ${CONDA_DEFAULT_ENV:-not set}"
+echo "Python:     $(which python)"
+echo "Python ver: $(python --version 2>&1)"
+echo "KinSim ver: $(kinsim --version 2>&1 || echo 'NOT FOUND')"
+echo "========================================================"
+echo ""
+
 # ---- Config ----
 MANIFEST="$1"
 SHARDS_DIR="$2"
@@ -90,7 +109,7 @@ if [ -n "$SLURM_ARRAY_TASK_ID" ]; then
     # ============ PHASE 1: Extract one shard (one manifest row per task) ============
     mkdir -p "$SHARDS_DIR"
 
-    echo "=== PHASE 1: Extract (task $SLURM_ARRAY_TASK_ID) ==="
+    echo "=== PHASE 1: Extract (task $SLURM_ARRAY_TASK_ID / $SLURM_ARRAY_TASK_MAX) ==="
     echo "Manifest: $MANIFEST"
     echo "Shards:   $SHARDS_DIR"
     echo ""
@@ -101,6 +120,14 @@ if [ -n "$SLURM_ARRAY_TASK_ID" ]; then
         --manifest "$MANIFEST" \
         --task     "$SLURM_ARRAY_TASK_ID" \
         --output-dir "$SHARDS_DIR"
+    EXIT_CODE=$?
+
+    if [ $EXIT_CODE -ne 0 ]; then
+        echo ""
+        echo "ERROR: kinsim extract failed with exit code $EXIT_CODE"
+        echo "Ended: $(date '+%Y-%m-%d %H:%M:%S')"
+        exit $EXIT_CODE
+    fi
 
     # The last array task auto-submits the merge job.
     # Suppressed when KINSIM_NO_AUTOMERGE=1 (used by kinsim_pipeline.sh, which
@@ -119,11 +146,33 @@ else
     echo "Master output: $MASTER_OUTPUT"
     echo ""
 
+    # List shards found
+    SHARD_COUNT=$(ls "$SHARDS_DIR"/*_shard.pkl 2>/dev/null | wc -l)
+    echo "Shards found:  $SHARD_COUNT"
+    ls -lh "$SHARDS_DIR"/*_shard.pkl 2>/dev/null || echo "(no *_shard.pkl files)"
+    echo ""
+
     mkdir -p "$(dirname "$MASTER_OUTPUT")"
 
     # Auto-detects *_shard.pkl (new) then *_cgan.pkl (legacy)
     kinsim merge "$SHARDS_DIR" "$MASTER_OUTPUT"
+    EXIT_CODE=$?
+
+    if [ $EXIT_CODE -ne 0 ]; then
+        echo ""
+        echo "ERROR: kinsim merge failed with exit code $EXIT_CODE"
+        echo "Ended: $(date '+%Y-%m-%d %H:%M:%S')"
+        exit $EXIT_CODE
+    fi
 
     echo ""
+    echo "Master file size: $(ls -lh "$MASTER_OUTPUT" | awk '{print $5}')"
     echo "=== Merge complete: $MASTER_OUTPUT ==="
 fi
+
+# ---- Summary ----
+END_TIME=$(date +%s)
+ELAPSED=$((END_TIME - START_TIME))
+echo ""
+echo "Elapsed: $((ELAPSED / 3600))h $((ELAPSED % 3600 / 60))m $((ELAPSED % 60))s"
+echo "Ended:   $(date '+%Y-%m-%d %H:%M:%S')"

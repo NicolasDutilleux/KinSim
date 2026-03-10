@@ -82,6 +82,34 @@ def _rc_kmer(kmer_id: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Fraction lookup from motif string
+# ---------------------------------------------------------------------------
+
+def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
+    """Parse motif string to build a meth_id → fraction lookup.
+
+    The fraction is the 5th field in PacBio-derived motif strings
+    (e.g. "m6A,GATC,1,3551,0.998").  Defaults to 1.0 when absent.
+    Unmethylated (meth_id=0) always maps to 0.0.
+    """
+    from ...encoding import METH_IDS
+
+    fracs: dict[int, float] = {0: 0.0}
+    if not motif_string:
+        return fracs
+    for entry in motif_string.split(';'):
+        if not entry or ',' not in entry:
+            continue
+        parts = entry.split(',')
+        if len(parts) < 3:
+            continue
+        m_id = METH_IDS.get(parts[0], 0)
+        frac = float(parts[4]) if len(parts) >= 5 else 1.0
+        fracs[m_id] = frac
+    return fracs
+
+
+# ---------------------------------------------------------------------------
 # Batched MLP inference
 # ---------------------------------------------------------------------------
 
@@ -90,6 +118,7 @@ def generate_signals_batch(
     model: MLPPredictor,
     kmer_ids: list,
     meth_ids: list,
+    fractions: list,
     device: torch.device,
     deterministic: bool = False,
 ) -> np.ndarray:
@@ -99,6 +128,8 @@ def generate_signals_batch(
         model:         Trained MLPPredictor in eval mode.
         kmer_ids:      List of kmer integer IDs (22-bit encoded 11-mers).
         meth_ids:      List of methylation IDs (0–3).
+        fractions:     List of stoichiometric fractions (0.0–1.0) per position.
+                       For unmethylated positions (meth_id=0), fraction is 0.0.
         device:        Torch device.
         deterministic: If True, return the predicted mean μ (no sampling).
                        If False, sample from N(μ, σ²) for biological realism.
@@ -108,16 +139,19 @@ def generate_signals_batch(
     """
     kmer_tensor = torch.tensor(kmer_ids, dtype=torch.long, device=device)
 
-    # Convert integer meth_ids → one-hot Float[N, 4] for the v2 Linear projection
-    meth_tensor = torch.nn.functional.one_hot(
-        torch.tensor(meth_ids, dtype=torch.long, device=device),
-        num_classes=4,
-    ).float()   # (N, 4)
+    # Build stoichiometric meth_probs from (meth_id, fraction) pairs.
+    # scatter_ places fraction[i] at meth_probs[i, meth_id[i]].
+    # For meth_id=0 (unmethylated), fraction=0.0 → row is all zeros.
+    # For meth_id=1, fraction=0.75 → [0, 0.75, 0, 0].
+    meth_ids_t   = torch.tensor(meth_ids,   dtype=torch.long,  device=device)
+    fractions_t  = torch.tensor(fractions,   dtype=torch.float, device=device)
+    meth_probs   = torch.zeros(len(meth_ids), 4, device=device)
+    meth_probs.scatter_(1, meth_ids_t.unsqueeze(1), fractions_t.unsqueeze(1))
 
     if deterministic:
-        signals = model.predict_mean(kmer_tensor, meth_tensor)
+        signals = model.predict_mean(kmer_tensor, meth_probs)
     else:
-        signals = model.sample(kmer_tensor, meth_tensor)
+        signals = model.sample(kmer_tensor, meth_probs)
 
     return signals.cpu().numpy()
 
@@ -159,11 +193,13 @@ def _load_model(checkpoint_path: str, device: torch.device) -> MLPPredictor:
     kmer_embed_dim = config["kmer_embed_dim"]
     hidden_dim     = config["hidden_dim"]
     meth_proj_dim  = config.get("meth_proj_dim", 8)   # default 8 for old checkpoints
+    dropout        = config.get("dropout", 0.0)        # default 0.0 for old checkpoints
 
     model = MLPPredictor(
         kmer_embed_dim=kmer_embed_dim,
         hidden_dim=hidden_dim,
         meth_proj_dim=meth_proj_dim,
+        dropout=dropout,
     ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
@@ -225,6 +261,9 @@ def generate_signals(
                                         revcomp=revcomp,
                                         no_fuzznuc=no_fuzznuc)
 
+    # Fraction lookup: meth_id → stoichiometric fraction from the motif string
+    frac_lookup = _build_fraction_lookup(motif_string)
+
     # Keep regex motifs for the fallback path (unmapped reads)
     fallback_motifs = parse_motifs(motif_string, revcomp=revcomp)
 
@@ -271,7 +310,8 @@ def generate_signals(
 
             if len(batch) >= batch_reads:
                 n_m, n_u = _process_batch(
-                    batch, ref_seqs, maf_mapping, meth_map, fallback_motifs,
+                    batch, ref_seqs, maf_mapping, meth_map, frac_lookup,
+                    fallback_motifs,
                     model, device, deterministic, circular, bam_out, header)
                 n_mapped   += n_m
                 n_unmapped += n_u
@@ -279,7 +319,8 @@ def generate_signals(
 
         if batch:
             n_m, n_u = _process_batch(
-                batch, ref_seqs, maf_mapping, meth_map, fallback_motifs,
+                batch, ref_seqs, maf_mapping, meth_map, frac_lookup,
+                fallback_motifs,
                 model, device, deterministic, circular, bam_out, header)
             n_mapped   += n_m
             n_unmapped += n_u
@@ -290,20 +331,24 @@ def generate_signals(
 
 
 def _process_batch(
-    batch, ref_seqs, maf_mapping, meth_map, fallback_motifs,
+    batch, ref_seqs, maf_mapping, meth_map, frac_lookup, fallback_motifs,
     model, device, deterministic, circular, bam_out, header,
 ):
     """Process a batch of reads with batched MLP inference.
 
-    Builds a flat list of (kmer_id, meth_id) pairs for all positions across
-    all reads in the batch, runs a single forward pass, then writes each read
-    to the BAM with its slice of the generated signals.
+    Builds a flat list of (kmer_id, meth_id, fraction) triples for all
+    positions across all reads in the batch, runs a single forward pass,
+    then writes each read to the BAM with its slice of the generated signals.
+
+    Args:
+        frac_lookup: dict mapping meth_id → stoichiometric fraction.
 
     Returns:
         Tuple (n_mapped, n_unmapped) — read counts for the batch.
     """
     all_kmer_ids    = []
     all_meth_ids    = []
+    all_fractions   = []   # stoichiometric fraction per position
     all_rc_kmer_ids = []   # RC kmer IDs for ri/rp inference
     is_n_context    = []   # Per-position flag: True = N-context, use default signal
     read_offsets    = [0]
@@ -345,6 +390,7 @@ def _process_batch(
                             all_kmer_ids.append(0)
                             all_rc_kmer_ids.append(0)
                             all_meth_ids.append(0)
+                            all_fractions.append(0.0)
                         else:
                             ref_pos = ref_start + read_pos
                             if circular:
@@ -356,6 +402,7 @@ def _process_batch(
                             all_kmer_ids.append(current_kmer)
                             all_rc_kmer_ids.append(_rc_kmer(current_kmer))
                             all_meth_ids.append(meth_id)
+                            all_fractions.append(frac_lookup.get(meth_id, 0.0))
 
             n_mapped += 1
 
@@ -376,12 +423,15 @@ def _process_batch(
                     all_kmer_ids.append(0)
                     all_rc_kmer_ids.append(0)
                     all_meth_ids.append(0)
+                    all_fractions.append(0.0)
                 else:
                     is_n_context.append(False)
-                    center = i - MID
+                    center  = i - MID
+                    meth_id = int(meth_status[center])
                     all_kmer_ids.append(current_kmer)
                     all_rc_kmer_ids.append(_rc_kmer(current_kmer))
-                    all_meth_ids.append(int(meth_status[center]))
+                    all_meth_ids.append(meth_id)
+                    all_fractions.append(frac_lookup.get(meth_id, 0.0))
 
             n_unmapped += 1
 
@@ -390,13 +440,13 @@ def _process_batch(
     # Batched MLP inference:
     #   Pass 1 — forward kmers  → fi (IPD) and fp (PW)
     #   Pass 2 — RC kmers       → ri (IPD) and rp (PW)
-    # Same meth_ids for both: the meth_map (built with revcomp=True) encodes
-    # both-strand methylation at each reference position.
+    # Same meth_ids/fractions for both: the meth_map (built with revcomp=True)
+    # encodes both-strand methylation at each reference position.
     if len(all_kmer_ids) > 0:
         all_signals    = generate_signals_batch(model, all_kmer_ids, all_meth_ids,
-                                                device, deterministic)
+                                                all_fractions, device, deterministic)
         all_rc_signals = generate_signals_batch(model, all_rc_kmer_ids, all_meth_ids,
-                                                device, deterministic)
+                                                all_fractions, device, deterministic)
     else:
         all_signals    = np.zeros((0, 2), dtype=np.float32)
         all_rc_signals = np.zeros((0, 2), dtype=np.float32)

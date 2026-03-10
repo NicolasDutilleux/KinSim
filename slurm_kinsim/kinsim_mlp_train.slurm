@@ -40,18 +40,25 @@
 #   sbatch kinsim_mlp_train.slurm master_data.pkl ./checkpoints_mlp/ \
 #       --resume ./checkpoints_mlp/checkpoint_epoch25.pt --epochs 50
 #
+#   # With Optuna HPO (searches lr, kmer_embed_dim, hidden_dim before final run):
+#   sbatch kinsim_mlp_train.slurm master_data.pkl ./checkpoints_mlp/ \
+#       --optuna --n-trials 20 --optuna-epochs 20 --epochs 50
+#
 # Output structure:
 #   checkpoint_dir/
-#     model_config.json           <- Architecture hyperparameters
-#     checkpoint_epoch10.pt       <- Model weights + optimizer state
-#     checkpoint_epoch20.pt
+#     model_config.json           <- Architecture hyperparameters (written first)
+#     checkpoint_epoch10.pt       <- Legacy format: weights + optimizer state
+#     checkpoint_epoch20.pt         (used by kinsim mlp generate / evaluate)
 #     ...
-#     runs/                       <- TensorBoard logs (if installed)
-#     training_log.csv            <- CSV fallback (always written)
+#     lightning_ckpts/            <- Lightning checkpoint files (top-3 + last)
+#     logs/version_0/metrics.csv  <- Per-epoch CSV log (always written)
+#     runs/version_0/             <- TensorBoard logs (if tensorboard installed)
+#     optuna/                     <- HPO trial logs (only when --optuna is used)
+#     optuna_best_params.json     <- Best Optuna hyperparameters
 #
 # Monitor training:
 #   tensorboard --logdir checkpoint_dir/runs
-#   tail -f checkpoint_dir/training_log.csv
+#   tail -f checkpoint_dir/logs/version_0/metrics.csv
 #
 # Memory estimate:
 #   ~1 GB for default kmer_embed_dim=64
@@ -70,7 +77,8 @@ if [ -z "$1" ]; then
     echo "  --config FILE      YAML config file (replaces positional args + sets all flags)"
     echo "  Additional flags:  --epochs, --batch-size, --lr, --loss, --kmer-embed-dim,"
     echo "                     --hidden-dim, --meth-proj-dim, --val-fraction,"
-    echo "                     --checkpoint-every, --resume, --device"
+    echo "                     --checkpoint-every, --resume, --device,"
+    echo "                     --optuna, --n-trials N, --optuna-epochs N"
     echo ""
     echo "Examples:"
     echo "  sbatch kinsim_mlp_train.slurm master_data.pkl ./checkpoints_mlp/"
@@ -86,6 +94,23 @@ fi
 source ~/.bashrc
 conda activate kinsim_env
 
+# ---- Diagnostics ----
+START_TIME=$(date +%s)
+echo "========================================================"
+echo "  KinSim MLP Training"
+echo "========================================================"
+echo "Date:       $(date '+%Y-%m-%d %H:%M:%S')"
+echo "Host:       $(hostname)"
+echo "Job ID:     ${SLURM_JOB_ID:-local}"
+echo "Partition:  ${SLURM_JOB_PARTITION:-unknown}"
+echo "CPUs:       ${SLURM_CPUS_PER_TASK:-1}"
+echo "Memory:     ${SLURM_MEM_PER_NODE:-unknown} MB"
+echo "Conda env:  ${CONDA_DEFAULT_ENV:-not set}"
+echo "Python:     $(which python)"
+echo "Python ver: $(python --version 2>&1)"
+echo "KinSim ver: $(kinsim --version 2>&1 || echo 'NOT FOUND')"
+echo ""
+
 # ---- GPU check ----
 if ! nvidia-smi > /dev/null 2>&1; then
     echo "ERROR: No GPU detected. This job requires --gres=gpu:1"
@@ -93,7 +118,11 @@ if ! nvidia-smi > /dev/null 2>&1; then
 fi
 
 echo "GPU Info:"
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+nvidia-smi --query-gpu=name,memory.total,memory.free,driver_version --format=csv,noheader
+echo ""
+echo "CUDA visible:  ${CUDA_VISIBLE_DEVICES:-not set}"
+python -c "import torch; print(f'PyTorch:  {torch.__version__}'); print(f'CUDA:     {torch.version.cuda}'); print(f'cuDNN:    {torch.backends.cudnn.version()}'); print(f'GPU seen: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"NONE\"}')" 2>&1
+echo "========================================================"
 echo ""
 
 # ---- Dispatch ----
@@ -107,6 +136,7 @@ if [ "$1" = "--config" ]; then
     echo ""
     mkdir -p logs
     kinsim train --model mlp "$@"
+    EXIT_CODE=$?
 else
     # Positional mode — pkl + checkpoint_dir as first two args
     MERGED_PKL="$1"
@@ -118,11 +148,13 @@ else
         exit 1
     fi
 
+    PKL_SIZE=$(ls -lh "$MERGED_PKL" | awk '{print $5}')
+    echo "Training data:  $MERGED_PKL  ($PKL_SIZE)"
+
     mkdir -p "$CKPT_DIR"
     mkdir -p logs
 
     echo "=== KinSim MLP Training ==="
-    echo "Training data:  $MERGED_PKL"
     echo "Checkpoint dir: $CKPT_DIR"
     if [ -n "$*" ]; then
         echo "Extra flags:    $*"
@@ -131,7 +163,30 @@ else
 
     # All remaining args forwarded (e.g. --epochs, --loss, --resume)
     kinsim train --model mlp "$MERGED_PKL" "$CKPT_DIR" "$@"
+    EXIT_CODE=$?
+fi
+
+# ---- Summary ----
+echo ""
+END_TIME=$(date +%s)
+ELAPSED=$((END_TIME - START_TIME))
+
+if [ $EXIT_CODE -ne 0 ]; then
+    echo "ERROR: Training failed with exit code $EXIT_CODE"
+else
+    echo "=== Training complete ==="
+    # List checkpoints produced
+    if [ -n "$CKPT_DIR" ]; then
+        echo ""
+        echo "Checkpoints:"
+        ls -lhtr "$CKPT_DIR"/checkpoint_epoch*.pt 2>/dev/null || echo "  (none found)"
+        echo ""
+        echo "Config:"
+        ls -lh "$CKPT_DIR"/model_config.json 2>/dev/null || echo "  model_config.json NOT FOUND"
+    fi
 fi
 
 echo ""
-echo "=== Training complete ==="
+echo "Elapsed: $((ELAPSED / 3600))h $((ELAPSED % 3600 / 60))m $((ELAPSED % 60))s"
+echo "Ended:   $(date '+%Y-%m-%d %H:%M:%S')"
+exit $EXIT_CODE

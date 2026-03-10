@@ -202,32 +202,53 @@ def parse_motifs_csv(csv_path, min_fraction=0.40, min_detected=20):
 # Unified motif-string loader (auto-detect source)
 # ---------------------------------------------------------------------------
 
-def load_motif_string(motifs_arg, min_fraction=0.40, min_detected=20):
+def load_motif_string(motifs_arg, min_fraction=0.40, min_detected=20,
+                      parser_name=None):
     """Load a KinSim motif string from a file path or return the argument as-is.
 
-    Auto-detection:
-        - If motifs_arg is an existing file path ending in '.csv'
-          -> parse as PacBio motifs.csv (applies min_fraction / min_detected)
-        - If motifs_arg is any other existing file path
-          -> parse as REBASE file (auto-detects simplified or Format #19)
-        - Otherwise -> treat as a literal KinSim motif string
+    Auto-detection (when parser_name is None):
+        1. If motifs_arg is an existing file path ending in '.csv'
+           -> parse as PacBio motifs.csv (applies min_fraction / min_detected)
+        2. Try auto_detect_parser() from the callers registry
+        3. Fall through to REBASE file parser
+        4. Otherwise -> treat as a literal KinSim motif string
 
     Args:
         motifs_arg:    File path or motif string.
         min_fraction:  Minimum fraction threshold (PacBio CSV only).
         min_detected:  Minimum nDetected threshold (PacBio CSV only).
+        parser_name:   Explicit parser name ("pacbio", "modkit", "ipd_summary").
+                       When provided, bypasses auto-detection.
 
     Returns:
         A semicolon-delimited KinSim motif string.
     """
+    # Explicit parser requested
+    if parser_name is not None:
+        from .callers import create_parser
+        parser = create_parser(parser_name)
+        return parser.parse(motifs_arg,
+                            min_fraction=min_fraction,
+                            min_detected=min_detected)
+
     if os.path.isfile(motifs_arg):
         if motifs_arg.lower().endswith('.csv'):
             return parse_motifs_csv(motifs_arg,
                                     min_fraction=min_fraction,
                                     min_detected=min_detected)
-        else:
-            from .rebase_parser import parse_rebase_file
-            return parse_rebase_file(motifs_arg)
+
+        # Try callers registry auto-detection
+        from .callers import auto_detect_parser
+        parser = auto_detect_parser(motifs_arg)
+        if parser is not None:
+            return parser.parse(motifs_arg,
+                                min_fraction=min_fraction,
+                                min_detected=min_detected)
+
+        # Fall through to REBASE
+        from .rebase_parser import parse_rebase_file
+        return parse_rebase_file(motifs_arg)
+
     return motifs_arg
 
 

@@ -87,15 +87,38 @@ conda activate kinsim_env
 # KinSim falls back to Python regex automatically if fuzznuc is unavailable.
 # Add --no-fuzznuc to the kinsim command below to force regex mode.
 
+# ---- Diagnostics ----
+START_TIME=$(date +%s)
+echo "========================================================"
+echo "  KinSim MLP Generate"
+echo "========================================================"
+echo "Date:       $(date '+%Y-%m-%d %H:%M:%S')"
+echo "Host:       $(hostname)"
+echo "Job ID:     ${SLURM_JOB_ID:-local}"
+echo "Array ID:   ${SLURM_ARRAY_TASK_ID:-none}"
+echo "Partition:  ${SLURM_JOB_PARTITION:-unknown}"
+echo "CPUs:       ${SLURM_CPUS_PER_TASK:-1}"
+echo "Memory:     ${SLURM_MEM_PER_NODE:-unknown} MB"
+echo "Conda env:  ${CONDA_DEFAULT_ENV:-not set}"
+echo "Python:     $(which python)"
+echo "Python ver: $(python --version 2>&1)"
+echo "KinSim ver: $(kinsim --version 2>&1 || echo 'NOT FOUND')"
+echo "fuzznuc:    $(which fuzznuc 2>/dev/null || echo 'NOT FOUND (will use regex fallback)')"
+echo ""
+
 # ---- GPU check ----
 if ! nvidia-smi > /dev/null 2>&1; then
     echo "WARNING: No GPU detected. Falling back to CPU (slower)."
     DEVICE="cpu"
 else
     echo "GPU Info:"
-    nvidia-smi --query-gpu=name,memory.free --format=csv,noheader
+    nvidia-smi --query-gpu=name,memory.total,memory.free,driver_version --format=csv,noheader
+    echo "CUDA visible:  ${CUDA_VISIBLE_DEVICES:-not set}"
+    python -c "import torch; print(f'PyTorch:  {torch.__version__}'); print(f'CUDA:     {torch.version.cuda}'); print(f'GPU seen: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"NONE\"}')" 2>&1
     DEVICE="cuda"
 fi
+echo "========================================================"
+echo ""
 
 # ---- Config ----
 PBSIM3_DIR="$1"
@@ -187,6 +210,21 @@ echo ""
 kinsim mlp generate "$FASTQ_IN" "$MAF_IN" "$REF_IN" "$CKPT_IN" "$MOTIFS" "$BAM_OUT" \
     --device "$DEVICE" \
     --batch-reads 1000
+EXIT_CODE=$?
 
+# ---- Summary ----
 echo ""
-echo "=== Generation complete: $BAM_OUT ==="
+END_TIME=$(date +%s)
+ELAPSED=$((END_TIME - START_TIME))
+
+if [ $EXIT_CODE -ne 0 ]; then
+    echo "ERROR: Generation failed with exit code $EXIT_CODE for $SPECIES"
+else
+    echo "=== Generation complete: $BAM_OUT ==="
+    BAM_SIZE=$(ls -lh "$BAM_OUT" 2>/dev/null | awk '{print $5}')
+    echo "BAM size: ${BAM_SIZE:-file not found}"
+fi
+
+echo "Elapsed: $((ELAPSED / 3600))h $((ELAPSED % 3600 / 60))m $((ELAPSED % 60))s"
+echo "Ended:   $(date '+%Y-%m-%d %H:%M:%S')"
+exit $EXIT_CODE
