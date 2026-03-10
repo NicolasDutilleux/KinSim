@@ -22,11 +22,17 @@ REBASE X(Y) position notation:
 REBASE Format #19 MS field uses position(type) where type is 6mA, N4mC, or 5mC.
 """
 
+import logging
 import os
 import re
 import sys
 
 from .encoding import METH_IDS
+
+log = logging.getLogger(__name__)
+
+# Regex to validate IUPAC-only recognition sequences
+_IUPAC_RE = re.compile(r'^[ACGTRYSWKMBDHVN]+$')
 
 # REBASE Y-code → KinSim mod type (used in simple X(Y) notation)
 _REBASE_CODE_TO_METH = {'6': 'm6A', '5': 'm5C', '4': 'm4C'}
@@ -77,8 +83,7 @@ def parse_rebase_annotation(recognition_seq, meth_annotation):
 
         meth_type = _REBASE_CODE_TO_METH.get(y)
         if meth_type is None:
-            print(f"  WARN: REBASE: unknown methylation code ({y}) — skipped",
-                  file=sys.stderr)
+            log.warning("REBASE: unknown methylation code (%s) — skipped", y)
             continue
 
         if x > 0:
@@ -87,8 +92,8 @@ def parse_rebase_annotation(recognition_seq, meth_annotation):
             pos_0 = seq_len - abs(x)  # from 5' of complementary strand
 
         if not (0 <= pos_0 < seq_len):
-            print(f"  WARN: REBASE: position {x} out of range for "
-                  f"'{recognition_seq}' (len={seq_len}) — skipped", file=sys.stderr)
+            log.warning("REBASE: position %d out of range for '%s' (len=%d) — skipped",
+                        x, recognition_seq, seq_len)
             continue
 
         entries.append(f"{meth_type},{recognition_seq},{pos_0}")
@@ -122,13 +127,17 @@ def parse_rebase_simple(filepath):
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
-            parts = line.split()
+            parts = re.split(r'\s+', line, maxsplit=1)
             if len(parts) < 2:
-                print(f"  WARN: REBASE line {lineno}: expected 2 columns, "
-                      f"got {len(parts)} — skipped", file=sys.stderr)
+                log.warning("REBASE line %d: expected 2 columns, got %d — skipped",
+                            lineno, len(parts))
                 continue
-            rec_seq = parts[0]
+            rec_seq = parts[0].upper()
             meth_ann = parts[1]
+            if not _IUPAC_RE.match(rec_seq):
+                log.warning("REBASE line %d: invalid IUPAC sequence '%s' — skipped",
+                            lineno, rec_seq)
+                continue
             entries = parse_rebase_annotation(rec_seq, meth_ann)
             all_entries.extend(entries)
     return ';'.join(all_entries)
@@ -176,12 +185,18 @@ def parse_rebase_withrefm(filepath):
                     # Clean recognition sequence: remove cleavage site indicators
                     # RS can be "GATC, 2;" or "G^AATTC" or "GATC"
                     rec_clean = re.sub(r'[^ACGTRYMKSWHBVDN]', '', rec_seq.upper())
-                    if rec_clean:
+                    if rec_clean and not _IUPAC_RE.match(rec_clean):
+                        log.warning("REBASE: invalid IUPAC in RS '%s' (enzyme %s) — skipped",
+                                    rec_seq, current.get('ID', '?'))
+                        rec_clean = ''
+                if rec_clean:
                         for site_match in _MS_SITE_RE.finditer(ms_raw):
                             x   = int(site_match.group(1))
                             typ = site_match.group(2)
                             meth_type = _REBASE_TYPE_TO_METH.get(typ)
                             if meth_type is None:
+                                log.warning("REBASE: unknown MS type '%s' (enzyme %s) — skipped",
+                                            typ, current.get('ID', '?'))
                                 continue
 
                             seq_len = len(rec_clean)
@@ -197,11 +212,14 @@ def parse_rebase_withrefm(filepath):
                 current = {}
                 continue
 
-            if '   ' in line or '\t' in line:
-                # Tagged-field line: "ID   name" or "RS   GATC, 2;"
-                sep = line.find('\t') if '\t' in line else line.find('   ')
-                tag = line[:sep].strip()
-                val = line[sep:].strip()
+            # Tagged-field line: "ID   name" or "RS\tGATC, 2;"
+            # Fuzzy: accept 2+ spaces or tab as separator
+            m = re.match(r'^(\w{2})\s{2,}(.+)', line)
+            if not m and '\t' in line:
+                m = re.match(r'^(\w{2})\t(.+)', line)
+            if m:
+                tag = m.group(1).strip()
+                val = m.group(2).strip()
                 # Only keep the last RS/MS per record (some entries repeat)
                 if tag in ('ID', 'RS', 'MS', 'ET'):
                     current[tag] = val
@@ -298,6 +316,61 @@ def decode_fuzznuc_pattern_name(name):
         return meth_id, mod_pos
     except (ValueError, IndexError):
         return 0, 0
+
+
+# ---------------------------------------------------------------------------
+# Isoschizomer mapping (Format #19 only)
+# ---------------------------------------------------------------------------
+
+def parse_rebase_isoschizomers(filepath):
+    """Parse a REBASE Format #19 file and group enzymes by recognition sequence.
+
+    Returns a dict mapping each unique recognition sequence (cleaned, uppercase
+    IUPAC) to a deduplicated list of enzyme names (ID fields) that recognise it.
+
+    This is useful to list all enzymes associated with a given motif (e.g.,
+    GATC → ['DpnI', 'MalI', 'Sau3AI', ...]).
+
+    Only processes Format #19 files.  Returns an empty dict for simplified
+    two-column files.
+
+    Args:
+        filepath: Path to a REBASE Format #19 file.
+
+    Returns:
+        dict[str, list[str]]: recognition_seq → [enzyme_name, ...], no duplicates.
+    """
+    iso_map: dict[str, list[str]] = {}
+
+    with open(filepath) as f:
+        current: dict[str, str] = {}
+        for line in f:
+            line = line.rstrip('\n')
+            if line.startswith('//'):
+                rec_seq = current.get('RS', '').strip()
+                enz_id  = current.get('ID', '').strip()
+
+                if rec_seq and rec_seq != '?' and enz_id:
+                    rec_clean = re.sub(r'[^ACGTRYMKSWHBVDN]', '', rec_seq.upper())
+                    if rec_clean and _IUPAC_RE.match(rec_clean):
+                        if rec_clean not in iso_map:
+                            iso_map[rec_clean] = []
+                        if enz_id not in iso_map[rec_clean]:
+                            iso_map[rec_clean].append(enz_id)
+
+                current = {}
+                continue
+
+            m = re.match(r'^(\w{2})\s{2,}(.+)', line)
+            if not m and '\t' in line:
+                m = re.match(r'^(\w{2})\t(.+)', line)
+            if m:
+                tag = m.group(1).strip()
+                val = m.group(2).strip()
+                if tag in ('ID', 'RS', 'MS', 'ET'):
+                    current[tag] = val
+
+    return iso_map
 
 
 # ---------------------------------------------------------------------------

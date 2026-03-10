@@ -69,6 +69,7 @@ def _load_model(checkpoint_dir: str | Path, device: torch.device) -> MLPPredicto
         kmer_embed_dim=cfg["kmer_embed_dim"],
         hidden_dim=cfg["hidden_dim"],
         meth_proj_dim=cfg.get("meth_proj_dim", 8),
+        dropout=cfg.get("dropout", 0.0),
     ).to(device)
 
     # Find the latest checkpoint
@@ -262,16 +263,24 @@ def plot_kmer_distribution(
             + str([m for m_name, m_id in METH_IDS.items() if (kmer_id, m_id) in data])
         )
 
-    # Actual data: raw uint8 → log1p
-    actual_raw = data[key].astype(np.float32)   # (N, 2)
-    actual_log = np.log1p(actual_raw)            # (N, 2) log1p space
+    # Actual data: raw uint8 → log1p (use only IPD/PW columns)
+    samples    = data[key].astype(np.float32)
+    actual_raw = samples[:, :2]                     # (N, 2) [IPD, PW]
+    actual_log = np.log1p(actual_raw)               # (N, 2) log1p space
 
-    # Model prediction for this single context
+    # Build stoichiometric meth_probs from stored fraction (3rd column)
+    # For legacy 2-column data, default to 1.0 for methylated.
+    if samples.shape[1] >= 3:
+        fraction = float(samples[0, 2])
+    else:
+        fraction = 1.0 if meth_id > 0 else 0.0
+
     kmer_tensor = torch.tensor([kmer_id], dtype=torch.long, device=device)
-    one_hot     = torch.zeros(1, 4, device=device)
-    one_hot[0, meth_id] = 1.0
+    meth_probs  = torch.zeros(1, 4, device=device)
+    if meth_id > 0:
+        meth_probs[0, meth_id] = fraction
 
-    params  = model(kmer_tensor, one_hot)          # (1, 4)
+    params  = model(kmer_tensor, meth_probs)       # (1, 4)
     mu_log  = params[0, :2].cpu().numpy()          # [μ_ipd, μ_pw] log1p
     log_sig = np.clip(params[0, 2:].cpu().numpy(), *_SIGMA_CLAMP)
     sigma   = np.exp(log_sig)                      # [σ_ipd, σ_pw] log1p

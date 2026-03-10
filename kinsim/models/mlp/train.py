@@ -1,4 +1,4 @@
-"""Train the MLP predictor on merged raw kinetic samples.
+"""Train the MLP predictor with PyTorch Lightning + optional Optuna HPO.
 
 Input format
 ------------
@@ -16,7 +16,7 @@ Loss function
 We use Gaussian Negative Log-Likelihood (GNLL) by default.  The model outputs
 (μ, log_σ) for both IPD and PW, so the loss is:
 
-    L = 0.5 * [ log(σ²) + (target - μ)² / σ² ]
+    L = 0.5 * [ 2·log_σ + (target − μ)² / exp(2·log_σ) ]
 
 This jointly optimises the predicted mean and spread, which is important because
 signal variance is strongly context-dependent (e.g., methylated vs. plain sites).
@@ -26,15 +26,29 @@ the variance head — useful for ablations or when only mean accuracy matters.
 
 Evaluation metrics (logged per epoch)
 --------------------------------------
-    MSE (IPD/PW)    — mean squared error in log1p space
-    MAE (IPD/PW)    — mean absolute error in log1p space
-    Pearson r (IPD) — Pearson correlation between predicted μ_ipd and true IPD
-    Pearson r (PW)  — same for PW
+    MSE (IPD/PW)         — mean squared error in log1p space
+    MAE (IPD/PW)         — mean absolute error in log1p space
+    Pearson r (IPD/PW)   — correlation between predicted μ and true signal
+    2σ calibration       — fraction of observations within [μ−2σ, μ+2σ] (~95.4 %)
 
-All metrics are reported on both a 90 % training split and a 10 % validation split.
+All metrics are reported on the 10 % validation split.
+
+Hyperparameter optimisation (Optuna)
+-------------------------------------
+Pass --optuna to run a search before the final training run:
+
+    kinsim train --model mlp master.pkl ckpts/ --optuna --n-trials 20
+
+Optuna searches over lr (log-uniform 1e-4..1e-2), kmer_embed_dim (32, 64),
+hidden_dim (128, 256, 512).  Best values override CLI/YAML defaults.
+
+Backward compatibility
+----------------------
+In addition to Lightning .ckpt files, this module writes checkpoint_epoch{N}.pt
+files in the legacy format so that kinsim mlp generate and kinsim mlp evaluate
+continue to work unchanged.
 """
 
-import csv
 import json
 import logging
 from pathlib import Path
@@ -44,6 +58,22 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
+
+try:
+    import lightning as L
+    from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+    from lightning.pytorch.callbacks.callback import Callback
+    from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
+except ImportError:
+    try:
+        import pytorch_lightning as L
+        from pytorch_lightning.callbacks import Callback, EarlyStopping, ModelCheckpoint
+        from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
+    except ImportError as exc:
+        raise ImportError(
+            "PyTorch Lightning is required for MLP training.\n"
+            "Install with: pip install lightning"
+        ) from exc
 
 from ...common.dataset import MLPSignalDataset
 from .model import MLPPredictor
@@ -55,41 +85,27 @@ log = logging.getLogger(__name__)
 # Loss functions
 # ---------------------------------------------------------------------------
 
-def _gaussian_nll_loss(
-    params: torch.Tensor,
-    targets: torch.Tensor,
-) -> torch.Tensor:
+def _gaussian_nll_loss(params: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """Gaussian NLL for (IPD, PW) jointly.
 
     Args:
-        params:  Model output of shape (batch, 4) — [μ_ipd, μ_pw, log_σ_ipd, log_σ_pw].
-        targets: Ground-truth signals of shape (batch, 2) — [IPD, PW] in log1p space.
-
-    Returns:
-        Scalar loss (mean over batch and signal dimensions).
+        params:  Model output (batch, 4) — [μ_ipd, μ_pw, log_σ_ipd, log_σ_pw].
+        targets: Ground-truth signals (batch, 2) — [IPD, PW] in log1p space.
     """
-    mu      = params[:, :2]   # (batch, 2)
-    log_sig = params[:, 2:]   # (batch, 2)
-
-    # Clamp to a safe range: prevents log_σ from collapsing to -∞ or exploding
-    log_sig = torch.clamp(log_sig, -6.0, 3.0)
-    var = torch.exp(2.0 * log_sig)
-
-    # Pointwise Gaussian NLL (constant term dropped as it doesn't affect gradient)
-    nll = 0.5 * (log_sig * 2.0 + (targets - mu) ** 2 / var)
-    return nll.mean()
+    mu      = params[:, :2]
+    log_sig = torch.clamp(params[:, 2:], -6.0, 3.0)
+    var     = torch.exp(2.0 * log_sig)
+    return (0.5 * (log_sig * 2.0 + (targets - mu) ** 2 / var)).mean()
 
 
 def _mse_loss(params: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """Plain MSE on the mean head only (μ_ipd, μ_pw)."""
-    mu = params[:, :2]
-    return nn.functional.mse_loss(mu, targets)
+    return nn.functional.mse_loss(params[:, :2], targets)
 
 
 def _huber_loss(params: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """Huber (smooth L1) loss on the mean head — less sensitive to outliers."""
-    mu = params[:, :2]
-    return nn.functional.huber_loss(mu, targets)
+    return nn.functional.huber_loss(params[:, :2], targets)
 
 
 _LOSS_FUNCTIONS = {
@@ -100,78 +116,361 @@ _LOSS_FUNCTIONS = {
 
 
 # ---------------------------------------------------------------------------
-# Metrics
+# KineticDataModule
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def _compute_metrics(
-    model: MLPPredictor,
-    loader: DataLoader,
-    device: torch.device,
-) -> dict[str, float]:
-    """Compute MSE, MAE, Pearson r, and 2σ calibration on a data split.
+class KineticDataModule(L.LightningDataModule):
+    """LightningDataModule for KinSim kinetic .pkl files.
 
-    Calibration (``calibration_ipd`` / ``calibration_pw``): fraction of actual
-    observations that fall within the model's predicted interval [μ − 2σ, μ + 2σ].
-    A perfectly calibrated Gaussian gives ~95.4 %.  Values significantly below
-    95 % indicate the model underestimates uncertainty; above 95 % indicates
-    over-dispersion.
+    Wraps MLPSignalDataset with a reproducible train/val split.
+    MLPSignalDataset draws one random (IPD, PW) per unique (kmer, meth) key
+    per __getitem__ call, so effective data volume grows across epochs without
+    storing all samples in RAM.
 
     Args:
-        model:  MLPPredictor in eval mode.
-        loader: DataLoader for the split.
-        device: Torch device.
-
-    Returns:
-        Dictionary with keys: mse_ipd, mse_pw, mae_ipd, mae_pw,
-                              pearson_ipd, pearson_pw,
-                              calibration_ipd, calibration_pw.
+        pkl_path:     Path to merged .pkl file (from kinsim merge).
+        val_fraction: Fraction of unique (kmer, meth) keys for validation.
+        batch_size:   Training DataLoader batch size.
+        seed:         Random seed for reproducible train/val split.
     """
-    model.eval()
-    all_mu    = []
-    all_sigma = []
-    all_true  = []
 
-    for kmer_ids, meth_probs, signals in loader:
-        kmer_ids   = kmer_ids.to(device)
-        meth_probs = meth_probs.to(device)
-        signals    = signals.to(device)
+    def __init__(
+        self,
+        pkl_path: str,
+        val_fraction: float = 0.10,
+        batch_size: int = 4096,
+        seed: int = 42,
+    ) -> None:
+        super().__init__()
+        self.pkl_path     = pkl_path
+        self.val_fraction = val_fraction
+        self.batch_size   = batch_size
+        self.seed         = seed
+        self._train_subset = None
+        self._val_subset   = None
 
-        params  = model(kmer_ids, meth_probs)
+    def setup(self, stage: str | None = None) -> None:
+        dataset = MLPSignalDataset(self.pkl_path)
+        n_val   = max(1, int(len(dataset) * self.val_fraction))
+        n_train = len(dataset) - n_val
+        rng     = torch.Generator().manual_seed(self.seed)
+        indices = torch.randperm(len(dataset), generator=rng).tolist()
+        self._train_subset = Subset(dataset, indices[:n_train])
+        self._val_subset   = Subset(dataset, indices[n_train:])
+        log.info("Data split — train: %d keys, val: %d keys", n_train, n_val)
+
+    def train_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self._train_subset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+        )
+
+    def val_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self._val_subset,
+            batch_size=self.batch_size * 4,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# KineticPredictor (LightningModule)
+# ---------------------------------------------------------------------------
+
+class KineticPredictor(L.LightningModule):
+    """Lightning module wrapping MLPPredictor.
+
+    Training:
+        - Gaussian NLL loss (or MSE/Huber via loss_name).
+        - Adam optimiser with ReduceLROnPlateau (patience=5, factor=0.5).
+
+    Validation (per epoch):
+        - val_loss: GNLL on the validation split (used by EarlyStopping / scheduler).
+        - val_mse_ipd / val_mse_pw: mean squared error in log1p space.
+        - val_pearson_ipd / val_pearson_pw: Pearson r between predicted μ and truth.
+        - val_calib_ipd / val_calib_pw: 2σ calibration coverage (~95.4 % expected).
+
+    Args:
+        model:     MLPPredictor instance (architecture defined externally).
+        lr:        Initial Adam learning rate.
+        loss_name: "gnll" (default) | "mse" | "huber".
+    """
+
+    def __init__(
+        self,
+        model: MLPPredictor,
+        lr: float = 1e-3,
+        loss_name: str = "gnll",
+    ) -> None:
+        super().__init__()
+        self.model    = model
+        self.lr       = lr
+        self._loss_fn = _LOSS_FUNCTIONS[loss_name]
+        # Accumulate per-batch val predictions for epoch-level metric computation
+        self._val_mu:    list[torch.Tensor] = []
+        self._val_sigma: list[torch.Tensor] = []
+        self._val_true:  list[torch.Tensor] = []
+
+    def forward(self, kmer_ids: torch.Tensor, meth_probs: torch.Tensor) -> torch.Tensor:
+        return self.model(kmer_ids, meth_probs)
+
+    def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
+        kmer_ids, meth_probs, signals = batch
+        loss = self._loss_fn(self.model(kmer_ids, meth_probs), signals)
+        self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
+        kmer_ids, meth_probs, signals = batch
+        params  = self.model(kmer_ids, meth_probs)
+        loss    = self._loss_fn(params, signals)
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+
+        # Accumulate for epoch-level Pearson / calibration metrics
         mu      = params[:, :2]
         log_sig = torch.clamp(params[:, 2:], -6.0, 3.0)
         sigma   = torch.exp(log_sig)
+        self._val_mu.append(mu.detach().cpu())
+        self._val_sigma.append(sigma.detach().cpu())
+        self._val_true.append(signals.detach().cpu())
+        return loss
 
-        all_mu.append(mu.cpu())
-        all_sigma.append(sigma.cpu())
-        all_true.append(signals.cpu())
+    def on_validation_epoch_end(self) -> None:
+        if not self._val_mu:
+            return
 
-    all_mu    = torch.cat(all_mu,    dim=0).numpy()   # (N, 2)
-    all_sigma = torch.cat(all_sigma, dim=0).numpy()   # (N, 2)
-    all_true  = torch.cat(all_true,  dim=0).numpy()   # (N, 2)
+        all_mu    = torch.cat(self._val_mu,    dim=0).numpy()   # (N, 2)
+        all_sigma = torch.cat(self._val_sigma, dim=0).numpy()   # (N, 2)
+        all_true  = torch.cat(self._val_true,  dim=0).numpy()   # (N, 2)
 
-    diff  = all_mu - all_true
-    mse   = (diff ** 2).mean(axis=0)   # [mse_ipd, mse_pw]
-    mae   = np.abs(diff).mean(axis=0)  # [mae_ipd, mae_pw]
+        diff    = all_mu - all_true
+        mse     = (diff ** 2).mean(axis=0)
+        mae     = np.abs(diff).mean(axis=0)
+        in_2sig = (np.abs(diff) <= 2.0 * all_sigma).mean(axis=0)
 
-    # Calibration: fraction of real observations within predicted [μ-2σ, μ+2σ]
-    in_2sigma = (np.abs(diff) <= 2.0 * all_sigma).mean(axis=0)
+        def _pearson(a: np.ndarray, b: np.ndarray) -> float:
+            return float(np.corrcoef(a, b)[0, 1]) if a.std() > 1e-9 and b.std() > 1e-9 else 0.0
 
-    def _pearson(a: np.ndarray, b: np.ndarray) -> float:
-        if a.std() < 1e-9 or b.std() < 1e-9:
-            return 0.0
-        return float(np.corrcoef(a, b)[0, 1])
+        metrics = {
+            "val_mse_ipd":     float(mse[0]),
+            "val_mse_pw":      float(mse[1]),
+            "val_mae_ipd":     float(mae[0]),
+            "val_mae_pw":      float(mae[1]),
+            "val_pearson_ipd": _pearson(all_mu[:, 0], all_true[:, 0]),
+            "val_pearson_pw":  _pearson(all_mu[:, 1], all_true[:, 1]),
+            "val_calib_ipd":   float(in_2sig[0]),
+            "val_calib_pw":    float(in_2sig[1]),
+        }
+        self.log_dict(metrics, on_epoch=True)
+        log.info(
+            "  val — mse=(%.4f, %.4f)  pearson=(%.3f, %.3f)  calib=(%.1f%%, %.1f%%)",
+            metrics["val_mse_ipd"], metrics["val_mse_pw"],
+            metrics["val_pearson_ipd"], metrics["val_pearson_pw"],
+            metrics["val_calib_ipd"] * 100, metrics["val_calib_pw"] * 100,
+        )
+        self._val_mu.clear()
+        self._val_sigma.clear()
+        self._val_true.clear()
 
-    return {
-        "mse_ipd":          float(mse[0]),
-        "mse_pw":           float(mse[1]),
-        "mae_ipd":          float(mae[0]),
-        "mae_pw":           float(mae[1]),
-        "pearson_ipd":      _pearson(all_mu[:, 0], all_true[:, 0]),
-        "pearson_pw":       _pearson(all_mu[:, 1], all_true[:, 1]),
-        "calibration_ipd":  float(in_2sigma[0]),
-        "calibration_pw":   float(in_2sigma[1]),
+    def configure_optimizers(self):
+        optimizer = optim.Adam(self.parameters(), lr=self.lr)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=5
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor":   "val_loss",
+                "frequency": 1,
+            },
+        }
+
+    @torch.no_grad()
+    def sample(self, kmer_ids: torch.Tensor, meth_probs: torch.Tensor) -> torch.Tensor:
+        """Stochastic inference — delegates to MLPPredictor.sample()."""
+        return self.model.sample(kmer_ids, meth_probs)
+
+
+# ---------------------------------------------------------------------------
+# LegacyCheckpointCallback
+# ---------------------------------------------------------------------------
+
+class LegacyCheckpointCallback(Callback):
+    """Write checkpoint_epoch{N}.pt in the legacy format.
+
+    Allows kinsim mlp generate and kinsim mlp evaluate to work unchanged
+    alongside the new Lightning checkpoint infrastructure.  The legacy format
+    stores only the MLPPredictor state dict (no 'model.' prefix), matching
+    what generate.py and evaluate.py expect:
+
+        {
+            "epoch":     int,
+            "model":     MLPPredictor.state_dict(),   # no "model." prefix
+            "optimizer": ...,
+            "scheduler": ...,                         # when available
+        }
+
+    Saves every checkpoint_every epochs.  Always saves at the very end of
+    training to handle early stopping (which may stop mid-interval).
+
+    Args:
+        output_dir:       Directory to write checkpoint_epoch*.pt files.
+        checkpoint_every: Save every N epochs (default 10).
+    """
+
+    def __init__(self, output_dir: Path, checkpoint_every: int = 10) -> None:
+        self.output_dir       = Path(output_dir)
+        self.checkpoint_every = checkpoint_every
+
+    def _save(
+        self,
+        trainer: "L.Trainer",
+        pl_module: "KineticPredictor",
+        epoch: int,
+    ) -> None:
+        state: dict = {
+            "epoch": epoch,
+            "model": pl_module.model.state_dict(),
+            "optimizer": trainer.optimizers[0].state_dict(),
+        }
+        if trainer.lr_scheduler_configs:
+            state["scheduler"] = trainer.lr_scheduler_configs[0].scheduler.state_dict()
+        path = self.output_dir / f"checkpoint_epoch{epoch}.pt"
+        torch.save(state, path)
+        log.info("Legacy checkpoint saved: %s", path)
+
+    def on_train_epoch_end(
+        self,
+        trainer: "L.Trainer",
+        pl_module: "KineticPredictor",
+    ) -> None:
+        # trainer.current_epoch is 0-indexed during on_train_epoch_end
+        epoch = trainer.current_epoch + 1
+        if epoch % self.checkpoint_every == 0:
+            self._save(trainer, pl_module, epoch)
+
+    def on_train_end(
+        self,
+        trainer: "L.Trainer",
+        pl_module: "KineticPredictor",
+    ) -> None:
+        """Save the final epoch — handles early stopping stopping mid-interval."""
+        # After the last on_train_epoch_end, current_epoch is incremented by Lightning.
+        # So at on_train_end, current_epoch == number of completed epochs (1-indexed).
+        epoch     = trainer.current_epoch
+        ckpt_path = self.output_dir / f"checkpoint_epoch{epoch}.pt"
+        if not ckpt_path.exists():
+            self._save(trainer, pl_module, epoch)
+
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+def _save_model_config(output_dir: Path, model: MLPPredictor) -> None:
+    """Write model_config.json before training starts.
+
+    generate.py and evaluate.py both require this file to reconstruct the
+    MLPPredictor architecture.  Writing it before the first epoch ensures it
+    exists even if training is interrupted.
+    """
+    cfg = {
+        "kmer_embed_dim": model.kmer_embed_dim,
+        "hidden_dim":     model.hidden_dim,
+        "meth_proj_dim":  model.meth_proj_dim,
+        "dropout":        model.dropout,
     }
+    path = output_dir / "model_config.json"
+    path.write_text(json.dumps(cfg, indent=2))
+    log.info("Model config saved: %s", path)
+
+
+# ---------------------------------------------------------------------------
+# Optuna objective
+# ---------------------------------------------------------------------------
+
+def objective(
+    trial,
+    pkl_path: str,
+    output_dir: Path,
+    optuna_epochs: int = 20,
+    batch_size: int = 4096,
+    val_fraction: float = 0.10,
+    loss_name: str = "gnll",
+    device: str = "cuda",
+) -> float:
+    """Optuna objective — returns best val_loss (GNLL) for a trial.
+
+    Search space:
+        lr             float  log-uniform [1e-4, 1e-2]
+        kmer_embed_dim int    categorical {32, 64}
+        hidden_dim     int    categorical {128, 256, 512}
+
+    Pruning via optuna.integration.PyTorchLightningPruningCallback is applied
+    when available, skipping unpromising trials early.
+
+    Args:
+        trial:         Optuna Trial object.
+        pkl_path:      Merged .pkl file path.
+        output_dir:    Root dir for trial subdirectories.
+        optuna_epochs: Max epochs per trial (shorter than final run).
+        batch_size:    DataLoader batch size.
+        val_fraction:  Fraction of keys for validation.
+        loss_name:     Loss function.
+        device:        "cuda" or "cpu".
+
+    Returns:
+        Best val_loss seen during this trial (lower is better).
+    """
+    lr             = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
+    kmer_embed_dim = trial.suggest_categorical("kmer_embed_dim", [32, 64])
+    hidden_dim     = trial.suggest_categorical("hidden_dim", [128, 256, 512])
+    dropout        = trial.suggest_float("dropout", 0.0, 0.4)
+
+    model = MLPPredictor(
+        kmer_embed_dim=kmer_embed_dim,
+        hidden_dim=hidden_dim,
+        meth_proj_dim=8,
+        dropout=dropout,
+    )
+    lm = KineticPredictor(model, lr=lr, loss_name=loss_name)
+    dm = KineticDataModule(
+        pkl_path=pkl_path,
+        val_fraction=val_fraction,
+        batch_size=batch_size,
+    )
+
+    callbacks: list = [EarlyStopping(monitor="val_loss", patience=5, mode="min")]
+    try:
+        from optuna.integration import PyTorchLightningPruningCallback
+        callbacks.append(PyTorchLightningPruningCallback(trial, monitor="val_loss"))
+    except ImportError:
+        pass  # Pruning skipped — optuna.integration not available
+
+    trial_dir = output_dir / f"trial_{trial.number}"
+    trial_dir.mkdir(parents=True, exist_ok=True)
+
+    accelerator = "gpu" if device == "cuda" and torch.cuda.is_available() else "cpu"
+    trainer = L.Trainer(
+        max_epochs=optuna_epochs,
+        accelerator=accelerator,
+        devices=1,
+        gradient_clip_val=0.5,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        logger=CSVLogger(str(trial_dir)),
+        callbacks=callbacks,
+        log_every_n_steps=1,
+    )
+    trainer.fit(lm, datamodule=dm)
+
+    return float(trainer.callback_metrics.get("val_loss", float("inf")))
 
 
 # ---------------------------------------------------------------------------
@@ -187,223 +486,170 @@ def train_mlp(
     kmer_embed_dim: int = 64,
     hidden_dim: int = 128,
     meth_proj_dim: int = 8,
+    dropout: float = 0.0,
     loss_name: str = "gnll",
     val_fraction: float = 0.10,
     checkpoint_every: int = 10,
     device: str = "cuda",
     resume_ckpt: str | None = None,
+    run_optuna: bool = False,
+    n_trials: int = 20,
+    optuna_epochs: int = 20,
 ) -> None:
-    """Train the MLPPredictor on merged raw kinetic samples.
+    """Train MLPPredictor using PyTorch Lightning.
+
+    If run_optuna=True, an Optuna HPO study runs first to find the best
+    lr, kmer_embed_dim, and hidden_dim.  Best values override defaults.
 
     Args:
-        pkl_path:         Path to merged .pkl file (from `kinsim merge`).
+        pkl_path:         Merged .pkl file from kinsim merge.
         output_dir:       Directory for checkpoints, logs, and model config.
-        epochs:           Total number of training epochs.
-        batch_size:       Mini-batch size (= number of unique keys per step).
-        lr:               Initial learning rate for Adam.
-        kmer_embed_dim:   Dimension of the 11-mer embedding (32 or 64).
-        hidden_dim:       Width of the two hidden MLP layers.
-        meth_proj_dim:    Output dimension of the methylation linear projection.
-        loss_name:        Loss function: "gnll" | "mse" | "huber".
-        val_fraction:     Fraction of data held out for validation.
-        checkpoint_every: Save a checkpoint every N epochs (and at the final epoch).
+        epochs:           Total training epochs for the final run.
+        batch_size:       Mini-batch size (unique (kmer, meth) keys per step).
+        lr:               Initial Adam learning rate.
+        kmer_embed_dim:   11-mer embedding dimension (32 or 64).
+        hidden_dim:       Hidden layer width.
+        meth_proj_dim:    Methylation linear projection output dimension.
+        loss_name:        "gnll" (default) | "mse" | "huber".
+        val_fraction:     Fraction of keys reserved for validation.
+        checkpoint_every: Save legacy checkpoint_epoch*.pt every N epochs.
         device:           "cuda" or "cpu".
-        resume_ckpt:      Path to a previous checkpoint to resume from.
+        resume_ckpt:      Legacy .pt or Lightning .ckpt to load weights from.
+        run_optuna:       Run Optuna HPO before the final training run.
+        n_trials:         Number of Optuna trials.
+        optuna_epochs:    Epochs per trial (typically much shorter than epochs).
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device(device if torch.cuda.is_available() else "cpu")
-    log.info("Device: %s", device)
+    # ── Optuna HPO ────────────────────────────────────────────────────────
+    if run_optuna:
+        try:
+            import optuna
+        except ImportError:
+            raise ImportError(
+                "Optuna is required for HPO. Install with: pip install optuna"
+            )
 
-    # ------------------------------------------------------------------
-    # Data
-    # ------------------------------------------------------------------
-    dataset = MLPSignalDataset(pkl_path)    # random-shot, dynamic capping
+        log.info("Optuna HPO — %d trials × %d epochs", n_trials, optuna_epochs)
+        optuna_dir = output_dir / "optuna"
+        optuna_dir.mkdir(exist_ok=True)
 
-    n_val   = max(1, int(len(dataset) * val_fraction))
-    n_train = len(dataset) - n_val
+        study = optuna.create_study(
+            direction="minimize",
+            pruner=optuna.pruners.MedianPruner(n_warmup_steps=5),
+            study_name="kinsim_mlp",
+        )
+        study.optimize(
+            lambda trial: objective(
+                trial,
+                pkl_path=pkl_path,
+                output_dir=optuna_dir,
+                optuna_epochs=optuna_epochs,
+                batch_size=batch_size,
+                val_fraction=val_fraction,
+                loss_name=loss_name,
+                device=device,
+            ),
+            n_trials=n_trials,
+        )
 
-    # Reproducible split (same split across restarts)
-    rng = torch.Generator().manual_seed(42)
-    indices = torch.randperm(len(dataset), generator=rng).tolist()
+        best = study.best_params
+        log.info(
+            "Optuna best — val_loss=%.6f  lr=%.2e  kmer_embed_dim=%d  hidden_dim=%d",
+            study.best_value, best["lr"], best["kmer_embed_dim"], best["hidden_dim"],
+        )
+        # Override with Optuna's best hyperparameters
+        lr             = best["lr"]
+        kmer_embed_dim = best["kmer_embed_dim"]
+        hidden_dim     = best["hidden_dim"]
+        (output_dir / "optuna_best_params.json").write_text(
+            json.dumps({"best_val_loss": study.best_value, **best}, indent=2)
+        )
 
-    train_loader = DataLoader(
-        Subset(dataset, indices[:n_train]),
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=(device.type == "cuda"),
+    # ── Build model ───────────────────────────────────────────────────────
+    accelerator = "gpu" if device == "cuda" and torch.cuda.is_available() else "cpu"
+    log.info(
+        "Training — %d epochs  loss=%s  lr=%.2e  embed=%d  hidden=%d  "
+        "meth_proj=%d  dropout=%.2f  accel=%s",
+        epochs, loss_name, lr, kmer_embed_dim, hidden_dim, meth_proj_dim, dropout, accelerator,
     )
-    val_loader = DataLoader(
-        Subset(dataset, indices[n_train:]),
-        batch_size=batch_size * 4,   # larger batches are fine for eval
-        shuffle=False,
-        num_workers=2,
-        pin_memory=(device.type == "cuda"),
-    )
 
-    # n_train / n_val = number of unique (kmer, meth) keys in each split.
-    # Each step, the DataLoader draws one random signal per key from its pool,
-    # so the effective data volume grows over epochs without repeating any fixed order.
-    log.info("Keys (unique contexts) — train: %d, val: %d", n_train, n_val)
-
-    # ------------------------------------------------------------------
-    # Model, optimiser, scheduler
-    # ------------------------------------------------------------------
     model = MLPPredictor(
         kmer_embed_dim=kmer_embed_dim,
         hidden_dim=hidden_dim,
         meth_proj_dim=meth_proj_dim,
-    ).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
-    # Halve LR when validation loss stops improving for 5 consecutive epochs.
-    # verbose=True was removed in PyTorch 2.1+; we track LR changes manually.
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5
+        dropout=dropout,
     )
 
-    loss_fn = _LOSS_FUNCTIONS[loss_name]
+    # Save model config BEFORE first epoch — generate.py needs it even if interrupted
+    _save_model_config(output_dir, model)
 
-    start_epoch = 0
     if resume_ckpt:
-        log.info("Resuming from: %s", resume_ckpt)
-        ckpt = torch.load(resume_ckpt, map_location=device)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        if "scheduler" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler"])
-        start_epoch = ckpt["epoch"]
-        log.info("Resumed at epoch %d", start_epoch)
-
-    # ------------------------------------------------------------------
-    # TensorBoard / CSV logging
-    # ------------------------------------------------------------------
-    try:
-        from torch.utils.tensorboard import SummaryWriter
-        writer = SummaryWriter(log_dir=output_dir / "runs")
-        use_tb = True
-    except ImportError:
-        writer = None
-        use_tb = False
-        log.warning("TensorBoard not available — writing training_log.csv only.")
-
-    # Persist model config before training so generate.py can reconstruct
-    # the exact architecture even if training is interrupted.
-    model_config = {
-        "kmer_embed_dim": kmer_embed_dim,
-        "hidden_dim":     hidden_dim,
-        "meth_proj_dim":  meth_proj_dim,
-    }
-    with open(output_dir / "model_config.json", "w") as f:
-        json.dump(model_config, f, indent=2)
-
-    csv_path = output_dir / "training_log.csv"
-
-    # ------------------------------------------------------------------
-    # Training loop
-    # ------------------------------------------------------------------
-    log.info(
-        "Starting MLP training — %d epochs, loss=%s, lr=%.2e",
-        epochs, loss_name, lr,
-    )
-    log.info(
-        "  batch_size=%d  embed_dim=%d  hidden=%d  meth_proj_dim=%d",
-        batch_size, kmer_embed_dim, hidden_dim, meth_proj_dim,
-    )
-
-    csv_file = open(csv_path, "a", newline="")
-    try:
-        csv_writer = csv.writer(csv_file)
-        if start_epoch == 0:
-            csv_writer.writerow([
-                "epoch", "train_loss",
-                "val_mse_ipd", "val_mse_pw",
-                "val_mae_ipd", "val_mae_pw",
-                "val_pearson_ipd", "val_pearson_pw",
-                "val_calib_ipd", "val_calib_pw",
-                "lr",
-            ])
-
-        prev_lr = optimizer.param_groups[0]["lr"]
-
-        for epoch in range(start_epoch, epochs):
-            model.train()
-            total_loss = 0.0
-
-            for kmer_ids, meth_probs, signals in train_loader:
-                kmer_ids   = kmer_ids.to(device)
-                meth_probs = meth_probs.to(device)
-                signals    = signals.to(device)
-
-                optimizer.zero_grad()
-                params = model(kmer_ids, meth_probs)
-                loss   = loss_fn(params, signals)
-                loss.backward()
-                optimizer.step()
-
-                total_loss += loss.item()
-
-            avg_train_loss = total_loss / len(train_loader)
-
-            # Validate and step the LR scheduler
-            val_metrics = _compute_metrics(model, val_loader, device)
-            scheduler.step(val_metrics["mse_ipd"] + val_metrics["mse_pw"])
-
-            current_lr = optimizer.param_groups[0]["lr"]
-
-            # Log LR reduction manually (verbose=True was removed in PyTorch 2.1+)
-            if current_lr < prev_lr:
-                log.info("LR reduced: %.2e → %.2e", prev_lr, current_lr)
-                prev_lr = current_lr
-
-            log.info(
-                "Epoch [%3d/%d]  train_loss=%.4f  "
-                "val_mse=(%.4f, %.4f)  pearson=(%.3f, %.3f)  "
-                "calib=(%.1f%%, %.1f%%)  lr=%.2e",
-                epoch + 1, epochs, avg_train_loss,
-                val_metrics["mse_ipd"], val_metrics["mse_pw"],
-                val_metrics["pearson_ipd"], val_metrics["pearson_pw"],
-                val_metrics["calibration_ipd"] * 100,
-                val_metrics["calibration_pw"]  * 100,
-                current_lr,
+        log.info("Loading weights from: %s", resume_ckpt)
+        ckpt = torch.load(resume_ckpt, map_location="cpu", weights_only=False)
+        if "model" in ckpt:
+            # Legacy format: direct MLPPredictor state dict (no "model." prefix)
+            model.load_state_dict(ckpt["model"])
+        elif "state_dict" in ckpt:
+            # Lightning format: strip "model." prefix added by KineticPredictor wrapper
+            state_dict = {
+                k[len("model."):]: v
+                for k, v in ckpt["state_dict"].items()
+                if k.startswith("model.")
+            }
+            model.load_state_dict(state_dict)
+        else:
+            raise ValueError(
+                f"Unrecognized checkpoint format in {resume_ckpt}.\n"
+                "Expected 'model' key (legacy) or 'state_dict' key (Lightning)."
             )
+        log.info("Weights loaded.")
 
-            # TensorBoard
-            if use_tb:
-                writer.add_scalar("Loss/train", avg_train_loss, epoch + 1)
-                for k, v in val_metrics.items():
-                    writer.add_scalar(f"Val/{k}", v, epoch + 1)
-                writer.add_scalar("LR", current_lr, epoch + 1)
+    lm = KineticPredictor(model, lr=lr, loss_name=loss_name)
+    dm = KineticDataModule(
+        pkl_path=pkl_path,
+        val_fraction=val_fraction,
+        batch_size=batch_size,
+    )
 
-            # CSV — flush after every epoch so partial results survive a crash
-            csv_writer.writerow([
-                epoch + 1, avg_train_loss,
-                val_metrics["mse_ipd"],        val_metrics["mse_pw"],
-                val_metrics["mae_ipd"],        val_metrics["mae_pw"],
-                val_metrics["pearson_ipd"],    val_metrics["pearson_pw"],
-                val_metrics["calibration_ipd"], val_metrics["calibration_pw"],
-                current_lr,
-            ])
-            csv_file.flush()
+    # ── Callbacks ─────────────────────────────────────────────────────────
+    early_stop = EarlyStopping(monitor="val_loss", patience=10, mode="min")
+    lightning_ckpt = ModelCheckpoint(
+        dirpath=str(output_dir / "lightning_ckpts"),
+        filename="ckpt-{epoch:03d}-{val_loss:.4f}",
+        monitor="val_loss",
+        mode="min",
+        save_top_k=3,
+        save_last=True,
+    )
+    legacy_ckpt = LegacyCheckpointCallback(
+        output_dir=output_dir,
+        checkpoint_every=checkpoint_every,
+    )
 
-            # Checkpoint — include scheduler state for clean resume
-            if (epoch + 1) % checkpoint_every == 0 or (epoch + 1) == epochs:
-                ckpt_path = output_dir / f"checkpoint_epoch{epoch + 1}.pt"
-                torch.save({
-                    "epoch":     epoch + 1,
-                    "model":     model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                }, ckpt_path)
-                log.info("Checkpoint saved: %s", ckpt_path)
+    # ── Loggers ───────────────────────────────────────────────────────────
+    loggers: list = [CSVLogger(str(output_dir), name="logs")]
+    try:
+        from torch.utils.tensorboard import SummaryWriter  # noqa: F401
+        loggers.append(TensorBoardLogger(str(output_dir), name="runs"))
+    except ImportError:
+        log.warning("TensorBoard not available — CSV logger only.")
 
-    finally:
-        csv_file.close()
-        if use_tb:
-            writer.close()
+    # ── Trainer ───────────────────────────────────────────────────────────
+    trainer = L.Trainer(
+        max_epochs=epochs,
+        accelerator=accelerator,
+        devices=1,
+        gradient_clip_val=0.5,
+        callbacks=[early_stop, lightning_ckpt, legacy_ckpt],
+        logger=loggers,
+        log_every_n_steps=1,
+        enable_progress_bar=True,
+        enable_model_summary=True,
+    )
 
+    trainer.fit(lm, datamodule=dm)
     log.info("Training complete. Outputs in: %s", output_dir)
 
 
@@ -413,7 +659,7 @@ def train_mlp(
 
 def main(argv: list[str] | None = None) -> None:
     import argparse
-    from ...config import setup_logging, load_yaml_config
+    from ...config import load_yaml_config, setup_logging
 
     parser = argparse.ArgumentParser(
         prog="kinsim train --model mlp",
@@ -425,7 +671,9 @@ def main(argv: list[str] | None = None) -> None:
             "The .pkl maps (kmer_id, meth_id) -> np.ndarray(N, 2) [IPD, PW].\n"
             "MLP and cGAN share the same data pipeline — no separate extraction.\n\n"
             "All flags may be specified in a YAML config file (--config).\n"
-            "Command-line flags override YAML values."
+            "Command-line flags override YAML values.\n\n"
+            "Optuna HPO:\n"
+            "  kinsim train --model mlp master.pkl ckpts/ --optuna --n-trials 20"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -434,39 +682,58 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("output_dir", nargs="?", default=None,
                         help="Directory for checkpoints and logs")
 
-    parser.add_argument("--config",          default=None,
-                        help="YAML config file — all flags can be set here for reproducibility")
-    parser.add_argument("--epochs",          type=int,   default=None,  help="Training epochs (default: 50)")
-    parser.add_argument("--batch-size",      type=int,   default=None,  help="Batch size (default: 4096)")
-    parser.add_argument("--lr",              type=float, default=None,  help="Learning rate (default: 1e-3)")
-    parser.add_argument("--kmer-embed-dim",  type=int,   default=None,  help="11-mer embedding dimension (default: 64; use 32 for ~0.5 GB RAM)")
-    parser.add_argument("--hidden-dim",      type=int,   default=None,  help="Hidden layer width (default: 128)")
-    parser.add_argument("--meth-proj-dim",   type=int,   default=None,  help="Methylation linear projection output dim (default: 8)")
-    parser.add_argument("--loss",            default=None,
+    # Training hyperparameters
+    parser.add_argument("--config",           default=None,
+                        help="YAML config file — all flags can be set here")
+    parser.add_argument("--epochs",           type=int,   default=None,
+                        help="Training epochs (default: 50)")
+    parser.add_argument("--batch-size",       type=int,   default=None,
+                        help="Batch size (default: 4096)")
+    parser.add_argument("--lr",               type=float, default=None,
+                        help="Learning rate (default: 1e-3)")
+    parser.add_argument("--kmer-embed-dim",   type=int,   default=None,
+                        help="11-mer embedding dimension (default: 64; use 32 for ~0.5 GB RAM)")
+    parser.add_argument("--hidden-dim",       type=int,   default=None,
+                        help="Hidden layer width (default: 128)")
+    parser.add_argument("--meth-proj-dim",    type=int,   default=None,
+                        help="Methylation linear projection output dim (default: 8)")
+    parser.add_argument("--dropout",          type=float, default=None,
+                        help="Dropout probability after each LeakyReLU (default: 0.0 = disabled). "
+                             "Try 0.1–0.3 when LayerNorm alone doesn't prevent overfitting.")
+    parser.add_argument("--loss",             default=None,
                         choices=["gnll", "mse", "huber"],
                         help="Loss function: gnll=Gaussian NLL (default), mse, huber")
-    parser.add_argument("--val-fraction",    type=float, default=None,  help="Fraction for validation split (default: 0.10)")
-    parser.add_argument("--checkpoint-every",type=int,   default=None,  help="Save checkpoint every N epochs (default: 10)")
-    parser.add_argument("--device",          default=None,
+    parser.add_argument("--val-fraction",     type=float, default=None,
+                        help="Fraction for validation split (default: 0.10)")
+    parser.add_argument("--checkpoint-every", type=int,   default=None,
+                        help="Save legacy checkpoint every N epochs (default: 10)")
+    parser.add_argument("--device",           default=None,
                         choices=["cuda", "cpu"],
                         help="Device (default: cuda, falls back to cpu automatically)")
-    parser.add_argument("--resume",          dest="resume_ckpt",        help="Resume from a previous checkpoint .pt file")
-    parser.add_argument("--verbose", "-v",   action="store_true",       help="Enable DEBUG-level logging")
+    parser.add_argument("--resume",           dest="resume_ckpt",
+                        help="Resume weights from a checkpoint .pt or .ckpt file")
+
+    # Optuna HPO flags
+    parser.add_argument("--optuna",           action="store_true",
+                        help="Run Optuna HPO before the final training run")
+    parser.add_argument("--n-trials",         type=int,   default=None,
+                        help="Number of Optuna trials (default: 20)")
+    parser.add_argument("--optuna-epochs",    type=int,   default=None,
+                        help="Epochs per Optuna trial (default: 20, shorter than --epochs)")
+
+    parser.add_argument("--verbose", "-v",    action="store_true",
+                        help="Enable DEBUG-level logging")
 
     args = parser.parse_args(argv)
     setup_logging(verbose=args.verbose)
 
-    # ---- Merge YAML config (if provided) with CLI flags ----
-    # Precedence: CLI flags > YAML > hard-coded defaults
+    # Merge YAML config with CLI flags — precedence: CLI > YAML > hard-coded defaults
     cfg: dict = {}
     if args.config:
         cfg = load_yaml_config(args.config)
 
     def _get(cli_val, key, default):
-        """Return CLI value if given, else YAML value, else default."""
-        if cli_val is not None:
-            return cli_val
-        return cfg.get(key, default)
+        return cli_val if cli_val is not None else cfg.get(key, default)
 
     pkl_path   = args.pkl        or cfg.get("pkl")
     output_dir = args.output_dir or cfg.get("output_dir")
@@ -485,11 +752,15 @@ def main(argv: list[str] | None = None) -> None:
         kmer_embed_dim   = _get(args.kmer_embed_dim,  "kmer_embed_dim",  64),
         hidden_dim       = _get(args.hidden_dim,      "hidden_dim",      128),
         meth_proj_dim    = _get(args.meth_proj_dim,   "meth_proj_dim",   8),
+        dropout          = _get(args.dropout,         "dropout",         0.0),
         loss_name        = _get(args.loss,            "loss",            "gnll"),
         val_fraction     = _get(args.val_fraction,    "val_fraction",    0.10),
         checkpoint_every = _get(args.checkpoint_every,"checkpoint_every",10),
         device           = _get(args.device,          "device",          "cuda"),
         resume_ckpt      = args.resume_ckpt or cfg.get("resume"),
+        run_optuna       = args.optuna or cfg.get("optuna", False),
+        n_trials         = _get(args.n_trials,        "n_trials",        20),
+        optuna_epochs    = _get(args.optuna_epochs,   "optuna_epochs",   20),
     )
 
 

@@ -7,10 +7,17 @@ Data format
 -----------
 Each shard is a pickle file containing:
 
-    dict[(kmer_id: int, meth_id: int)] -> np.ndarray(N, 2)
+    dict[(kmer_id: int, meth_id: int)] -> np.ndarray(N, 3)
 
-where columns are [IPD, PW] as raw float32 values read from the fi/fp BAM
-tags.  Shards from multiple BAMs are combined in the merge step.
+where columns are [IPD, PW, fraction] as raw float32 values.  IPD and PW are
+read from the fi/fp BAM tags (uint8 [0, 255]).  The third column is the
+stoichiometric methylation fraction from the motif source (e.g., PacBio
+motifs.csv 'fraction' column).  For motifs without an explicit fraction,
+the value defaults to 1.0 (fully methylated); for unmethylated positions
+(meth_id = 0) the fraction is 0.0.
+
+Backward compatibility: older shards may have only 2 columns [IPD, PW].
+Dataset classes (common/dataset.py) handle both formats transparently.
 
 A special metadata key ``"__meta__"`` (string, not a tuple) may be present
 in any shard or master .pkl.  It holds provenance information (version,
@@ -104,6 +111,42 @@ def validate_bam_kinetics(bam_path: str, n_check: int = 10) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Fraction lookup from motif string
+# ---------------------------------------------------------------------------
+
+def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
+    """Parse the motif string to build a meth_id → fraction lookup.
+
+    The motif string format is "m6A,GATC,1[,nDetected[,fraction]];..."
+    When PacBio motifs.csv is the source, parse_motifs_csv preserves the
+    fraction as the 5th field.  For plain motif strings without a fraction
+    field, defaults to 1.0 (fully methylated).
+
+    If multiple motifs share the same meth_id (e.g., two m6A motifs with
+    different fractions), the last one wins.  This is acceptable because
+    the kmer embedding already distinguishes different motif contexts.
+
+    Returns:
+        dict mapping meth_id → float fraction.  Always includes {0: 0.0}.
+    """
+    from ..encoding import METH_IDS
+
+    fracs: dict[int, float] = {0: 0.0}
+    if not motif_string:
+        return fracs
+    for entry in motif_string.split(';'):
+        if not entry or ',' not in entry:
+            continue
+        parts = entry.split(',')
+        if len(parts) < 3:
+            continue
+        m_id = METH_IDS.get(parts[0], 0)
+        frac = float(parts[4]) if len(parts) >= 5 else 1.0
+        fracs[m_id] = frac
+    return fracs
+
+
+# ---------------------------------------------------------------------------
 # Extract: raw samples from one BAM file
 # ---------------------------------------------------------------------------
 
@@ -144,13 +187,14 @@ def extract_samples_from_bam(
 
     Returns:
         dict with:
-          - tuple keys ``(kmer_id, meth_id)`` → ``np.ndarray(N, 2)`` [IPD, PW]
+          - tuple keys ``(kmer_id, meth_id)`` → ``np.ndarray(N, 3)`` [IPD, PW, fraction]
           - ``"__meta__"``                     → dict with provenance metadata
     """
     validate_bam_kinetics(bam_path)
 
     mid    = K // 2   # Centre position of the 11-mer window (= 5)
     motifs = parse_motifs(motif_string, revcomp=revcomp)
+    frac_lookup = _build_fraction_lookup(motif_string)
 
     samples: dict = defaultdict(list)
     counts:  dict = defaultdict(int)   # total observations seen per key
@@ -181,19 +225,21 @@ def extract_samples_from_bam(
 
                 if i >= K - 1:
                     center  = i - mid
-                    key     = (current_kmer, int(meth_status[center]))
+                    meth_id = int(meth_status[center])
+                    key     = (current_kmer, meth_id)
                     ipd_val = float(ipds[center])
                     pw_val  = float(pws[center])
+                    frac    = frac_lookup.get(meth_id, 0.0)
 
                     counts[key] += 1
                     n = counts[key]
                     if n <= max_samples_per_key:
-                        samples[key].append([ipd_val, pw_val])
+                        samples[key].append([ipd_val, pw_val, frac])
                     else:
                         # Reservoir sampling: replace a random existing entry
                         j = np.random.randint(0, n)
                         if j < max_samples_per_key:
-                            samples[key][j] = [ipd_val, pw_val]
+                            samples[key][j] = [ipd_val, pw_val, frac]
 
             # --- Reverse strand: slide RC 11-mer window, collect ri/rp ---
             #
@@ -225,18 +271,20 @@ def extract_samples_from_bam(
                             rc_center  = j - mid
                             fwd_center = min_rev_len - 1 - rc_center
 
-                            rc_key = (rc_kmer, int(rev_meth_status[rc_center]))
+                            rc_meth_id = int(rev_meth_status[rc_center])
+                            rc_key = (rc_kmer, rc_meth_id)
                             ri_val = float(ri_tags[fwd_center])
                             rp_val = float(rp_tags[fwd_center])
+                            frac   = frac_lookup.get(rc_meth_id, 0.0)
 
                             counts[rc_key] += 1
                             n = counts[rc_key]
                             if n <= max_samples_per_key:
-                                samples[rc_key].append([ri_val, rp_val])
+                                samples[rc_key].append([ri_val, rp_val, frac])
                             else:
                                 j2 = np.random.randint(0, n)
                                 if j2 < max_samples_per_key:
-                                    samples[rc_key][j2] = [ri_val, rp_val]
+                                    samples[rc_key][j2] = [ri_val, rp_val, frac]
 
             n_reads_processed += 1
 

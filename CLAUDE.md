@@ -31,6 +31,14 @@ KinSim/
 │   ├── prepare.py                  kinsim prepare — validates BAM/motif config files
 │   ├── config.py                   manifest CSV loader, YAML config, logging setup
 │   │
+│   ├── callers/                    methylation caller output parsers (read-only)
+│   │   ├── __init__.py             exports: BaseOutputParser, create_parser, list_parsers, auto_detect_parser
+│   │   ├── base.py                 BaseOutputParser ABC
+│   │   ├── registry.py             @register decorator, create_parser(), auto_detect_parser()
+│   │   ├── pacbio.py               PacBioParser — motifs.csv with variable columns
+│   │   ├── modkit.py               ModkitParser — modkit pileup --bedMethyl TSV
+│   │   └── ipd_summary.py          IpdSummaryParser — ipdSummary CSV/GFF3
+│   │
 │   ├── common/                     shared data pipeline (used by MLP and cGAN)
 │   │   ├── __init__.py
 │   │   ├── dataset.py              log_transform, inv_log_transform, KmerSignalDataset, MLPSignalDataset
@@ -53,8 +61,9 @@ KinSim/
 │       └── mlp/
 │           ├── __init__.py
 │           ├── model.py            MLPPredictor (Gaussian NLL head)
-│           ├── train.py            supervised training loop
-│           └── generate.py         BAM generation with trained MLPPredictor
+│           ├── train.py            supervised training loop (Lightning + Optuna)
+│           ├── generate.py         BAM generation with trained MLPPredictor
+│           └── evaluate.py         calibration report + per-kmer distribution plots
 │
 ├── slurm_kinsim/                   HPC SLURM job scripts
 │   ├── kinsim_pipeline.sh          master script (mode: dictionary | cgan | mlp)
@@ -104,7 +113,7 @@ reverse_complement(seq)                    # IUPAC-aware
 parse_motifs(motif_string, revcomp=True)   # "m6A,GATC,1;..." → list of dicts
 scan_sequence(seq, motifs) -> np.int8[]   # per-base methylation ID array
 parse_motifs_csv(path, min_fraction=0.40)  # PacBio motifs.csv → KinSim string
-load_motif_string(arg, ...)                # auto-detect: string | .csv | REBASE | per-species file
+load_motif_string(arg, ..., parser_name=None)  # auto-detect or explicit parser from callers registry
 build_reference_meth_map(ref_seqs, motif_string)  # genome-wide O(1) lookup array
 ```
 
@@ -119,8 +128,44 @@ Converts REBASE notation (1-based) to KinSim notation (0-based).
 parse_rebase_annotation(recognition_seq, meth_annotation) -> list[str]
 parse_rebase_simple(filepath)       # 2-column TSV format
 parse_rebase_withrefm(filepath)     # Format #19 tagged fields (RS=, MS=)
+parse_rebase_isoschizomers(filepath) -> dict[str, list[str]]  # motif → [enzyme_IDs]
 write_fuzznuc_pattern_file(motif_string, filepath) -> dict  # for EMBOSS fuzznuc
 ```
+
+### `kinsim/callers/`
+Read-only parsing library for methylation caller output files. Plugin registry
+with `@register` decorator — adding a new format = one file + `@register` class.
+
+```python
+from kinsim.callers import create_parser, list_parsers, auto_detect_parser
+
+# Explicit parser
+parser = create_parser("pacbio")       # or "modkit", "ipd_summary"
+motif_string = parser.parse("motifs.csv", min_fraction=0.40, min_detected=20)
+
+# Auto-detect from file content
+parser = auto_detect_parser("output.bed")
+
+# List registered parsers
+list_parsers()  # ['ipd_summary', 'modkit', 'pacbio']
+```
+
+**BaseOutputParser ABC** (`base.py`):
+- `name: ClassVar[str]` — registry key
+- `supported_mods: ClassVar[list[str]]` — mod types this format carries
+- `parse(filepath, min_fraction, min_detected) -> str` — file → motif string
+- `is_file_for_this_parser(filepath) -> bool` — heuristic for auto-detection
+
+**PacBioParser** (`pacbio.py`): Handles motifs.csv with variable columns.
+Required: `motifString`, `centerPos`. Optional: `modificationType`, `fraction`, `nDetected`.
+Missing `modificationType` → inferred from base at centerPos (A→m6A, C→m4C).
+
+**ModkitParser** (`modkit.py`): Handles modkit pileup `--bedMethyl` TSV (11+ columns).
+
+**IpdSummaryParser** (`ipd_summary.py`): Auto-detects CSV vs GFF3 from ipdSummary.
+
+**Integration**: `load_motif_string()` in `motifs.py` accepts optional `parser_name` kwarg.
+When provided, bypasses auto-detection and uses the named parser from the registry.
 
 ### `kinsim/config.py`
 Manifest CSV parsing, YAML config loading, and logging setup.
@@ -164,20 +209,26 @@ log_transform(x: Tensor) -> Tensor      # log1p — raw [0,255] → training spa
 inv_log_transform(x: Tensor) -> Tensor  # expm1 clamped to [0,255] — inference
 
 class KmerSignalDataset(Dataset):
-    # Input:  dict[(kmer_id, meth_id)] -> np.ndarray(N, 2)  raw IPD/PW
+    # Input:  dict[(kmer_id, meth_id)] -> np.ndarray(N, 2 or 3)
     # Output: (kmer_id: long, meth_id: long, signal: float32 in log1p)
+    # Uses only [IPD, PW] columns (fraction ignored — cGAN uses integer meth_id)
     # log_transform applied once at load time, not per-epoch
 
 class MLPSignalDataset(Dataset):
-    # Input:  same dict format as above
+    # Input:  dict[(kmer_id, meth_id)] -> np.ndarray(N, 3) [IPD, PW, fraction]
     # __len__ = number of unique (kmer_id, meth_id) keys
-    # __getitem__ draws ONE random (IPD, PW) per key (random-shot sampling)
-    # meth output = Float[4] one-hot vector (not integer id)
+    # __getitem__ draws ONE random (IPD, PW, fraction) per key (random-shot)
+    # meth output = Float[4] stoichiometric vector (NOT one-hot):
+    #   meth_id=0 → [0, 0, 0, 0]  (no methylation signal)
+    #   meth_id=1, fraction=0.75 → [0, 0.75, 0, 0]
     # dynamic capping: meth_id=0 → max 20 samples; meth_id∈{1,2,3} → max 100
+    # Backward compat: 2-column .pkl → fraction defaults to 1.0 (meth) / 0.0 (unmeth)
 ```
 
 **Raw values are stored in .pkl files** (not log-transformed). The transform happens
 inside the dataset class. This allows inspection and different model-specific transforms.
+The third column (fraction) is the stoichiometric methylation fraction from PacBio
+motifs.csv (default 1.0 when not available).
 
 ### `kinsim/common/extract.py`
 The data preparation pipeline shared by all neural modes.
@@ -191,8 +242,10 @@ extract_samples_from_bam(bam_path, motif_string, max_samples_per_key=10000, revc
     # calls validate_bam_kinetics first
     # sliding 11-mer window → encode_kmer() → kmer_id
     # scan_sequence() → meth_id per position
+    # _build_fraction_lookup(motif_string) → {meth_id: fraction} from motif string field 5
     # reservoir sampling (capped at max_samples_per_key per (kmer, meth) key)
-    # returns dict with (kmer_id, meth_id) tuple keys + "__meta__" provenance key
+    # returns dict with (kmer_id, meth_id) tuple keys → np.ndarray(N, 3) [IPD, PW, fraction]
+    #   + "__meta__" provenance key
 
 merge_shards(input_dir, output_file, max_samples_per_key=50000, glob_pattern="auto")
     # "auto" tries *_shard.pkl (new) then *_cgan.pkl (legacy)
@@ -271,14 +324,18 @@ Do not add logic here.
 
 ```python
 class MLPPredictor(nn.Module):
-    # kmer_embed_dim=64, hidden_dim=128
-    # forward(kmer_ids, meth_ids) -> (batch, 4)
+    # kmer_embed_dim=64, hidden_dim=128, meth_proj_dim=8, dropout=0.0
+    # Methylation input: nn.Linear(4, meth_proj_dim, bias=False)
+    #   accepts Float[batch, 4] stoichiometric probability vector (not integer id)
+    #   e.g. m6A at 75% → [0, 0.75, 0, 0]; unmethylated → [0, 0, 0, 0]
+    #
+    # forward(kmer_ids, meth_probs) -> (batch, 4)
     #   [:, 0:2] = [μ_ipd, μ_pw]        in log1p space
     #   [:, 2:4] = [log_σ_ipd, log_σ_pw]
     #
     # @torch.no_grad()
-    # sample(kmer_ids, meth_ids) -> (batch, 2)  stochastic, values in [0,255]
-    # predict_mean(kmer_ids, meth_ids) -> (batch, 2)  deterministic, values in [0,255]
+    # sample(kmer_ids, meth_probs) -> (batch, 2)  stochastic, values in [0,255]
+    # predict_mean(kmer_ids, meth_probs) -> (batch, 2)  deterministic, values in [0,255]
 ```
 
 `log_σ` is clamped to [-6, 3] in `sample()` for numerical stability.
@@ -301,9 +358,16 @@ Example: `kinsim train --model mlp --config config_mlp.yaml --epochs 100`
 Mirrors `cgan/generate.py`. Key difference: no noise vector.
 
 ```python
-generate_signals_batch(model, kmer_ids, meth_ids, device, deterministic=False)
+generate_signals_batch(model, kmer_ids, meth_ids, fractions, device, deterministic=False)
+    # Builds stoichiometric meth_probs from (meth_id, fraction) pairs via scatter_()
+    # e.g. meth_id=1, fraction=0.75 → meth_probs = [0, 0.75, 0, 0]
     # deterministic=False → model.sample()       (default, stochastic)
     # deterministic=True  → model.predict_mean() (same result every run)
+
+_build_fraction_lookup(motif_string) -> dict[int, float]
+    # Parses motif string field 5 (fraction) into {meth_id: fraction} dict
+    # Defaults to 1.0 when fraction field absent; meth_id=0 always maps to 0.0
+    # Used in both generate.py and extract.py
 ```
 
 `_load_model(checkpoint_path, device)` reads `model_config.json` and hard-errors if missing.
@@ -321,7 +385,9 @@ Real PacBio BAMs + Manifest CSV (sample_id, bam_path, motifs)
       │  validate_bam_kinetics() — fail-fast before extraction loop
       │  sliding 11-mer → encode_kmer → kmer_id
       │  scan_sequence → meth_id per position
+      │  _build_fraction_lookup → meth_id → stoichiometric fraction
       │  reservoir sampling → cap 10,000 per (kmer, meth)
+      │  stores [IPD, PW, fraction] per sample (3 columns)
       │  writes shards/<sample_id>_shard.pkl  (includes __meta__ provenance)
       ▼
 strain1_shard.pkl  strain2_shard.pkl  ...
@@ -331,7 +397,7 @@ strain1_shard.pkl  strain2_shard.pkl  ...
       ▼
 master_data.pkl
     "__meta__": {kinsim_version, merged_from, created, ...}
-    (kmer_id, meth_id) → np.ndarray(N, 2)  [IPD, PW] raw
+    (kmer_id, meth_id) → np.ndarray(N, 3)  [IPD, PW, fraction] raw
       │
       ├──▶  kinsim train --model mlp  [--config config_mlp.yaml]
       │         → checkpoint.pt + model_config.json + training_log.csv
@@ -420,6 +486,7 @@ kinsim cgan generate         → kinsim/models/cgan/generate.py    main(...)
 
 kinsim mlp train             → kinsim/models/mlp/train.py        main(...)
 kinsim mlp generate          → kinsim/models/mlp/generate.py     main(...)
+kinsim mlp evaluate          → kinsim/models/mlp/evaluate.py     main(...)
 ```
 
 Typo suggestions via `difflib.get_close_matches` in `__main__.py`.
@@ -464,7 +531,8 @@ torch.save({
 ### Signal Space
 - **Training**: always in log1p space (`log_transform` applied by `KmerSignalDataset`).
 - **Inference**: model outputs in log1p space → `inv_log_transform` → uint8 [0, 255].
-- **Storage (.pkl)**: raw values (not transformed) — transforms are model-specific.
+- **Storage (.pkl)**: raw values (not transformed) + stoichiometric fraction column.
+  Format: `np.ndarray(N, 3)` with columns [IPD, PW, fraction]. Legacy 2-col supported.
 - **Metadata**: every .pkl has a `"__meta__"` string key with provenance. Dataset classes skip it.
 
 ### SLURM Scripts
@@ -489,6 +557,7 @@ torch.save({
 - **Do not** add a new mode without adding a corresponding entry to `__main__.py` and `kinsim_pipeline.sh`.
 - **Do not** hardcode `kmer_embed_dim` or `hidden_dim` in `generate.py` — always read from `model_config.json` and hard-error if missing.
 - **Do not** use `..encoding` or `..motifs` from within `models/cgan/` or `models/mlp/` — use 3 dots (`...`).
+- **Do not** modify `motifs.py` for stoichiometric fraction handling — fractions are parsed from the motif string at the storage level (`_build_fraction_lookup` in `extract.py` and `generate.py`), not in the motif scanning code.
 
 ---
 

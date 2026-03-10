@@ -31,3 +31,11 @@ device: cuda               # cuda | cpu  (auto-falls-back to cpu if no GPU)
 
 # ---- Resume (optional) ----
 # resume: /data/projects/p774/kinsim/checkpoints_mlp/checkpoint_epoch25.pt
+
+# ---- Optuna HPO (optional) ----
+# Set optuna: true to run hyperparameter search before the final training run.
+# Searches over: lr (log-uniform 1e-4..1e-2), kmer_embed_dim (32,64), hidden_dim (128,256,512).
+# Best values override lr / kmer_embed_dim / hidden_dim above.
+# optuna:        false    # set to true to enable HPO
+# n_trials:      20       # number of Optuna trials
+# optuna_epochs: 20       # epochs per trial (shorter than 'epochs')
