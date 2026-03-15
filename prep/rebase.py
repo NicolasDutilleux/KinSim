@@ -560,10 +560,33 @@ def _find_table_end(html: str, table_start: int) -> int:
     return len(html)
 
 
+def _is_palindromic(motif: str) -> bool:
+    """True if the IUPAC motif is its own reverse complement."""
+    from kinsim.utils.motifs import reverse_complement
+    return reverse_complement(motif.upper()) == motif.upper()
+
+
+def _rc_offset(motif: str, offset: int) -> int:
+    """Compute the 0-based offset of the methylated base on the RC strand.
+
+    For a motif of length L with methylated base at position P:
+    the complementary base is at position (L - 1 - P) in the RC string.
+    """
+    return len(motif) - 1 - offset
+
+
 def _parse_active_mtases_table(html: str,
                                 color_to_meth: dict[str, str]) -> list[dict]:
-    """Parse the 'MTases active in the genome' table and return entry dicts."""
+    """Parse the 'MTases active in the genome' table and return entry dicts.
+
+    For non-palindromic motifs (% Detected shows two values like "86.4/85.0"),
+    generates TWO entries: one for the top strand and one for the reverse
+    complement, each with its own fraction and offset.
+
+    For palindromic motifs (% Detected shows one value), generates one entry.
+    """
     from .motif_merge import _make_entry
+    from kinsim.utils.motifs import reverse_complement
 
     marker = 'MTases active in the genome'
     idx = html.find(marker)
@@ -631,40 +654,74 @@ def _parse_active_mtases_table(html: str,
             except (ValueError, AttributeError):
                 pass
 
-        # % Detected -> fraction (average of two values for non-palindromic)
-        fraction: float | str = ''
+        # % Detected -> parse top/bottom fractions separately
+        pct_parts: list[float] = []
         if col_pct < len(cells):
-            parts = texts[col_pct].split('/')
+            raw = texts[col_pct].split('/')
             try:
-                vals = [float(p.strip()) / 100.0 for p in parts if p.strip()]
-                if vals:
-                    fraction = round(sum(vals) / len(vals), 7)
+                pct_parts = [float(p.strip()) / 100.0 for p in raw if p.strip()]
             except ValueError:
                 pass
 
-        # Estimate nGenome = round(nDetected / fraction)
-        n_genome: int | str = ''
-        if isinstance(n_detected, int) and isinstance(fraction, float) and fraction > 0:
-            n_genome = round(n_detected / fraction)
+        is_palindrome = _is_palindromic(motif_str)
+        two_strand = len(pct_parts) == 2
 
         # Coverage -> meanCoverage
         mean_coverage: float | str = ''
         if col_coverage < len(cells):
+            cov_parts = texts[col_coverage].split('/')
             try:
-                mean_coverage = float(texts[col_coverage])
-            except (ValueError, AttributeError):
+                mean_coverage = round(
+                    sum(float(p.strip()) for p in cov_parts if p.strip()) / len(cov_parts),
+                    1,
+                )
+            except (ValueError, ZeroDivisionError):
                 pass
+
+        # ---- Top strand entry ----
+        frac_top = round(pct_parts[0], 7) if pct_parts else ''
+        n_genome_top: int | str = ''
+        if isinstance(n_detected, int) and isinstance(frac_top, float) and frac_top > 0:
+            n_genome_top = round(n_detected / frac_top)
+
+        rc_motif = reverse_complement(motif_str)
+        partner  = rc_motif if not is_palindrome else motif_str
 
         entries.append(_make_entry(
             motif_str=motif_str,
             offset=center_pos,
             mod_type=mod_type,
-            fraction=fraction,
+            fraction=frac_top,
             n_detected=n_detected,
-            n_genome=n_genome,
+            n_genome=n_genome_top,
             mean_coverage=mean_coverage,
             source='rebase',
         ))
+        log.info("  [TOP]  %s offset=%d %s  frac=%.3f  palindromic=%s",
+                 motif_str, center_pos, mod_type,
+                 frac_top if isinstance(frac_top, float) else 0,
+                 is_palindrome)
+
+        # ---- Reverse complement entry (non-palindromic only) ----
+        if not is_palindrome and two_strand:
+            rc_offset = _rc_offset(motif_str, center_pos)
+            frac_bot  = round(pct_parts[1], 7)
+            n_genome_bot: int | str = ''
+            if isinstance(n_detected, int) and frac_bot > 0:
+                n_genome_bot = round(n_detected / frac_bot)
+
+            entries.append(_make_entry(
+                motif_str=rc_motif,
+                offset=rc_offset,
+                mod_type=mod_type,
+                fraction=frac_bot,
+                n_detected=n_detected,
+                n_genome=n_genome_bot,
+                mean_coverage=mean_coverage,
+                source='rebase',
+            ))
+            log.info("  [RC]   %s offset=%d %s  frac=%.3f  (complement of %s)",
+                     rc_motif, rc_offset, mod_type, frac_bot, motif_str)
 
     return entries
 
