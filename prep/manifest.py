@@ -2,20 +2,20 @@
 
 Provides three subcommands that operate on a manifest CSV:
 
-    kinsim manifest count    manifest.csv         — print the number of data rows
-    kinsim manifest validate manifest.csv          — check for errors (files, duplicates)
-    kinsim manifest list     manifest.csv          — tabular display of all entries
+    kinsim-prep manifest count    manifest.csv  -- print the number of data rows
+    kinsim-prep manifest validate manifest.csv  -- check for errors (files, duplicates)
+    kinsim-prep manifest list     manifest.csv  -- tabular display of all entries
 
 The ``count`` subcommand is designed to be used directly in shell scripts, for
 example when setting the SLURM array size::
 
-    N=$(kinsim manifest count manifest.csv)
+    N=$(kinsim-prep manifest count manifest.csv)
     sbatch --array=1-$N kinsim_extract.slurm manifest.csv shards/ master.pkl
 
-Using ``kinsim manifest count`` instead of ``grep -c .`` or ``wc -l`` is safer
-because it reuses the same Python logic as ``load_manifest()`` — it correctly
-skips comment rows (``#``), blank rows, and the header, matching exactly the
-row indices that ``kinsim extract --task N`` will use.
+Using ``kinsim-prep manifest count`` instead of ``grep -c .`` or ``wc -l`` is
+safer because it reuses the same Python logic as ``load_manifest()`` -- it
+correctly skips comment rows (``#``), blank rows, and the header, matching
+exactly the row indices that ``kinsim extract --task N`` will use.
 """
 
 import sys
@@ -23,10 +23,10 @@ import sys
 
 def main(argv=None) -> None:
     import argparse
-    from ..config import load_manifest, validate_manifest, setup_logging
+    from kinsim.config import load_manifest, validate_manifest, setup_logging
 
     parser = argparse.ArgumentParser(
-        prog="kinsim manifest",
+        prog="kinsim-prep manifest",
         description=(
             "Inspect and validate a KinSim manifest CSV.\n\n"
             "Manifest format:\n"
@@ -49,7 +49,7 @@ def main(argv=None) -> None:
         description=(
             "Count data rows in the manifest, skipping comment (#) and blank rows.\n\n"
             "Usage in SLURM scripts:\n"
-            "  N=$(kinsim manifest count manifest.csv)\n"
+            "  N=$(kinsim-prep manifest count manifest.csv)\n"
             "  sbatch --array=1-$N kinsim_extract.slurm manifest.csv shards/ master.pkl"
         ),
     )
@@ -88,17 +88,16 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
     setup_logging(verbose=args.verbose)
 
-    # ── count ──────────────────────────────────────────────────────────────────
+    # -- count --
     if args.subcommand == "count":
         try:
             entries = load_manifest(args.manifest)
         except (FileNotFoundError, ValueError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             sys.exit(1)
-        # Print just the integer — easy to capture in shell: N=$(kinsim manifest count ...)
         print(len(entries))
 
-    # ── validate ───────────────────────────────────────────────────────────────
+    # -- validate --
     elif args.subcommand == "validate":
         try:
             entries = load_manifest(args.manifest)
@@ -118,7 +117,7 @@ def main(argv=None) -> None:
                 print(f"  - {err}", file=sys.stderr)
             sys.exit(1)
 
-    # ── list ───────────────────────────────────────────────────────────────────
+    # -- list --
     elif args.subcommand == "list":
         try:
             entries = load_manifest(args.manifest)

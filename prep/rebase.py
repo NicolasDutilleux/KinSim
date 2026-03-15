@@ -29,17 +29,17 @@ import os
 import re
 import sys
 
-from ..encoding import METH_IDS
+from kinsim.encoding import METH_IDS
 
 log = logging.getLogger(__name__)
 
 # Regex to validate IUPAC-only recognition sequences
 _IUPAC_RE = re.compile(r'^[ACGTRYSWKMBDHVN]+$')
 
-# REBASE Y-code → KinSim mod type (used in simple X(Y) notation)
+# REBASE Y-code -> KinSim mod type (used in simple X(Y) notation)
 _REBASE_CODE_TO_METH = {'6': 'm6A', '5': 'm5C', '4': 'm4C'}
 
-# REBASE Format #19 MS type strings → KinSim mod type
+# REBASE Format #19 MS type strings -> KinSim mod type
 _REBASE_TYPE_TO_METH = {
     '6mA': 'm6A',
     '5mC': 'm5C',
@@ -85,7 +85,7 @@ def parse_rebase_annotation(recognition_seq, meth_annotation):
 
         meth_type = _REBASE_CODE_TO_METH.get(y)
         if meth_type is None:
-            log.warning("REBASE: unknown methylation code (%s) — skipped", y)
+            log.warning("REBASE: unknown methylation code (%s) -- skipped", y)
             continue
 
         if x > 0:
@@ -94,7 +94,7 @@ def parse_rebase_annotation(recognition_seq, meth_annotation):
             pos_0 = seq_len - abs(x)  # from 5' of complementary strand
 
         if not (0 <= pos_0 < seq_len):
-            log.warning("REBASE: position %d out of range for '%s' (len=%d) — skipped",
+            log.warning("REBASE: position %d out of range for '%s' (len=%d) -- skipped",
                         x, recognition_seq, seq_len)
             continue
 
@@ -131,13 +131,13 @@ def parse_rebase_simple(filepath):
                 continue
             parts = re.split(r'\s+', line, maxsplit=1)
             if len(parts) < 2:
-                log.warning("REBASE line %d: expected 2 columns, got %d — skipped",
+                log.warning("REBASE line %d: expected 2 columns, got %d -- skipped",
                             lineno, len(parts))
                 continue
             rec_seq = parts[0].upper()
             meth_ann = parts[1]
             if not _IUPAC_RE.match(rec_seq):
-                log.warning("REBASE line %d: invalid IUPAC sequence '%s' — skipped",
+                log.warning("REBASE line %d: invalid IUPAC sequence '%s' -- skipped",
                             lineno, rec_seq)
                 continue
             entries = parse_rebase_annotation(rec_seq, meth_ann)
@@ -185,10 +185,9 @@ def parse_rebase_withrefm(filepath):
 
                 if rec_seq and rec_seq != '?' and ms_raw and ms_raw != '?':
                     # Clean recognition sequence: remove cleavage site indicators
-                    # RS can be "GATC, 2;" or "G^AATTC" or "GATC"
                     rec_clean = re.sub(r'[^ACGTRYMKSWHBVDN]', '', rec_seq.upper())
                     if rec_clean and not _IUPAC_RE.match(rec_clean):
-                        log.warning("REBASE: invalid IUPAC in RS '%s' (enzyme %s) — skipped",
+                        log.warning("REBASE: invalid IUPAC in RS '%s' (enzyme %s) -- skipped",
                                     rec_seq, current.get('ID', '?'))
                         rec_clean = ''
                 if rec_clean:
@@ -197,7 +196,7 @@ def parse_rebase_withrefm(filepath):
                             typ = site_match.group(2)
                             meth_type = _REBASE_TYPE_TO_METH.get(typ)
                             if meth_type is None:
-                                log.warning("REBASE: unknown MS type '%s' (enzyme %s) — skipped",
+                                log.warning("REBASE: unknown MS type '%s' (enzyme %s) -- skipped",
                                             typ, current.get('ID', '?'))
                                 continue
 
@@ -215,14 +214,12 @@ def parse_rebase_withrefm(filepath):
                 continue
 
             # Tagged-field line: "ID   name" or "RS\tGATC, 2;"
-            # Fuzzy: accept 2+ spaces or tab as separator
             m = re.match(r'^(\w{2})\s{2,}(.+)', line)
             if not m and '\t' in line:
                 m = re.match(r'^(\w{2})\t(.+)', line)
             if m:
                 tag = m.group(1).strip()
                 val = m.group(2).strip()
-                # Only keep the last RS/MS per record (some entries repeat)
                 if tag in ('ID', 'RS', 'MS', 'ET'):
                     current[tag] = val
 
@@ -330,9 +327,6 @@ def parse_rebase_isoschizomers(filepath):
     Returns a dict mapping each unique recognition sequence (cleaned, uppercase
     IUPAC) to a deduplicated list of enzyme names (ID fields) that recognise it.
 
-    This is useful to list all enzymes associated with a given motif (e.g.,
-    GATC → ['DpnI', 'MalI', 'Sau3AI', ...]).
-
     Only processes Format #19 files.  Returns an empty dict for simplified
     two-column files.
 
@@ -340,7 +334,7 @@ def parse_rebase_isoschizomers(filepath):
         filepath: Path to a REBASE Format #19 file.
 
     Returns:
-        dict[str, list[str]]: recognition_seq → [enzyme_name, ...], no duplicates.
+        dict[str, list[str]]: recognition_seq -> [enzyme_name, ...], no duplicates.
     """
     iso_map: dict[str, list[str]] = {}
 
@@ -376,7 +370,7 @@ def parse_rebase_isoschizomers(filepath):
 
 
 # ---------------------------------------------------------------------------
-# REBASE web fetch (kinsim prep rebase fetch <org_num>)
+# REBASE web fetch (kinsim-prep rebase fetch <org_num>)
 # ---------------------------------------------------------------------------
 #
 # URL: https://rebase.neb.com/cgi-bin/pacbioget?<org_num>
@@ -393,8 +387,8 @@ def parse_rebase_isoschizomers(filepath):
 # The color matches the legend color for the corresponding methylation type.
 #
 # % Detected:
-#   Palindromic motif  → single value, e.g. "88.5"
-#   Non-palindromic    → two values,   e.g. "86.4/85.0"  (top / complementary)
+#   Palindromic motif  -> single value, e.g. "88.5"
+#   Non-palindromic    -> two values,   e.g. "86.4/85.0"  (top / complementary)
 #   We store the mean as `fraction`.
 #
 # nGenome is estimated as round(nDetected / fraction) when both are available.
@@ -403,15 +397,15 @@ def parse_rebase_isoschizomers(filepath):
 # Fallback color map in case the page legend cannot be parsed.
 # These are REBASE's historic colors as of 2024.
 _REBASE_FALLBACK_COLORS: dict[str, str] = {
-    # m6A — blue variants
+    # m6A -- blue variants
     '#1e90ff': 'm6A', '1e90ff': 'm6A',
     '#0000ff': 'm6A', '0000ff': 'm6A',
     '#4169e1': 'm6A', '4169e1': 'm6A',
-    # m5C — green variants
+    # m5C -- green variants
     '#008000': 'm5C', '008000': 'm5C',
     '#228b22': 'm5C', '228b22': 'm5C',
     '#006400': 'm5C', '006400': 'm5C',
-    # m4C — orange variants
+    # m4C -- orange variants
     '#ff8c00': 'm4C', 'ff8c00': 'm4C',
     '#ffa500': 'm4C', 'ffa500': 'm4C',
     '#ff7f00': 'm4C', 'ff7f00': 'm4C',
@@ -468,7 +462,7 @@ def _parse_color_legend(html: str) -> dict[str, str]:
                           <font color="#1E90FF">m6A</font> unknown
     """
     color_to_meth: dict[str, str] = {}
-    # Scan only the first 4 KB — the legend is always near the top
+    # Scan only the first 4 KB -- the legend is always near the top
     snippet = html[:4096]
     pattern = re.compile(
         r'<font[^>]+color\s*=\s*["\']?([^"\'>\s]+)["\']?[^>]*>\s*(m6A|m5C|m4C)\s*</font>',
@@ -507,7 +501,7 @@ def _parse_motif_cell(cell_html: str,
         G<font color="#1E90FF">A</font>TC   (m6A at position 1 in GATC)
 
     Returns:
-        (motif_string, center_pos, mod_type)  — all uppercase motif, 0-based
+        (motif_string, center_pos, mod_type)  -- all uppercase motif, 0-based
         None if the cell cannot be parsed as a valid methylated motif.
     """
     tag_re   = re.compile(r'<[^>]+>')
@@ -693,12 +687,12 @@ def fetch_rebase_org(org_num: int, output_path: str) -> list[dict]:
     """
     from .motif_merge import write_pacbio_motifs_csv
 
-    html         = _fetch_rebase_html(org_num)
+    html          = _fetch_rebase_html(org_num)
     color_to_meth = _parse_color_legend(html)
 
     if not color_to_meth:
         log.warning(
-            "Could not extract color legend from REBASE page — "
+            "Could not extract color legend from REBASE page -- "
             "using fallback color map.  Colors may be wrong if REBASE changed."
         )
         color_to_meth = {}   # _resolve_color() will hit the fallback dict
@@ -716,14 +710,14 @@ def fetch_rebase_org(org_num: int, output_path: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# CLI: kinsim rebase
+# CLI: kinsim-prep rebase
 # ---------------------------------------------------------------------------
 
 def main(argv=None):
     import argparse
 
     parser = argparse.ArgumentParser(
-        prog="kinsim rebase",
+        prog="kinsim-prep rebase",
         description=(
             "Parse REBASE files and generate fuzznuc pattern files.\n\n"
             "Accepted REBASE formats:\n"
@@ -745,7 +739,7 @@ def main(argv=None):
             "With --output-csv: write a standard PacBio motifs.csv instead.\n"
             "This file is named 'rebase_motifs.csv' by default and can be\n"
             "merged with calling-derived motifs via:\n\n"
-            "    kinsim prep merge-motifs species_motifs.csv rebase_motifs.csv \\\n"
+            "    kinsim-prep merge-motifs species_motifs.csv rebase_motifs.csv \\\n"
             "        --output final_motifs.csv\n"
         ),
     )
@@ -772,8 +766,8 @@ def main(argv=None):
             "The organism number (Org#) is shown on REBASE organism pages.\n"
             "Parses only 'MTases active in the genome' (genuine motifs).\n\n"
             "Example:\n"
-            "  kinsim prep rebase fetch 1260 --output Ecoli_rebase.csv\n"
-            "  kinsim prep rebase fetch 1260   # writes rebase_motifs.csv\n"
+            "  kinsim-prep rebase fetch 1260 --output Ecoli_rebase.csv\n"
+            "  kinsim-prep rebase fetch 1260   # writes rebase_motifs.csv\n"
         ),
     )
     p_fetch.add_argument(
@@ -807,7 +801,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.command == "fetch":
-        from ..config import setup_logging
+        from kinsim.config import setup_logging
         setup_logging(verbose=getattr(args, 'verbose', False))
         try:
             entries = fetch_rebase_org(args.org_num, args.output)
@@ -851,7 +845,7 @@ def main(argv=None):
             print(result)
 
     elif args.command == "patterns":
-        from ..motifs import load_motif_string
+        from kinsim.motifs import load_motif_string
         motif_string = load_motif_string(args.motifs,
                                          min_fraction=args.min_fraction,
                                          min_detected=args.min_detected)

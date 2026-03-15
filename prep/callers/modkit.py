@@ -27,19 +27,19 @@ position 0. Downstream KinSim tools can still use these for training.
 
 import logging
 
-from ...encoding import METH_IDS
+from kinsim.encoding import METH_IDS
 from .base import BaseOutputParser
 from .registry import register
 
 log = logging.getLogger(__name__)
 
-# modkit mod codes → KinSim mod types
+# modkit mod codes -> KinSim mod types
 _MODKIT_CODE_MAP = {
     'a': 'm6A',
     '6mA': 'm6A',
     'm': 'm5C',
     '5mC': 'm5C',
-    'h': 'm5C',     # 5hmC → treat as m5C
+    'h': 'm5C',     # 5hmC -> treat as m5C
     '5hmC': 'm5C',
     '21839': 'm4C',  # SAM spec numeric code for m4C
 }
@@ -70,14 +70,14 @@ class ModkitParser(BaseOutputParser):
                 fields = line.split('\t')
                 if len(fields) < 11:
                     log.warning("modkit line %d: expected >=11 columns, "
-                                "got %d — skipped", lineno, len(fields))
+                                "got %d -- skipped", lineno, len(fields))
                     continue
 
                 mod_code = fields[3].strip()
                 mod_type = _MODKIT_CODE_MAP.get(mod_code)
                 if mod_type is None:
                     log.warning("modkit line %d: unknown mod code '%s' "
-                                "— skipped", lineno, mod_code)
+                                "-- skipped", lineno, mod_code)
                     continue
 
                 try:
@@ -85,10 +85,10 @@ class ModkitParser(BaseOutputParser):
                     frac_pct = float(fields[10])
                 except (ValueError, IndexError):
                     log.warning("modkit line %d: invalid Nvalid/fraction "
-                                "— skipped", lineno)
+                                "-- skipped", lineno)
                     continue
 
-                fraction = frac_pct / 100.0  # percent → [0,1]
+                fraction = frac_pct / 100.0  # percent -> [0,1]
 
                 if fraction < min_fraction or n_valid < min_detected:
                     continue
@@ -98,7 +98,6 @@ class ModkitParser(BaseOutputParser):
                 strand = fields[5]
 
                 # Per-site entry: use chrom:pos:strand as "motif" context
-                # For KinSim integration, we record base-level data
                 entry = f"{mod_type},{chrom}:{start}:{strand},0,{n_valid},{fraction:.6g}"
                 if entry not in seen:
                     seen.add(entry)

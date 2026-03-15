@@ -7,10 +7,14 @@ Given PBSIM3-simulated reads and a reference genome, KinSim injects biologically
 per-base IPD/PW values into unaligned BAM files using one of three modes:
 
 - **dictionary** — Gaussian sampling from per-k-mer accumulators (fast, no GPU)
-- **mlp**        — Supervised MLP/Conv predicting N(μ, σ²) per context (Level 1 AI)
+- **mlp**        — Supervised MLP/Conv predicting N(mu, sigma^2) per context (Level 1 AI)
 - **cgan**       — Conditional WGAN-GP (Level 2 AI, captures non-Gaussian distributions)
 
 All three modes output BAMs with standard PacBio tags: `fi:B:C` (IPD) and `fp:B:C` (PW).
+
+Two CLI tools are installed from the same repository:
+- **`kinsim`**      — ML pipeline: extract, merge, train, generate, evaluate, analyze
+- **`kinsim-prep`** — Data preparation: rebase, merge-motifs, manifest, filter, prepare, parse
 
 ---
 
@@ -18,31 +22,16 @@ All three modes output BAMs with standard PacBio tags: `fi:B:C` (IPD) and `fp:B:
 
 ```
 KinSim/
-├── pyproject.toml                  entry point: kinsim = "kinsim.__main__:main"
+├── pyproject.toml                  entry points: kinsim + kinsim-prep
 ├── requirements.txt
 │
-├── kinsim/                         main Python package
+├── kinsim/                         ML pipeline package
 │   ├── __init__.py
-│   ├── __main__.py                 CLI router (v0.3.0) — all commands dispatched here
+│   ├── __main__.py                 CLI router (v0.3.0) — core commands only
 │   │
 │   ├── encoding.py                 11-mer bit-packing (no dependencies)
 │   ├── motifs.py                   IUPAC motif parsing, sequence scanning, meth maps
 │   ├── config.py                   manifest CSV loader, YAML config, logging setup
-│   │
-│   ├── prep/                       data preparation tools (parsing, filtering)
-│   │   ├── __init__.py
-│   │   ├── rebase.py               REBASE → KinSim motif string conversion + fuzznuc
-│   │   ├── prepare.py              legacy BAM/motif pair validation
-│   │   ├── manifest.py             manifest CSV CLI (count / validate / list)
-│   │   ├── filter.py               General Dictionary → Training Dictionary filtering
-│   │   └── callers/                methylation caller output parsers (plugin registry)
-│   │       ├── __init__.py         exports: BaseOutputParser, create_parser, list_parsers, auto_detect_parser
-│   │       ├── base.py             BaseOutputParser ABC
-│   │       ├── registry.py         @register decorator, factory functions
-│   │       ├── pacbio.py           PacBioParser — motifs.csv with variable columns
-│   │       ├── modkit.py           ModkitParser — modkit pileup --bedMethyl TSV
-│   │       ├── ipd_summary.py      IpdSummaryParser — ipdSummary CSV/GFF3
-│   │       └── combined.py         CombinedParser — mod_type,motif,offset,frac_mod,n_sites,source
 │   │
 │   ├── common/                     shared data pipeline (used by MLP and cGAN)
 │   │   ├── __init__.py
@@ -55,25 +44,38 @@ KinSim/
 │   │   ├── inject.py               injects signals using dictionary lookup
 │   │   └── analyze.py              coverage stats, HTML/text reports
 │   │
-│   ├── models/                     all neural model implementations
-│   │   ├── __init__.py
-│   │   ├── cgan/
-│   │   │   ├── __init__.py
-│   │   │   ├── model.py            Generator + Discriminator (WGAN-GP)
-│   │   │   ├── train.py            WGAN-GP training loop
-│   │   │   ├── generate.py         BAM generation with trained Generator
-│   │   │   └── parse_train.py      shim → delegates to common/extract.py
-│   │   └── mlp/
-│   │       ├── __init__.py
-│   │       ├── model.py            ConvPredictor + MLPPredictor + create_from_config()
-│   │       ├── train.py            supervised training loop (--architecture conv|mlp)
-│   │       ├── generate.py         BAM generation with trained model
-│   │       └── evaluate.py         calibration report + per-kmer distribution plots
+│   └── models/                     all neural model implementations
+│       ├── __init__.py
+│       ├── cgan/
+│       │   ├── __init__.py
+│       │   ├── model.py            Generator + Discriminator (WGAN-GP)
+│       │   ├── train.py            WGAN-GP training loop
+│       │   ├── generate.py         BAM generation with trained Generator
+│       │   └── parse_train.py      shim -> delegates to common/extract.py
+│       └── mlp/
+│           ├── __init__.py
+│           ├── model.py            ConvPredictor + MLPPredictor + create_from_config()
+│           ├── train.py            supervised training loop (--architecture conv|mlp)
+│           ├── generate.py         BAM generation with trained model
+│           └── evaluate.py         calibration report + per-kmer distribution plots
+│
+├── prep/                           data preparation package (kinsim-prep CLI)
+│   ├── __init__.py
+│   ├── __main__.py                 CLI router for kinsim-prep
 │   │
-│   ├── callers/                    backward-compat shim → re-exports from prep/callers
-│   ├── rebase_parser.py            backward-compat shim → re-exports from prep/rebase
-│   ├── prepare.py                  backward-compat shim → re-exports from prep/prepare
-│   └── manifest_cmd.py             backward-compat shim → re-exports from prep/manifest
+│   ├── rebase.py                   REBASE web fetch + file parsing + fuzznuc patterns
+│   ├── motif_merge.py              merge/filter/dedup motifs -> standard PacBio CSV
+│   ├── manifest.py                 manifest CSV CLI (count / validate / list)
+│   ├── prepare.py                  legacy BAM/motif pair validation (alternating-line format)
+│   ├── filter.py                   General Dictionary -> Training Dictionary filtering
+│   └── callers/                    methylation caller output parsers (plugin registry)
+│       ├── __init__.py             exports: BaseOutputParser, create_parser, list_parsers, auto_detect_parser
+│       ├── base.py                 BaseOutputParser ABC
+│       ├── registry.py             @register decorator, factory functions
+│       ├── pacbio.py               PacBioParser -- motifs.csv with variable columns
+│       ├── modkit.py               ModkitParser -- modkit pileup --bedMethyl TSV
+│       ├── ipd_summary.py          IpdSummaryParser -- ipdSummary CSV/GFF3
+│       └── combined.py             CombinedParser -- mod_type,motif,offset,frac_mod,n_sites,source
 │
 └── slurm_kinsim/                   HPC SLURM job scripts
     ├── kinsim_pipeline.sh          master script (mode: dictionary | cgan | mlp)
@@ -83,7 +85,9 @@ KinSim/
     ├── kinsim_mlp_evaluate.slurm   mlp evaluate
     ├── kinsim_cgan_train.slurm     cgan train (1 GPU, 24h)
     ├── kinsim_cgan_generate.slurm  cgan generate (array job)
-    └── ...                         dictionary and legacy scripts
+    ├── prep_MSA1003_rebase.sh      fetch REBASE motifs for MSA1003 species
+    ├── prep_MSA1003_merge.sh       merge calling + REBASE motifs, build manifest
+    └── ...                         dictionary and other scripts
 ```
 
 ---
@@ -99,23 +103,23 @@ KMER_MASK = (1 << 22) - 1      # 22-bit mask for sliding window
 BASE_MAP  = {'A':0,'C':1,'G':2,'T':3}
 METH_IDS  = {'none':0,'m6A':1,'m4C':2,'m5C':3}
 
-encode_kmer(seq: str) -> int    # 11-char string → 22-bit integer
-decode_kmer(val: int) -> str    # 22-bit integer → 11-char string
-get_ipd_stats(acc) -> (μ, σ)   # extract IPD mean/std from accumulator
-get_pw_stats(acc)  -> (μ, σ)   # extract PW  mean/std from accumulator
+encode_kmer(seq: str) -> int    # 11-char string -> 22-bit integer
+decode_kmer(val: int) -> str    # 22-bit integer -> 11-char string
+get_ipd_stats(acc) -> (mean, std)  # extract IPD mean/std from accumulator
+get_pw_stats(acc)  -> (mean, std)  # extract PW  mean/std from accumulator
 ```
 
-Accumulator format: `np.array([n, Σipd, Σipd², Σpw, Σpw²])` (Welford-style).
+Accumulator format: `np.array([n, sum_ipd, sum_ipd2, sum_pw, sum_pw2])` (Welford-style).
 
 ### `kinsim/motifs.py`
 Everything methylation-motif related. Used by all three modes.
 
 ```python
-iupac_to_re(motif)                        # "RGATCY" → "[AG]GAT[CT][CT]"
+iupac_to_re(motif)                        # "RGATCY" -> "[AG]GAT[CT][CT]"
 reverse_complement(seq)                    # IUPAC-aware
-parse_motifs(motif_string, revcomp=True)   # "m6A,GATC,1;..." → list of dicts
+parse_motifs(motif_string, revcomp=True)   # "m6A,GATC,1;..." -> list of dicts
 scan_sequence(seq, motifs) -> np.int8[]   # per-base methylation ID array
-parse_motifs_csv(path, min_fraction=0.40)  # PacBio motifs.csv → KinSim string
+parse_motifs_csv(path, min_fraction=0.40)  # PacBio motifs.csv -> KinSim string
 load_motif_string(arg, ..., parser_name=None)  # auto-detect or explicit parser
 build_reference_meth_map(ref_seqs, motif_string)  # genome-wide O(1) lookup array
 ```
@@ -124,14 +128,18 @@ build_reference_meth_map(ref_seqs, motif_string)  # genome-wide O(1) lookup arra
 Example: `"m6A,GATC,1;m4C,CCWGG,2"`.
 Position is 0-based index of the modified base within the pattern.
 
-### `kinsim/prep/` — Data Preparation Subpackage
+`load_motif_string()` uses lazy imports from `prep.callers` and `prep.rebase`
+for file-based motif loading. Both packages are installed together so these
+imports always succeed.
 
-#### `kinsim/prep/callers/`
+### `prep/` — Data Preparation Package
+
+#### `prep/callers/`
 Read-only parsing library for methylation caller output files. Plugin registry
 with `@register` decorator — adding a new format = one file + `@register` class.
 
 ```python
-from kinsim.prep.callers import create_parser, list_parsers, auto_detect_parser
+from prep.callers import create_parser, list_parsers, auto_detect_parser
 
 # Explicit parser
 parser = create_parser("pacbio")       # or "modkit", "ipd_summary", "combined"
@@ -147,7 +155,7 @@ list_parsers()  # ['combined', 'ipd_summary', 'modkit', 'pacbio']
 **BaseOutputParser ABC** (`base.py`):
 - `name: ClassVar[str]` — registry key
 - `supported_mods: ClassVar[list[str]]` — mod types this format carries
-- `parse(filepath, min_fraction, min_detected) -> str` — file → motif string
+- `parse(filepath, min_fraction, min_detected) -> str` — file -> motif string
 - `is_file_for_this_parser(filepath) -> bool` — heuristic for auto-detection
 
 **PacBioParser** (`pacbio.py`): Handles motifs.csv with variable columns.
@@ -161,10 +169,10 @@ Required: `motifString`, `centerPos`. Optional: `modificationType`, `fraction`, 
 `mod_type,motif,offset,frac_mod,n_sites,source`. Auto-detected when CSV header
 contains both `mod_type` and `frac_mod`.
 
-**Integration**: `load_motif_string()` in `motifs.py` accepts optional `parser_name` kwarg.
+**Integration**: `load_motif_string()` in `kinsim/motifs.py` accepts optional `parser_name` kwarg.
 When provided, bypasses auto-detection and uses the named parser from the registry.
 
-#### `kinsim/prep/rebase.py`
+#### `prep/rebase.py`
 Converts REBASE notation (1-based) to KinSim notation (0-based).
 
 ```python
@@ -175,30 +183,22 @@ parse_rebase_file(filepath)         # auto-detect format
 parse_rebase_isoschizomers(filepath) -> dict[str, list[str]]
 write_fuzznuc_pattern_file(motif_string, filepath) -> dict
 decode_fuzznuc_pattern_name(name) -> (meth_id, mod_pos)
+fetch_rebase_org(org_num, output_path) -> list[dict]   # web fetch
 ```
 
-CLI: `kinsim prep rebase parse rebase.txt --output-csv rebase_motifs.csv`
-- Default (no `--output-csv`): prints KinSim motif string to stdout
-- With `--output-csv FILE`: writes standard PacBio CSV (fraction=1.0, nDetected=blank)
-- `--output-csv` with no FILE: defaults to `rebase_motifs.csv` in current directory
+CLI:
+- `kinsim-prep rebase fetch <org_num>` — fetch from REBASE website, write CSV
+- `kinsim-prep rebase parse <file>` — parse local REBASE file, print motif string
+- `kinsim-prep rebase patterns <motifs> <outfile>` — write fuzznuc pattern file
 
-#### `kinsim/prep/motif_merge.py`
+#### `prep/motif_merge.py`
 Merges, filters, and deduplicates motifs from calling-derived CSV and REBASE
 into a single standard PacBio `motifs.csv`.
 
 ```python
-# IUPAC-aware containment check
 motif_contains(longer, offset_longer, shorter, offset_shorter) -> bool
-    # True if longer motif contains shorter at the aligned modified position
-    # Used by deduplicate_motifs() to remove redundant extensions
-
-# Deduplication: GATCA/CGATC/TGATC → all removed if GATC is present
 deduplicate_motifs(entries: list[dict]) -> list[dict]
-
-# Write standard PacBio CSV (12 columns, blank for unavailable fields)
 write_pacbio_motifs_csv(entries: list[dict], filepath: str)
-
-# Full pipeline: parse → merge → filter → dedup → write PacBio CSV
 merge_motifs(input_files, output_path, *, min_frac=0.8, min_sites=300,
              deduplicate=True) -> dict
 ```
@@ -207,10 +207,10 @@ Input formats (auto-detected per file):
 - Combined CSV: `mod_type,motif,offset,frac_mod,n_sites,source`
 - PacBio CSV: `motifString,centerPos,modificationType,fraction,...`
 
-CLI: `kinsim prep merge-motifs species_motifs.csv rebase_motifs.csv --output final_motifs.csv`
+CLI: `kinsim-prep merge-motifs species_motifs.csv rebase_motifs.csv --output final_motifs.csv`
 
-#### `kinsim/prep/filter.py`
-Two-dictionary architecture: General Dictionary → Training Dictionary.
+#### `prep/filter.py`
+Two-dictionary architecture: General Dictionary -> Training Dictionary.
 
 ```python
 filter_pkl(input_path, output_path, *, min_coverage=0, mod_types=None, max_keys=0) -> dict
@@ -218,23 +218,24 @@ filter_pkl(input_path, output_path, *, min_coverage=0, mod_types=None, max_keys=
     # Returns stats: {keys_in, keys_out, samples_in, samples_out}
 ```
 
-CLI: `kinsim prep filter general.pkl training.pkl --min-coverage 50 --mod-type m6A,m5C`
+CLI: `kinsim-prep filter general.pkl training.pkl --min-coverage 50 --mod-type m6A,m5C`
 
-#### `kinsim/prep/manifest.py`
+#### `prep/manifest.py`
 Manifest CSV inspection utilities.
 
 CLI:
 ```
-kinsim prep manifest count <csv>       # prints integer for SLURM --array
-kinsim prep manifest validate <csv>    # checks duplicates, file existence
-kinsim prep manifest list <csv>        # tabular display
+kinsim-prep manifest count <csv>       # prints integer for SLURM --array
+kinsim-prep manifest validate <csv>    # checks duplicates, file existence
+kinsim-prep manifest list <csv>        # tabular display
 ```
 
-#### `kinsim/prep/prepare.py`
+#### `prep/prepare.py`
 Legacy BAM + motif-source pair validation (alternating-line text format).
 
 ### `kinsim/config.py`
 Manifest CSV parsing, YAML config loading, and logging setup.
+Used by both `kinsim` and `prep` packages.
 
 ```python
 @dataclass
@@ -244,6 +245,7 @@ class SampleEntry:
     motifs:    str    # KinSim string or path (resolved by load_motif_string)
 
 load_manifest(manifest_path) -> list[SampleEntry]
+validate_manifest(entries, check_files=True) -> list[str]
 load_yaml_config(path) -> dict
 setup_logging(verbose=False)
 ```
@@ -252,8 +254,8 @@ setup_logging(verbose=False)
 The shared data contract between cGAN and MLP. Never import transforms from model files.
 
 ```python
-log_transform(x: Tensor) -> Tensor      # log1p — raw [0,255] → training space
-inv_log_transform(x: Tensor) -> Tensor  # expm1 clamped to [0,255] — inference
+log_transform(x: Tensor) -> Tensor      # log1p -- raw [0,255] -> training space
+inv_log_transform(x: Tensor) -> Tensor  # expm1 clamped to [0,255] -- inference
 
 class KmerSignalDataset(Dataset):  # cGAN: (kmer_id, meth_id, signal)
 class MLPSignalDataset(Dataset):   # MLP: random-shot per key, stoichiometric meth vector
@@ -274,11 +276,11 @@ Dual architecture with factory pattern:
 
 ```python
 class ConvPredictor(nn.Module):    # NEW DEFAULT (~140K params)
-    # Per-base embedding (4×16) + positional embedding (11×16)
+    # Per-base embedding (4x16) + positional embedding (11x16)
     # FiLM conditioning: methylation modulates base embeddings
     # Conv1D backbone (3 layers, k=3, BatchNorm, GELU)
     # Dual readout: center position + global average pool
-    # → [μ_ipd, μ_pw, log_σ_ipd, log_σ_pw]
+    # -> [mu_ipd, mu_pw, log_sigma_ipd, log_sigma_pw]
 
 class MLPPredictor(nn.Module):     # LEGACY (~268M params)
     # Flat 4.2M-row kmer embedding + 2-layer MLP
@@ -293,7 +295,7 @@ Both share interface: `forward(kmer_ids, meth_probs)`, `sample()`, `predict_mean
 Supervised training with Gaussian NLL loss.
 
 ```python
-Loss = 0.5 * (2*log_σ + (target - μ)² / σ²)
+Loss = 0.5 * (2*log_sigma + (target - mu)^2 / sigma^2)
 ```
 
 CLI: `kinsim train --model mlp --architecture conv --config config_mlp.yaml`
@@ -311,25 +313,34 @@ CLI: `kinsim evaluate --model mlp <ckpt_dir> <pkl>`
 ## Data Flow
 
 ```
-Real PacBio BAMs + Manifest CSV
-      │
-      ▼  kinsim extract --manifest manifest.csv --task $TASK --output-dir shards/
-      ▼
+Real PacBio BAMs
+      |
+      v  (once per species: kinsim-prep rebase fetch <org_num>)
+rebase_motifs.csv
+      |
+      v  (kinsim-prep merge-motifs calling.csv rebase.csv --output final_motifs.csv)
+final_motifs.csv
+      |
+      v  (kinsim-prep manifest count manifest.csv  ->  N for SLURM --array)
+manifest.csv  [sample_id, bam_path, motifs]
+      |
+      v  kinsim extract --manifest manifest.csv --task $TASK --output-dir shards/
+      v
 strain1_shard.pkl  strain2_shard.pkl  ...
-      │
-      ▼  kinsim merge shards/ general_data.pkl     ← General Dictionary
-      │
-      ▼  kinsim prep filter general_data.pkl training_data.pkl --min-coverage 50
-      ▼                                             ← Training Dictionary
+      |
+      v  kinsim merge shards/ general_data.pkl     <- General Dictionary
+      |
+      v  kinsim-prep filter general_data.pkl training_data.pkl --min-coverage 50
+      v                                             <- Training Dictionary
 training_data.pkl
-      │
-      ├──▶  kinsim train --model mlp  → checkpoint.pt + model_config.json
-      └──▶  kinsim train --model cgan → checkpoint.pt + model_config.json
+      |
+      +-->  kinsim train --model mlp   -> checkpoint.pt + model_config.json
+      +-->  kinsim train --model cgan  -> checkpoint.pt + model_config.json
 
 PBSIM3 reads + reference + checkpoint.pt
-      │
-      ▼  kinsim generate --model mlp  / cgan
-      ▼
+      |
+      v  kinsim generate --model mlp  / cgan
+      v
 species_mlp.bam / species_cgan.bam
   flag=4  fi:B:C (IPD uint8)  fp:B:C (PW uint8)
 ```
@@ -351,42 +362,34 @@ species_mlp.bam / species_cgan.bam
 ## CLI Command Map
 
 ```
-# ── Core pipeline ────────────────────────────────────────────────────────────
-kinsim extract                → kinsim/common/extract.py
-kinsim merge                  → kinsim/common/extract.py
-kinsim train --model <m>      → kinsim/models/<m>/train.py  or  dictionary/train.py
-kinsim generate --model <m>   → kinsim/models/<m>/generate.py  or  dictionary/inject.py
-kinsim evaluate --model mlp   → kinsim/models/mlp/evaluate.py
-kinsim analyze                → kinsim/dictionary/analyze.py
+# kinsim -- ML pipeline --------------------------------------------------
+kinsim extract                -> kinsim/common/extract.py
+kinsim merge                  -> kinsim/common/extract.py
+kinsim train --model <m>      -> kinsim/models/<m>/train.py  or  dictionary/train.py
+kinsim generate --model <m>   -> kinsim/models/<m>/generate.py  or  dictionary/inject.py
+kinsim evaluate --model mlp   -> kinsim/models/mlp/evaluate.py
+kinsim analyze                -> kinsim/dictionary/analyze.py
 
-# ── Prep tools ───────────────────────────────────────────────────────────────
-kinsim prep parse             → kinsim/motifs.py              (unified motif parser)
-kinsim prep rebase            → kinsim/prep/rebase.py         (REBASE files → motif string or CSV)
-kinsim prep merge-motifs      → kinsim/prep/motif_merge.py    (merge + filter + dedup → PacBio CSV)
-kinsim prep manifest          → kinsim/prep/manifest.py       (count/validate/list)
-kinsim prep prepare           → kinsim/prep/prepare.py        (legacy BAM/motif pairs)
-kinsim prep filter            → kinsim/prep/filter.py         (General → Training .pkl)
-
-# ── Backward-compat (legacy commands still work) ─────────────────────────────
-kinsim prepare                → kinsim/prep/prepare.py
-kinsim manifest               → kinsim/prep/manifest.py
-kinsim parse                  → kinsim/motifs.py
-kinsim motifs                 → kinsim/motifs.py
-kinsim rebase                 → kinsim/prep/rebase.py
-kinsim filter                 → kinsim/prep/filter.py
-kinsim merge-motifs           → kinsim/prep/motif_merge.py
-kinsim dictionary <subcmd>    → kinsim/dictionary/
-kinsim cgan <subcmd>          → kinsim/models/cgan/
-kinsim mlp <subcmd>           → kinsim/models/mlp/
+# kinsim-prep -- data preparation ----------------------------------------
+kinsim-prep parse             -> kinsim/motifs.py              (unified motif parser)
+kinsim-prep rebase            -> prep/rebase.py                (REBASE fetch + parse)
+kinsim-prep merge-motifs      -> prep/motif_merge.py           (merge + filter + dedup)
+kinsim-prep manifest          -> prep/manifest.py              (count/validate/list)
+kinsim-prep prepare           -> prep/prepare.py               (legacy BAM/motif pairs)
+kinsim-prep filter            -> prep/filter.py                (General -> Training .pkl)
 ```
 
-Typo suggestions via `difflib.get_close_matches` in `__main__.py`.
+Typo suggestions via `difflib.get_close_matches` in both `__main__.py` files.
+If a user types `kinsim prep`, `kinsim rebase`, etc., a helpful redirect message
+points them to `kinsim-prep`.
 
 ---
 
 ## Import Path Rules
 
-All files under `kinsim/models/cgan/` and `kinsim/models/mlp/` are **2 levels** below `kinsim/`.
+### Within `kinsim/` package
+
+Files under `kinsim/models/cgan/` and `kinsim/models/mlp/` are **2 levels** below `kinsim/`.
 Use 3 dots to reach `kinsim/`-level modules:
 
 ```python
@@ -400,21 +403,38 @@ from ...config import setup_logging, load_manifest, load_yaml_config
 from .model import ...      # within the same sub-package (1 dot)
 ```
 
-All files under `kinsim/prep/callers/` are **2 levels** below `kinsim/`.
-Use 3 dots to reach `kinsim/`-level modules:
+### Within `prep/` package
+
+Files under `prep/callers/` are **1 level** below `prep/`.
+Use absolute imports for `kinsim` modules:
 
 ```python
-# From kinsim/prep/callers/:
-from ...encoding import METH_IDS
+# From prep/callers/:
+from kinsim.encoding import METH_IDS
+from .base import BaseOutputParser
+from .registry import register
 ```
 
-Files directly under `kinsim/prep/` are **1 level** below `kinsim/`:
+Files directly under `prep/` use absolute imports for `kinsim`:
 
 ```python
-# From kinsim/prep/:
-from ..encoding import METH_IDS
-from ..motifs import load_motif_string
-from ..config import setup_logging, load_manifest
+# From prep/:
+from kinsim.encoding import METH_IDS
+from kinsim.motifs import load_motif_string
+from kinsim.config import setup_logging, load_manifest
+```
+
+### Cross-package lazy imports (in `kinsim/motifs.py`)
+
+`load_motif_string()` and `_build_meth_map_fuzznuc()` use lazy imports from `prep`
+to avoid circular imports at module-load time. Both packages are always co-installed
+(same `pyproject.toml`), so these imports always succeed at runtime:
+
+```python
+from prep.callers import create_parser      # lazy, inside function
+from prep.callers import auto_detect_parser # lazy, inside function
+from prep.rebase import parse_rebase_file   # lazy, inside function
+from prep.rebase import write_fuzznuc_pattern_file  # lazy, inside function
 ```
 
 **Never import `log_transform`/`inv_log_transform` from `cgan/model.py`.**
@@ -431,7 +451,7 @@ Always use `log = logging.getLogger(__name__)` and `log.info()`, `log.warning()`
 METH_IDS = {'none': 0, 'm6A': 1, 'm4C': 2, 'm5C': 3}
 ```
 
-Consistent across all modes. Defined in `encoding.py`, used everywhere.
+Consistent across all modes. Defined in `kinsim/encoding.py`, used everywhere.
 
 ---
 
@@ -448,7 +468,7 @@ Consistent across all modes. Defined in `encoding.py`, used everywhere.
 - Xavier uniform init for `nn.Linear`, small normal (`std=0.02`) for `nn.Embedding`.
 - Always write `model.eval()` before inference; `model.train()` at start of epoch.
 - `@torch.no_grad()` on all inference functions (`sample`, `predict_mean`, `generate_signals_batch`).
-- Use `ReduceLROnPlateau` — never `verbose=True` (removed in PyTorch ≥ 2.1). Log LR drops via `log.info(...)`.
+- Use `ReduceLROnPlateau` — never `verbose=True` (removed in PyTorch >= 2.1). Log LR drops via `log.info(...)`.
 - Wrap training loops in `try/finally` to ensure CSV and TensorBoard are closed on crash.
 - Always save `model_config.json` **before** the first epoch, not after training.
 - Always include `"scheduler"` key in checkpoint dict for resume support.
@@ -473,7 +493,7 @@ torch.save({
 
 ### Signal Space
 - **Training**: always in log1p space (`log_transform` applied by `KmerSignalDataset`).
-- **Inference**: model outputs in log1p space → `inv_log_transform` → uint8 [0, 255].
+- **Inference**: model outputs in log1p space -> `inv_log_transform` -> uint8 [0, 255].
 - **Storage (.pkl)**: raw values (not transformed) + stoichiometric fraction column.
   Format: `np.ndarray(N, 3)` with columns [IPD, PW, fraction]. Legacy 2-col supported.
 - **Metadata**: every .pkl has a `"__meta__"` string key with provenance. Dataset classes skip it.
@@ -487,7 +507,7 @@ torch.save({
 
 ### Manifest CSV
 - Manifest columns: `sample_id`, `bam_path`, `motifs` (CSV with header, commas OK in quoted fields).
-- Count rows for `--array`: `N=$(kinsim prep manifest count manifest.csv)`.
+- Count rows for `--array`: `N=$(kinsim-prep manifest count manifest.csv)`.
 - Output shard naming: `shards/<sample_id>_shard.pkl` (derived from manifest `sample_id`).
 
 ---
@@ -497,13 +517,14 @@ torch.save({
 - **Do not** add logic to `models/cgan/parse_train.py` — it is a shim only.
 - **Do not** store log-transformed data in `.pkl` files — raw values only.
 - **Do not** import `KmerSignalDataset` or transforms from `cgan/train.py` — use `common/dataset.py`.
-- **Do not** use `verbose=True` in `ReduceLROnPlateau` — crashes on PyTorch ≥ 2.1.
-- **Do not** add a new mode without adding a corresponding entry to `__main__.py` and `kinsim_pipeline.sh`.
+- **Do not** use `verbose=True` in `ReduceLROnPlateau` — crashes on PyTorch >= 2.1.
+- **Do not** add a new mode without adding a corresponding entry to `kinsim/__main__.py` and `kinsim_pipeline.sh`.
 - **Do not** hardcode architecture params in `generate.py` — always read from `model_config.json` via `create_from_config()`.
 - **Do not** use `..encoding` or `..motifs` from within `models/cgan/` or `models/mlp/` — use 3 dots (`...`).
 - **Do not** modify `motifs.py` for stoichiometric fraction handling — fractions are parsed at the storage level (`_build_fraction_lookup` in `extract.py` and `generate.py`).
-- **Do not** add new callers/parsers outside of `kinsim/prep/callers/` — use the `@register` decorator pattern.
-- **Do not** import from backward-compat shims (`kinsim/callers/`, `kinsim/rebase_parser.py`) in new code — use `kinsim/prep/` paths directly.
+- **Do not** add new callers/parsers outside of `prep/callers/` — use the `@register` decorator pattern.
+- **Do not** add data preparation commands to `kinsim/__main__.py` — they belong in `prep/__main__.py`.
+- **Do not** use relative imports (`from ..prep`) from `kinsim` to reach `prep` — use absolute `from prep.` imports (lazy, inside functions only).
 
 ---
 
@@ -522,9 +543,9 @@ torch.save({
 
 ## Adding a New Motif Parser
 
-1. Create `kinsim/prep/callers/<name>.py` with a `@register` class inheriting `BaseOutputParser`.
+1. Create `prep/callers/<name>.py` with a `@register` class inheriting `BaseOutputParser`.
 2. Define `name`, `supported_mods`, `parse()`, and `is_file_for_this_parser()`.
-3. Import the new module in `kinsim/prep/callers/__init__.py` to trigger registration.
+3. Import the new module in `prep/callers/__init__.py` to trigger registration.
 4. The parser is immediately available via `create_parser("name")` and auto-detection.
 
 ---
@@ -533,22 +554,22 @@ torch.save({
 
 | Constant | Value | Where |
 |---|---|---|
-| K (k-mer size) | 11 | `encoding.py` |
-| Total possible k-mers | 4,194,304 (4^11) | `encoding.py` |
-| Methylation states | 4 (none/m6A/m4C/m5C) | `encoding.py` |
-| MID (flanking bases) | 5 | `dictionary/inject.py` |
-| Reservoir cap (extract) | 10,000 per (kmer, meth) | `common/extract.py` |
-| Reservoir cap (merge) | 50,000 per (kmer, meth) | `common/extract.py` |
-| MLPSignalDataset cap (unmeth) | 20 per key | `common/dataset.py` |
-| MLPSignalDataset cap (meth) | 100 per key | `common/dataset.py` |
+| K (k-mer size) | 11 | `kinsim/encoding.py` |
+| Total possible k-mers | 4,194,304 (4^11) | `kinsim/encoding.py` |
+| Methylation states | 4 (none/m6A/m4C/m5C) | `kinsim/encoding.py` |
+| MID (flanking bases) | 5 | `kinsim/dictionary/inject.py` |
+| Reservoir cap (extract) | 10,000 per (kmer, meth) | `kinsim/common/extract.py` |
+| Reservoir cap (merge) | 50,000 per (kmer, meth) | `kinsim/common/extract.py` |
+| MLPSignalDataset cap (unmeth) | 20 per key | `kinsim/common/dataset.py` |
+| MLPSignalDataset cap (meth) | 100 per key | `kinsim/common/dataset.py` |
 | BAM signal range | [0, 255] uint8 | all generate files |
 | N-context default signal | 1 (not 0) | all generate files |
-| log_σ clamp range | [-6, 3] | `models/mlp/model.py` |
-| cGAN n_critic | 5 | `models/cgan/train.py` |
-| cGAN lambda_gp | 10 | `models/cgan/train.py` |
-| MLP train/val split | 90% / 10% | `models/mlp/train.py` |
-| LR patience (MLP) | 5 epochs | `models/mlp/train.py` |
-| LR factor (MLP) | 0.5 | `models/mlp/train.py` |
-| meth_proj_dim | 8 | `models/mlp/model.py` |
-| ConvPredictor params | ~140K | `models/mlp/model.py` |
-| MLPPredictor params | ~268M | `models/mlp/model.py` |
+| log_sigma clamp range | [-6, 3] | `kinsim/models/mlp/model.py` |
+| cGAN n_critic | 5 | `kinsim/models/cgan/train.py` |
+| cGAN lambda_gp | 10 | `kinsim/models/cgan/train.py` |
+| MLP train/val split | 90% / 10% | `kinsim/models/mlp/train.py` |
+| LR patience (MLP) | 5 epochs | `kinsim/models/mlp/train.py` |
+| LR factor (MLP) | 0.5 | `kinsim/models/mlp/train.py` |
+| meth_proj_dim | 8 | `kinsim/models/mlp/model.py` |
+| ConvPredictor params | ~140K | `kinsim/models/mlp/model.py` |
+| MLPPredictor params | ~268M | `kinsim/models/mlp/model.py` |

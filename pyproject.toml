@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kinsim"
-version = "0.2.0"
+version = "0.3.0"
 description = "PacBio kinetic signal simulator for metagenomic binning"
 license = "MIT"
 requires-python = ">=3.10"
@@ -14,12 +14,13 @@ dependencies = [
 ]
 
 [project.scripts]
-kinsim = "kinsim.__main__:main"
+kinsim      = "kinsim.__main__:main"
+kinsim-prep = "prep.__main__:main"
 
 [project.optional-dependencies]
 cluster = ["pyyaml"]
-cgan = ["torch>=2.0", "tensorboard"]
+cgan    = ["torch>=2.0", "tensorboard"]
 analyze = ["plotly>=5.0"]
 
 [tool.setuptools.packages.find]
-include = ["kinsim*"]
+include = ["kinsim*", "prep*"]

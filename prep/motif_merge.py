@@ -2,27 +2,27 @@
 
 Two-step workflow
 -----------------
-1. Parse REBASE file → rebase_motifs.csv (standard PacBio format)::
+1. Fetch REBASE motifs -> rebase_motifs.csv (standard PacBio format)::
 
-       kinsim prep rebase parse rebase.txt --output-csv rebase_motifs.csv
+       kinsim-prep rebase fetch <org_num> --output rebase_motifs.csv
 
-2. Merge calling-derived CSV + rebase_motifs.csv → final_motifs.csv::
+2. Merge calling-derived CSV + rebase_motifs.csv -> final_motifs.csv::
 
-       kinsim prep merge-motifs species_motifs.csv rebase_motifs.csv \\
+       kinsim-prep merge-motifs species_motifs.csv rebase_motifs.csv \\
            --output final_motifs.csv --min-frac 0.8 --min-sites 300
 
 Input formats accepted (auto-detected per file):
 
-    Combined CSV  — mod_type,motif,offset,frac_mod,n_sites,source
+    Combined CSV  -- mod_type,motif,offset,frac_mod,n_sites,source
                     (output from modkit + fibertools pipeline)
-    PacBio CSV    — motifString,centerPos,modificationType,fraction,...
-                    (output from SMRT Link, or from kinsim prep rebase parse)
+    PacBio CSV    -- motifString,centerPos,modificationType,fraction,...
+                    (output from SMRT Link, or from kinsim-prep rebase)
 
 Filtering (applied before deduplication):
     --min-frac    Minimum frac_mod / fraction  (default: 0.80)
     --min-sites   Minimum n_sites / nGenome    (default: 300)
     Fields that are absent or blank bypass their respective filter
-    (e.g. REBASE entries have no n_sites — they are always retained).
+    (e.g. REBASE entries have no n_sites -- they are always retained).
 
 Deduplication
 -------------
@@ -32,17 +32,11 @@ removed.
 
 Example for E. coli Dam methyltransferase (m6A at GATC):
 
-    6mA, GATC,  offset=1   ← core motif (KEPT)
-    6mA, GATCA, offset=1   ← GATC + trailing A  → REMOVED
-    6mA, CGATC, offset=2   ← C + GATC           → REMOVED
-    6mA, TGATC, offset=2   ← T + GATC           → REMOVED
+    6mA, GATC,  offset=1   <- core motif (KEPT)
+    6mA, GATCA, offset=1   <- GATC + trailing A  -> REMOVED
+    6mA, CGATC, offset=2   <- C + GATC           -> REMOVED
+    6mA, TGATC, offset=2   <- T + GATC           -> REMOVED
     ...
-
-Example for 5mC:
-
-    5mC, TCNATC,   offset=1   ← core motif (KEPT)
-    5mC, ATCNATC,  offset=2   ← extension of TCNATC → REMOVED
-    5mC, RNTCNATC, offset=3   ← extension of TCNATC → REMOVED
 
 Output format
 -------------
@@ -53,7 +47,7 @@ Standard PacBio motifs.csv (comma-separated, 12 columns):
     meanScore, meanIpdRatio, meanCoverage, objectiveScore
 
 Columns without available data are written as empty strings.
-This file is directly parseable by ``kinsim prep parse`` (PacBioParser),
+This file is directly parseable by ``kinsim-prep parse`` (PacBioParser),
 which converts it to a KinSim motif string for use in the pipeline.
 """
 
@@ -79,10 +73,10 @@ _MOD_NORMALIZE: dict[str, str] = {
     '6mA':  'm6A', 'm6A':  'm6A',
     '5mC':  'm5C', 'm5C':  'm5C',
     '4mC':  'm4C', 'm4C':  'm4C',
-    '5hmC': 'm5C',   # 5-hydroxymethylcytosine → treat as m5C
+    '5hmC': 'm5C',   # 5-hydroxymethylcytosine -> treat as m5C
 }
 
-# IUPAC base expansion — used for motif containment checks
+# IUPAC base expansion -- used for motif containment checks
 _IUPAC_EXPAND: dict[str, frozenset[str]] = {
     'A': frozenset('A'), 'C': frozenset('C'),
     'G': frozenset('G'), 'T': frozenset('T'),
@@ -112,7 +106,7 @@ def motif_contains(longer: str, offset_longer: int,
 
     Containment requires two conditions:
       1. There exists a starting position ``p`` within *longer* such that
-         every base of *shorter* is IUPAC-compatible with *longer[p+i]*.
+         every base of *shorter* is IUPAC-compatible with ``longer[p+i]``.
       2. The modified position of *longer* aligns with that of *shorter*:
          ``p + offset_shorter == offset_longer``.
 
@@ -193,8 +187,10 @@ def _parse_motif_file(filepath: str) -> list[dict]:
         is_pacbio   = 'motifString' in fieldnames and 'centerPos' in fieldnames
 
         if is_combined:
+            fmt_label = "combined CSV"
             entries = _parse_combined_rows(reader, filepath)
         elif is_pacbio:
+            fmt_label = "PacBio CSV"
             entries = _parse_pacbio_rows(reader, filepath)
         else:
             log.error(
@@ -206,7 +202,13 @@ def _parse_motif_file(filepath: str) -> list[dict]:
             )
             sys.exit(1)
 
-    log.info("Parsed %d motifs from %s", len(entries), filepath)
+    log.info("Parsed %d motifs from %s (format: %s)", len(entries), filepath, fmt_label)
+    for e in entries:
+        frac_str = f"frac={e['fraction']:.2f}" if isinstance(e['fraction'], float) else "frac=N/A"
+        sites_str = f"sites={e['n_genome']}" if isinstance(e['n_genome'], int) else "sites=N/A"
+        log.info("  [%s] %s %s offset=%d  %s  %s  (from: %s)",
+                 e['mod_type'], e['motif'], e['mod_type'], e['offset'],
+                 frac_str, sites_str, filepath)
     return entries
 
 
@@ -226,7 +228,7 @@ def _parse_combined_rows(reader: csv.DictReader, filepath: str) -> list[dict]:
 
         norm_mod = _MOD_NORMALIZE.get(mod_raw)
         if norm_mod is None:
-            log.warning("%s line %d: unknown mod_type '%s' — skipped",
+            log.warning("%s line %d: unknown mod_type '%s' -- skipped",
                         filepath, lineno, mod_raw)
             continue
 
@@ -235,7 +237,7 @@ def _parse_combined_rows(reader: csv.DictReader, filepath: str) -> list[dict]:
             fraction = float(frac_str) if frac_str else ''
             n_genome = int(ns_str) if ns_str else ''
         except ValueError:
-            log.warning("%s line %d: invalid numeric field — skipped",
+            log.warning("%s line %d: invalid numeric field -- skipped",
                         filepath, lineno)
             continue
 
@@ -259,7 +261,7 @@ def _parse_pacbio_rows(reader: csv.DictReader, filepath: str) -> list[dict]:
     has_ngenome    = 'nGenome'           in fieldnames
     has_mod_type   = 'modificationType'  in fieldnames
 
-    # Base→mod type fallback (for 'modified_base' entries)
+    # Base->mod type fallback (for 'modified_base' entries)
     _base_to_meth = {'A': 'm6A', 'C': 'm4C'}
 
     for lineno, row in enumerate(reader, 2):
@@ -271,7 +273,7 @@ def _parse_pacbio_rows(reader: csv.DictReader, filepath: str) -> list[dict]:
         try:
             offset = int(center_str)
         except ValueError:
-            log.warning("%s line %d: invalid centerPos — skipped",
+            log.warning("%s line %d: invalid centerPos -- skipped",
                         filepath, lineno)
             continue
 
@@ -281,17 +283,17 @@ def _parse_pacbio_rows(reader: csv.DictReader, filepath: str) -> list[dict]:
         if not norm_mod:
             if mod_raw in ('modified_base', ''):
                 if offset >= len(motif_seq):
-                    log.warning("%s line %d: centerPos %d OOB for '%s' — skipped",
+                    log.warning("%s line %d: centerPos %d OOB for '%s' -- skipped",
                                 filepath, lineno, offset, motif_seq)
                     continue
                 base = motif_seq[offset].upper()
                 norm_mod = _base_to_meth.get(base, '')
                 if not norm_mod:
-                    log.warning("%s line %d: cannot infer mod type from '%s'[%d] — skipped",
+                    log.warning("%s line %d: cannot infer mod type from '%s'[%d] -- skipped",
                                 filepath, lineno, motif_seq, offset)
                     continue
             else:
-                log.warning("%s line %d: unknown modificationType '%s' — skipped",
+                log.warning("%s line %d: unknown modificationType '%s' -- skipped",
                             filepath, lineno, mod_raw)
                 continue
 
@@ -348,22 +350,36 @@ def _apply_filters(
 ) -> list[dict]:
     """Filter motifs by minimum fraction and minimum n_sites.
 
-    Blank fields bypass their filter — entries without coverage data
+    Blank fields bypass their filter -- entries without coverage data
     (e.g. REBASE-derived motifs) are always retained.
     """
     kept: list[dict] = []
     for e in entries:
         frac     = e.get('fraction', '')
         n_genome = e.get('n_genome', '')
+        label = f"{e['mod_type']} {e['motif']} offset={e['offset']}"
 
         if isinstance(frac, float) and frac < min_frac:
+            log.info("  [FILTERED] %s -- fraction=%.3f < min_frac=%.2f  (source: %s)",
+                     label, frac, min_frac, e.get('source', '?'))
             continue
         if isinstance(n_genome, int) and n_genome < min_sites:
+            log.info("  [FILTERED] %s -- n_sites=%d < min_sites=%d  (source: %s)",
+                     label, n_genome, min_sites, e.get('source', '?'))
             continue
+
+        bypass_parts = []
+        if not isinstance(frac, float):
+            bypass_parts.append("frac=N/A (bypass)")
+        if not isinstance(n_genome, int):
+            bypass_parts.append("sites=N/A (bypass)")
+        bypass_note = f"  [{', '.join(bypass_parts)}]" if bypass_parts else ""
+        log.info("  [KEPT]     %s%s", label, bypass_note)
         kept.append(e)
 
-    log.info("Filtering: %d → %d motifs (min_frac=%.2f, min_sites=%d)",
-             len(entries), len(kept), min_frac, min_sites)
+    n_dropped = len(entries) - len(kept)
+    log.info("Filtering summary: %d in -> %d kept, %d dropped (min_frac=%.2f, min_sites=%d)",
+             len(entries), len(kept), n_dropped, min_frac, min_sites)
     return kept
 
 
@@ -413,10 +429,17 @@ def deduplicate_motifs(entries: list[dict]) -> list[dict]:
                     shorter['motif'], shorter['offset'],
                 ):
                     redundant[j] = True
+                    log.info("  [DEDUP]    %s %s (offset=%d) removed -- "
+                             "contained in shorter core: %s (offset=%d)",
+                             mod_type, longer['motif'], longer['offset'],
+                             shorter['motif'], shorter['offset'])
 
         kept = [m for m, r in zip(sorted_m, redundant) if not r]
-        log.info("  %s: %d → %d motifs after deduplication",
-                 mod_type, n, len(kept))
+        for m in kept:
+            log.info("  [FINAL]    %s %s offset=%d", mod_type, m['motif'], m['offset'])
+        n_removed = n - len(kept)
+        log.info("  %s: %d -> %d motifs after deduplication (%d redundant removed)",
+                 mod_type, n, len(kept), n_removed)
         result.extend(kept)
 
     return result
@@ -434,8 +457,18 @@ def _merge_entries(a: list[dict], b: list[dict]) -> list[dict]:
     n_genome value is kept (more genomic evidence = more reliable).
     """
     seen: dict[tuple, dict] = {}
-    for e in a + b:
+    # Track which keys came from which list for logging
+    from_a: set[tuple] = set()
+    from_b: set[tuple] = set()
+
+    for e in a:
         key = (e['mod_type'], e['motif'], e['offset'])
+        from_a.add(key)
+        seen[key] = e
+
+    for e in b:
+        key = (e['mod_type'], e['motif'], e['offset'])
+        from_b.add(key)
         if key not in seen:
             seen[key] = e
         else:
@@ -443,6 +476,39 @@ def _merge_entries(a: list[dict], b: list[dict]) -> list[dict]:
             new_ng      = e.get('n_genome') or 0
             if new_ng > existing_ng:
                 seen[key] = e
+
+    # Log cross-file matches and unique motifs
+    matched   = from_a & from_b
+    only_in_a = from_a - from_b
+    only_in_b = from_b - from_a
+
+    if matched:
+        log.info("Cross-file matches (%d motifs found in BOTH sources):", len(matched))
+        for key in sorted(matched):
+            e = seen[key]
+            src = e.get('source', '?')
+            log.info("  [MATCH]    %s %s offset=%d  (kept from: %s)",
+                     key[0], key[1], key[2], src)
+
+    if only_in_a:
+        log.info("Motifs only in previous inputs (%d):", len(only_in_a))
+        for key in sorted(only_in_a):
+            e = seen[key]
+            src = e.get('source', '?')
+            log.info("  [UNIQUE]   %s %s offset=%d  (source: %s)",
+                     key[0], key[1], key[2], src)
+
+    if only_in_b:
+        log.info("Motifs only in new input (%d):", len(only_in_b))
+        for key in sorted(only_in_b):
+            e = seen[key]
+            src = e.get('source', '?')
+            log.info("  [UNIQUE]   %s %s offset=%d  (source: %s)",
+                     key[0], key[1], key[2], src)
+
+    log.info("Merge: %d + %d -> %d unique motifs (%d matched across files)",
+             len(a), len(b), len(seen), len(matched))
+
     return list(seen.values())
 
 
@@ -456,7 +522,7 @@ def write_pacbio_motifs_csv(entries: list[dict], filepath: str) -> None:
     All 12 standard columns are written; unavailable fields are empty strings.
     The output is directly parseable by PacBioParser::
 
-        kinsim prep parse final_motifs.csv   → KinSim motif string
+        kinsim-prep parse final_motifs.csv   -> KinSim motif string
 
     Args:
         entries:  List of motif entry dicts from :func:`_make_entry`.
@@ -517,12 +583,25 @@ def merge_motifs(
         Stats dict: {motifs_in, motifs_after_filter, motifs_out}.
     """
     # Parse and merge all input files
+    log.info("=" * 60)
+    log.info("MERGE-MOTIFS: %d input file(s)", len(input_files))
+    for i, path in enumerate(input_files, 1):
+        log.info("  Input %d: %s", i, path)
+    log.info("  Output:  %s", output_path)
+    log.info("  Filters: min_frac=%.2f, min_sites=%d, dedup=%s",
+             min_frac, min_sites, deduplicate)
+    log.info("=" * 60)
+
     merged: list[dict] = []
-    for path in input_files:
+    for i, path in enumerate(input_files, 1):
+        log.info("--- Parsing input %d/%d: %s ---", i, len(input_files), path)
         entries = _parse_motif_file(path)
+        if merged:
+            log.info("--- Merging input %d with previous entries ---", i)
         merged  = _merge_entries(merged, entries)
 
     motifs_in = len(merged)
+    log.info("--- Total unique motifs after merging all inputs: %d ---", motifs_in)
 
     # Filter
     filtered = _apply_filters(merged, min_frac=min_frac, min_sites=min_sites)
@@ -530,8 +609,10 @@ def merge_motifs(
 
     # Deduplicate
     if deduplicate:
+        log.info("--- Deduplication (IUPAC containment) ---")
         deduped = deduplicate_motifs(filtered)
     else:
+        log.info("--- Deduplication: SKIPPED (--no-dedup) ---")
         deduped = filtered
 
     motifs_out = len(deduped)
@@ -542,8 +623,15 @@ def merge_motifs(
     # Write standard PacBio CSV
     write_pacbio_motifs_csv(deduped, output_path)
 
-    log.info("Merge done: %d in → %d filtered → %d final",
-             motifs_in, motifs_after_filter, motifs_out)
+    log.info("=" * 60)
+    log.info("MERGE-MOTIFS COMPLETE")
+    log.info("  Total from all inputs: %d", motifs_in)
+    log.info("  After filtering:       %d  (%d removed)",
+             motifs_after_filter, motifs_in - motifs_after_filter)
+    log.info("  After deduplication:   %d  (%d redundant removed)",
+             motifs_out, motifs_after_filter - motifs_out)
+    log.info("  Written to: %s", output_path)
+    log.info("=" * 60)
 
     return {
         'motifs_in':           motifs_in,
@@ -558,10 +646,10 @@ def merge_motifs(
 
 def main(argv=None) -> None:
     import argparse
-    from ..config import setup_logging
+    from kinsim.config import setup_logging
 
     parser = argparse.ArgumentParser(
-        prog="kinsim merge-motifs",
+        prog="kinsim-prep merge-motifs",
         description=(
             "Merge, filter, and deduplicate motifs from multiple sources\n"
             "into a single standard PacBio motifs.csv.\n\n"
@@ -569,14 +657,12 @@ def main(argv=None) -> None:
             "  Combined CSV  : mod_type,motif,offset,frac_mod,n_sites,source\n"
             "                  (output from modkit + fibertools pipeline)\n"
             "  PacBio CSV    : motifString,centerPos,modificationType,...\n"
-            "                  (output from 'kinsim prep rebase parse --output-csv')\n\n"
+            "                  (output from 'kinsim-prep rebase fetch')\n\n"
             "Deduplication removes motifs that are IUPAC-supersets of shorter cores:\n"
             "  6mA GATC (offset=1) is the core; CGATC, GATCA, TGATC, GGATC\n"
             "  are all extensions and will be removed.\n\n"
-            "  5mC TCNATC (offset=1) is the core; ATCNATC, RNTCNATC, etc.\n"
-            "  are all extensions and will be removed.\n\n"
             "Output is a standard PacBio motifs.csv, readable by:\n"
-            "  kinsim prep parse final_motifs.csv   -> KinSim motif string\n"
+            "  kinsim-prep parse final_motifs.csv  -> KinSim motif string\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

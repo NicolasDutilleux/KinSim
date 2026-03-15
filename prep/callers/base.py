@@ -13,7 +13,7 @@ class BaseOutputParser(ABC):
     Subclasses must define:
         name:            Short identifier used for registry lookup.
         supported_mods:  List of mod types this format can carry.
-        parse():         File → KinSim motif string conversion.
+        parse():         File -> KinSim motif string conversion.
     """
 
     name: ClassVar[str]
@@ -44,6 +44,6 @@ class BaseOutputParser(ABC):
         """Heuristic: return True if filepath looks like this format.
 
         Used by auto_detect_parser() to guess the right parser.
-        Default returns False — subclasses should override.
+        Default returns False -- subclasses should override.
         """
         return False
