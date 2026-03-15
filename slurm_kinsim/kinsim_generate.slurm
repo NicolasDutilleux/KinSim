@@ -6,7 +6,7 @@
 #SBATCH --partition=pibu_el8
 #SBATCH --gres=gpu:1
 #SBATCH --time=02:00:00
-#SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/kinsim_mlp_generate_%A_%a.log
+#SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/kinsim_generate_%A_%a.log
 #SBATCH --mail-user=nicolas.dutilleux@unifr.ch
 #SBATCH --mail-type=FAIL
 
@@ -18,7 +18,7 @@
 # generation (falls back to CPU automatically if unavailable).
 #
 # Usage:
-#   sbatch --array=1-N kinsim_mlp_generate.slurm <pbsim3_dir> <checkpoint.pt> <motifs> <output_dir>
+#   sbatch --array=1-N kinsim_generate.slurm <pbsim3_dir> <checkpoint.pt> <motifs> <output_dir>
 #
 # Arguments:
 #   $1  PBSIM3 output directory — two supported layouts (auto-detected):
@@ -48,15 +48,15 @@
 #   Flat layout:      ls <pbsim3_dir>/*.fq.gz | wc -l
 #
 # Examples:
-#   sbatch --array=1-57 kinsim_mlp_generate.slurm pbsim3_output/ checkpoint.pt \
+#   sbatch --array=1-57 kinsim_generate.slurm pbsim3_output/ checkpoint.pt \
 #       "m6A,GATC,2;m4C,CCWGG,1" generated_mlp/
 #
 #   # Per-species motifs file:
-#   sbatch --array=1-57 kinsim_mlp_generate.slurm pbsim3_output/ checkpoint.pt \
+#   sbatch --array=1-57 kinsim_generate.slurm pbsim3_output/ checkpoint.pt \
 #       motifs_map.txt generated_mlp/
 #
 #   # Deterministic (mean prediction, no sampling — useful for ablations):
-#   sbatch --array=1-57 kinsim_mlp_generate.slurm pbsim3_output/ checkpoint.pt \
+#   sbatch --array=1-57 kinsim_generate.slurm pbsim3_output/ checkpoint.pt \
 #       "m6A,GATC,1" generated_mlp_det/
 #   # then add --deterministic to the kinsim command below
 #
@@ -66,7 +66,7 @@
 
 # ---- Usage check ----
 if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ]; then
-    echo "Usage: sbatch --array=1-N kinsim_mlp_generate.slurm <pbsim3_dir> <checkpoint.pt> <motifs> <output_dir>"
+    echo "Usage: sbatch --array=1-N kinsim_generate.slurm <pbsim3_dir> <checkpoint.pt> <motifs> <output_dir>"
     echo ""
     echo "Arguments:"
     echo "  pbsim3_dir      Species subdirectories OR flat .fq.gz files"
@@ -207,7 +207,7 @@ echo ""
 # ---- Run ----
 # Remove --deterministic below for stochastic generation (default, recommended).
 # Add --deterministic for ablation studies (identical signal per context).
-kinsim mlp generate "$FASTQ_IN" "$MAF_IN" "$REF_IN" "$CKPT_IN" "$MOTIFS" "$BAM_OUT" \
+kinsim generate "$FASTQ_IN" "$MAF_IN" "$REF_IN" "$CKPT_IN" "$MOTIFS" "$BAM_OUT" \
     --device "$DEVICE" \
     --batch-reads 1000
 EXIT_CODE=$?

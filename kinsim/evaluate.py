@@ -43,9 +43,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from ...common.dataset import MLPSignalDataset, inv_log_transform, log_transform
-from ...encoding import METH_IDS, encode_kmer
-from .model import MLPPredictor, create_from_config
+from .data.dataset import MLPSignalDataset, inv_log_transform, log_transform
+from .utils.encoding import METH_IDS, encode_kmer
+from .models.predictor import MLPPredictor, create_from_config
 
 log = logging.getLogger(__name__)
 
@@ -366,7 +366,7 @@ def plot_kmer_distribution(
 
 def main(argv=None) -> None:
     import argparse
-    from ...config import setup_logging
+    from .utils.config import setup_logging
 
     parser = argparse.ArgumentParser(
         prog="kinsim mlp evaluate",

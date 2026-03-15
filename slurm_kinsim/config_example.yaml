@@ -2,8 +2,8 @@
 # KinSim MLP — Training configuration
 #
 # Usage:
-#   kinsim train --model mlp --config config_mlp.yaml
-#   sbatch kinsim_mlp_train.slurm --config config_mlp.yaml
+#   kinsim train --config config.yaml
+#   sbatch kinsim_train.slurm --config config.yaml
 #
 # All values below are the defaults.  Remove a key to use the default.
 # Command-line flags always override YAML values.

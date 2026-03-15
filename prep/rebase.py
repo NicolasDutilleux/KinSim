@@ -29,7 +29,7 @@ import os
 import re
 import sys
 
-from kinsim.encoding import METH_IDS
+from kinsim.utils.encoding import METH_IDS
 
 log = logging.getLogger(__name__)
 
@@ -801,7 +801,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.command == "fetch":
-        from kinsim.config import setup_logging
+        from kinsim.utils.config import setup_logging
         setup_logging(verbose=getattr(args, 'verbose', False))
         try:
             entries = fetch_rebase_org(args.org_num, args.output)
@@ -845,7 +845,7 @@ def main(argv=None):
             print(result)
 
     elif args.command == "patterns":
-        from kinsim.motifs import load_motif_string
+        from kinsim.utils.motifs import load_motif_string
         motif_string = load_motif_string(args.motifs,
                                          min_fraction=args.min_fraction,
                                          min_detected=args.min_detected)

@@ -29,7 +29,7 @@ import logging
 import os
 import sys
 
-from kinsim.motifs import load_motif_string
+from kinsim.utils.motifs import load_motif_string
 
 log = logging.getLogger(__name__)
 
@@ -93,7 +93,7 @@ def prepare_config(input_file, output_file, min_fraction=0.40, min_detected=20):
 
 def main(argv=None):
     import argparse
-    from kinsim.config import setup_logging
+    from kinsim.utils.config import setup_logging
     parser = argparse.ArgumentParser(
         prog="kinsim-prep prepare",
         description=(

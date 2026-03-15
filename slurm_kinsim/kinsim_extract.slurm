@@ -38,19 +38,19 @@
 #   $3  Path for the final merged master training data (.pkl)
 #
 # Count N for --array:
-#   N=$(kinsim manifest count manifest.csv)
+#   N=$(kinsim-prep manifest count manifest.csv)
 #   sbatch --array=1-$N kinsim_extract.slurm manifest.csv shards/ master_data.pkl
 #
 # Examples:
 #   # Submit extract + auto-merge (standalone, no pipeline):
-#   N=$(kinsim manifest count manifest.csv)
+#   N=$(kinsim-prep manifest count manifest.csv)
 #   sbatch --array=1-$N kinsim_extract.slurm manifest.csv shards/ master_data.pkl
 #
 #   # Submit via kinsim_pipeline.sh (handles merge dependency automatically):
-#   bash kinsim_pipeline.sh mlp manifest.csv shards/ master_data.pkl ...
+#   # (pipeline.sh moved to archive) manifest.csv shards/ master_data.pkl ...
 #
 # Output consumed by:
-#   kinsim_mlp_train.slurm     (trains the MLPPredictor)
+#   kinsim_train.slurm     (trains the MLPPredictor)
 #   kinsim_cgan_train.slurm    (trains the Generator + Discriminator)
 # ============================================================
 
@@ -63,10 +63,10 @@ if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then
     echo "  shards_dir      Directory for intermediate *_shard.pkl files"
     echo "  master_output   Path for the final merged training data (.pkl)"
     echo ""
-    echo "Count N:  kinsim manifest count manifest.csv"
+    echo "Count N:  kinsim-prep manifest count manifest.csv"
     echo ""
     echo "Example:"
-    echo "  N=\$(kinsim manifest count manifest.csv)"
+    echo "  N=\$(kinsim-prep manifest count manifest.csv)"
     echo "  sbatch --array=1-\$N kinsim_extract.slurm manifest.csv shards/ master_data.pkl"
     exit 1
 fi

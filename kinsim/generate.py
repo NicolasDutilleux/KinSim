@@ -50,18 +50,14 @@ import pysam
 import torch
 import torch.nn as nn
 
-from .model import MLPPredictor, create_from_config
-from ...encoding import BASE_MAP, K, KMER_MASK
-from ...motifs import (build_reference_meth_map, load_motif_string,
-                       parse_motifs, scan_sequence)
+from .models.predictor import MLPPredictor, create_from_config
+from .utils.encoding import BASE_MAP, K, KMER_MASK
+from .utils.motifs import (build_reference_meth_map, load_motif_string,
+                     parse_motifs, scan_sequence)
+from .utils.io import (MID, find_pbsim3_files, resolve_motifs_for_species,
+                        get_extended_context, load_reference, parse_maf)
 
 log = logging.getLogger(__name__)
-
-# Reuse from dictionary.inject — no code duplication
-from ...dictionary.inject import (MID, _find_pbsim3_files,
-                                   _resolve_motifs_for_species,
-                                   get_extended_context, load_reference,
-                                   parse_maf)
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +504,7 @@ def generate_directory(
 
     Output BAMs are written to output_dir as <species_name>_mlp.bam.
     """
-    genomes = _find_pbsim3_files(pbsim3_dir)
+    genomes = find_pbsim3_files(pbsim3_dir)
     if not genomes:
         log.error("No genome sets found in %s", pbsim3_dir)
         sys.exit(1)
@@ -517,7 +513,7 @@ def generate_directory(
     log.info("Found %d species in %s", len(genomes), pbsim3_dir)
 
     for fq_path, maf_path, ref_path, species in genomes:
-        motif_string = _resolve_motifs_for_species(motif_source, species,
+        motif_string = resolve_motifs_for_species(motif_source, species,
                                                    min_fraction, min_detected)
         if not motif_string:
             log.error("No motifs found for species '%s'.", species)

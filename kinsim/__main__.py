@@ -6,32 +6,29 @@ Usage:
 """
 
 import difflib
-import logging
 import sys
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 COMMANDS = [
-    "extract", "merge", "train", "generate", "evaluate", "analyze",
+    "extract", "merge", "train", "generate", "evaluate",
 ]
 
 USAGE = """\
 usage: kinsim [--version] <command> [<args>]
 
-KinSim - PacBio kinetic signal simulator for metagenomic binning.
+KinSim - PacBio kinetic signal simulator (MLP pipeline).
 
-Core commands:
+Commands:
   extract     Extract raw IPD/PW samples from a BAM file  (-> .pkl shard)
   merge       Merge .pkl shards into a master training set
-  train       Train a kinetic model  (--model dictionary | mlp | cgan)
+  train       Train the ConvPredictor / MLPPredictor model
   generate    Generate synthetic kinetic signals for PBSIM3 reads
-              (--model dictionary | mlp | cgan)
-  evaluate    Evaluate a trained model  (--model mlp)
-  analyze     Report coverage and signal statistics for a dictionary .pkl
+  evaluate    Evaluate a trained model (calibration report + plots)
 
 Data preparation:
   Use 'kinsim-prep' for motif parsing, REBASE fetching, manifest tools,
-  and general dictionary filtering.
+  and dictionary filtering.
 
 Use 'kinsim <command> -h' for detailed help on a specific command.
 Use 'kinsim --version' to print the version number.
@@ -47,51 +44,14 @@ def _suggest(word, candidates, n=1, cutoff=0.6):
     return difflib.get_close_matches(word, candidates, n=n, cutoff=cutoff)
 
 
-def _pop_model(args):
-    """Remove --model <value> from an arg list.
-
-    Returns (model_str, remaining_args).
-    model_str is None when the flag is absent.
-
-    Supports both '--model mlp' and '--model=mlp' forms.
-    """
-    for i, arg in enumerate(args):
-        if arg == "--model" and i + 1 < len(args):
-            return args[i + 1], args[:i] + args[i + 2:]
-        if arg.startswith("--model="):
-            return arg[len("--model="):], args[:i] + args[i + 1:]
-    return None, args
-
-
-def _require_model(rest, command):
-    """Parse --model from rest; exit with a clear message if missing."""
-    model, subrest = _pop_model(rest)
-    if not model:
-        print(
-            f"ERROR: 'kinsim {command}' requires --model <dictionary|mlp|cgan>.\n"
-            f"  Example: kinsim {command} ... --model mlp",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    if model not in ("dictionary", "mlp", "cgan"):
-        print(
-            f"ERROR: unknown model '{model}'. "
-            "Valid choices: dictionary, mlp, cgan",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    return model, subrest
-
-
 # ---------------------------------------------------------------------------
 # Main dispatcher
 # ---------------------------------------------------------------------------
 
 def main(argv=None):
-    from .config import setup_logging
+    from .utils.config import setup_logging
     args = argv if argv is not None else sys.argv[1:]
 
-    # Set up logging early so all submodules emit timestamped output to SLURM logs.
     setup_logging(verbose=False)
 
     if not args or args[0] in ("-h", "--help"):
@@ -106,65 +66,28 @@ def main(argv=None):
 
     # -- extract --
     if cmd == "extract":
-        from .common.extract import main as run
+        from .extract import main as run
         run(["extract"] + rest)
 
     # -- merge --
     elif cmd == "merge":
-        from .common.extract import main as run
+        from .extract import main as run
         run(["merge"] + rest)
-
-    # -- analyze --
-    elif cmd == "analyze":
-        from .dictionary.analyze import main as run
-        run(rest)
 
     # -- train --
     elif cmd == "train":
-        model, subrest = _require_model(rest, "train")
-
-        if model == "dictionary":
-            from .dictionary.train import main as run
-            run(["train"] + subrest)
-
-        elif model == "mlp":
-            from .models.mlp.train import main as run
-            run(subrest)
-
-        elif model == "cgan":
-            from .models.cgan.train import main as run
-            run(subrest)
+        from .train import main as run
+        run(rest)
 
     # -- generate --
     elif cmd == "generate":
-        model, subrest = _require_model(rest, "generate")
-
-        if model == "dictionary":
-            from .dictionary.inject import main as run
-            run(subrest)
-
-        elif model == "mlp":
-            from .models.mlp.generate import main as run
-            run(subrest)
-
-        elif model == "cgan":
-            from .models.cgan.generate import main as run
-            run(subrest)
+        from .generate import main as run
+        run(rest)
 
     # -- evaluate --
     elif cmd == "evaluate":
-        model, subrest = _require_model(rest, "evaluate")
-
-        if model == "mlp":
-            from .models.mlp.evaluate import main as run
-            run(subrest)
-        else:
-            print(
-                f"ERROR: 'kinsim evaluate' is currently only supported for "
-                f"--model mlp (got '{model}').",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        from .evaluate import main as run
+        run(rest)
 
     # -- unknown --
     else:
@@ -175,8 +98,14 @@ def main(argv=None):
         # Hint for users who try prep commands on kinsim
         prep_cmds = {"prep", "rebase", "manifest", "filter", "prepare", "parse", "motifs"}
         if cmd in prep_cmds:
-            msg += f"\n\nData prep commands have moved to 'kinsim-prep'.\n"
+            msg += f"\n\nData prep commands live in 'kinsim-prep'.\n"
             msg += f"  Try:  kinsim-prep {cmd} ..."
+        # Hint for users who try old model-based syntax
+        old_cmds = {"dictionary", "cgan", "mlp"}
+        if cmd in old_cmds:
+            msg += f"\n\nThe --model flag has been removed. KinSim is now MLP-only.\n"
+            msg += "  Use:  kinsim train / kinsim generate / kinsim evaluate\n"
+            msg += "  Dictionary and cGAN code has been moved to archive/."
         print(msg, file=sys.stderr)
         print(USAGE)
         sys.exit(1)

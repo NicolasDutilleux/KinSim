@@ -23,7 +23,7 @@ and 'frac_mod' in the CSV header.
 import csv
 import logging
 
-from kinsim.encoding import METH_IDS
+from kinsim.utils.encoding import METH_IDS
 from .base import BaseOutputParser
 from .registry import register
 

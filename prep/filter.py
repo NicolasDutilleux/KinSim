@@ -25,7 +25,7 @@ import pickle
 import sys
 from pathlib import Path
 
-from kinsim.encoding import METH_IDS
+from kinsim.utils.encoding import METH_IDS
 
 log = logging.getLogger(__name__)
 
@@ -149,7 +149,7 @@ def filter_pkl(
 
 
 def main(argv=None) -> None:
-    from kinsim.config import setup_logging
+    from kinsim.utils.config import setup_logging
 
     parser = argparse.ArgumentParser(
         prog="kinsim-prep filter",

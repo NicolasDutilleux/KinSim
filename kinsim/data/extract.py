@@ -54,11 +54,11 @@ from pathlib import Path
 import numpy as np
 import pysam
 
-from ..encoding import BASE_MAP, K, KMER_MASK
-from ..motifs import load_motif_string, parse_motifs, reverse_complement, scan_sequence
+from ..utils.encoding import BASE_MAP, K, KMER_MASK
+from ..utils.motifs import load_motif_string, parse_motifs, reverse_complement, scan_sequence
 
 try:
-    from ..__version__ import __version__ as _KINSIM_VERSION
+    from ..__init__ import __version__ as _KINSIM_VERSION
 except ImportError:
     try:
         from ..__main__ import __version__ as _KINSIM_VERSION
@@ -129,7 +129,7 @@ def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
     Returns:
         dict mapping meth_id → float fraction.  Always includes {0: 0.0}.
     """
-    from ..encoding import METH_IDS
+    from ..utils.encoding import METH_IDS
 
     fracs: dict[int, float] = {0: 0.0}
     if not motif_string:
@@ -448,8 +448,8 @@ def extract_from_manifest_task(
         revcomp:              Scan reverse complement strand for motifs.
         use_reverse_strand:   Extract ri/rp complementary-strand kinetics.
     """
-    from ..config import load_manifest
-    from ..motifs import load_motif_string as _load_motif_string
+    from ..utils.config import load_manifest
+    from ..utils.motifs import load_motif_string as _load_motif_string
 
     entries = load_manifest(manifest_path)
 
@@ -500,7 +500,7 @@ def extract_from_manifest_task(
 
 def main(argv=None) -> None:
     import argparse
-    from ..config import setup_logging
+    from ..utils.config import setup_logging
 
     parser = argparse.ArgumentParser(
         prog="kinsim data",

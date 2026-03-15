@@ -646,7 +646,7 @@ def merge_motifs(
 
 def main(argv=None) -> None:
     import argparse
-    from kinsim.config import setup_logging
+    from kinsim.utils.config import setup_logging
 
     parser = argparse.ArgumentParser(
         prog="kinsim-prep merge-motifs",

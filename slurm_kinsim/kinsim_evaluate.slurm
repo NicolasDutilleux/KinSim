@@ -6,7 +6,7 @@
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
 #SBATCH --time=01:00:00
-#SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/kinsim_mlp_evaluate_%j.log
+#SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/kinsim_evaluate_%j.log
 #SBATCH --mail-user=nicolas.dutilleux@unifr.ch
 #SBATCH --mail-type=FAIL
 
@@ -17,7 +17,7 @@
 # and optionally generates per-kmer distribution plots.
 #
 # Usage:
-#   sbatch kinsim_mlp_evaluate.slurm <checkpoint_dir> <master_data.pkl> [extra_flags]
+#   sbatch kinsim_evaluate.slurm <checkpoint_dir> <master_data.pkl> [extra_flags]
 #
 # Arguments:
 #   $1  Checkpoint directory (contains model_config.json + checkpoint_epoch*.pt)
@@ -26,10 +26,10 @@
 #
 # Examples:
 #   # Full calibration report:
-#   sbatch kinsim_mlp_evaluate.slurm checkpoints_mlp/ master_data.pkl
+#   sbatch kinsim_evaluate.slurm checkpoints_mlp/ master_data.pkl
 #
 #   # Per-kmer distribution plot:
-#   sbatch kinsim_mlp_evaluate.slurm checkpoints_mlp/ master_data.pkl \
+#   sbatch kinsim_evaluate.slurm checkpoints_mlp/ master_data.pkl \
 #       --kmer GGATCCTGCAT --meth m6A --plot gatc_m6A.png
 #
 # Output:
@@ -39,15 +39,15 @@
 
 # ---- Usage check ----
 if [ -z "$1" ] || [ -z "$2" ]; then
-    echo "Usage: sbatch kinsim_mlp_evaluate.slurm <checkpoint_dir> <master_data.pkl> [flags]"
+    echo "Usage: sbatch kinsim_evaluate.slurm <checkpoint_dir> <master_data.pkl> [flags]"
     echo ""
     echo "Arguments:"
     echo "  checkpoint_dir     Directory with model_config.json and checkpoint_epoch*.pt"
     echo "  master_data.pkl    Merged training data .pkl file"
     echo ""
     echo "Examples:"
-    echo "  sbatch kinsim_mlp_evaluate.slurm checkpoints_mlp/ master_data.pkl"
-    echo "  sbatch kinsim_mlp_evaluate.slurm checkpoints_mlp/ master_data.pkl \\"
+    echo "  sbatch kinsim_evaluate.slurm checkpoints_mlp/ master_data.pkl"
+    echo "  sbatch kinsim_evaluate.slurm checkpoints_mlp/ master_data.pkl \\"
     echo "      --kmer GGATCCTGCAT --meth m6A --plot gatc_m6A.png"
     exit 1
 fi
@@ -111,7 +111,7 @@ fi
 echo ""
 
 # ---- Run ----
-kinsim mlp evaluate "$CKPT_DIR" "$PKL" --device "$DEVICE" "$@"
+kinsim evaluate "$CKPT_DIR" "$PKL" --device "$DEVICE" "$@"
 EXIT_CODE=$?
 
 # ---- Summary ----
