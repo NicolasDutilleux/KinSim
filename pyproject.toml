@@ -7,7 +7,7 @@ name = "kinsim"
 version = "0.4.0"
 description = "PacBio kinetic signal simulator for metagenomic binning"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = [
     "numpy",
     "pysam",
