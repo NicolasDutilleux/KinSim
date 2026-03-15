@@ -347,39 +347,55 @@ def _apply_filters(
     entries: list[dict],
     min_frac: float,
     min_sites: int,
+    min_detected: int = 0,
 ) -> list[dict]:
-    """Filter motifs by minimum fraction and minimum n_sites.
+    """Filter motifs by fraction, n_sites/nGenome, and nDetected.
 
-    Blank fields bypass their filter -- entries without coverage data
-    (e.g. REBASE-derived motifs) are always retained.
+    Blank fields bypass their respective filter -- entries without coverage
+    data (e.g. REBASE-derived motifs) are always retained.
+
+    The nDetected check uses whichever is available: n_detected first,
+    then n_genome as fallback.  This ensures calling CSVs that only have
+    nDetected (no nGenome) are still filtered.
     """
     kept: list[dict] = []
     for e in entries:
-        frac     = e.get('fraction', '')
-        n_genome = e.get('n_genome', '')
+        frac       = e.get('fraction', '')
+        n_genome   = e.get('n_genome', '')
+        n_detected = e.get('n_detected', '')
         label = f"{e['mod_type']} {e['motif']} offset={e['offset']}"
 
         if isinstance(frac, float) and frac < min_frac:
             log.info("  [FILTERED] %s -- fraction=%.3f < min_frac=%.2f  (source: %s)",
                      label, frac, min_frac, e.get('source', '?'))
             continue
-        if isinstance(n_genome, int) and n_genome < min_sites:
-            log.info("  [FILTERED] %s -- n_sites=%d < min_sites=%d  (source: %s)",
-                     label, n_genome, min_sites, e.get('source', '?'))
+
+        # Check count: use n_detected if available, else n_genome
+        count = n_detected if isinstance(n_detected, int) else n_genome
+        if isinstance(count, int) and min_sites > 0 and count < min_sites:
+            log.info("  [FILTERED] %s -- count=%d < min_sites=%d  (source: %s)",
+                     label, count, min_sites, e.get('source', '?'))
+            continue
+
+        if min_detected > 0 and isinstance(n_detected, int) and n_detected < min_detected:
+            log.info("  [FILTERED] %s -- nDetected=%d < min_detected=%d  (source: %s)",
+                     label, n_detected, min_detected, e.get('source', '?'))
             continue
 
         bypass_parts = []
         if not isinstance(frac, float):
             bypass_parts.append("frac=N/A (bypass)")
-        if not isinstance(n_genome, int):
-            bypass_parts.append("sites=N/A (bypass)")
+        if not isinstance(count, int):
+            bypass_parts.append("count=N/A (bypass)")
         bypass_note = f"  [{', '.join(bypass_parts)}]" if bypass_parts else ""
-        log.info("  [KEPT]     %s%s", label, bypass_note)
+        log.info("  [KEPT]     %s  count=%s%s", label,
+                 str(count) if isinstance(count, int) else "N/A", bypass_note)
         kept.append(e)
 
     n_dropped = len(entries) - len(kept)
-    log.info("Filtering summary: %d in -> %d kept, %d dropped (min_frac=%.2f, min_sites=%d)",
-             len(entries), len(kept), n_dropped, min_frac, min_sites)
+    log.info("Filtering summary: %d in -> %d kept, %d dropped "
+             "(min_frac=%.2f, min_sites=%d, min_detected=%d)",
+             len(entries), len(kept), n_dropped, min_frac, min_sites, min_detected)
     return kept
 
 
@@ -563,6 +579,7 @@ def merge_motifs(
     *,
     min_frac: float = 0.8,
     min_sites: int = 300,
+    min_detected: int = 0,
     deduplicate: bool = True,
 ) -> dict:
     """Merge, filter, and deduplicate motifs from multiple CSV sources.
@@ -588,8 +605,8 @@ def merge_motifs(
     for i, path in enumerate(input_files, 1):
         log.info("  Input %d: %s", i, path)
     log.info("  Output:  %s", output_path)
-    log.info("  Filters: min_frac=%.2f, min_sites=%d, dedup=%s",
-             min_frac, min_sites, deduplicate)
+    log.info("  Filters: min_frac=%.2f, min_sites=%d, min_detected=%d, dedup=%s",
+             min_frac, min_sites, min_detected, deduplicate)
     log.info("=" * 60)
 
     merged: list[dict] = []
@@ -604,7 +621,8 @@ def merge_motifs(
     log.info("--- Total unique motifs after merging all inputs: %d ---", motifs_in)
 
     # Filter
-    filtered = _apply_filters(merged, min_frac=min_frac, min_sites=min_sites)
+    filtered = _apply_filters(merged, min_frac=min_frac, min_sites=min_sites,
+                              min_detected=min_detected)
     motifs_after_filter = len(filtered)
 
     # Deduplicate
@@ -693,6 +711,14 @@ def main(argv=None) -> None:
         ),
     )
     parser.add_argument(
+        "--min-detected", type=int, default=0,
+        help=(
+            "Minimum nDetected count to retain a motif (default: 0 = no filter). "
+            "Also used as fallback when nGenome is absent. "
+            "Entries with blank counts bypass this filter."
+        ),
+    )
+    parser.add_argument(
         "--no-dedup", action="store_true",
         help="Disable IUPAC motif containment deduplication.",
     )
@@ -713,6 +739,7 @@ def main(argv=None) -> None:
         output_path=args.output,
         min_frac=args.min_frac,
         min_sites=args.min_sites,
+        min_detected=args.min_detected,
         deduplicate=not args.no_dedup,
     )
 
