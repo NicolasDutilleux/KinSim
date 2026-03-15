@@ -108,7 +108,7 @@ def parse_motifs(motif_string, revcomp=True):
         parts = entry.split(',')
         m_type, seq, pos = parts[0], parts[1], parts[2]
         m_id = METH_IDS.get(m_type, 0)
-        mod_pos = int(pos)
+        mod_pos = int(pos) - 1  # 1-based input → 0-based internal
 
         pairs = [(seq, mod_pos)]
         if revcomp:
@@ -224,11 +224,12 @@ def parse_motifs_csv(csv_path, min_fraction=0.40, min_detected=20):
             mod_type = row.get('modificationType', '').strip() if has_mod_type else ''
 
             if mod_type in ('modified_base', ''):
-                if center_pos >= len(motif_seq):
+                idx = center_pos - 1   # centerPos is 1-based in CSV
+                if idx < 0 or idx >= len(motif_seq):
                     log.warning("motifs.csv line %d: centerPos %d OOB for '%s' — skipped",
                                 lineno, center_pos, motif_seq)
                     continue
-                base = motif_seq[center_pos].upper()
+                base = motif_seq[idx].upper()
                 resolved = _BASE_TO_METH.get(base)
                 if resolved is None:
                     log.warning("motifs.csv line %d: cannot infer mod type at "
