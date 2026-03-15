@@ -1,33 +1,15 @@
-"""Methylation caller output parsers for KinSim.
+"""Backward-compatibility shim — callers moved to kinsim.prep.callers.
 
-Read-only parsing library that converts output files from different
-methylation callers into KinSim motif strings.
-
-Supported parsers:
-  - pacbio:      PacBio SMRT Link motifs.csv (variable columns)
-  - modkit:      Oxford Nanopore modkit pileup --bedMethyl TSV
-  - ipd_summary: PacBio ipdSummary CSV or GFF3 output
-
-Usage:
-    from kinsim.callers import create_parser, list_parsers, auto_detect_parser
-
-    # Explicit parser
-    parser = create_parser("pacbio")
-    motif_string = parser.parse("/data/motifs.csv")
-
-    # Auto-detect from file content
-    parser = auto_detect_parser("/data/output.csv")
-    if parser:
-        motif_string = parser.parse("/data/output.csv")
+All imports from kinsim.callers are re-exported from kinsim.prep.callers.
+Update your imports to use kinsim.prep.callers directly.
 """
 
-from .base import BaseOutputParser
-from .registry import auto_detect_parser, create_parser, list_parsers
-
-# Import parsers to trigger @register decorators
-from . import ipd_summary as _ipd_summary  # noqa: F401
-from . import modkit as _modkit  # noqa: F401
-from . import pacbio as _pacbio  # noqa: F401
+from ..prep.callers import (  # noqa: F401
+    BaseOutputParser,
+    auto_detect_parser,
+    create_parser,
+    list_parsers,
+)
 
 __all__ = [
     "BaseOutputParser",

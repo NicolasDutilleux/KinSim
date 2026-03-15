@@ -1,1 +1,0 @@
-feat: kinsim MLP. Simple MLP structure to predict gaussian parameters.

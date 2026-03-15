@@ -382,7 +382,7 @@ def render_html_report(
         from plotly.subplots import make_subplots
         import plotly.io as pio
     except ImportError:
-        print('WARNING: plotly not installed — skipping HTML report.')
+        print('WARNING: plotly not installed - skipping HTML report.')
         print('  Install with: pip install plotly  or  pip install -e .[analyze]')
         return
 
@@ -857,8 +857,8 @@ def main(argv=None):
         description=(
             'Comprehensive analysis of a trained 11-mer kinetic dictionary.\n\n'
             'Generates:\n'
-            '  <basename>_report.txt  — printed to stdout AND saved to file\n'
-            '  <basename>_report.html — interactive Plotly visualizations\n'
+            '  <basename>_report.txt  : printed to stdout AND saved to file\n'
+            '  <basename>_report.html : interactive Plotly visualizations\n'
             '                          (requires: pip install plotly, or '
             'pip install -e .[analyze])\n\n'
             'Analysis includes:\n'

@@ -1,0 +1,22 @@
+sample_id,bam_path,motifs
+# Lines starting with # are skipped.
+# sample_id  — unique name for this BAM, used as the shard filename prefix.
+# bam_path   — absolute path to a PacBio HiFi BAM with fi/fp kinetic tags.
+# motifs     — KinSim motif string OR path to a PacBio motifs.csv or REBASE file.
+#
+# Motif string examples:
+#   Single motif:  m6A,GATC,1
+#   Two motifs:    "m6A,GATC,1;m4C,CCWGG,1"
+#   PacBio CSV:    /data/motifs/strain1/motifs.csv
+#   REBASE file:   /data/rebase/strain1_rebase.txt
+#
+# Count rows for --array flag:
+#   N=$(tail -n +2 manifest.csv | grep -cv '^#')
+#   sbatch --array=1-$N kinsim_extract.slurm manifest.csv shards/ master_data.pkl
+#
+Ecoli_K12,/data/projects/p774/bams/Ecoli_K12.bam,"m6A,GATC,1"
+Ecoli_O157,/data/projects/p774/bams/Ecoli_O157.bam,/data/projects/p774/motifs/Ecoli_O157/motifs.csv
+Salmonella_LT2,/data/projects/p774/bams/Salmonella_LT2.bam,"m6A,GATC,1;m4C,CCWGG,1"
+Salmonella_Newport,/data/projects/p774/bams/Salmonella_Newport.bam,/data/projects/p774/rebase/Salmonella_Newport.txt
+Klebsiella_pneumo,/data/projects/p774/bams/Klebsiella_pneumo.bam,"m6A,GATCAG,4"
+Pseudomonas_PA01,/data/projects/p774/bams/Pseudomonas_PA01.bam,"m6A,GANTC,1"
