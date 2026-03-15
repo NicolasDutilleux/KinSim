@@ -77,8 +77,8 @@ except ImportError:
             "Install with: pip install lightning"
         ) from exc
 
-from ...common.dataset import MLPSignalDataset
-from .model import MLPPredictor, ConvPredictor, create_from_config
+from .data.dataset import MLPSignalDataset
+from .models.predictor import MLPPredictor, ConvPredictor, create_from_config
 
 log = logging.getLogger(__name__)
 
@@ -717,7 +717,7 @@ def train_mlp(
 
 def main(argv: list[str] | None = None) -> None:
     import argparse
-    from ...config import load_yaml_config, setup_logging
+    from .utils.config import load_yaml_config, setup_logging
 
     parser = argparse.ArgumentParser(
         prog="kinsim train --model mlp",

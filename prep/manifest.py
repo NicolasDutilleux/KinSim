@@ -23,7 +23,7 @@ import sys
 
 def main(argv=None) -> None:
     import argparse
-    from kinsim.config import load_manifest, validate_manifest, setup_logging
+    from kinsim.utils.config import load_manifest, validate_manifest, setup_logging
 
     parser = argparse.ArgumentParser(
         prog="kinsim-prep manifest",

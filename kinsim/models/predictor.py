@@ -41,7 +41,7 @@ import torch
 import torch.nn as nn
 
 # Reuse log-space transforms from common — shared with cGAN.
-from ...common.dataset import log_transform, inv_log_transform  # noqa: F401 (re-exported)
+from ..data.dataset import log_transform, inv_log_transform  # noqa: F401 (re-exported)
 
 # Total number of 11-mers: 4^11 = 4,194,304
 _NUM_KMERS = 4 ** 11

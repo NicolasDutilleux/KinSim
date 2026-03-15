@@ -23,7 +23,7 @@ import csv
 import logging
 import re
 
-from kinsim.encoding import METH_IDS
+from kinsim.utils.encoding import METH_IDS
 from .base import BaseOutputParser
 from .registry import register
 

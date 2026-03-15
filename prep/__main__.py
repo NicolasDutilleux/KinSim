@@ -39,7 +39,7 @@ def _suggest(word, candidates, n=1, cutoff=0.6):
 
 
 def main(argv=None):
-    from kinsim.config import setup_logging
+    from kinsim.utils.config import setup_logging
     args = argv if argv is not None else sys.argv[1:]
 
     setup_logging(verbose=False)
@@ -55,7 +55,7 @@ def main(argv=None):
     cmd, rest = args[0], args[1:]
 
     if cmd == "parse":
-        from kinsim.motifs import main as run
+        from kinsim.utils.motifs import main as run
         run(rest)
 
     elif cmd == "rebase":
