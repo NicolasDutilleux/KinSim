@@ -8,12 +8,12 @@ and fibertools 6mA results into a single CSV:
     6mA,GATC,1,0.891234,1205,fibertools
 
 Column mapping to KinSim:
-    mod_type  → KinSim mod type (5mC→m5C, 6mA→m6A, 4mC→m4C)
-    motif     → IUPAC recognition sequence
-    offset    → 0-based position of modified base within motif
-    n_sites   → nDetected (for filtering)
-    frac_mod  → fraction (for filtering)
-    source    → informational only (modkit, fibertools, etc.)
+    mod_type  -> KinSim mod type (5mC->m5C, 6mA->m6A, 4mC->m4C)
+    motif     -> IUPAC recognition sequence
+    offset    -> 0-based position of modified base within motif
+    n_sites   -> nDetected (for filtering)
+    frac_mod  -> fraction (for filtering)
+    source    -> informational only (modkit, fibertools, etc.)
 
 This format is NOT compatible with PacBioParser (which expects motifString,
 centerPos columns).  Auto-detection checks for the presence of 'mod_type'
@@ -23,7 +23,7 @@ and 'frac_mod' in the CSV header.
 import csv
 import logging
 
-from ...encoding import METH_IDS
+from kinsim.encoding import METH_IDS
 from .base import BaseOutputParser
 from .registry import register
 
@@ -37,7 +37,7 @@ _COMBINED_MOD_MAP = {
     'm6A': 'm6A',
     '4mC': 'm4C',
     'm4C': 'm4C',
-    '5hmC': 'm5C',  # hydroxymethylcytosine → treat as m5C
+    '5hmC': 'm5C',  # hydroxymethylcytosine -> treat as m5C
 }
 
 
@@ -69,13 +69,13 @@ class CombinedParser(BaseOutputParser):
                 mod_type = _COMBINED_MOD_MAP.get(raw_mod)
                 if mod_type is None:
                     log.warning("Combined CSV line %d: unknown mod_type '%s' "
-                                "— skipped", lineno, raw_mod)
+                                "-- skipped", lineno, raw_mod)
                     continue
 
                 # -- motif (required) --
                 motif_seq = row.get('motif', '').strip()
                 if not motif_seq:
-                    log.warning("Combined CSV line %d: missing motif — skipped",
+                    log.warning("Combined CSV line %d: missing motif -- skipped",
                                 lineno)
                     continue
 
@@ -85,7 +85,7 @@ class CombinedParser(BaseOutputParser):
                     offset = int(offset_str)
                 except ValueError:
                     log.warning("Combined CSV line %d: invalid offset '%s' "
-                                "— skipped", lineno, offset_str)
+                                "-- skipped", lineno, offset_str)
                     continue
 
                 # -- frac_mod (optional, default 1.0) --
@@ -94,7 +94,7 @@ class CombinedParser(BaseOutputParser):
                     fraction = float(frac_str) if frac_str else 1.0
                 except ValueError:
                     log.warning("Combined CSV line %d: invalid frac_mod '%s' "
-                                "— using 1.0", lineno, frac_str)
+                                "-- using 1.0", lineno, frac_str)
                     fraction = 1.0
 
                 # -- n_sites (optional, default 0) --
@@ -103,7 +103,7 @@ class CombinedParser(BaseOutputParser):
                     n_sites = int(ns_str) if ns_str else 0
                 except ValueError:
                     log.warning("Combined CSV line %d: invalid n_sites '%s' "
-                                "— using 0", lineno, ns_str)
+                                "-- using 0", lineno, ns_str)
                     n_sites = 0
 
                 # -- Apply thresholds --
@@ -112,7 +112,7 @@ class CombinedParser(BaseOutputParser):
 
                 if mod_type not in METH_IDS:
                     log.warning("Combined CSV line %d: mod_type '%s' not in "
-                                "METH_IDS — skipped", lineno, mod_type)
+                                "METH_IDS -- skipped", lineno, mod_type)
                     continue
 
                 entries.append(

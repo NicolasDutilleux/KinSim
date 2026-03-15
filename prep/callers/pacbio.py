@@ -15,7 +15,7 @@ from __future__ import annotations
 import csv
 import logging
 
-from ...encoding import METH_IDS
+from kinsim.encoding import METH_IDS
 from .base import BaseOutputParser
 from .registry import register
 
@@ -56,14 +56,14 @@ class PacBioParser(BaseOutputParser):
                 center_str = row.get('centerPos', '').strip()
                 if not motif_seq or not center_str:
                     log.warning("PacBio CSV line %d: missing motifString or "
-                                "centerPos — skipped", lineno)
+                                "centerPos -- skipped", lineno)
                     continue
 
                 try:
                     center_pos = int(center_str)
                 except ValueError:
                     log.warning("PacBio CSV line %d: invalid centerPos '%s' "
-                                "— skipped", lineno, center_str)
+                                "-- skipped", lineno, center_str)
                     continue
 
                 # -- fraction (optional, default 1.0) --
@@ -73,14 +73,14 @@ class PacBioParser(BaseOutputParser):
                         fraction = float(frac_str) if frac_str else 1.0
                     except ValueError:
                         log.warning("PacBio CSV line %d: invalid fraction '%s' "
-                                    "— using 1.0", lineno, frac_str)
+                                    "-- using 1.0", lineno, frac_str)
                         fraction = 1.0
                 else:
                     fraction = 1.0
 
-                # -- nDetected (optional; blank → bypass min_detected filter) --
+                # -- nDetected (optional; blank -> bypass min_detected filter) --
                 # A blank nDetected means the data is absent (e.g. REBASE-derived
-                # entries).  Do not treat blank as 0 — that would incorrectly
+                # entries).  Do not treat blank as 0 -- that would incorrectly
                 # filter out valid high-confidence entries that have no count data.
                 n_detected: int | None = None
                 if has_ndetected:
@@ -90,7 +90,7 @@ class PacBioParser(BaseOutputParser):
                             n_detected = int(nd_str)
                         except ValueError:
                             log.warning("PacBio CSV line %d: invalid nDetected '%s' "
-                                        "— bypassing filter", lineno, nd_str)
+                                        "-- bypassing filter", lineno, nd_str)
 
                 # -- Apply thresholds --
                 if fraction < min_fraction:
@@ -107,21 +107,21 @@ class PacBioParser(BaseOutputParser):
                 if not mod_type or mod_type == 'modified_base':
                     if center_pos >= len(motif_seq):
                         log.warning("PacBio CSV line %d: centerPos %d out of "
-                                    "bounds for '%s' — skipped",
+                                    "bounds for '%s' -- skipped",
                                     lineno, center_pos, motif_seq)
                         continue
                     base = motif_seq[center_pos].upper()
                     resolved = _BASE_TO_METH.get(base)
                     if resolved is None:
                         log.warning("PacBio CSV line %d: cannot resolve mod "
-                                    "type at %s[%d]='%s' — skipped",
+                                    "type at %s[%d]='%s' -- skipped",
                                     lineno, motif_seq, center_pos, base)
                         continue
                     mod_type = resolved
 
                 if mod_type not in METH_IDS:
                     log.warning("PacBio CSV line %d: unknown mod type '%s' "
-                                "for %s — skipped", lineno, mod_type, motif_seq)
+                                "for %s -- skipped", lineno, mod_type, motif_seq)
                     continue
 
                 nd_out = n_detected if n_detected is not None else 0

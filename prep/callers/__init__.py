@@ -10,7 +10,7 @@ Supported parsers:
   - combined:    Combined CSV (mod_type, motif, offset, frac_mod, n_sites, source)
 
 Usage:
-    from kinsim.prep.callers import create_parser, list_parsers, auto_detect_parser
+    from prep.callers import create_parser, list_parsers, auto_detect_parser
 
     # Explicit parser
     parser = create_parser("pacbio")

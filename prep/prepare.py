@@ -7,18 +7,18 @@ Reads a text file with alternating lines:
 Supported motif source formats (auto-detected):
   - PacBio motifs.csv  (ends in '.csv')
   - REBASE tab-delimited file  (any other extension)
-  - KinSim motif string  (not a file path — used as-is)
+  - KinSim motif string  (not a file path -- used as-is)
 
 Outputs a new text file with the same BAM-path lines, but the motif source
 lines are replaced by compact KinSim motif strings:
   "m6A,GCCGATC,5,3551,0.998;m6A,CTGAAG,5,2891,1.0"
 
 Field layout per semicolon-delimited entry:
-  1. MOD_TYPE     — m6A, m4C, or m5C
-  2. IUPAC_MOTIF  — recognition sequence
-  3. POS          — 0-based position of modified base
-  4. nDetected    — number of detected occurrences (PacBio CSV only)
-  5. fraction     — methylation fraction 0.0-1.0  (PacBio CSV only)
+  1. MOD_TYPE     -- m6A, m4C, or m5C
+  2. IUPAC_MOTIF  -- recognition sequence
+  3. POS          -- 0-based position of modified base
+  4. nDetected    -- number of detected occurrences (PacBio CSV only)
+  5. fraction     -- methylation fraction 0.0-1.0  (PacBio CSV only)
 
 Fields 4 and 5 are absent for REBASE-derived entries. Downstream tools
 (train, inject, generate) only read the first 3 fields. nDetected is
@@ -29,7 +29,7 @@ import logging
 import os
 import sys
 
-from ..motifs import load_motif_string
+from kinsim.motifs import load_motif_string
 
 log = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ def prepare_config(input_file, output_file, min_fraction=0.40, min_detected=20):
         # If motif_src looks like a file path, check it exists
         if os.sep in motif_src or motif_src.endswith('.csv') or motif_src.endswith('.txt'):
             if not os.path.isfile(motif_src):
-                log.warning("Motif file not found: %s — skipping pair", motif_src)
+                log.warning("Motif file not found: %s -- skipping pair", motif_src)
                 skipped += 1
                 continue
 
@@ -76,11 +76,11 @@ def prepare_config(input_file, output_file, min_fraction=0.40, min_detected=20):
                                          min_detected=min_detected)
 
         if not motif_string:
-            log.warning("No motifs found for %s — skipping pair", label)
+            log.warning("No motifs found for %s -- skipping pair", label)
             skipped += 1
             continue
 
-        log.info("  %s → %s", label, motif_string[:60] + ("..." if len(motif_string) > 60 else ""))
+        log.info("  %s -> %s", label, motif_string[:60] + ("..." if len(motif_string) > 60 else ""))
         output_lines.append(bam_path)
         output_lines.append(motif_string)
 
@@ -88,20 +88,20 @@ def prepare_config(input_file, output_file, min_fraction=0.40, min_detected=20):
         f.write('\n'.join(output_lines) + '\n')
 
     kept = n_pairs - skipped
-    log.info("Prepared %d/%d strain pairs → %s", kept, n_pairs, output_file)
+    log.info("Prepared %d/%d strain pairs -> %s", kept, n_pairs, output_file)
 
 
 def main(argv=None):
     import argparse
-    from ..config import setup_logging
+    from kinsim.config import setup_logging
     parser = argparse.ArgumentParser(
-        prog="kinsim prepare",
+        prog="kinsim-prep prepare",
         description=(
             "Parse BAM + motif-source pairs into a config file for the KinSim pipeline.\n\n"
             "Accepted motif sources (auto-detected per line):\n"
-            "  PacBio motifs.csv  — filtered by --min-fraction / --min-detected\n"
-            "  REBASE file        — tab-delimited: RECOGNITION_SEQ  X(Y)[,X2(Y2)]\n"
-            "  KinSim string      — used as-is: 'm6A,GATC,1;m4C,CCWGG,1'\n\n"
+            "  PacBio motifs.csv  -- filtered by --min-fraction / --min-detected\n"
+            "  REBASE file        -- tab-delimited: RECOGNITION_SEQ  X(Y)[,X2(Y2)]\n"
+            "  KinSim string      -- used as-is: 'm6A,GATC,1;m4C,CCWGG,1'\n\n"
             "Input format (alternating lines):\n"
             "  /path/to/strain1.bam\n"
             "  /path/to/strain1/motifs.csv          # or a REBASE file\n"

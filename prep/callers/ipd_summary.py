@@ -5,8 +5,8 @@ Handles two output formats from ipdSummary (auto-detected):
 1. CSV format:
    refName, tpl, strand, base, score, tMean, tErr, modelPrediction,
    ipdRatio, pvalue, ...
-   - base "A" with high score → m6A
-   - base "C" with high score → m4C
+   - base "A" with high score -> m6A
+   - base "C" with high score -> m4C
 
 2. GFF3 format:
    seqname, source, feature, start, end, score, strand, frame, attributes
@@ -23,13 +23,13 @@ import csv
 import logging
 import re
 
-from ...encoding import METH_IDS
+from kinsim.encoding import METH_IDS
 from .base import BaseOutputParser
 from .registry import register
 
 log = logging.getLogger(__name__)
 
-# ipdSummary base codes → KinSim mod types
+# ipdSummary base codes -> KinSim mod types
 _BASE_TO_METH = {
     'A': 'm6A',
     'C': 'm4C',

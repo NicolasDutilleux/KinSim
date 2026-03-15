@@ -1,24 +1,20 @@
 """Filter a General Dictionary .pkl into a Training Dictionary .pkl.
 
 The two-dictionary architecture:
-  1. General Dictionary  — extract ALL kinetic data from ALL BAMs for ALL motifs.
+  1. General Dictionary  -- extract ALL kinetic data from ALL BAMs for ALL motifs.
      No filtering. Complete reference.
-  2. Training Dictionary — filtered subset with configurable thresholds.
+  2. Training Dictionary -- filtered subset with configurable thresholds.
 
-This module provides the filtering step between General → Training, allowing
+This module provides the filtering step between General -> Training, allowing
 reproducible and adjustable filtering without re-extracting from BAMs.
 
 Filtering criteria (all optional, combinable):
-  --min-fraction   Minimum methylation fraction per motif (e.g. 0.8)
-  --min-sites      Minimum number of sites per motif (e.g. 100)
   --min-coverage   Minimum samples per (kmer, meth) key
   --mod-type       Keep only specific mod types (m6A, m5C, m4C, or comma-sep)
-  --top-n          Keep only top N motifs per species (by n_sites)
-  --manifest       Filter to specific sample_ids from a manifest CSV
+  --max-keys       Keep only top N most data-rich keys
 
 CLI:
-    kinsim prep filter general.pkl training.pkl [--min-fraction 0.8] [...]
-    kinsim filter general.pkl training.pkl [--min-fraction 0.8] [...]
+    kinsim-prep filter general.pkl training.pkl [--min-coverage 50] [...]
 """
 
 from __future__ import annotations
@@ -29,11 +25,11 @@ import pickle
 import sys
 from pathlib import Path
 
-from ..encoding import METH_IDS
+from kinsim.encoding import METH_IDS
 
 log = logging.getLogger(__name__)
 
-# Inverse mapping: int → mod type name
+# Inverse mapping: int -> mod type name
 _METH_NAMES = {v: k for k, v in METH_IDS.items()}
 
 
@@ -84,7 +80,7 @@ def filter_pkl(
             if mt in METH_IDS:
                 allowed_meth_ids.add(METH_IDS[mt])
             else:
-                log.warning("Unknown mod type '%s' — ignored. Valid: %s",
+                log.warning("Unknown mod type '%s' -- ignored. Valid: %s",
                             mt, list(METH_IDS.keys()))
 
     keys_in = len(data)
@@ -145,7 +141,7 @@ def filter_pkl(
         "samples_out": samples_out,
     }
 
-    log.info("Filtered: %d → %d keys, %d → %d samples",
+    log.info("Filtered: %d -> %d keys, %d -> %d samples",
              keys_in, keys_out, samples_in, samples_out)
     log.info("Training Dictionary written to: %s", output_path)
 
@@ -153,10 +149,10 @@ def filter_pkl(
 
 
 def main(argv=None) -> None:
-    from ..config import setup_logging
+    from kinsim.config import setup_logging
 
     parser = argparse.ArgumentParser(
-        prog="kinsim filter",
+        prog="kinsim-prep filter",
         description=(
             "Filter a General Dictionary .pkl into a Training Dictionary.\n\n"
             "The General Dictionary contains ALL extracted kinetic data.\n"
@@ -165,11 +161,11 @@ def main(argv=None) -> None:
             "re-extracting from BAMs.\n\n"
             "Examples:\n"
             "  # Keep only well-covered methylated keys:\n"
-            "  kinsim filter general.pkl training.pkl --min-coverage 50\n\n"
+            "  kinsim-prep filter general.pkl training.pkl --min-coverage 50\n\n"
             "  # Keep only m6A data:\n"
-            "  kinsim filter general.pkl training.pkl --mod-type m6A\n\n"
+            "  kinsim-prep filter general.pkl training.pkl --mod-type m6A\n\n"
             "  # Keep top 100k most data-rich keys, m6A and m5C only:\n"
-            "  kinsim filter general.pkl training.pkl \\\n"
+            "  kinsim-prep filter general.pkl training.pkl \\\n"
             "      --mod-type m6A,m5C --max-keys 100000 --min-coverage 10"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
