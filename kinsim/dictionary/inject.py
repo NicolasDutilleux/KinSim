@@ -410,12 +410,12 @@ def _find_pbsim3_files(pbsim3_dir):
 
         maf_path = _find_file_by_extensions(search_dir, MAF_EXTS)
         if maf_path is None:
-            print(f"  WARN: no .maf.gz/.maf for '{species}' — skipping", file=sys.stderr)
+            print(f"  WARN: no .maf.gz/.maf for '{species}' - skipping", file=sys.stderr)
             continue
 
         ref_path = _find_file_by_extensions(search_dir, REF_EXTS)
         if ref_path is None:
-            print(f"  WARN: no .fna/.fa/.fasta for '{species}' — skipping", file=sys.stderr)
+            print(f"  WARN: no .fna/.fa/.fasta for '{species}' - skipping", file=sys.stderr)
             continue
 
         results.append((fq_path, maf_path, ref_path, species))

@@ -49,6 +49,8 @@ files in the legacy format so that kinsim mlp generate and kinsim mlp evaluate
 continue to work unchanged.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 from pathlib import Path
@@ -76,7 +78,7 @@ except ImportError:
         ) from exc
 
 from ...common.dataset import MLPSignalDataset
-from .model import MLPPredictor
+from .model import MLPPredictor, ConvPredictor, create_from_config
 
 log = logging.getLogger(__name__)
 
@@ -373,22 +375,17 @@ class LegacyCheckpointCallback(Callback):
 # Helper
 # ---------------------------------------------------------------------------
 
-def _save_model_config(output_dir: Path, model: MLPPredictor) -> None:
+def _save_model_config(output_dir: Path, model: nn.Module) -> None:
     """Write model_config.json before training starts.
 
     generate.py and evaluate.py both require this file to reconstruct the
-    MLPPredictor architecture.  Writing it before the first epoch ensures it
+    model architecture.  Writing it before the first epoch ensures it
     exists even if training is interrupted.
     """
-    cfg = {
-        "kmer_embed_dim": model.kmer_embed_dim,
-        "hidden_dim":     model.hidden_dim,
-        "meth_proj_dim":  model.meth_proj_dim,
-        "dropout":        model.dropout,
-    }
+    cfg = model.get_config()
     path = output_dir / "model_config.json"
     path.write_text(json.dumps(cfg, indent=2))
-    log.info("Model config saved: %s", path)
+    log.info("Model config saved: %s  (architecture=%s)", path, cfg.get("architecture"))
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +396,7 @@ def objective(
     trial,
     pkl_path: str,
     output_dir: Path,
+    architecture: str = "conv",
     optuna_epochs: int = 20,
     batch_size: int = 4096,
     val_fraction: float = 0.10,
@@ -407,18 +405,15 @@ def objective(
 ) -> float:
     """Optuna objective — returns best val_loss (GNLL) for a trial.
 
-    Search space:
-        lr             float  log-uniform [1e-4, 1e-2]
-        kmer_embed_dim int    categorical {32, 64}
-        hidden_dim     int    categorical {128, 256, 512}
-
-    Pruning via optuna.integration.PyTorchLightningPruningCallback is applied
-    when available, skipping unpromising trials early.
+    Search space depends on architecture:
+        conv: lr, base_embed_dim, conv_dim, head_dim, kernel_size, dropout
+        mlp:  lr, kmer_embed_dim, hidden_dim, dropout
 
     Args:
         trial:         Optuna Trial object.
         pkl_path:      Merged .pkl file path.
         output_dir:    Root dir for trial subdirectories.
+        architecture:  "conv" (default) or "mlp".
         optuna_epochs: Max epochs per trial (shorter than final run).
         batch_size:    DataLoader batch size.
         val_fraction:  Fraction of keys for validation.
@@ -428,17 +423,31 @@ def objective(
     Returns:
         Best val_loss seen during this trial (lower is better).
     """
-    lr             = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
-    kmer_embed_dim = trial.suggest_categorical("kmer_embed_dim", [32, 64])
-    hidden_dim     = trial.suggest_categorical("hidden_dim", [128, 256, 512])
-    dropout        = trial.suggest_float("dropout", 0.0, 0.4)
+    lr      = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
+    dropout = trial.suggest_float("dropout", 0.0, 0.4)
 
-    model = MLPPredictor(
-        kmer_embed_dim=kmer_embed_dim,
-        hidden_dim=hidden_dim,
-        meth_proj_dim=8,
-        dropout=dropout,
-    )
+    if architecture == "conv":
+        base_embed_dim = trial.suggest_categorical("base_embed_dim", [8, 16])
+        conv_dim       = trial.suggest_categorical("conv_dim", [64, 128])
+        head_dim       = trial.suggest_categorical("head_dim", [64, 128, 256])
+        kernel_size    = trial.suggest_categorical("kernel_size", [3, 5])
+        model = ConvPredictor(
+            base_embed_dim=base_embed_dim,
+            conv_dim=conv_dim,
+            head_dim=head_dim,
+            kernel_size=kernel_size,
+            dropout=dropout,
+        )
+    else:
+        kmer_embed_dim = trial.suggest_categorical("kmer_embed_dim", [32, 64])
+        hidden_dim     = trial.suggest_categorical("hidden_dim", [128, 256, 512])
+        model = MLPPredictor(
+            kmer_embed_dim=kmer_embed_dim,
+            hidden_dim=hidden_dim,
+            meth_proj_dim=8,
+            dropout=dropout,
+        )
+
     lm = KineticPredictor(model, lr=lr, loss_name=loss_name)
     dm = KineticDataModule(
         pkl_path=pkl_path,
@@ -480,13 +489,22 @@ def objective(
 def train_mlp(
     pkl_path: str,
     output_dir: str,
+    architecture: str = "conv",
     epochs: int = 50,
     batch_size: int = 4096,
     lr: float = 1e-3,
+    # Conv architecture params
+    base_embed_dim: int = 16,
+    conv_dim: int = 128,
+    n_conv_layers: int = 3,
+    kernel_size: int = 3,
+    head_dim: int = 128,
+    # MLP architecture params (legacy)
     kmer_embed_dim: int = 64,
     hidden_dim: int = 128,
+    # Shared params
     meth_proj_dim: int = 8,
-    dropout: float = 0.0,
+    dropout: float = 0.1,
     loss_name: str = "gnll",
     val_fraction: float = 0.10,
     checkpoint_every: int = 10,
@@ -496,20 +514,33 @@ def train_mlp(
     n_trials: int = 20,
     optuna_epochs: int = 20,
 ) -> None:
-    """Train MLPPredictor using PyTorch Lightning.
+    """Train kinetic predictor using PyTorch Lightning.
 
-    If run_optuna=True, an Optuna HPO study runs first to find the best
-    lr, kmer_embed_dim, and hidden_dim.  Best values override defaults.
+    Supports two architectures:
+        "conv" (default): ConvPredictor — per-base embeddings + 1D conv + FiLM.
+                          ~140K params.  Learns compositional spatial rules.
+        "mlp"  (legacy):  MLPPredictor — flat 4.2M k-mer embedding + MLP.
+                          ~268M params.  Fast lookup, but memorises each 11-mer.
+
+    If run_optuna=True, an Optuna HPO study runs first.  Best values override
+    defaults for the final training run.
 
     Args:
         pkl_path:         Merged .pkl file from kinsim merge.
         output_dir:       Directory for checkpoints, logs, and model config.
+        architecture:     "conv" (default) or "mlp".
         epochs:           Total training epochs for the final run.
         batch_size:       Mini-batch size (unique (kmer, meth) keys per step).
         lr:               Initial Adam learning rate.
-        kmer_embed_dim:   11-mer embedding dimension (32 or 64).
-        hidden_dim:       Hidden layer width.
-        meth_proj_dim:    Methylation linear projection output dimension.
+        base_embed_dim:   [conv] Per-base embedding dimension (default 16).
+        conv_dim:         [conv] Conv channel width (default 128).
+        n_conv_layers:    [conv] Number of conv layers (default 3).
+        kernel_size:      [conv] Conv kernel size (default 3).
+        head_dim:         [conv] Head hidden layer width (default 128).
+        kmer_embed_dim:   [mlp] 11-mer embedding dimension (32 or 64).
+        hidden_dim:       [mlp] Hidden layer width.
+        meth_proj_dim:    Methylation projection output dimension.
+        dropout:          Dropout probability (default 0.1 for conv, 0.0 for mlp).
         loss_name:        "gnll" (default) | "mse" | "huber".
         val_fraction:     Fraction of keys reserved for validation.
         checkpoint_every: Save legacy checkpoint_epoch*.pt every N epochs.
@@ -531,7 +562,8 @@ def train_mlp(
                 "Optuna is required for HPO. Install with: pip install optuna"
             )
 
-        log.info("Optuna HPO — %d trials × %d epochs", n_trials, optuna_epochs)
+        log.info("Optuna HPO — arch=%s  %d trials × %d epochs",
+                 architecture, n_trials, optuna_epochs)
         optuna_dir = output_dir / "optuna"
         optuna_dir.mkdir(exist_ok=True)
 
@@ -545,6 +577,7 @@ def train_mlp(
                 trial,
                 pkl_path=pkl_path,
                 output_dir=optuna_dir,
+                architecture=architecture,
                 optuna_epochs=optuna_epochs,
                 batch_size=batch_size,
                 val_fraction=val_fraction,
@@ -555,32 +588,57 @@ def train_mlp(
         )
 
         best = study.best_params
-        log.info(
-            "Optuna best — val_loss=%.6f  lr=%.2e  kmer_embed_dim=%d  hidden_dim=%d",
-            study.best_value, best["lr"], best["kmer_embed_dim"], best["hidden_dim"],
-        )
+        log.info("Optuna best — val_loss=%.6f  params=%s", study.best_value, best)
         # Override with Optuna's best hyperparameters
-        lr             = best["lr"]
-        kmer_embed_dim = best["kmer_embed_dim"]
-        hidden_dim     = best["hidden_dim"]
+        lr      = best["lr"]
+        dropout = best.get("dropout", dropout)
+        if architecture == "conv":
+            base_embed_dim = best.get("base_embed_dim", base_embed_dim)
+            conv_dim       = best.get("conv_dim", conv_dim)
+            head_dim       = best.get("head_dim", head_dim)
+            kernel_size    = best.get("kernel_size", kernel_size)
+        else:
+            kmer_embed_dim = best.get("kmer_embed_dim", kmer_embed_dim)
+            hidden_dim     = best.get("hidden_dim", hidden_dim)
         (output_dir / "optuna_best_params.json").write_text(
             json.dumps({"best_val_loss": study.best_value, **best}, indent=2)
         )
 
     # ── Build model ───────────────────────────────────────────────────────
     accelerator = "gpu" if device == "cuda" and torch.cuda.is_available() else "cpu"
-    log.info(
-        "Training — %d epochs  loss=%s  lr=%.2e  embed=%d  hidden=%d  "
-        "meth_proj=%d  dropout=%.2f  accel=%s",
-        epochs, loss_name, lr, kmer_embed_dim, hidden_dim, meth_proj_dim, dropout, accelerator,
-    )
 
-    model = MLPPredictor(
-        kmer_embed_dim=kmer_embed_dim,
-        hidden_dim=hidden_dim,
-        meth_proj_dim=meth_proj_dim,
-        dropout=dropout,
-    )
+    if architecture == "conv":
+        log.info(
+            "Training — arch=conv  %d epochs  loss=%s  lr=%.2e  base_embed=%d  "
+            "conv_dim=%d  n_layers=%d  k=%d  head=%d  meth_proj=%d  dropout=%.2f  accel=%s",
+            epochs, loss_name, lr, base_embed_dim, conv_dim, n_conv_layers,
+            kernel_size, head_dim, meth_proj_dim, dropout, accelerator,
+        )
+        model = ConvPredictor(
+            base_embed_dim=base_embed_dim,
+            meth_proj_dim=meth_proj_dim,
+            conv_dim=conv_dim,
+            n_conv_layers=n_conv_layers,
+            kernel_size=kernel_size,
+            head_dim=head_dim,
+            dropout=dropout,
+        )
+    else:
+        log.info(
+            "Training — arch=mlp  %d epochs  loss=%s  lr=%.2e  embed=%d  hidden=%d  "
+            "meth_proj=%d  dropout=%.2f  accel=%s",
+            epochs, loss_name, lr, kmer_embed_dim, hidden_dim, meth_proj_dim,
+            dropout, accelerator,
+        )
+        model = MLPPredictor(
+            kmer_embed_dim=kmer_embed_dim,
+            hidden_dim=hidden_dim,
+            meth_proj_dim=meth_proj_dim,
+            dropout=dropout,
+        )
+
+    n_params = sum(p.numel() for p in model.parameters())
+    log.info("Model parameters: %s (%s)", f"{n_params:,}", architecture)
 
     # Save model config BEFORE first epoch — generate.py needs it even if interrupted
     _save_model_config(output_dir, model)
@@ -682,24 +740,44 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("output_dir", nargs="?", default=None,
                         help="Directory for checkpoints and logs")
 
+    # Architecture selection
+    parser.add_argument("--architecture",     default=None,
+                        choices=["conv", "mlp"],
+                        help="Model architecture: conv (default, 1D-conv + FiLM) or mlp (legacy embedding)")
+
     # Training hyperparameters
     parser.add_argument("--config",           default=None,
-                        help="YAML config file — all flags can be set here")
+                        help="YAML config file (all flags can be set here)")
     parser.add_argument("--epochs",           type=int,   default=None,
                         help="Training epochs (default: 50)")
     parser.add_argument("--batch-size",       type=int,   default=None,
                         help="Batch size (default: 4096)")
     parser.add_argument("--lr",               type=float, default=None,
                         help="Learning rate (default: 1e-3)")
+
+    # Conv architecture params
+    parser.add_argument("--base-embed-dim",   type=int,   default=None,
+                        help="[conv] Per-base embedding dimension (default: 16)")
+    parser.add_argument("--conv-dim",         type=int,   default=None,
+                        help="[conv] Conv channel width (default: 128)")
+    parser.add_argument("--n-conv-layers",    type=int,   default=None,
+                        help="[conv] Number of conv layers (default: 3)")
+    parser.add_argument("--kernel-size",      type=int,   default=None,
+                        help="[conv] Conv kernel size (default: 3)")
+    parser.add_argument("--head-dim",         type=int,   default=None,
+                        help="[conv] Head hidden layer width (default: 128)")
+
+    # MLP architecture params (legacy)
     parser.add_argument("--kmer-embed-dim",   type=int,   default=None,
-                        help="11-mer embedding dimension (default: 64; use 32 for ~0.5 GB RAM)")
+                        help="[mlp] 11-mer embedding dimension (default: 64)")
     parser.add_argument("--hidden-dim",       type=int,   default=None,
-                        help="Hidden layer width (default: 128)")
+                        help="[mlp] Hidden layer width (default: 128)")
+
+    # Shared params
     parser.add_argument("--meth-proj-dim",    type=int,   default=None,
-                        help="Methylation linear projection output dim (default: 8)")
+                        help="Methylation projection output dim (default: 8)")
     parser.add_argument("--dropout",          type=float, default=None,
-                        help="Dropout probability after each LeakyReLU (default: 0.0 = disabled). "
-                             "Try 0.1–0.3 when LayerNorm alone doesn't prevent overfitting.")
+                        help="Dropout probability (default: 0.1 for conv, 0.0 for mlp)")
     parser.add_argument("--loss",             default=None,
                         choices=["gnll", "mse", "huber"],
                         help="Loss function: gnll=Gaussian NLL (default), mse, huber")
@@ -743,16 +821,29 @@ def main(argv: list[str] | None = None) -> None:
     if not output_dir:
         parser.error("output_dir is required (positional arg or 'output_dir' in YAML config)")
 
+    architecture = _get(args.architecture, "architecture", "conv")
+    # Default dropout depends on architecture
+    default_dropout = 0.1 if architecture == "conv" else 0.0
+
     train_mlp(
         pkl_path         = pkl_path,
         output_dir       = output_dir,
+        architecture     = architecture,
         epochs           = _get(args.epochs,          "epochs",          50),
         batch_size       = _get(args.batch_size,      "batch_size",      4096),
         lr               = _get(args.lr,              "lr",              1e-3),
+        # Conv params
+        base_embed_dim   = _get(args.base_embed_dim,  "base_embed_dim",  16),
+        conv_dim         = _get(args.conv_dim,        "conv_dim",        128),
+        n_conv_layers    = _get(args.n_conv_layers,   "n_conv_layers",   3),
+        kernel_size      = _get(args.kernel_size,     "kernel_size",     3),
+        head_dim         = _get(args.head_dim,        "head_dim",        128),
+        # MLP params
         kmer_embed_dim   = _get(args.kmer_embed_dim,  "kmer_embed_dim",  64),
         hidden_dim       = _get(args.hidden_dim,      "hidden_dim",      128),
+        # Shared
         meth_proj_dim    = _get(args.meth_proj_dim,   "meth_proj_dim",   8),
-        dropout          = _get(args.dropout,         "dropout",         0.0),
+        dropout          = _get(args.dropout,         "dropout",         default_dropout),
         loss_name        = _get(args.loss,            "loss",            "gnll"),
         val_fraction     = _get(args.val_fraction,    "val_fraction",    0.10),
         checkpoint_every = _get(args.checkpoint_every,"checkpoint_every",10),

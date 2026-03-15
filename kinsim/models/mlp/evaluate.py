@@ -32,6 +32,8 @@ MAE (log-space)
     noisier than background.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import pickle
@@ -43,7 +45,7 @@ from torch.utils.data import DataLoader
 
 from ...common.dataset import MLPSignalDataset, inv_log_transform, log_transform
 from ...encoding import METH_IDS, encode_kmer
-from .model import MLPPredictor
+from .model import MLPPredictor, create_from_config
 
 log = logging.getLogger(__name__)
 
@@ -54,8 +56,8 @@ _SIGMA_CLAMP = (-6.0, 3.0)
 # Model loading
 # ---------------------------------------------------------------------------
 
-def _load_model(checkpoint_dir: str | Path, device: torch.device) -> MLPPredictor:
-    """Load MLPPredictor from a checkpoint directory."""
+def _load_model(checkpoint_dir: str | Path, device: torch.device) -> torch.nn.Module:
+    """Load model from a checkpoint directory (supports conv and mlp)."""
     checkpoint_dir = Path(checkpoint_dir)
     cfg_path = checkpoint_dir / "model_config.json"
     if not cfg_path.exists():
@@ -65,23 +67,22 @@ def _load_model(checkpoint_dir: str | Path, device: torch.device) -> MLPPredicto
         )
     cfg = json.loads(cfg_path.read_text())
 
-    model = MLPPredictor(
-        kmer_embed_dim=cfg["kmer_embed_dim"],
-        hidden_dim=cfg["hidden_dim"],
-        meth_proj_dim=cfg.get("meth_proj_dim", 8),
-        dropout=cfg.get("dropout", 0.0),
-    ).to(device)
+    model = create_from_config(cfg).to(device)
 
     # Find the latest checkpoint
     pts = sorted(checkpoint_dir.glob("checkpoint_epoch*.pt"))
     if not pts:
         raise FileNotFoundError(f"No checkpoint_epoch*.pt files found in {checkpoint_dir}")
     ckpt_path = pts[-1]
-    log.info("Loading checkpoint: %s", ckpt_path.name)
 
     ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model"])
     model.eval()
+
+    arch = cfg.get("architecture", "mlp")
+    n_params = sum(p.numel() for p in model.parameters())
+    log.info("Model loaded: architecture=%s  params=%s  checkpoint=%s",
+             arch, f"{n_params:,}", ckpt_path.name)
     return model
 
 

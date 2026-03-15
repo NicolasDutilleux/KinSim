@@ -9,28 +9,53 @@ import difflib
 import logging
 import sys
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
-COMMANDS = ["prepare", "manifest", "parse", "extract", "merge", "train", "generate", "analyze"]
+COMMANDS = [
+    "prep", "extract", "merge", "train", "generate", "evaluate", "analyze",
+]
+
+# Prep subcommands (for typo suggestions within 'kinsim prep')
+_PREP_COMMANDS = ["parse", "rebase", "manifest", "prepare", "filter", "merge-motifs"]
 
 USAGE = """\
 usage: kinsim [--version] <command> [<args>]
 
-KinSim — PacBio kinetic signal simulator for metagenomic binning.
+KinSim - PacBio kinetic signal simulator for metagenomic binning.
 
-Commands:
-  prepare     Validate BAM/motif pairs into a reusable config file
-  manifest    Inspect and validate a manifest CSV (count / validate / list)
-  parse       Parse any motif source (PacBio CSV, REBASE, or inline string)
-  extract     Extract raw IPD/PW samples from a BAM file  (→ .pkl shard)
+Core commands:
+  extract     Extract raw IPD/PW samples from a BAM file  (-> .pkl shard)
   merge       Merge .pkl shards into a master training set
   train       Train a kinetic model  (--model dictionary | mlp | cgan)
   generate    Generate synthetic kinetic signals for PBSIM3 reads
               (--model dictionary | mlp | cgan)
+  evaluate    Evaluate a trained model  (--model mlp)
   analyze     Report coverage and signal statistics for a dictionary .pkl
+
+Data preparation:
+  prep        Data preparation tools (parse, rebase, manifest, filter)
+              Use 'kinsim prep -h' for subcommand list.
 
 Use 'kinsim <command> -h' for detailed help on a specific command.
 Use 'kinsim --version' to print the version number.
+"""
+
+_PREP_USAGE = """\
+usage: kinsim prep <subcommand> [<args>]
+
+Data preparation tools for KinSim.
+
+Subcommands:
+  parse          Parse any motif source (PacBio CSV, combined CSV, REBASE, or
+                 inline string) into a KinSim motif string
+  rebase         Parse REBASE files and optionally write rebase_motifs.csv
+  merge-motifs   Merge, filter, and deduplicate motifs from multiple sources
+                 (calling CSV + REBASE) into a standard PacBio motifs.csv
+  manifest       Inspect and validate manifest CSVs (count / validate / list)
+  prepare        Validate BAM/motif pairs (legacy alternating-line format)
+  filter         Filter a General Dictionary .pkl into a Training Dictionary
+
+Use 'kinsim prep <subcommand> -h' for detailed help.
 """
 
 
@@ -88,8 +113,6 @@ def main(argv=None):
     args = argv if argv is not None else sys.argv[1:]
 
     # Set up logging early so all submodules emit timestamped output to SLURM logs.
-    # Individual commands may call setup_logging again with verbose=True if --verbose
-    # is passed; that call overrides this one (basicConfig is idempotent on first call).
     setup_logging(verbose=False)
 
     if not args or args[0] in ("-h", "--help"):
@@ -102,46 +125,64 @@ def main(argv=None):
 
     cmd, rest = args[0], args[1:]
 
-    # ── prepare ──────────────────────────────────────────────────────────────
-    if cmd == "prepare":
-        from .prepare import main as run
-        run(rest)
+    # ── prep ──────────────────────────────────────────────────────────────────
+    # Data preparation tools: parse, rebase, manifest, prepare, filter
+    if cmd == "prep":
+        if not rest or rest[0] in ("-h", "--help"):
+            print(_PREP_USAGE)
+            sys.exit(0)
 
-    # ── manifest ──────────────────────────────────────────────────────────────
-    # count / validate / list  — manifest CSV inspection utilities
-    elif cmd == "manifest":
-        from .manifest_cmd import main as run
-        run(rest)
+        subcmd, subrest = rest[0], rest[1:]
 
-    # ── parse ─────────────────────────────────────────────────────────────────
-    # Unified entry for CSV, REBASE, and inline motif strings.
-    # Replaces the old 'kinsim motifs' and 'kinsim rebase parse/patterns'.
-    elif cmd == "parse":
-        from .motifs import main as run
-        run(rest)
+        if subcmd == "parse":
+            from .motifs import main as run
+            run(subrest)
+
+        elif subcmd == "rebase":
+            from .prep.rebase import main as run
+            run(subrest)
+
+        elif subcmd == "manifest":
+            from .prep.manifest import main as run
+            run(subrest)
+
+        elif subcmd == "prepare":
+            from .prep.prepare import main as run
+            run(subrest)
+
+        elif subcmd == "filter":
+            from .prep.filter import main as run
+            run(subrest)
+
+        elif subcmd == "merge-motifs":
+            from .prep.motif_merge import main as run
+            run(subrest)
+
+        else:
+            msg = f"Unknown prep subcommand: '{subcmd}'"
+            hint = _suggest(subcmd, _PREP_COMMANDS)
+            if hint:
+                msg += f"\n\nDid you mean:  kinsim prep {hint[0]}"
+            print(msg, file=sys.stderr)
+            print(_PREP_USAGE)
+            sys.exit(1)
 
     # ── extract ───────────────────────────────────────────────────────────────
-    # Extract raw (IPD, PW) samples from a real PacBio BAM file.
-    # Replaces 'kinsim cgan extract'.
     elif cmd == "extract":
         from .common.extract import main as run
         run(["extract"] + rest)
 
     # ── merge ─────────────────────────────────────────────────────────────────
-    # Merge .pkl shards produced by 'kinsim extract' into one master file.
-    # Replaces 'kinsim cgan merge'.
     elif cmd == "merge":
         from .common.extract import main as run
         run(["merge"] + rest)
 
     # ── analyze ───────────────────────────────────────────────────────────────
-    # Coverage statistics and signal reports for a dictionary .pkl.
     elif cmd == "analyze":
         from .dictionary.analyze import main as run
         run(rest)
 
     # ── train ─────────────────────────────────────────────────────────────────
-    # Unified training command. --model selects the back-end.
     elif cmd == "train":
         model, subrest = _require_model(rest, "train")
 
@@ -158,7 +199,6 @@ def main(argv=None):
             run(subrest)
 
     # ── generate ──────────────────────────────────────────────────────────────
-    # Unified generation command. --model selects the back-end.
     elif cmd == "generate":
         model, subrest = _require_model(rest, "generate")
 
@@ -174,15 +214,50 @@ def main(argv=None):
             from .models.cgan.generate import main as run
             run(subrest)
 
+    # ── evaluate ──────────────────────────────────────────────────────────────
+    elif cmd == "evaluate":
+        model, subrest = _require_model(rest, "evaluate")
+
+        if model == "mlp":
+            from .models.mlp.evaluate import main as run
+            run(subrest)
+        else:
+            print(
+                f"ERROR: 'kinsim evaluate' is currently only supported for "
+                f"--model mlp (got '{model}').",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     # ── backward-compat: legacy sub-command style ─────────────────────────────
     # Old SLURM scripts and notebooks continue to work unchanged.
+
+    elif cmd == "prepare":
+        from .prep.prepare import main as run
+        run(rest)
+
+    elif cmd == "manifest":
+        from .prep.manifest import main as run
+        run(rest)
+
+    elif cmd == "parse":
+        from .motifs import main as run
+        run(rest)
 
     elif cmd == "motifs":
         from .motifs import main as run
         run(rest)
 
     elif cmd == "rebase":
-        from .rebase_parser import main as run
+        from .prep.rebase import main as run
+        run(rest)
+
+    elif cmd == "filter":
+        from .prep.filter import main as run
+        run(rest)
+
+    elif cmd == "merge-motifs":
+        from .prep.motif_merge import main as run
         run(rest)
 
     elif cmd == "dictionary":
@@ -250,7 +325,11 @@ def main(argv=None):
     # ── unknown ───────────────────────────────────────────────────────────────
     else:
         msg = f"Unknown command: '{cmd}'"
-        hint = _suggest(cmd, COMMANDS)
+        all_commands = COMMANDS + [
+            "prepare", "manifest", "parse", "filter",  # legacy top-level
+            "motifs", "rebase", "dictionary", "cgan", "mlp",  # backward-compat
+        ]
+        hint = _suggest(cmd, all_commands)
         if hint:
             msg += f"\n\nDid you mean:  kinsim {hint[0]}"
         print(msg, file=sys.stderr)

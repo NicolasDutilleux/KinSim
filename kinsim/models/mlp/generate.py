@@ -41,17 +41,21 @@ already encodes both-strand methylation at each reference position.
 import array
 import gzip
 import json
+import logging
 import os
 import sys
 
 import numpy as np
 import pysam
 import torch
+import torch.nn as nn
 
-from .model import MLPPredictor
+from .model import MLPPredictor, create_from_config
 from ...encoding import BASE_MAP, K, KMER_MASK
 from ...motifs import (build_reference_meth_map, load_motif_string,
                        parse_motifs, scan_sequence)
+
+log = logging.getLogger(__name__)
 
 # Reuse from dictionary.inject — no code duplication
 from ...dictionary.inject import (MID, _find_pbsim3_files,
@@ -160,52 +164,43 @@ def generate_signals_batch(
 # Model loading helper
 # ---------------------------------------------------------------------------
 
-def _load_model(checkpoint_path: str, device: torch.device) -> MLPPredictor:
-    """Load MLPPredictor from a checkpoint file.
+def _load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
+    """Load a trained model from a checkpoint file.
 
     Reads model_config.json from the same directory as the checkpoint to
-    reconstruct the exact architecture used during training.
+    reconstruct the exact architecture used during training.  Supports both
+    ConvPredictor (architecture="conv") and MLPPredictor (architecture="mlp").
 
     Args:
         checkpoint_path: Path to the .pt checkpoint file.
         device:          Torch device to load the model onto.
 
     Returns:
-        MLPPredictor in eval mode, ready for inference.
+        Model in eval mode, ready for inference.
     """
     ckpt = torch.load(checkpoint_path, map_location=device)
 
-    # model_config.json is always written at the start of training (before the
-    # first epoch), so it must exist alongside the checkpoint.  Using wrong
-    # defaults here would silently produce a mismatched architecture.
     config_path = os.path.join(os.path.dirname(checkpoint_path), "model_config.json")
     if not os.path.exists(config_path):
-        print(
-            f"ERROR: model_config.json not found in {os.path.dirname(checkpoint_path)}\n"
-            "       This file is written by 'kinsim mlp train' at the start of training.\n"
-            "       Ensure the checkpoint directory contains model_config.json.",
-            file=sys.stderr,
+        log.error(
+            "model_config.json not found in %s. "
+            "This file is written by 'kinsim mlp train' at the start of training. "
+            "Ensure the checkpoint directory contains model_config.json.",
+            os.path.dirname(checkpoint_path),
         )
         sys.exit(1)
 
     with open(config_path, "r") as f:
         config = json.load(f)
-    kmer_embed_dim = config["kmer_embed_dim"]
-    hidden_dim     = config["hidden_dim"]
-    meth_proj_dim  = config.get("meth_proj_dim", 8)   # default 8 for old checkpoints
-    dropout        = config.get("dropout", 0.0)        # default 0.0 for old checkpoints
 
-    model = MLPPredictor(
-        kmer_embed_dim=kmer_embed_dim,
-        hidden_dim=hidden_dim,
-        meth_proj_dim=meth_proj_dim,
-        dropout=dropout,
-    ).to(device)
+    model = create_from_config(config).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    print(f"  MLPPredictor loaded (kmer_embed_dim={kmer_embed_dim}, "
-          f"hidden_dim={hidden_dim}, meth_proj_dim={meth_proj_dim})")
+    arch = config.get("architecture", "mlp")
+    n_params = sum(p.numel() for p in model.parameters())
+    log.info("Model loaded: architecture=%s  params=%s  checkpoint=%s",
+             arch, f"{n_params:,}", os.path.basename(checkpoint_path))
     return model
 
 
@@ -250,13 +245,13 @@ def generate_signals(
                        Default False matches natural PacBio signal variability.
     """
     device = torch.device(device if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    log.info("Using device: %s", device)
 
-    print(f"Loading reference: {ref_path}")
+    log.info("Loading reference: %s", ref_path)
     ref_seqs = load_reference(ref_path)
 
     backend = "regex (forced)" if no_fuzznuc else "fuzznuc (primary, regex fallback)"
-    print(f"Pre-scanning reference for methylation sites ({backend})...")
+    log.info("Pre-scanning reference for methylation sites (%s)...", backend)
     meth_map = build_reference_meth_map(ref_seqs, motif_string,
                                         revcomp=revcomp,
                                         no_fuzznuc=no_fuzznuc)
@@ -267,15 +262,15 @@ def generate_signals(
     # Keep regex motifs for the fallback path (unmapped reads)
     fallback_motifs = parse_motifs(motif_string, revcomp=revcomp)
 
-    print(f"Loading checkpoint: {checkpoint_path}")
+    log.info("Loading checkpoint: %s", checkpoint_path)
     model = _load_model(checkpoint_path, device)
     mode_label = "deterministic (mean)" if deterministic else "stochastic (sample)"
-    print(f"  Inference mode: {mode_label}")
+    log.info("Inference mode: %s", mode_label)
 
-    print(f"Parsing MAF: {maf_path}")
+    log.info("Parsing MAF: %s", maf_path)
     maf_mapping = parse_maf(maf_path)
 
-    print(f"Generating signals for reads from {fastq_path}...")
+    log.info("Generating signals for reads from %s...", fastq_path)
     n_reads    = 0
     n_mapped   = 0
     n_unmapped = 0
@@ -325,9 +320,9 @@ def generate_signals(
             n_mapped   += n_m
             n_unmapped += n_u
 
-    print(f"Done. {n_reads} reads processed "
-          f"({n_mapped} with ref context, {n_unmapped} without).")
-    print(f"Output: {output_bam}")
+    log.info("Done. %d reads processed (%d with ref context, %d without).",
+             n_reads, n_mapped, n_unmapped)
+    log.info("Output: %s", output_bam)
 
 
 def _process_batch(
@@ -515,22 +510,21 @@ def generate_directory(
     """
     genomes = _find_pbsim3_files(pbsim3_dir)
     if not genomes:
-        print(f"ERROR: No genome sets found in {pbsim3_dir}", file=sys.stderr)
+        log.error("No genome sets found in %s", pbsim3_dir)
         sys.exit(1)
 
     os.makedirs(output_dir, exist_ok=True)
-    print(f"Found {len(genomes)} species in {pbsim3_dir}")
+    log.info("Found %d species in %s", len(genomes), pbsim3_dir)
 
     for fq_path, maf_path, ref_path, species in genomes:
         motif_string = _resolve_motifs_for_species(motif_source, species,
                                                    min_fraction, min_detected)
         if not motif_string:
-            print(f"ERROR: no motifs found for species '{species}'.",
-                  file=sys.stderr)
+            log.error("No motifs found for species '%s'.", species)
             sys.exit(1)
 
         out_bam = os.path.join(output_dir, species + "_mlp.bam")
-        print(f"\n--- {species} ---")
+        log.info("--- %s ---", species)
         generate_signals(
             fq_path, maf_path, ref_path, checkpoint_path, motif_string, out_bam,
             circular=circular, revcomp=revcomp,
@@ -538,7 +532,7 @@ def generate_directory(
             no_fuzznuc=no_fuzznuc, deterministic=deterministic,
         )
 
-    print(f"\nAll done. {len(genomes)} BAM(s) written to: {output_dir}")
+    log.info("All done. %d BAM(s) written to: %s", len(genomes), output_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -600,7 +594,7 @@ def _main_directory(argv):
     parser.add_argument("--no-fuzznuc", action="store_true",
                         help="Force Python regex for reference methylation scanning")
     parser.add_argument("--deterministic", action="store_true",
-                        help="Use predicted mean μ only — no stochastic sampling. "
+                        help="Use predicted mean (mu) only - no stochastic sampling. "
                              "Produces identical signals for every read at the same "
                              "context (useful for ablations). Default: stochastic.")
     parser.add_argument("--min-fraction", type=float, default=0.40,
@@ -666,7 +660,7 @@ def _main_per_genome(argv):
                              "backend and falls back to regex automatically if fuzznuc "
                              "is not installed.")
     parser.add_argument("--deterministic", action="store_true",
-                        help="Use predicted mean μ only — no stochastic sampling. "
+                        help="Use predicted mean (mu) only - no stochastic sampling. "
                              "Produces identical signals for every read at the same "
                              "context (useful for ablations). Default: stochastic.")
     parser.add_argument("--min-fraction", type=float, default=0.40,
@@ -679,7 +673,7 @@ def _main_per_genome(argv):
                                      min_fraction=args.min_fraction,
                                      min_detected=args.min_detected)
     if not motif_string:
-        print("ERROR: no motifs found from the provided source.", file=sys.stderr)
+        log.error("No motifs found from the provided source.")
         sys.exit(1)
 
     generate_signals(

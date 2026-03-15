@@ -1,2 +1,0 @@
-[console_scripts]
-kinsim = kinsim.__main__:main
