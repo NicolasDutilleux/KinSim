@@ -566,6 +566,8 @@ def main(argv=None) -> None:
                            help="Minimum fraction threshold for PacBio CSV (default: 0.40)")
     p_extract.add_argument("--min-detected", type=int, default=20,
                            help="Minimum nDetected threshold for PacBio CSV (default: 20)")
+    p_extract.add_argument("--verbose", "-v", action="store_true",
+                           help="Enable DEBUG-level logging")
 
     # -- merge subcommand --
     p_merge = sub.add_parser(
@@ -587,9 +589,11 @@ def main(argv=None) -> None:
     p_merge.add_argument("--glob", default="auto",
                          dest="glob_pattern",
                          help="Glob pattern for shard files (default: auto-detect)")
+    p_merge.add_argument("--verbose", "-v", action="store_true",
+                         help="Enable DEBUG-level logging")
 
     args = parser.parse_args(argv)
-    setup_logging(verbose=args.verbose)
+    setup_logging(verbose=getattr(args, "verbose", False))
 
     if args.command == "merge":
         merge_shards(
