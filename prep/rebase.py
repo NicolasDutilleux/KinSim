@@ -494,17 +494,19 @@ def _resolve_color(color: str, color_to_meth: dict[str, str]) -> str | None:
 
 
 def _parse_motif_cell(cell_html: str,
-                      color_to_meth: dict[str, str]) -> tuple[str, int, str] | None:
+                      color_to_meth: dict[str, str]) -> list[tuple[str, int, str, str]]:
     """Parse a REBASE motif table cell.
 
-    REBASE HTML may color multiple bases (e.g. all bases in recognition seq).
-    We find ALL colored bases, then pick the one that:
-      1. Has a color matching a known methylation type (m6A/m4C/m5C)
-      2. Has a base compatible with that mod type (A for m6A, C for m4C/m5C)
+    REBASE colors bases to indicate methylation:
+      - A colored with m6A color → direct: m6A on this A (top strand)
+      - T colored with m6A color → complement: m6A on the A of the RC strand
+      - C colored with m5C color → direct: m5C on this C (top strand)
+      - G colored with m5C color → complement: m5C on the C of the RC strand
 
     Returns:
-        (motif_string, center_pos, mod_type)  -- all uppercase motif, 0-based
-        None if no valid methylated base can be identified.
+        List of (motif_string, center_pos_0based, mod_type, strand) tuples.
+        strand is 'top' (base matches mod type directly) or 'rc' (complement).
+        Empty list if nothing parseable.
     """
     tag_re   = re.compile(r'<[^>]+>')
     font_re  = re.compile(
@@ -512,16 +514,15 @@ def _parse_motif_cell(cell_html: str,
         re.IGNORECASE,
     )
 
-    # Valid base for each mod type
-    _VALID_BASE = {'m6A': 'A', 'm4C': 'C', 'm5C': 'C'}
+    # Direct base and complement base for each mod type
+    _DIRECT = {'m6A': 'A', 'm4C': 'C', 'm5C': 'C'}
+    _COMPL  = {'m6A': 'T', 'm4C': 'G', 'm5C': 'G'}
 
-    # Full motif text (strip all HTML tags, uppercase)
     full_motif = tag_re.sub('', cell_html).strip().upper()
     if not full_motif or not _IUPAC_MOTIF_RE.match(full_motif):
-        return None
+        return []
 
-    # Find ALL colored bases and their positions
-    candidates = []
+    results: list[tuple[str, int, str, str]] = []
     for m in font_re.finditer(cell_html):
         color    = m.group(1).strip()
         base_str = m.group(2).strip().upper()
@@ -529,42 +530,21 @@ def _parse_motif_cell(cell_html: str,
         if mod_type is None:
             continue
 
-        # Count plain-text characters before this <font> tag -> 0-based position
         before_tag  = cell_html[:m.start()]
         text_before = tag_re.sub('', before_tag).strip()
         pos         = len(text_before)
 
-        # The <font> tag may wrap multiple characters; check each
         for char_offset, base_char in enumerate(base_str):
             actual_pos = pos + char_offset
             if actual_pos >= len(full_motif):
                 continue
-            expected_base = _VALID_BASE.get(mod_type)
-            if expected_base and base_char.upper() == expected_base:
-                candidates.append((full_motif, actual_pos, mod_type))
 
-    if not candidates:
-        # Fallback: if no base-validated match, try first colored base with known type
-        for m in font_re.finditer(cell_html):
-            color    = m.group(1).strip()
-            mod_type = _resolve_color(color, color_to_meth)
-            if mod_type is not None:
-                before_tag  = cell_html[:m.start()]
-                text_before = tag_re.sub('', before_tag).strip()
-                pos         = len(text_before)
-                if pos < len(full_motif):
-                    log.warning("REBASE HTML: base '%s' at pos %d in '%s' does not "
-                                "match expected base for %s -- using anyway",
-                                full_motif[pos], pos, full_motif, mod_type)
-                    return full_motif, pos, mod_type
-        return None
+            if base_char == _DIRECT.get(mod_type):
+                results.append((full_motif, actual_pos, mod_type, 'top'))
+            elif base_char == _COMPL.get(mod_type):
+                results.append((full_motif, actual_pos, mod_type, 'rc'))
 
-    if len(candidates) > 1:
-        log.info("REBASE HTML: %d candidate methylated bases in '%s': %s -- using first",
-                 len(candidates), full_motif,
-                 [(c[2], c[1], full_motif[c[1]]) for c in candidates])
-
-    return candidates[0]
+    return results
 
 
 def _find_table_end(html: str, table_start: int) -> int:
@@ -668,11 +648,14 @@ def _parse_active_mtases_table(html: str,
         if not motif_plain or not _IUPAC_MOTIF_RE.match(motif_plain.upper()):
             continue
 
-        result = _parse_motif_cell(cells[col_motif], color_to_meth)
-        if result is None:
+        hits = _parse_motif_cell(cells[col_motif], color_to_meth)
+        if not hits:
             log.warning("REBASE HTML: could not parse motif cell '%s'", motif_plain)
             continue
-        motif_str, center_pos, mod_type = result
+
+        # Use the first hit to get motif_str and mod_type
+        motif_str = hits[0][0]
+        mod_type  = hits[0][2]
 
         # Count -> nDetected
         n_detected: int | str = ''
@@ -692,7 +675,6 @@ def _parse_active_mtases_table(html: str,
                 pass
 
         is_palindrome = _is_palindromic(motif_str)
-        two_strand = len(pct_parts) == 2
 
         # Coverage -> meanCoverage
         mean_coverage: float | str = ''
@@ -706,44 +688,51 @@ def _parse_active_mtases_table(html: str,
             except (ValueError, ZeroDivisionError):
                 pass
 
-        # ---- Top strand entry ----
-        frac_top = round(pct_parts[0], 7) if pct_parts else ''
-        n_genome_top: int | str = ''
-        if isinstance(n_detected, int) and isinstance(frac_top, float) and frac_top > 0:
-            n_genome_top = round(n_detected / frac_top)
-
         rc_motif = reverse_complement(motif_str)
-        partner  = rc_motif if not is_palindrome else motif_str
 
-        # Convert 0-based HTML position to 1-based for output
-        center_pos_1b = center_pos + 1
+        # Separate hits by strand
+        top_hits = [h for h in hits if h[3] == 'top']
+        rc_hits  = [h for h in hits if h[3] == 'rc']
 
-        entries.append(_make_entry(
-            motif_str=motif_str,
-            offset=center_pos_1b,
-            mod_type=mod_type,
-            fraction=frac_top,
-            n_detected=n_detected,
-            n_genome=n_genome_top,
-            mean_coverage=mean_coverage,
-            source='rebase',
-        ))
-        log.info("  [TOP]  %s offset=%d %s  frac=%.3f  palindromic=%s",
-                 motif_str, center_pos_1b, mod_type,
-                 frac_top if isinstance(frac_top, float) else 0,
-                 is_palindrome)
+        # ---- Top strand entry ----
+        if top_hits:
+            center_pos = top_hits[0][1]   # 0-based from HTML
+            center_pos_1b = center_pos + 1
+            frac_top = round(pct_parts[0], 7) if pct_parts else ''
+            n_genome_top: int | str = ''
+            if isinstance(n_detected, int) and isinstance(frac_top, float) and frac_top > 0:
+                n_genome_top = round(n_detected / frac_top)
 
-        # ---- Reverse complement entry (non-palindromic only) ----
-        if not is_palindrome and two_strand:
-            rc_offset_1b = _rc_offset(motif_str, center_pos) + 1  # 0-based RC → 1-based
-            frac_bot  = round(pct_parts[1], 7)
+            entries.append(_make_entry(
+                motif_str=motif_str,
+                offset=center_pos_1b,
+                mod_type=mod_type,
+                fraction=frac_top,
+                n_detected=n_detected,
+                n_genome=n_genome_top,
+                mean_coverage=mean_coverage,
+                source='rebase',
+            ))
+            log.info("  [TOP]  %s offset=%d %s  frac=%.3f  palindromic=%s",
+                     motif_str, center_pos_1b, mod_type,
+                     frac_top if isinstance(frac_top, float) else 0,
+                     is_palindrome)
+
+        # ---- RC strand entry (from complement-colored bases) ----
+        if rc_hits and not is_palindrome:
+            # A complement-colored base (T for m6A, G for m5C) at position P
+            # in the top motif means the RC motif has the methylated base at
+            # position (len - 1 - P), which IS the correct base (A or C).
+            rc_pos_0b = len(motif_str) - 1 - rc_hits[0][1]
+            rc_pos_1b = rc_pos_0b + 1
+            frac_bot = round(pct_parts[1], 7) if len(pct_parts) >= 2 else ''
             n_genome_bot: int | str = ''
-            if isinstance(n_detected, int) and frac_bot > 0:
+            if isinstance(n_detected, int) and isinstance(frac_bot, float) and frac_bot > 0:
                 n_genome_bot = round(n_detected / frac_bot)
 
             entries.append(_make_entry(
                 motif_str=rc_motif,
-                offset=rc_offset_1b,
+                offset=rc_pos_1b,
                 mod_type=mod_type,
                 fraction=frac_bot,
                 n_detected=n_detected,
@@ -752,7 +741,15 @@ def _parse_active_mtases_table(html: str,
                 source='rebase',
             ))
             log.info("  [RC]   %s offset=%d %s  frac=%.3f  (complement of %s)",
-                     rc_motif, rc_offset_1b, mod_type, frac_bot, motif_str)
+                     rc_motif, rc_pos_1b, mod_type,
+                     frac_bot if isinstance(frac_bot, float) else 0,
+                     motif_str)
+
+        # ---- Fallback: no top hit but we have a single colored base ----
+        # (shouldn't happen normally, but handles edge cases)
+        if not top_hits and not rc_hits:
+            log.warning("REBASE HTML: no valid direct or complement hits for '%s'",
+                        motif_plain)
 
     # Deduplicate: same (motif, offset, mod_type) from multiple table rows
     seen: dict[tuple, dict] = {}
