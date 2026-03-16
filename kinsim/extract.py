@@ -158,6 +158,7 @@ def extract_samples_from_bam(
     use_reverse_strand: bool = True,
     max_reads: int = 0,
     kmer_size: int = K,
+    unmeth_subsample_rate: float = 0.05,
 ) -> dict:
     """Extract raw (IPD, PW) pairs from a BAM file for each k-mer context.
 
@@ -189,6 +190,11 @@ def extract_samples_from_bam(
                               For smoke-testing only — reservoir sampling is biased
                               when the BAM is not fully read.
         kmer_size:            K-mer window size (default K=11). Must be odd.
+        unmeth_subsample_rate: Fraction of unmethylated (meth_id=0) positions to
+                              keep (default 0.05 = 5%). Methylated positions are
+                              always kept. Controls the unmeth/meth balance in the
+                              raw shard and prevents the dict from being dominated
+                              by the ~4M possible unmethylated k-mers.
 
     Returns:
         dict with:
@@ -235,6 +241,9 @@ def extract_samples_from_bam(
                 if i >= kmer_size - 1:
                     center  = i - mid
                     meth_id = int(meth_status[center])
+                    # Subsample unmethylated positions to control dict size
+                    if meth_id == 0 and np.random.random() >= unmeth_subsample_rate:
+                        continue
                     key     = (current_kmer, meth_id)
                     ipd_val = float(ipds[center])
                     pw_val  = float(pws[center])
@@ -281,6 +290,8 @@ def extract_samples_from_bam(
                             fwd_center = min_rev_len - 1 - rc_center
 
                             rc_meth_id = int(rev_meth_status[rc_center])
+                            if rc_meth_id == 0 and np.random.random() >= unmeth_subsample_rate:
+                                continue
                             rc_key = (rc_kmer, rc_meth_id)
                             ri_val = float(ri_tags[fwd_center])
                             rp_val = float(rp_tags[fwd_center])
@@ -320,6 +331,7 @@ def extract_samples_from_bam(
         "source_bam":              str(bam_path),
         "motifs":                  motif_string,
         "kmer_size":               kmer_size,
+        "unmeth_subsample_rate":   unmeth_subsample_rate,
         "use_reverse_strand":      use_reverse_strand,
         "max_samples_per_key":     max_samples_per_key,
         "n_reads_processed":       n_reads_processed,
@@ -445,6 +457,7 @@ def extract_from_manifest_task(
     use_reverse_strand: bool = True,
     max_reads: int = 0,
     kmer_size: int = K,
+    unmeth_subsample_rate: float = 0.05,
 ) -> None:
     """Extract one BAM from a manifest CSV (for SLURM array jobs).
 
@@ -495,6 +508,7 @@ def extract_from_manifest_task(
         use_reverse_strand=use_reverse_strand,
         max_reads=max_reads,
         kmer_size=kmer_size,
+        unmeth_subsample_rate=unmeth_subsample_rate,
     )
 
     with open(output_pkl, "wb") as f:
@@ -584,6 +598,10 @@ def main(argv=None) -> None:
     p_extract.add_argument("--kmer-size", type=int, default=None,
                            help="K-mer window size (default: from encoding.py K=11). "
                                 "Must match the value used during training.")
+    p_extract.add_argument("--unmeth-subsample-rate", type=float, default=0.05,
+                           help="Fraction of unmethylated positions to keep (default: 0.05). "
+                                "Methylated positions are always kept. Prevents the dict "
+                                "from being dominated by ~4M unmethylated k-mers.")
     p_extract.add_argument("--max-reads", type=int, default=0,
                            help="Stop after N reads (0 = no limit). "
                                 "Smoke-test only — biases reservoir sampling.")
@@ -634,13 +652,14 @@ def main(argv=None) -> None:
                 sys.exit(1)
             extract_from_manifest_task(
                 args.manifest,
-                task_index         = args.task,
-                output_dir         = args.output_dir,
-                max_samples_per_key= args.max_samples,
-                revcomp            = not args.no_revcomp,
-                use_reverse_strand = not args.no_reverse_strand,
-                max_reads          = args.max_reads,
-                kmer_size          = args.kmer_size or K,
+                task_index           = args.task,
+                output_dir           = args.output_dir,
+                max_samples_per_key  = args.max_samples,
+                revcomp              = not args.no_revcomp,
+                use_reverse_strand   = not args.no_reverse_strand,
+                max_reads            = args.max_reads,
+                kmer_size            = args.kmer_size or K,
+                unmeth_subsample_rate= args.unmeth_subsample_rate,
             )
 
         else:
