@@ -561,9 +561,9 @@ def main(argv=None) -> None:
                            help="Output directory for shard .pkl files (manifest mode)")
 
     # Common options
-    p_extract.add_argument("--max-samples", type=int, default=10_000,
+    p_extract.add_argument("--max-samples", type=int, default=20_000,
                            help="Max samples per (kmer, meth_id) via reservoir "
-                                "sampling (default: 10000)")
+                                "sampling (default: 20000)")
     p_extract.add_argument("--no-revcomp", action="store_true",
                            help="Do not scan reverse complement strand for motifs")
     p_extract.add_argument("--no-reverse-strand", action="store_true",

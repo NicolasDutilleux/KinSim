@@ -10,7 +10,7 @@ import sys
 
 __version__ = "0.3.0"
 
-COMMANDS = ["parse", "rebase", "merge-motifs", "manifest", "prepare", "filter"]
+COMMANDS = ["parse", "rebase", "merge-motifs", "manifest", "prepare", "filter", "balance"]
 
 USAGE = """\
 usage: kinsim-prep [--version] <subcommand> [<args>]
@@ -27,6 +27,8 @@ Subcommands:
   manifest       Inspect and validate manifest CSVs (count / validate / list)
   prepare        Validate BAM/motif pairs (legacy alternating-line format)
   filter         Filter a General Dictionary .pkl into a Training Dictionary
+  balance        Balance a merged dictionary: even out mod types (m6A/m4C/m5C)
+                 and maximise IPD diversity per key
 
 Use 'kinsim-prep <subcommand> -h' for detailed help.
 Use 'kinsim-prep --version' to print the version number.
@@ -76,6 +78,10 @@ def main(argv=None):
 
     elif cmd == "filter":
         from .filter import main as run
+        run(rest)
+
+    elif cmd == "balance":
+        from .balance import main as run
         run(rest)
 
     else:
