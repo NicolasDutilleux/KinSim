@@ -156,6 +156,7 @@ def extract_samples_from_bam(
     max_samples_per_key: int = 10_000,
     revcomp: bool = True,
     use_reverse_strand: bool = True,
+    max_reads: int = 0,
 ) -> dict:
     """Extract raw (IPD, PW) pairs from a BAM file for each 11-mer context.
 
@@ -184,6 +185,9 @@ def extract_samples_from_bam(
         use_reverse_strand:   Also extract ri/rp complementary-strand kinetics
                               using RC(11-mer) as the key.  Silently skipped for
                               reads or BAMs that lack ri/rp tags.
+        max_reads:            Stop after this many reads (0 = no limit).
+                              For smoke-testing only — reservoir sampling is biased
+                              when the BAM is not fully read.
 
     Returns:
         dict with:
@@ -206,6 +210,9 @@ def extract_samples_from_bam(
 
     with pysam.AlignmentFile(bam_path, "rb", check_sq=False) as bam:
         for read in bam:
+            if max_reads > 0 and n_reads_processed >= max_reads:
+                log.info("--max-reads %d reached — stopping early (smoke test only)", max_reads)
+                break
             seq = read.query_sequence
             if not (seq and len(seq) >= K and read.has_tag("fi")):
                 continue
@@ -433,6 +440,7 @@ def extract_from_manifest_task(
     max_samples_per_key: int = 10_000,
     revcomp: bool = True,
     use_reverse_strand: bool = True,
+    max_reads: int = 0,
 ) -> None:
     """Extract one BAM from a manifest CSV (for SLURM array jobs).
 
@@ -447,6 +455,7 @@ def extract_from_manifest_task(
         max_samples_per_key:  Reservoir cap per (kmer, meth_id) key.
         revcomp:              Scan reverse complement strand for motifs.
         use_reverse_strand:   Extract ri/rp complementary-strand kinetics.
+        max_reads:            Stop after N reads (0 = no limit, smoke test only).
     """
     from .utils.config import load_manifest
     from .utils.motifs import load_motif_string as _load_motif_string
@@ -480,6 +489,7 @@ def extract_from_manifest_task(
         max_samples_per_key=max_samples_per_key,
         revcomp=revcomp,
         use_reverse_strand=use_reverse_strand,
+        max_reads=max_reads,
     )
 
     with open(output_pkl, "wb") as f:
@@ -566,6 +576,9 @@ def main(argv=None) -> None:
                            help="Minimum fraction threshold for PacBio CSV (default: 0.40)")
     p_extract.add_argument("--min-detected", type=int, default=20,
                            help="Minimum nDetected threshold for PacBio CSV (default: 20)")
+    p_extract.add_argument("--max-reads", type=int, default=0,
+                           help="Stop after N reads (0 = no limit). "
+                                "Smoke-test only — biases reservoir sampling.")
     p_extract.add_argument("--verbose", "-v", action="store_true",
                            help="Enable DEBUG-level logging")
 
@@ -618,6 +631,7 @@ def main(argv=None) -> None:
                 max_samples_per_key= args.max_samples,
                 revcomp            = not args.no_revcomp,
                 use_reverse_strand = not args.no_reverse_strand,
+                max_reads          = args.max_reads,
             )
 
         else:
