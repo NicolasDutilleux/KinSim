@@ -54,7 +54,7 @@ from pathlib import Path
 import numpy as np
 import pysam
 
-from .utils.encoding import BASE_MAP, K, KMER_MASK
+from .utils.encoding import BASE_MAP, K, KMER_MASK, kmer_mask
 from .utils.motifs import load_motif_string, parse_motifs, reverse_complement, scan_sequence
 
 try:
