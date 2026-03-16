@@ -42,12 +42,7 @@ import torch.nn as nn
 
 # Reuse log-space transforms from common — shared with cGAN.
 from ..data.dataset import log_transform, inv_log_transform  # noqa: F401
-
-# Total number of 11-mers: 4^11 = 4,194,304
-_NUM_KMERS = 4 ** 11
-
-# Window size (fixed everywhere in KinSim)
-_K = 11
+from ..utils.encoding import K as _DEFAULT_K, kmer_mask
 
 
 # =========================================================================
@@ -74,6 +69,7 @@ class MLPPredictor(nn.Module):
         hidden_dim: int = 128,
         meth_proj_dim: int = 8,
         dropout: float = 0.0,
+        kmer_size: int = _DEFAULT_K,
     ):
         super().__init__()
 
@@ -81,8 +77,10 @@ class MLPPredictor(nn.Module):
         self.hidden_dim     = hidden_dim
         self.meth_proj_dim  = meth_proj_dim
         self.dropout        = dropout
+        self.kmer_size      = kmer_size
 
-        self.kmer_embed = nn.Embedding(_NUM_KMERS, kmer_embed_dim)
+        _num_kmers = 4 ** kmer_size
+        self.kmer_embed = nn.Embedding(_num_kmers, kmer_embed_dim)
         self.meth_proj = nn.Linear(4, meth_proj_dim, bias=False)
 
         input_dim = kmer_embed_dim + meth_proj_dim
@@ -139,6 +137,7 @@ class MLPPredictor(nn.Module):
         """Return architecture config for model_config.json."""
         return {
             "architecture":   "mlp",
+            "kmer_size":      self.kmer_size,
             "kmer_embed_dim": self.kmer_embed_dim,
             "hidden_dim":     self.hidden_dim,
             "meth_proj_dim":  self.meth_proj_dim,
@@ -207,6 +206,7 @@ class ConvPredictor(nn.Module):
         kernel_size: int = 3,
         head_dim: int = 128,
         dropout: float = 0.1,
+        kmer_size: int = _DEFAULT_K,
     ):
         super().__init__()
 
@@ -218,15 +218,16 @@ class ConvPredictor(nn.Module):
         self.kernel_size    = kernel_size
         self.head_dim       = head_dim
         self.dropout_p      = dropout
+        self.kmer_size      = kmer_size
 
         # --- Per-base embedding: A=0, C=1, G=2, T=3 ---
         self.base_embed = nn.Embedding(4, base_embed_dim)
 
-        # --- Learnable positional embedding (11 positions) ---
-        # Captures "distance from active site" effects: the center (pos 5)
+        # --- Learnable positional embedding (kmer_size positions) ---
+        # Captures "distance from active site" effects: the center position
         # is where the polymerase incorporates; flanking bases contribute
         # stiffness, steric effects, unzipping energy.
-        self.pos_embed = nn.Parameter(torch.zeros(1, _K, base_embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, kmer_size, base_embed_dim))
 
         # --- Methylation projection (shared across positions) ---
         # Linear(M, proj_dim, bias=False): zero meth -> zero output.
@@ -271,7 +272,7 @@ class ConvPredictor(nn.Module):
         # Registered as buffer so it moves with .to(device) automatically.
         self.register_buffer(
             "_shifts",
-            torch.arange(_K - 1, -1, -1) * 2,  # [20, 18, ..., 2, 0]
+            torch.arange(kmer_size - 1, -1, -1) * 2,
         )
 
         self._init_weights()
@@ -312,16 +313,14 @@ class ConvPredictor(nn.Module):
     # ------------------------------------------------------------------
 
     def _decode_kmer_ids(self, kmer_ids: torch.Tensor) -> torch.Tensor:
-        """Decode 22-bit packed k-mer IDs to per-position base indices.
+        """Decode packed k-mer IDs to per-position base indices.
 
         Args:
-            kmer_ids: (B,) Long tensor of 22-bit encoded 11-mers.
+            kmer_ids: (B,) Long tensor of 2*kmer_size-bit encoded k-mers.
 
         Returns:
-            (B, 11) Long tensor of base indices [0-3].
+            (B, kmer_size) Long tensor of base indices [0-3].
         """
-        # _shifts = [20, 18, 16, 14, 12, 10, 8, 6, 4, 2, 0]
-        # bits 21-20 = base[0] (leftmost), bits 1-0 = base[10] (rightmost)
         return (kmer_ids.unsqueeze(1) >> self._shifts.unsqueeze(0)) & 3
 
     def _expand_center_meth(self, meth_probs: torch.Tensor) -> torch.Tensor:
@@ -329,20 +328,21 @@ class ConvPredictor(nn.Module):
 
         The current pipeline stores methylation only for the center position
         (where the polymerase incorporates).  This method places it at
-        position K//2 = 5, with zeros at all flanking positions.
+        position kmer_size//2, with zeros at all flanking positions.
 
         Forward-compatible: when the data pipeline provides per-position
-        methylation, pass (B, 11, M) directly to forward_positional().
+        methylation, pass (B, kmer_size, M) directly to forward_positional().
 
         Args:
             meth_probs: (B, M) methylation probabilities for center position.
 
         Returns:
-            (B, 11, M) tensor with meth_probs at center, zeros elsewhere.
+            (B, kmer_size, M) tensor with meth_probs at center, zeros elsewhere.
         """
         B, M = meth_probs.shape
-        full = torch.zeros(B, _K, M, device=meth_probs.device, dtype=meth_probs.dtype)
-        full[:, _K // 2, :] = meth_probs
+        full = torch.zeros(B, self.kmer_size, M,
+                           device=meth_probs.device, dtype=meth_probs.dtype)
+        full[:, self.kmer_size // 2, :] = meth_probs
         return full
 
     # ------------------------------------------------------------------
@@ -379,7 +379,7 @@ class ConvPredictor(nn.Module):
         x = self.conv(x)                                # (B, conv_dim, 11)
 
         # Dual readout: center (active site) + global context
-        center      = x[:, :, _K // 2]                  # (B, conv_dim)
+        center      = x[:, :, self.kmer_size // 2]      # (B, conv_dim)
         global_pool = x.mean(dim=2)                      # (B, conv_dim)
         readout     = torch.cat([center, global_pool], dim=1)  # (B, 2*conv_dim)
 
@@ -456,6 +456,7 @@ class ConvPredictor(nn.Module):
         """Return architecture config for model_config.json."""
         return {
             "architecture":   "conv",
+            "kmer_size":      self.kmer_size,
             "base_embed_dim": self.base_embed_dim,
             "num_meth_types": self.num_meth_types,
             "meth_proj_dim":  self.meth_proj_dim,
@@ -485,12 +486,15 @@ def create_from_config(config: dict) -> nn.Module:
     """
     arch = config.get("architecture", "mlp")
 
+    kmer_size = config.get("kmer_size", _DEFAULT_K)
+
     if arch == "mlp":
         return MLPPredictor(
-            kmer_embed_dim=config["kmer_embed_dim"],
-            hidden_dim=config["hidden_dim"],
+            kmer_embed_dim=config.get("kmer_embed_dim", 64),
+            hidden_dim=config.get("hidden_dim", 128),
             meth_proj_dim=config.get("meth_proj_dim", 8),
             dropout=config.get("dropout", 0.0),
+            kmer_size=kmer_size,
         )
     elif arch == "conv":
         return ConvPredictor(
@@ -502,6 +506,7 @@ def create_from_config(config: dict) -> nn.Module:
             kernel_size=config.get("kernel_size", 3),
             head_dim=config.get("head_dim", 128),
             dropout=config.get("dropout", 0.1),
+            kmer_size=kmer_size,
         )
     else:
         raise ValueError(
