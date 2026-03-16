@@ -105,12 +105,14 @@ class PacBioParser(BaseOutputParser):
                     mod_type = ''
 
                 if not mod_type or mod_type == 'modified_base':
-                    if center_pos >= len(motif_seq):
+                    # centerPos is 1-based; convert to 0-based for indexing
+                    idx = center_pos - 1
+                    if idx < 0 or idx >= len(motif_seq):
                         log.warning("PacBio CSV line %d: centerPos %d out of "
                                     "bounds for '%s' -- skipped",
                                     lineno, center_pos, motif_seq)
                         continue
-                    base = motif_seq[center_pos].upper()
+                    base = motif_seq[idx].upper()
                     resolved = _BASE_TO_METH.get(base)
                     if resolved is None:
                         log.warning("PacBio CSV line %d: cannot resolve mod "
