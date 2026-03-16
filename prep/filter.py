@@ -10,11 +10,14 @@ reproducible and adjustable filtering without re-extracting from BAMs.
 
 Filtering criteria (all optional, combinable):
   --min-coverage   Minimum samples per (kmer, meth) key
+  --min-fraction   Minimum mean methylation fraction for methylated keys (default 0.0)
+                   Applied only to keys with meth_id != 0 (unmethylated keys always kept).
+                   Requires a 3-column shard (IPD, PW, fraction); 2-col shards are skipped.
   --mod-type       Keep only specific mod types (m6A, m5C, m4C, or comma-sep)
   --max-keys       Keep only top N most data-rich keys
 
 CLI:
-    kinsim-prep filter general.pkl training.pkl [--min-coverage 50] [...]
+    kinsim-prep filter general.pkl training.pkl [--min-coverage 50] [--min-fraction 0.4] [...]
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ def filter_pkl(
     output_path: str,
     *,
     min_coverage: int = 0,
+    min_fraction: float = 0.0,
     mod_types: list[str] | None = None,
     max_keys: int = 0,
 ) -> dict:
@@ -48,6 +52,12 @@ def filter_pkl(
         output_path:  Path to write the filtered Training Dictionary .pkl.
         min_coverage: Minimum number of samples per (kmer, meth) key.
                       Keys with fewer samples are dropped.
+        min_fraction: Minimum mean methylation fraction for methylated keys
+                      (meth_id != 0). Keys whose mean fraction column is below
+                      this threshold are dropped. Unmethylated keys (meth_id=0)
+                      are never filtered by this criterion. Requires 3-column
+                      data; 2-column shards are silently kept regardless.
+                      Default: 0.0 (no filtering).
         mod_types:    List of mod type names to keep (e.g. ["m6A", "m5C"]).
                       None or empty means keep all.
         max_keys:     Maximum number of keys to keep (0 = unlimited).
@@ -55,7 +65,8 @@ def filter_pkl(
                       most data-rich keys are retained.
 
     Returns:
-        dict with filtering statistics: keys_in, keys_out, samples_in, samples_out.
+        dict with filtering statistics: keys_in, keys_out, samples_in, samples_out,
+        fraction_dropped (count of keys dropped by min_fraction filter).
     """
     import numpy as np
 
@@ -88,6 +99,7 @@ def filter_pkl(
 
     # Apply filters
     filtered = {}
+    fraction_dropped = 0
     for key, value in data.items():
         if not isinstance(key, tuple) or len(key) != 2:
             continue
@@ -103,6 +115,14 @@ def filter_pkl(
             continue
         if len(value) < min_coverage:
             continue
+
+        # Fraction filter: only for methylated keys with a fraction column
+        if min_fraction > 0.0 and meth_id != 0:
+            if value.ndim == 2 and value.shape[1] >= 3:
+                mean_frac = float(np.mean(value[:, 2]))
+                if mean_frac < min_fraction:
+                    fraction_dropped += 1
+                    continue
 
         filtered[key] = value
 
@@ -123,6 +143,7 @@ def filter_pkl(
             meta["filtered_from"] = str(input_path)
             meta["filter_params"] = {
                 "min_coverage": min_coverage,
+                "min_fraction": min_fraction,
                 "mod_types": mod_types,
                 "max_keys": max_keys,
             }
@@ -139,10 +160,13 @@ def filter_pkl(
         "keys_out": keys_out,
         "samples_in": samples_in,
         "samples_out": samples_out,
+        "fraction_dropped": fraction_dropped,
     }
 
     log.info("Filtered: %d -> %d keys, %d -> %d samples",
              keys_in, keys_out, samples_in, samples_out)
+    if fraction_dropped:
+        log.info("  Dropped by min_fraction=%.2f: %d methylated keys", min_fraction, fraction_dropped)
     log.info("Training Dictionary written to: %s", output_path)
 
     return stats
@@ -162,11 +186,13 @@ def main(argv=None) -> None:
             "Examples:\n"
             "  # Keep only well-covered methylated keys:\n"
             "  kinsim-prep filter general.pkl training.pkl --min-coverage 50\n\n"
+            "  # Keep methylated keys with >=40% mean fraction:\n"
+            "  kinsim-prep filter general.pkl training.pkl --min-fraction 0.4\n\n"
             "  # Keep only m6A data:\n"
             "  kinsim-prep filter general.pkl training.pkl --mod-type m6A\n\n"
             "  # Keep top 100k most data-rich keys, m6A and m5C only:\n"
             "  kinsim-prep filter general.pkl training.pkl \\\n"
-            "      --mod-type m6A,m5C --max-keys 100000 --min-coverage 10"
+            "      --mod-type m6A,m5C --max-keys 100000 --min-coverage 10 --min-fraction 0.4"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -176,6 +202,10 @@ def main(argv=None) -> None:
                         help="Output Training Dictionary .pkl file")
     parser.add_argument("--min-coverage", type=int, default=0,
                         help="Minimum samples per (kmer, meth) key (default: 0)")
+    parser.add_argument("--min-fraction", type=float, default=0.0,
+                        help="Minimum mean methylation fraction for methylated keys "
+                             "(0.0–1.0, default: 0.0). Keys with meth_id!=0 and mean "
+                             "fraction below this are dropped. Unmethylated keys are unaffected.")
     parser.add_argument("--mod-type", type=str, default=None,
                         help="Comma-separated mod types to keep (e.g. m6A,m5C). "
                              "Default: keep all.")
@@ -196,6 +226,7 @@ def main(argv=None) -> None:
         args.input,
         args.output,
         min_coverage=args.min_coverage,
+        min_fraction=args.min_fraction,
         mod_types=mod_types,
         max_keys=args.max_keys,
     )
@@ -207,6 +238,9 @@ def main(argv=None) -> None:
                    if stats["samples_in"] > 0 else 0)
     print(f"Keys:    {stats['keys_in']:>10,} -> {stats['keys_out']:>10,}  "
           f"({pct_keys:.1f}% retained)")
+    if stats.get("fraction_dropped"):
+        print(f"  Dropped by --min-fraction {args.min_fraction}: "
+              f"{stats['fraction_dropped']:,} methylated keys")
     print(f"Samples: {stats['samples_in']:>10,} -> {stats['samples_out']:>10,}  "
           f"({pct_samples:.1f}% retained)")
     print(f"Output:  {args.output}")
