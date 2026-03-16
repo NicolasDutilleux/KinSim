@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=KinSim_Extract
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=64G
+#SBATCH --mem=128G
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
 #SBATCH --time=24:00:00
 #SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/kinsim_extract_%A_%a.log
 #SBATCH --mail-user=nicolas.dutilleux@unifr.ch
-#SBATCH --mail-type=FAIL
+#SBATCH --mail-type=FAIL,END
 
 # ============================================================
 # KinSim — Extract raw kinetic samples + merge (manifest-based, two-phase)
