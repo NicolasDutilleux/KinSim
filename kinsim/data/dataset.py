@@ -310,4 +310,5 @@ class MLPSignalDataset(Dataset):
             torch.tensor(kmer_id, dtype=torch.long),
             meth_probs,
             signal,
+            torch.tensor(meth_id, dtype=torch.long),  # for per-type metrics
         )
