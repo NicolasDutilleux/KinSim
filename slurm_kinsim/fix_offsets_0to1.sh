@@ -33,6 +33,10 @@ find "$DIR" -name "*_motifs.csv" -type f | sort | while read -r CSV; do
         # Combined CSV format: offset is column 3 (1-indexed)
         COL=3
         FMT="combined"
+    elif echo "$HEADER" | grep -q "^mod_code,motif,offset"; then
+        # Modkit CSV format: offset is column 3 (1-indexed)
+        COL=3
+        FMT="modkit"
     elif echo "$HEADER" | grep -q "motifString.*centerPos"; then
         # PacBio CSV format: centerPos is column 2 (1-indexed)
         COL=2
