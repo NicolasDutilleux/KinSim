@@ -11,7 +11,7 @@ import sys
 __version__ = "0.4.0"
 
 COMMANDS = [
-    "extract", "merge", "train", "generate", "evaluate",
+    "extract", "merge", "sample", "train", "generate", "evaluate",
 ]
 
 USAGE = """\
@@ -22,6 +22,7 @@ KinSim - PacBio kinetic signal simulator (MLP pipeline).
 Commands:
   extract     Extract raw IPD/PW samples from a BAM file  (-> .pkl shard)
   merge       Merge .pkl shards into a master training set
+  sample      Randomly subsample a dictionary .pkl (for train/test splits)
   train       Train the ConvPredictor / MLPPredictor model
   generate    Generate synthetic kinetic signals for PBSIM3 reads
   evaluate    Evaluate a trained model (calibration report + plots)
@@ -73,6 +74,11 @@ def main(argv=None):
     elif cmd == "merge":
         from .extract import main as run
         run(["merge"] + rest)
+
+    # -- sample --
+    elif cmd == "sample":
+        from .sample import main as run
+        run(rest)
 
     # -- train --
     elif cmd == "train":

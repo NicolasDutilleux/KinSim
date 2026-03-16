@@ -2,67 +2,43 @@
 # =============================================================================
 # prep_MSA1003_merge.sh
 #
-# For each species in each MSA1003 experience:
-#   1. Merge calling motifs ({ACC}_motifs.csv) with REBASE motifs
-#      (rebase_motifs.csv, if present) into final_motifs.csv
-#   2. Write one manifest.csv row per BAM
+# For each species in each experience under SPLIT_DIR:
+#   1. Merge calling motifs + REBASE motifs into final_motifs.csv
+#   2. Write one manifest row per BAM
 #
-# Run AFTER prep_MSA1003_rebase.sh.
-#
-# Output per species per experience:
-#   $SPLIT/<experience>/$ACC/final_motifs.csv
-#
-# Manifest:
-#   $BASE/manifest.csv
+# Auto-discovers experiences (MSA1003.* subdirs) and species (subdirs within).
 #
 # Usage:
-#   conda activate kinsim_env
-#   bash slurm_kinsim/prep_MSA1003_merge.sh
+#   bash slurm_kinsim/prep_MSA1003_merge.sh [SPLIT_DIR] [MANIFEST]
+#
+# Defaults:
+#   SPLIT_DIR = $BASE/trimmed_species_by_experience
+#   MANIFEST  = $BASE/manifest.csv
 # =============================================================================
 
 set -euo pipefail
 
 BASE=/data/projects/p774_MARSD/NDutilleux/training/PB_MOCK
-SPLIT=$BASE/species_split_by_experience
-MANIFEST=$BASE/manifest.csv
+SPLIT="${1:-$BASE/trimmed_species_by_experience}"
+MANIFEST="${2:-$BASE/manifest.csv}"
 
-# All 4 replicates
-EXPERIENCES=(
-    MSA1003.490fb6ec_6--6
-    MSA1003.8f6d4655_6--6
-    MSA1003.be664413_6--6
-    MSA1003.ee67a0a5_6--6
-)
+echo "========================================"
+echo "  Merge motifs + build manifest"
+echo "========================================"
+echo "  Input:    $SPLIT"
+echo "  Manifest: $MANIFEST"
+echo ""
 
-# ---------------------------------------------------------------------------
-# Species list (ordered)
-# ---------------------------------------------------------------------------
-SPECIES=(
-    AE000511.1      # Helicobacter pylori 26695
-    AE000513.1      # Deinococcus radiodurans R1 chromosome 1
-    AE002098.2      # Neisseria meningitidis MC58
-    AE009948.1      # Streptococcus agalactiae 2603V/R
-    AE014133.2      # Streptococcus mutans UA159
-    AE015929.1      # Staphylococcus epidermidis ATCC 12228
-    AE017194.1      # Bacillus cereus ATCC 10987
-    AP009256.1      # Bifidobacterium adolescentis ATCC 15703
-    AP009380.1      # Porphyromonas gingivalis ATCC 33277
-    CP000139.1      # Bacteroides vulgatus ATCC 8482
-    CP000255.1      # Staphylococcus aureus USA300_FPR3757
-    CP000413.1      # Lactobacillus gasseri ATCC 33323
-    CP000521.1      # Acinetobacter baumannii ATCC 17978
-    CP000577.1      # Cereibacter sphaeroides ATCC 17029 chromosome 1
-    CP000744.1      # Pseudomonas paraeruginosa PA7
-    CP003084.1      # Propionibacterium acnes ATCC 11828
-    CP046315.1      # Schaalia odontolytica FDAARGOS_732
-    NC_009050.1     # Cereibacter sphaeroides ATCC 17029 chromosome 2
-    NC_017316.1     # Enterococcus faecalis OG1RF
-    NZ_CP006777.1   # Clostridium beijerinckii ATCC 35702 SA-1
-    U00096.3        # Escherichia coli K-12 MG1655
-)
+# Auto-discover experiences
+EXPERIENCES=($(ls -d "$SPLIT"/MSA1003.* 2>/dev/null | xargs -n1 basename | sort))
+if [ ${#EXPERIENCES[@]} -eq 0 ]; then
+    echo "ERROR: No MSA1003.* experience directories found in $SPLIT"
+    exit 1
+fi
+echo "  Experiences: ${#EXPERIENCES[@]}"
 
 # ---------------------------------------------------------------------------
-# Main loop: merge motifs per species per experience, build manifest
+# Main loop: discover species from directory, merge motifs, build manifest
 # ---------------------------------------------------------------------------
 echo "sample_id,bam_path,motifs" > "$MANIFEST"
 
@@ -73,8 +49,10 @@ for EXP in "${EXPERIENCES[@]}"; do
     echo "  Experience: $EXP  (replicate $R)"
     echo "=========================================="
 
-    for ACC in "${SPECIES[@]}"; do
-        SPECIES_DIR="$SPLIT/$EXP/$ACC"
+    for SPECIES_DIR in "$SPLIT/$EXP"/*/; do
+        [ -d "$SPECIES_DIR" ] || continue
+        ACC=$(basename "$SPECIES_DIR")
+
         CALLING_CSV="$SPECIES_DIR/${ACC}_motifs.csv"
         REBASE_CSV="$SPECIES_DIR/rebase_motifs.csv"
         FINAL_CSV="$SPECIES_DIR/final_motifs.csv"
