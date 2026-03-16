@@ -30,7 +30,7 @@
 #   sbatch --array=1-N%MAX_CONCURRENT kinsim_extract.slurm <manifest.csv> <shards_dir> <master_output>
 #
 #   The %MAX_CONCURRENT suffix limits how many tasks run simultaneously.
-#   Recommended: 8 (polite default for a shared cluster with 64G-per-task jobs).
+#   Recommended: 2 (conservative default — each task needs 64G RAM).
 #   Adjust up/down based on cluster policy and available memory nodes.
 #
 # Usage — Merge phase (single job, triggered automatically or manually):
@@ -43,12 +43,12 @@
 #
 # Count N for --array:
 #   N=$(kinsim-prep manifest count manifest.csv)
-#   sbatch --array=1-$N%8 kinsim_extract.slurm manifest.csv shards/ master_data.pkl
+#   sbatch --array=1-$N%2 kinsim_extract.slurm manifest.csv shards/ master_data.pkl
 #
 # Examples:
 #   # Submit extract + auto-merge, max 8 tasks at a time:
 #   N=$(kinsim-prep manifest count manifest.csv)
-#   sbatch --array=1-$N%8 kinsim_extract.slurm manifest.csv shards/ master_data.pkl
+#   sbatch --array=1-$N%2 kinsim_extract.slurm manifest.csv shards/ master_data.pkl
 #
 #   # More aggressive (larger cluster or off-peak):
 #   sbatch --array=1-$N%16 kinsim_extract.slurm manifest.csv shards/ master_data.pkl
@@ -60,21 +60,21 @@
 
 # ---- Usage check ----
 if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then
-    echo "Usage: sbatch --array=1-N%8 kinsim_extract.slurm <manifest.csv> <shards_dir> <master_output>"
+    echo "Usage: sbatch --array=1-N%2 kinsim_extract.slurm <manifest.csv> <shards_dir> <master_output>"
     echo ""
     echo "Arguments:"
     echo "  manifest.csv    CSV with columns: sample_id, bam_path, motifs"
     echo "  shards_dir      Directory for intermediate *_shard.pkl files"
     echo "  master_output   Path for the final merged training data (.pkl)"
     echo ""
-    echo "The %8 suffix limits concurrent tasks (polite default for 64G-per-task jobs)."
-    echo "Adjust as needed: --array=1-N%4 (conservative) or --array=1-N%16 (aggressive)."
+    echo "The %2 suffix limits concurrent tasks (conservative: 2×64G = 128G RAM total)."
+    echo "Adjust as needed: --array=1-N%1 (one at a time) or --array=1-N%4 (if cluster allows)."
     echo ""
     echo "Count N:  kinsim-prep manifest count manifest.csv"
     echo ""
     echo "Example:"
     echo "  N=\$(kinsim-prep manifest count manifest.csv)"
-    echo "  sbatch --array=1-\$N%8 kinsim_extract.slurm manifest.csv shards/ master_data.pkl"
+    echo "  sbatch --array=1-\$N%2 kinsim_extract.slurm manifest.csv shards/ master_data.pkl"
     exit 1
 fi
 
