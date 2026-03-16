@@ -10,7 +10,7 @@ import sys
 
 __version__ = "0.3.0"
 
-COMMANDS = ["parse", "rebase", "merge-motifs", "manifest", "prepare", "filter", "balance"]
+COMMANDS = ["parse", "rebase", "merge-motifs", "manifest", "balance"]
 
 USAGE = """\
 usage: kinsim-prep [--version] <subcommand> [<args>]
@@ -25,8 +25,6 @@ Subcommands:
   merge-motifs   Merge, filter, and deduplicate motifs from multiple sources
                  (calling CSV + REBASE CSV) into a standard PacBio motifs.csv
   manifest       Inspect and validate manifest CSVs (count / validate / list)
-  prepare        Validate BAM/motif pairs (legacy alternating-line format)
-  filter         Filter a General Dictionary .pkl into a Training Dictionary
   balance        Balance a merged dictionary: even out mod types (m6A/m4C/m5C)
                  and maximise IPD diversity per key
 
@@ -70,14 +68,6 @@ def main(argv=None):
 
     elif cmd == "manifest":
         from .manifest import main as run
-        run(rest)
-
-    elif cmd == "prepare":
-        from .prepare import main as run
-        run(rest)
-
-    elif cmd == "filter":
-        from .filter import main as run
         run(rest)
 
     elif cmd == "balance":
