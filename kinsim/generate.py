@@ -92,7 +92,7 @@ def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
     (e.g. "m6A,GATC,1,3551,0.998").  Defaults to 1.0 when absent.
     Unmethylated (meth_id=0) always maps to 0.0.
     """
-    from ...encoding import METH_IDS
+    from .utils.encoding import METH_IDS
 
     fracs: dict[int, float] = {0: 0.0}
     if not motif_string:
