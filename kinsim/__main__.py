@@ -11,7 +11,7 @@ import sys
 __version__ = "0.4.0"
 
 COMMANDS = [
-    "extract", "merge", "sample", "train", "generate", "evaluate",
+    "extract", "merge", "sample", "train", "generate", "evaluate", "analyze",
 ]
 
 USAGE = """\
@@ -26,6 +26,7 @@ Commands:
   train       Train the ConvPredictor / MLPPredictor model
   generate    Generate synthetic kinetic signals for PBSIM3 reads
   evaluate    Evaluate a trained model (calibration report + plots)
+  analyze     Analyse a .pkl shard or dictionary (coverage, signals, sensitivity)
 
 Data preparation:
   Use 'kinsim-prep' for motif parsing, REBASE fetching, manifest tools,
@@ -93,6 +94,11 @@ def main(argv=None):
     # -- evaluate --
     elif cmd == "evaluate":
         from .evaluate import main as run
+        run(rest)
+
+    # -- analyze --
+    elif cmd == "analyze":
+        from .analyze import main as run
         run(rest)
 
     # -- unknown --
