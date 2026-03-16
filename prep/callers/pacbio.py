@@ -16,13 +16,18 @@ import csv
 import logging
 
 from kinsim.utils.encoding import METH_IDS
+from kinsim.utils.motifs import reverse_complement
 from .base import BaseOutputParser
 from .registry import register
 
 log = logging.getLogger(__name__)
 
-# Resolve ambiguous "modified_base" by the base at centerPos
+# Resolve ambiguous "modified_base" by the base at centerPos (forward strand)
 _BASE_TO_METH = {'A': 'm6A', 'C': 'm4C'}
+
+# When the base at centerPos is on the complement strand (G or T),
+# the actual modified base is the complement: C→m4C, A→m6A
+_COMP_BASE_TO_METH = {'G': 'm4C', 'T': 'm6A'}
 
 
 @register
@@ -115,11 +120,24 @@ class PacBioParser(BaseOutputParser):
                     base = motif_seq[idx].upper()
                     resolved = _BASE_TO_METH.get(base)
                     if resolved is None:
-                        log.warning("PacBio CSV line %d: cannot resolve mod "
-                                    "type at %s[%d]='%s' -- skipped",
-                                    lineno, motif_seq, center_pos, base)
-                        continue
-                    mod_type = resolved
+                        # Try complement strand: G→C→m4C, T→A→m6A
+                        comp_resolved = _COMP_BASE_TO_METH.get(base)
+                        if comp_resolved is not None:
+                            rc_motif = reverse_complement(motif_seq)
+                            rc_idx = len(motif_seq) - 1 - idx
+                            mod_type = comp_resolved
+                            motif_seq = rc_motif
+                            center_pos = rc_idx + 1  # back to 1-based
+                            log.info("PacBio CSV line %d: base '%s' on complement strand "
+                                     "-> RC motif %s centerPos %d (%s)",
+                                     lineno, base, motif_seq, center_pos, mod_type)
+                        else:
+                            log.warning("PacBio CSV line %d: cannot resolve mod "
+                                        "type at %s[%d]='%s' -- skipped",
+                                        lineno, motif_seq, center_pos, base)
+                            continue
+                    else:
+                        mod_type = resolved
 
                 if mod_type not in METH_IDS:
                     log.warning("PacBio CSV line %d: unknown mod type '%s' "
