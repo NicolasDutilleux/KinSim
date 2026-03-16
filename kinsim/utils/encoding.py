@@ -1,31 +1,58 @@
-"""11-mer bit-packing: encode/decode DNA k-mers as 22-bit integers."""
+"""K-mer bit-packing: encode/decode DNA k-mers as 2k-bit integers.
+
+Default k=11 (22-bit integers, 4^11 = 4,194,304 possible k-mers).
+All functions accept an optional ``k`` parameter so the window size
+can be changed without touching call sites that use the default.
+"""
 
 import numpy as np
 
+# Default k-mer size — change here to shift the whole pipeline default.
 K = 11
-KMER_BITS = 2 * K  # 22
-KMER_MASK = (1 << KMER_BITS) - 1
+KMER_BITS = 2 * K       # 22 for K=11
+KMER_MASK = (1 << KMER_BITS) - 1  # mask for default K
 
-BASE_MAP = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
-INT_TO_BASE = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
-VALID_BASES = set('ACGT')
+BASE_MAP     = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+INT_TO_BASE  = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
+VALID_BASES  = set('ACGT')
 
 METH_IDS = {'none': 0, 'm6A': 1, 'm4C': 2, 'm5C': 3}
-TOTAL_POSSIBLE_KMERS = 4 ** K  # 4,194,304
+TOTAL_POSSIBLE_KMERS = 4 ** K  # 4,194,304 for K=11
 
 
-def encode_kmer(seq):
-    """Encode an 11-mer string to a 22-bit integer."""
+def kmer_mask(k: int = K) -> int:
+    """Return the bit-mask for a k-mer of size k (= (1 << 2k) - 1)."""
+    return (1 << (2 * k)) - 1
+
+
+def encode_kmer(seq: str, k: int = K) -> int:
+    """Encode a k-mer string to a 2k-bit integer.
+
+    Args:
+        seq: DNA string of length k (ACGT only).
+        k:   K-mer size (default K=11).
+
+    Returns:
+        Integer in [0, 4^k).
+    """
     val = 0
     for base in seq:
         val = (val << 2) | BASE_MAP[base]
-    return val
+    return val & kmer_mask(k)
 
 
-def decode_kmer(val):
-    """Decode a 22-bit integer back to an 11-mer string."""
+def decode_kmer(val: int, k: int = K) -> str:
+    """Decode a 2k-bit integer back to a k-mer string.
+
+    Args:
+        val: Integer in [0, 4^k).
+        k:   K-mer size (default K=11).
+
+    Returns:
+        DNA string of length k.
+    """
     bases = []
-    for _ in range(K):
+    for _ in range(k):
         bases.append(INT_TO_BASE[val & 3])
         val >>= 2
     return ''.join(reversed(bases))

@@ -157,21 +157,21 @@ def extract_samples_from_bam(
     revcomp: bool = True,
     use_reverse_strand: bool = True,
     max_reads: int = 0,
+    kmer_size: int = K,
 ) -> dict:
-    """Extract raw (IPD, PW) pairs from a BAM file for each 11-mer context.
+    """Extract raw (IPD, PW) pairs from a BAM file for each k-mer context.
 
     For each read: extract sequence + fi/fp kinetic tags, scan methylation
-    motifs, then slide an 11-mer window collecting raw signal values.
+    motifs, then slide a kmer_size-mer window collecting raw signal values.
 
     When ``use_reverse_strand=True`` (default) and the BAM contains ``ri``/``rp``
     complementary-strand kinetic tags, a second extraction pass processes the
     reverse strand.  For position *i* in the read, the reverse-strand kinetic
     signal ``ri[i]`` was measured as the polymerase traversed the complementary
     strand in its 5'→3' direction.  The correct sequence context for that signal
-    is ``RC(seq[i-5:i+6])`` — not the forward 11-mer.  Using RC kmers with the
-    complementary-strand IPD/PW values effectively doubles the training set and
-    makes the model strand-invariant: it learns that a methylated A on the forward
-    strand and the paired T on the reverse strand share the same kinetic signature.
+    is ``RC(seq[i-mid:i+mid+1])`` — not the forward k-mer.  Using RC kmers with
+    the complementary-strand IPD/PW values effectively doubles the training set
+    and makes the model strand-invariant.
 
     Reservoir sampling keeps memory bounded: once a (kmer, meth_id) key
     reaches max_samples_per_key, new samples randomly replace existing ones
@@ -183,11 +183,12 @@ def extract_samples_from_bam(
         max_samples_per_key:  Maximum samples stored per (kmer, meth_id) key.
         revcomp:              Include reverse complement motif patterns (default True).
         use_reverse_strand:   Also extract ri/rp complementary-strand kinetics
-                              using RC(11-mer) as the key.  Silently skipped for
+                              using RC(k-mer) as the key.  Silently skipped for
                               reads or BAMs that lack ri/rp tags.
         max_reads:            Stop after this many reads (0 = no limit).
                               For smoke-testing only — reservoir sampling is biased
                               when the BAM is not fully read.
+        kmer_size:            K-mer window size (default K=11). Must be odd.
 
     Returns:
         dict with:
@@ -196,7 +197,8 @@ def extract_samples_from_bam(
     """
     validate_bam_kinetics(bam_path)
 
-    mid    = K // 2   # Centre position of the 11-mer window (= 5)
+    _mask  = kmer_mask(kmer_size)
+    mid    = kmer_size // 2
     motifs = parse_motifs(motif_string, revcomp=revcomp)
     frac_lookup = _build_fraction_lookup(motif_string)
 
@@ -214,7 +216,7 @@ def extract_samples_from_bam(
                 log.info("--max-reads %d reached — stopping early (smoke test only)", max_reads)
                 break
             seq = read.query_sequence
-            if not (seq and len(seq) >= K and read.has_tag("fi")):
+            if not (seq and len(seq) >= kmer_size and read.has_tag("fi")):
                 continue
 
             ipds    = read.get_tag("fi")
@@ -224,13 +226,13 @@ def extract_samples_from_bam(
             # Per-read regex scan for methylation positions (forward strand).
             meth_status = scan_sequence(seq[:min_len], motifs)
 
-            # --- Forward strand: slide 11-mer window, collect fi/fp ---
+            # --- Forward strand: slide kmer_size window, collect fi/fp ---
             current_kmer = 0
             for i in range(min_len):
                 base_val     = BASE_MAP.get(seq[i], 0)
-                current_kmer = ((current_kmer << 2) | base_val) & KMER_MASK
+                current_kmer = ((current_kmer << 2) | base_val) & _mask
 
-                if i >= K - 1:
+                if i >= kmer_size - 1:
                     center  = i - mid
                     meth_id = int(meth_status[center])
                     key     = (current_kmer, meth_id)
@@ -264,7 +266,7 @@ def extract_samples_from_bam(
                 rp_tags = read.get_tag("rp")
                 min_rev_len = min(min_len, len(ri_tags), len(rp_tags))
 
-                if min_rev_len >= K:
+                if min_rev_len >= kmer_size:
                     n_reads_with_reverse += 1
                     rc_seq          = reverse_complement(seq[:min_rev_len])
                     rev_meth_status = scan_sequence(rc_seq, motifs)
@@ -272,9 +274,9 @@ def extract_samples_from_bam(
                     rc_kmer = 0
                     for j in range(min_rev_len):
                         rc_base = BASE_MAP.get(rc_seq[j], 0)
-                        rc_kmer = ((rc_kmer << 2) | rc_base) & KMER_MASK
+                        rc_kmer = ((rc_kmer << 2) | rc_base) & _mask
 
-                        if j >= K - 1:
+                        if j >= kmer_size - 1:
                             rc_center  = j - mid
                             fwd_center = min_rev_len - 1 - rc_center
 
@@ -317,6 +319,7 @@ def extract_samples_from_bam(
         "kinsim_version":          _KINSIM_VERSION,
         "source_bam":              str(bam_path),
         "motifs":                  motif_string,
+        "kmer_size":               kmer_size,
         "use_reverse_strand":      use_reverse_strand,
         "max_samples_per_key":     max_samples_per_key,
         "n_reads_processed":       n_reads_processed,
@@ -441,6 +444,7 @@ def extract_from_manifest_task(
     revcomp: bool = True,
     use_reverse_strand: bool = True,
     max_reads: int = 0,
+    kmer_size: int = K,
 ) -> None:
     """Extract one BAM from a manifest CSV (for SLURM array jobs).
 
@@ -490,6 +494,7 @@ def extract_from_manifest_task(
         revcomp=revcomp,
         use_reverse_strand=use_reverse_strand,
         max_reads=max_reads,
+        kmer_size=kmer_size,
     )
 
     with open(output_pkl, "wb") as f:
@@ -576,6 +581,9 @@ def main(argv=None) -> None:
                            help="Minimum fraction threshold for PacBio CSV (default: 0.40)")
     p_extract.add_argument("--min-detected", type=int, default=20,
                            help="Minimum nDetected threshold for PacBio CSV (default: 20)")
+    p_extract.add_argument("--kmer-size", type=int, default=None,
+                           help="K-mer window size (default: from encoding.py K=11). "
+                                "Must match the value used during training.")
     p_extract.add_argument("--max-reads", type=int, default=0,
                            help="Stop after N reads (0 = no limit). "
                                 "Smoke-test only — biases reservoir sampling.")
@@ -632,6 +640,7 @@ def main(argv=None) -> None:
                 revcomp            = not args.no_revcomp,
                 use_reverse_strand = not args.no_reverse_strand,
                 max_reads          = args.max_reads,
+                kmer_size          = args.kmer_size or K,
             )
 
         else:
