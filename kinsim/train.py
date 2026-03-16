@@ -116,6 +116,121 @@ _LOSS_FUNCTIONS = {
     "huber": _huber_loss,
 }
 
+_METH_NAMES = {0: "none", 1: "m6A", 2: "m4C", 3: "m5C"}
+
+
+def _pearson(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.corrcoef(a, b)[0, 1]) if a.std() > 1e-9 and b.std() > 1e-9 else 0.0
+
+
+def _compute_metrics(
+    all_mu: np.ndarray,
+    all_sigma: np.ndarray,
+    all_true: np.ndarray,
+    all_meth_ids: np.ndarray,
+    prefix: str,
+) -> dict:
+    """Compute overall + per-meth-type metrics.
+
+    Returns a flat dict of floats for logging, plus a nested 'by_type' dict
+    for human-readable output.
+    """
+    diff = all_mu - all_true
+    result: dict = {}
+
+    # Overall metrics
+    mse     = (diff ** 2).mean(axis=0)
+    mae     = np.abs(diff).mean(axis=0)
+    in_1sig = (np.abs(diff) <= 1.0 * all_sigma).mean(axis=0)
+    in_2sig = (np.abs(diff) <= 2.0 * all_sigma).mean(axis=0)
+    in_3sig = (np.abs(diff) <= 3.0 * all_sigma).mean(axis=0)
+    result.update({
+        f"{prefix}_mse_ipd":      float(mse[0]),
+        f"{prefix}_mse_pw":       float(mse[1]),
+        f"{prefix}_mae_ipd":      float(mae[0]),
+        f"{prefix}_mae_pw":       float(mae[1]),
+        f"{prefix}_pearson_ipd":  _pearson(all_mu[:, 0], all_true[:, 0]),
+        f"{prefix}_pearson_pw":   _pearson(all_mu[:, 1], all_true[:, 1]),
+        f"{prefix}_calib_1sig_ipd": float(in_1sig[0]),
+        f"{prefix}_calib_1sig_pw":  float(in_1sig[1]),
+        f"{prefix}_calib_2sig_ipd": float(in_2sig[0]),
+        f"{prefix}_calib_2sig_pw":  float(in_2sig[1]),
+        f"{prefix}_calib_3sig_ipd": float(in_3sig[0]),
+        f"{prefix}_calib_3sig_pw":  float(in_3sig[1]),
+    })
+
+    # Per-meth-type breakdown
+    by_type: dict = {}
+    for meth_id in sorted(np.unique(all_meth_ids)):
+        mask = all_meth_ids == meth_id
+        if mask.sum() < 2:
+            continue
+        mu_m    = all_mu[mask]
+        sig_m   = all_sigma[mask]
+        true_m  = all_true[mask]
+        diff_m  = mu_m - true_m
+        name    = _METH_NAMES.get(int(meth_id), f"meth{meth_id}")
+        by_type[name] = {
+            "n":          int(mask.sum()),
+            "pearson_ipd": _pearson(mu_m[:, 0], true_m[:, 0]),
+            "pearson_pw":  _pearson(mu_m[:, 1], true_m[:, 1]),
+            "mae_ipd":     float(np.abs(diff_m[:, 0]).mean()),
+            "mae_pw":      float(np.abs(diff_m[:, 1]).mean()),
+            "calib_1sig":  float((np.abs(diff_m) <= 1.0 * sig_m).mean()),
+            "calib_2sig":  float((np.abs(diff_m) <= 2.0 * sig_m).mean()),
+            "calib_3sig":  float((np.abs(diff_m) <= 3.0 * sig_m).mean()),
+        }
+        # Also log per-type scalars for CSV/TensorBoard
+        result[f"{prefix}_pearson_ipd_{name}"] = by_type[name]["pearson_ipd"]
+        result[f"{prefix}_pearson_pw_{name}"]  = by_type[name]["pearson_pw"]
+        result[f"{prefix}_calib_2sig_{name}"]  = by_type[name]["calib_2sig"]
+
+    result["_by_type"] = by_type   # human-readable, not logged as scalar
+    return result
+
+
+def _log_metrics(metrics: dict, prefix: str) -> None:
+    """Print a formatted summary of metrics to the log."""
+    W = 64
+    log.info("─" * W)
+    log.info("  %s metrics", prefix.upper())
+    log.info("─" * W)
+    log.info(
+        "  Overall  pearson=(IPD %.3f, PW %.3f)  mae=(%.4f, %.4f)",
+        metrics.get(f"{prefix}_pearson_ipd", 0),
+        metrics.get(f"{prefix}_pearson_pw", 0),
+        metrics.get(f"{prefix}_mae_ipd", 0),
+        metrics.get(f"{prefix}_mae_pw", 0),
+    )
+    log.info(
+        "  Calibration (ideal: 1σ=68%% 2σ=95%% 3σ=99.7%%)"
+    )
+    log.info(
+        "    IPD:  1σ=%.1f%%  2σ=%.1f%%  3σ=%.1f%%",
+        metrics.get(f"{prefix}_calib_1sig_ipd", 0) * 100,
+        metrics.get(f"{prefix}_calib_2sig_ipd", 0) * 100,
+        metrics.get(f"{prefix}_calib_3sig_ipd", 0) * 100,
+    )
+    log.info(
+        "    PW:   1σ=%.1f%%  2σ=%.1f%%  3σ=%.1f%%",
+        metrics.get(f"{prefix}_calib_1sig_pw", 0) * 100,
+        metrics.get(f"{prefix}_calib_2sig_pw", 0) * 100,
+        metrics.get(f"{prefix}_calib_3sig_pw", 0) * 100,
+    )
+    by_type = metrics.get("_by_type", {})
+    if by_type:
+        log.info("  Per methylation type:")
+        for name, t in by_type.items():
+            log.info(
+                "    %-8s n=%-8d  pearson=(%.3f, %.3f)  "
+                "2σ-calib=%.1f%%  mae=(%.4f, %.4f)",
+                name, t["n"],
+                t["pearson_ipd"], t["pearson_pw"],
+                t["calib_2sig"] * 100,
+                t["mae_ipd"], t["mae_pw"],
+            )
+    log.info("─" * W)
+
 
 # ---------------------------------------------------------------------------
 # KineticDataModule
@@ -124,14 +239,13 @@ _LOSS_FUNCTIONS = {
 class KineticDataModule(L.LightningDataModule):
     """LightningDataModule for KinSim kinetic .pkl files.
 
-    Wraps MLPSignalDataset with a reproducible train/val split.
-    MLPSignalDataset draws one random (IPD, PW) per unique (kmer, meth) key
-    per __getitem__ call, so effective data volume grows across epochs without
-    storing all samples in RAM.
+    Wraps MLPSignalDataset with a reproducible train/val split and an optional
+    separate held-out test set.
 
     Args:
-        pkl_path:     Path to merged .pkl file (from kinsim merge).
-        val_fraction: Fraction of unique (kmer, meth) keys for validation.
+        pkl_path:     Path to balanced training .pkl (from kinsim-prep balance).
+        test_pkl:     Path to separate test .pkl (optional).
+        val_fraction: Fraction of training keys held out for validation.
         batch_size:   Training DataLoader batch size.
         seed:         Random seed for reproducible train/val split.
     """
@@ -139,27 +253,34 @@ class KineticDataModule(L.LightningDataModule):
     def __init__(
         self,
         pkl_path: str,
+        test_pkl: str | None = None,
         val_fraction: float = 0.10,
         batch_size: int = 4096,
         seed: int = 42,
     ) -> None:
         super().__init__()
         self.pkl_path     = pkl_path
+        self.test_pkl     = test_pkl
         self.val_fraction = val_fraction
         self.batch_size   = batch_size
         self.seed         = seed
         self._train_subset = None
         self._val_subset   = None
+        self._test_dataset = None
 
     def setup(self, stage: str | None = None) -> None:
-        dataset = MLPSignalDataset(self.pkl_path)
-        n_val   = max(1, int(len(dataset) * self.val_fraction))
-        n_train = len(dataset) - n_val
-        rng     = torch.Generator().manual_seed(self.seed)
-        indices = torch.randperm(len(dataset), generator=rng).tolist()
-        self._train_subset = Subset(dataset, indices[:n_train])
-        self._val_subset   = Subset(dataset, indices[n_train:])
-        log.info("Data split — train: %d keys, val: %d keys", n_train, n_val)
+        if stage in ("fit", None):
+            dataset = MLPSignalDataset(self.pkl_path)
+            n_val   = max(1, int(len(dataset) * self.val_fraction))
+            n_train = len(dataset) - n_val
+            rng     = torch.Generator().manual_seed(self.seed)
+            indices = torch.randperm(len(dataset), generator=rng).tolist()
+            self._train_subset = Subset(dataset, indices[:n_train])
+            self._val_subset   = Subset(dataset, indices[n_train:])
+            log.info("Data split — train: %d keys, val: %d keys", n_train, n_val)
+        if stage in ("test", None) and self.test_pkl:
+            self._test_dataset = MLPSignalDataset(self.test_pkl)
+            log.info("Test set: %d keys from %s", len(self._test_dataset), self.test_pkl)
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
@@ -173,6 +294,17 @@ class KineticDataModule(L.LightningDataModule):
     def val_dataloader(self) -> DataLoader:
         return DataLoader(
             self._val_subset,
+            batch_size=self.batch_size * 4,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True,
+        )
+
+    def test_dataloader(self) -> DataLoader | None:
+        if self._test_dataset is None:
+            return None
+        return DataLoader(
+            self._test_dataset,
             batch_size=self.batch_size * 4,
             shuffle=False,
             num_workers=2,
@@ -213,71 +345,88 @@ class KineticPredictor(L.LightningModule):
         self.model    = model
         self.lr       = lr
         self._loss_fn = _LOSS_FUNCTIONS[loss_name]
-        # Accumulate per-batch val predictions for epoch-level metric computation
-        self._val_mu:    list[torch.Tensor] = []
-        self._val_sigma: list[torch.Tensor] = []
-        self._val_true:  list[torch.Tensor] = []
+        # Accumulate per-batch predictions for epoch-level metrics
+        self._val_mu:       list[torch.Tensor] = []
+        self._val_sigma:    list[torch.Tensor] = []
+        self._val_true:     list[torch.Tensor] = []
+        self._val_meth_ids: list[torch.Tensor] = []
+        self._test_mu:      list[torch.Tensor] = []
+        self._test_sigma:   list[torch.Tensor] = []
+        self._test_true:    list[torch.Tensor] = []
+        self._test_meth_ids: list[torch.Tensor] = []
 
     def forward(self, kmer_ids: torch.Tensor, meth_probs: torch.Tensor) -> torch.Tensor:
         return self.model(kmer_ids, meth_probs)
 
     def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
-        kmer_ids, meth_probs, signals = batch
+        kmer_ids, meth_probs, signals, _meth_ids = batch
         loss = self._loss_fn(self.model(kmer_ids, meth_probs), signals)
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
-        kmer_ids, meth_probs, signals = batch
+        kmer_ids, meth_probs, signals, meth_ids = batch
         params  = self.model(kmer_ids, meth_probs)
         loss    = self._loss_fn(params, signals)
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-
-        # Accumulate for epoch-level Pearson / calibration metrics
         mu      = params[:, :2]
         log_sig = torch.clamp(params[:, 2:], -6.0, 3.0)
         sigma   = torch.exp(log_sig)
         self._val_mu.append(mu.detach().cpu())
         self._val_sigma.append(sigma.detach().cpu())
         self._val_true.append(signals.detach().cpu())
+        self._val_meth_ids.append(meth_ids.detach().cpu())
         return loss
 
     def on_validation_epoch_end(self) -> None:
         if not self._val_mu:
             return
+        all_mu       = torch.cat(self._val_mu).numpy()        # (N, 2)
+        all_sigma    = torch.cat(self._val_sigma).numpy()     # (N, 2)
+        all_true     = torch.cat(self._val_true).numpy()      # (N, 2)
+        all_meth_ids = torch.cat(self._val_meth_ids).numpy()  # (N,)
 
-        all_mu    = torch.cat(self._val_mu,    dim=0).numpy()   # (N, 2)
-        all_sigma = torch.cat(self._val_sigma, dim=0).numpy()   # (N, 2)
-        all_true  = torch.cat(self._val_true,  dim=0).numpy()   # (N, 2)
-
-        diff    = all_mu - all_true
-        mse     = (diff ** 2).mean(axis=0)
-        mae     = np.abs(diff).mean(axis=0)
-        in_2sig = (np.abs(diff) <= 2.0 * all_sigma).mean(axis=0)
-
-        def _pearson(a: np.ndarray, b: np.ndarray) -> float:
-            return float(np.corrcoef(a, b)[0, 1]) if a.std() > 1e-9 and b.std() > 1e-9 else 0.0
-
-        metrics = {
-            "val_mse_ipd":     float(mse[0]),
-            "val_mse_pw":      float(mse[1]),
-            "val_mae_ipd":     float(mae[0]),
-            "val_mae_pw":      float(mae[1]),
-            "val_pearson_ipd": _pearson(all_mu[:, 0], all_true[:, 0]),
-            "val_pearson_pw":  _pearson(all_mu[:, 1], all_true[:, 1]),
-            "val_calib_ipd":   float(in_2sig[0]),
-            "val_calib_pw":    float(in_2sig[1]),
-        }
-        self.log_dict(metrics, on_epoch=True)
-        log.info(
-            "  val — mse=(%.4f, %.4f)  pearson=(%.3f, %.3f)  calib=(%.1f%%, %.1f%%)",
-            metrics["val_mse_ipd"], metrics["val_mse_pw"],
-            metrics["val_pearson_ipd"], metrics["val_pearson_pw"],
-            metrics["val_calib_ipd"] * 100, metrics["val_calib_pw"] * 100,
+        metrics = _compute_metrics(all_mu, all_sigma, all_true, all_meth_ids, prefix="val")
+        self.log_dict(
+            {k: v for k, v in metrics.items() if isinstance(v, float)},
+            on_epoch=True,
         )
+        _log_metrics(metrics, prefix="val")
+
         self._val_mu.clear()
         self._val_sigma.clear()
         self._val_true.clear()
+        self._val_meth_ids.clear()
+
+    def test_step(self, batch: tuple, batch_idx: int) -> None:
+        kmer_ids, meth_probs, signals, meth_ids = batch
+        params  = self.model(kmer_ids, meth_probs)
+        mu      = params[:, :2]
+        log_sig = torch.clamp(params[:, 2:], -6.0, 3.0)
+        sigma   = torch.exp(log_sig)
+        self._test_mu.append(mu.detach().cpu())
+        self._test_sigma.append(sigma.detach().cpu())
+        self._test_true.append(signals.detach().cpu())
+        self._test_meth_ids.append(meth_ids.detach().cpu())
+
+    def on_test_epoch_end(self) -> None:
+        if not self._test_mu:
+            return
+        all_mu       = torch.cat(self._test_mu).numpy()
+        all_sigma    = torch.cat(self._test_sigma).numpy()
+        all_true     = torch.cat(self._test_true).numpy()
+        all_meth_ids = torch.cat(self._test_meth_ids).numpy()
+
+        metrics = _compute_metrics(all_mu, all_sigma, all_true, all_meth_ids, prefix="test")
+        self.log_dict(
+            {k: v for k, v in metrics.items() if isinstance(v, float)},
+        )
+        _log_metrics(metrics, prefix="test")
+
+        self._test_mu.clear()
+        self._test_sigma.clear()
+        self._test_true.clear()
+        self._test_meth_ids.clear()
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.lr)
@@ -489,6 +638,7 @@ def objective(
 def train_mlp(
     pkl_path: str,
     output_dir: str,
+    test_pkl: str | None = None,
     architecture: str = "conv",
     epochs: int = 50,
     batch_size: int = 4096,
@@ -667,6 +817,7 @@ def train_mlp(
     lm = KineticPredictor(model, lr=lr, loss_name=loss_name)
     dm = KineticDataModule(
         pkl_path=pkl_path,
+        test_pkl=test_pkl,
         val_fraction=val_fraction,
         batch_size=batch_size,
     )
@@ -710,6 +861,10 @@ def train_mlp(
     trainer.fit(lm, datamodule=dm)
     log.info("Training complete. Outputs in: %s", output_dir)
 
+    if test_pkl:
+        log.info("Running evaluation on held-out test set: %s", test_pkl)
+        trainer.test(lm, datamodule=dm)
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -736,9 +891,12 @@ def main(argv: list[str] | None = None) -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("pkl",        nargs="?", default=None,
-                        help="Merged training data .pkl file")
+                        help="Balanced training data .pkl (from kinsim-prep balance)")
     parser.add_argument("output_dir", nargs="?", default=None,
                         help="Directory for checkpoints and logs")
+    parser.add_argument("--test-pkl", default=None,
+                        help="Held-out test .pkl — evaluated once after training "
+                             "(should be balanced the same way as the training set)")
 
     # Architecture selection
     parser.add_argument("--architecture",     default=None,
@@ -828,6 +986,7 @@ def main(argv: list[str] | None = None) -> None:
     train_mlp(
         pkl_path         = pkl_path,
         output_dir       = output_dir,
+        test_pkl         = args.test_pkl or cfg.get("test_pkl"),
         architecture     = architecture,
         epochs           = _get(args.epochs,          "epochs",          50),
         batch_size       = _get(args.batch_size,      "batch_size",      4096),
