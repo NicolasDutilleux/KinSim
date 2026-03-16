@@ -468,8 +468,8 @@ def extract_from_manifest_task(
     # Auto-detect motif source (CSV, REBASE, or inline string)
     motif_string = _load_motif_string(entry.motifs)
     if not motif_string:
-        log.error("No motifs resolved for sample '%s'. Aborting.", entry.sample_id)
-        sys.exit(1)
+        log.warning("No motifs resolved for sample '%s' -- SKIPPING.", entry.sample_id)
+        return
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     output_pkl = os.path.join(output_dir, f"{entry.sample_id}_shard.pkl")
