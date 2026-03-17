@@ -3,7 +3,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --account=p774
-#SBATCH --partition=pibu_el8
+#SBATCH --partition=pgpu
 #SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00
 #SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/kinsim_train_%j.log
