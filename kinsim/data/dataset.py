@@ -302,7 +302,7 @@ class MLPSignalDataset(Dataset):
         # meth_id=1, fraction=0.75 → [0, 0.75, 0, 0]
         meth_probs = torch.zeros(self._num_meth_types, dtype=torch.float32)
         if meth_id > 0:
-            meth_probs[meth_id] = row[2]              # stoichiometric fraction
+            meth_probs[meth_id] = float(row[2])          # stoichiometric fraction
 
         signal = log_transform(torch.from_numpy(row[:2].copy()))  # log1p([IPD, PW])
 
