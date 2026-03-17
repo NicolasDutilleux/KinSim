@@ -128,9 +128,13 @@ def balance_pkl(
 
     # ---- Key-level budget calculation ----
     if max_keys <= 0:
-        # No key budget: keep everything, but still balance the type fractions
-        # by capping the dominant class.
-        total_available = keys_in
+        # Derive total budget from methylated key count so meth_fraction is
+        # actually achieved: total = meth_keys / meth_fraction
+        # e.g. 6K meth keys at 50% → 12K total → 6K unmeth kept, 2M dropped
+        if total_meth_keys > 0 and 0 < meth_fraction < 1:
+            total_available = min(keys_in, int(round(total_meth_keys / meth_fraction)))
+        else:
+            total_available = keys_in
     else:
         total_available = min(max_keys, keys_in)
 
