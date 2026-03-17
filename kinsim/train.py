@@ -189,45 +189,84 @@ def _compute_metrics(
     return result
 
 
+def _grade(value: float, good: float, ok: float, higher_is_better: bool = True) -> str:
+    """Return GOOD / OK / POOR based on thresholds."""
+    if higher_is_better:
+        if value >= good:  return "GOOD"
+        if value >= ok:    return "OK  "
+        return "POOR"
+    else:
+        if value <= good:  return "GOOD"
+        if value <= ok:    return "OK  "
+        return "POOR"
+
+
 def _log_metrics(metrics: dict, prefix: str) -> None:
-    """Print a formatted summary of metrics to the log."""
-    W = 64
+    """Print a compact, self-interpreting summary of metrics.
+
+    Reference thresholds (log1p-space, PacBio IPD/PW):
+      Pearson r IPD : GOOD ≥ 0.70  OK ≥ 0.50  POOR < 0.50
+      Pearson r PW  : GOOD ≥ 0.60  OK ≥ 0.40  POOR < 0.40
+      2σ calibration: GOOD 90–99%  OK 80–90%  POOR otherwise
+        (ideal 95.4% — if overconfident model: <80%, underconfident: >99%)
+      GNLL loss     : GOOD ≤ 1.0   OK ≤ 1.5   POOR > 1.5
+        (lower = better; well-calibrated model on log1p signals ≈ 0.5–1.0)
+    """
+    W = 72
     log.info("─" * W)
-    log.info("  %s metrics", prefix.upper())
+    log.info("  %s  [GOOD/OK/POOR thresholds shown]", prefix.upper())
     log.info("─" * W)
+
+    p_ipd = metrics.get(f"{prefix}_pearson_ipd", 0.0)
+    p_pw  = metrics.get(f"{prefix}_pearson_pw",  0.0)
+    m_ipd = metrics.get(f"{prefix}_mae_ipd", 0.0)
+    m_pw  = metrics.get(f"{prefix}_mae_pw",  0.0)
+    c1i   = metrics.get(f"{prefix}_calib_1sig_ipd", 0.0) * 100
+    c2i   = metrics.get(f"{prefix}_calib_2sig_ipd", 0.0) * 100
+    c3i   = metrics.get(f"{prefix}_calib_3sig_ipd", 0.0) * 100
+    c1p   = metrics.get(f"{prefix}_calib_1sig_pw",  0.0) * 100
+    c2p   = metrics.get(f"{prefix}_calib_2sig_pw",  0.0) * 100
+    c3p   = metrics.get(f"{prefix}_calib_3sig_pw",  0.0) * 100
+
+    # Calibration grade: ideally near 95.4% for 2σ
+    calib_grade = _grade(c2i, 90.0, 80.0, higher_is_better=True)
+    if c2i > 99.0:
+        calib_grade = "POOR"  # underconfident
+
     log.info(
-        "  Overall  pearson=(IPD %.3f, PW %.3f)  mae=(%.4f, %.4f)",
-        metrics.get(f"{prefix}_pearson_ipd", 0),
-        metrics.get(f"{prefix}_pearson_pw", 0),
-        metrics.get(f"{prefix}_mae_ipd", 0),
-        metrics.get(f"{prefix}_mae_pw", 0),
+        "  Pearson  IPD=%.3f [%s ≥0.70]   PW=%.3f [%s ≥0.60]",
+        p_ipd, _grade(p_ipd, 0.70, 0.50), p_pw, _grade(p_pw, 0.60, 0.40),
     )
     log.info(
-        "  Calibration (ideal: 1σ=68%% 2σ=95%% 3σ=99.7%%)"
+        "  MAE      IPD=%.4f               PW=%.4f  (log1p space)",
+        m_ipd, m_pw,
     )
     log.info(
-        "    IPD:  1σ=%.1f%%  2σ=%.1f%%  3σ=%.1f%%",
-        metrics.get(f"{prefix}_calib_1sig_ipd", 0) * 100,
-        metrics.get(f"{prefix}_calib_2sig_ipd", 0) * 100,
-        metrics.get(f"{prefix}_calib_3sig_ipd", 0) * 100,
+        "  Calib    IPD: 1σ=%.1f%%  2σ=%.1f%% [%s 90-99%%]  3σ=%.1f%%",
+        c1i, c2i, calib_grade, c3i,
     )
     log.info(
-        "    PW:   1σ=%.1f%%  2σ=%.1f%%  3σ=%.1f%%",
-        metrics.get(f"{prefix}_calib_1sig_pw", 0) * 100,
-        metrics.get(f"{prefix}_calib_2sig_pw", 0) * 100,
-        metrics.get(f"{prefix}_calib_3sig_pw", 0) * 100,
+        "           PW:  1σ=%.1f%%  2σ=%.1f%%               3σ=%.1f%%",
+        c1p, c2p, c3p,
     )
+    log.info(
+        "  (ideal calibration: 1σ=68%%  2σ=95.4%%  3σ=99.7%%)"
+    )
+
     by_type = metrics.get("_by_type", {})
     if by_type:
-        log.info("  Per methylation type:")
+        log.info("  Per-type breakdown:")
         for name, t in by_type.items():
+            cg = _grade(t["calib_2sig"] * 100, 90.0, 80.0)
+            if t["calib_2sig"] * 100 > 99.0:
+                cg = "POOR"
             log.info(
-                "    %-8s n=%-8d  pearson=(%.3f, %.3f)  "
-                "2σ-calib=%.1f%%  mae=(%.4f, %.4f)",
+                "    %-6s  n=%-7d  pearson=(IPD %.3f [%s] PW %.3f [%s])  "
+                "2σ=%.1f%% [%s]",
                 name, t["n"],
-                t["pearson_ipd"], t["pearson_pw"],
-                t["calib_2sig"] * 100,
-                t["mae_ipd"], t["mae_pw"],
+                t["pearson_ipd"], _grade(t["pearson_ipd"], 0.70, 0.50),
+                t["pearson_pw"],  _grade(t["pearson_pw"],  0.60, 0.40),
+                t["calib_2sig"] * 100, cg,
             )
     log.info("─" * W)
 
@@ -386,6 +425,12 @@ class KineticPredictor(L.LightningModule):
         all_true     = torch.cat(self._val_true).numpy()      # (N, 2)
         all_meth_ids = torch.cat(self._val_meth_ids).numpy()  # (N,)
 
+        val_loss = self.trainer.callback_metrics.get("val_loss", float("nan"))
+        gnll_grade = _grade(float(val_loss), 1.0, 1.5, higher_is_better=False)
+        log.info(
+            "Epoch %d  val_loss(GNLL)=%.4f [%s ≤1.0]",
+            self.current_epoch, float(val_loss), gnll_grade,
+        )
         metrics = _compute_metrics(all_mu, all_sigma, all_true, all_meth_ids, prefix="val")
         self.log_dict(
             {k: v for k, v in metrics.items() if isinstance(v, float)},
