@@ -128,17 +128,14 @@ class KmerSignalDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 class MLPSignalDataset(Dataset):
-    """Random-shot dataset for MLP training with stoichiometric soft labels.
+    """Flat-sample dataset for MLP training with stoichiometric soft labels.
 
-    Unlike KmerSignalDataset (which flattens all samples into a 1-D list),
-    this dataset keeps the dict structure: each (kmer_id, meth_id) key maps
-    to a pool of observed (IPD, PW, fraction) triples capped at load time.
+    Loads the merged .pkl and pre-flattens all (kmer_id, meth_id, IPD, PW,
+    fraction) entries into contiguous arrays so that every sample is seen
+    exactly once per epoch.  The DataLoader shuffles the flat index each epoch,
+    giving the model full exposure to the training distribution.
 
-    __getitem__ picks ONE triple randomly from the pool for the requested key,
-    so the model sees the full signal distribution over training epochs rather
-    than memorising a fixed ordering.
-
-    Dynamic capping prevents majority class bias:
+    Dynamic capping prevents majority class bias at load time:
         meth_id = 0 (unmethylated) → keep at most max_unmeth samples (default 20)
         meth_id ∈ {1, 2, 3}        → keep at most max_meth  samples (default 100)
 
@@ -146,20 +143,12 @@ class MLPSignalDataset(Dataset):
     --------------------------
     The methylation output is a Float[num_meth_types] probability vector built
     from the per-sample stoichiometric fraction stored in column 3 of the data.
-    The fraction comes from the PacBio motifs.csv 'fraction' column (or defaults
-    to 1.0 when not available).
 
     For a sample with meth_id = 1 (m6A) and fraction = 0.75:
         meth_probs = [0, 0.75, 0, 0]
 
     For an unmethylated sample (meth_id = 0, fraction = 0.0):
         meth_probs = [0, 0, 0, 0]
-
-    This matches the nn.Linear(4, meth_proj_dim) projection in MLPPredictor:
-    when a position has no methylation, the projection output is zero (no bias),
-    so the kmer embedding alone drives the baseline kinetic prediction.  For
-    partially methylated sites, the model learns a proportional modulation of
-    the kinetic signature.
 
     Args:
         pkl_path:       Path to a merged .pkl produced by `kinsim merge`.
@@ -189,7 +178,6 @@ class MLPSignalDataset(Dataset):
         if len(data_dict) == 0:
             raise ValueError(f"The .pkl file is empty: {pkl_path}")
 
-        # Sample the first data key to validate structure
         first_key, first_val = None, None
         for k, v in data_dict.items():
             if isinstance(k, tuple):
@@ -211,7 +199,6 @@ class MLPSignalDataset(Dataset):
                 "[IPD, PW, fraction]."
             )
 
-        # Detect data format: 2-column (legacy) or 3-column (with fraction)
         n_cols = first_val.shape[1]
         has_fraction = n_cols >= 3
         if not has_fraction:
@@ -221,41 +208,49 @@ class MLPSignalDataset(Dataset):
 
         self._num_meth_types = num_meth_types
 
-        # ── Build pools with capping ──────────────────────────────────
-        self._keys:  list = []   # list of (kmer_id, meth_id) tuples
-        self._pools: list = []   # list of np.ndarray(N_capped, 3) float32
+        # ── Build flat arrays (all samples, capped per key) ───────────────────
+        kmer_ids_list:  list = []
+        meth_ids_list:  list = []
+        signals_list:   list = []
+        fractions_list: list = []
 
-        n_subsampled = 0
-        n_meth_counts = {0: 0, 1: 0, 2: 0, 3: 0}   # for the summary log
+        n_subsampled  = 0
+        n_keys        = 0
+        n_meth_counts = defaultdict(int)
 
         for key, samples in data_dict.items():
-            # Skip the provenance metadata key (string "__meta__", not a tuple)
             if not isinstance(key, tuple):
                 continue
             kmer_id, meth_id = key
             cap = max_unmeth if meth_id == 0 else max_meth
             if len(samples) > cap:
-                # Seeded subsampling: deterministic for the same .pkl across restarts
                 rng = np.random.default_rng(seed=kmer_id ^ (meth_id << 22))
                 idx = rng.choice(len(samples), size=cap, replace=False)
                 samples = samples[idx]
                 n_subsampled += 1
 
-            # Normalise to 3 columns: [IPD, PW, fraction]
+            n = len(samples)
+            kmer_ids_list.append(np.full(n, kmer_id, dtype=np.int32))
+            meth_ids_list.append(np.full(n, meth_id, dtype=np.int8))
+            signals_list.append(samples[:, :2].astype(np.float32))
             if has_fraction:
-                pool = samples[:, :3].astype(np.float32)
+                fractions_list.append(samples[:, 2].astype(np.float32))
             else:
-                # Legacy 2-column: synthesise fraction column
                 frac_val = 1.0 if meth_id > 0 else 0.0
-                frac_col = np.full((len(samples), 1), frac_val, dtype=np.float32)
-                pool = np.hstack([samples[:, :2].astype(np.float32), frac_col])
+                fractions_list.append(np.full(n, frac_val, dtype=np.float32))
 
-            self._keys.append((kmer_id, meth_id))
-            self._pools.append(pool)
-            n_meth_counts[meth_id] = n_meth_counts.get(meth_id, 0) + 1
+            n_meth_counts[meth_id] += 1
+            n_keys += 1
 
-        n_keys  = len(self._keys)
-        n_total = sum(len(p) for p in self._pools)
+        self._kmer_ids  = np.concatenate(kmer_ids_list)
+        self._meth_ids  = np.concatenate(meth_ids_list)
+        # Pre-log-transform signals once at load time — avoids per-item overhead
+        self._signals   = log_transform(
+            torch.from_numpy(np.concatenate(signals_list, axis=0)).float()
+        )
+        self._fractions = np.concatenate(fractions_list)
+
+        n_total = len(self._kmer_ids)
         meth_labels = {0: "unmeth", 1: "m6A", 2: "m4C", 3: "m5C"}
         meth_summary = ", ".join(
             f"{meth_labels[m]}={n_meth_counts[m]:,}"
@@ -272,14 +267,14 @@ class MLPSignalDataset(Dataset):
         )
 
     def __len__(self) -> int:
-        return len(self._keys)
+        """Total number of individual (IPD, PW) samples across all keys."""
+        return len(self._kmer_ids)
 
     def __getitem__(self, idx: int):
-        """Return one random (IPD, PW) observation for the key at position idx.
+        """Return the (IPD, PW) sample at flat index idx.
 
-        Called by DataLoader workers. Uses torch.randint (not np.random) so that
-        PyTorch's automatic per-worker seeding produces independent draws across
-        workers — avoids correlated samples when num_workers > 0.
+        The DataLoader shuffles indices each epoch, so all samples are seen
+        exactly once per epoch in random order.
 
         Returns:
             Tuple of:
@@ -288,27 +283,20 @@ class MLPSignalDataset(Dataset):
                            methylation vector built from the stored fraction.
                            e.g. m6A at 75% → [0, 0.75, 0, 0]
               signal     — Float tensor of shape (2,): [IPD, PW] in log1p space
+              meth_id    — Long scalar tensor (for per-type metrics)
         """
-        kmer_id, meth_id = self._keys[idx]
-        pool = self._pools[idx]                       # (N_capped, 3) float32
+        kmer_id = int(self._kmer_ids[idx])
+        meth_id = int(self._meth_ids[idx])
+        signal  = self._signals[idx]                  # already log-transformed
+        frac    = float(self._fractions[idx])
 
-        # torch.randint is seeded per-worker by PyTorch's DataLoader — safe with
-        # num_workers > 0, unlike np.random which shares state across forked workers.
-        row_idx = int(torch.randint(len(pool), (1,)).item())
-        row = pool[row_idx]                           # (3,) float32: [IPD, PW, fraction]
-
-        # Build stoichiometric meth_probs vector from (meth_id, fraction)
-        # meth_id=0 → all zeros (no methylation signal)
-        # meth_id=1, fraction=0.75 → [0, 0.75, 0, 0]
         meth_probs = torch.zeros(self._num_meth_types, dtype=torch.float32)
         if meth_id > 0:
-            meth_probs[meth_id] = float(row[2])          # stoichiometric fraction
-
-        signal = log_transform(torch.from_numpy(row[:2].copy()))  # log1p([IPD, PW])
+            meth_probs[meth_id] = frac
 
         return (
             torch.tensor(kmer_id, dtype=torch.long),
             meth_probs,
             signal,
-            torch.tensor(meth_id, dtype=torch.long),  # for per-type metrics
+            torch.tensor(meth_id, dtype=torch.long),
         )
