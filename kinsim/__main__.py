@@ -12,6 +12,7 @@ __version__ = "0.4.0"
 
 COMMANDS = [
     "extract", "merge", "train", "generate", "evaluate", "analyze",
+    "strip-kinetics",
 ]
 
 USAGE = """\
@@ -20,12 +21,13 @@ usage: kinsim [--version] <command> [<args>]
 KinSim - PacBio kinetic signal simulator (MLP pipeline).
 
 Commands:
-  extract     Extract raw IPD/PW samples from a BAM file  (-> .pkl shard)
-  merge       Merge .pkl shards into a master training set
-  train       Train the ConvPredictor / MLPPredictor model
-  generate    Generate synthetic kinetic signals for PBSIM3 reads
-  evaluate    Evaluate a trained model (calibration report + plots)
-  analyze     Analyse a .pkl shard or dictionary (coverage, signals, sensitivity)
+  extract          Extract raw IPD/PW samples from a BAM file  (-> .pkl shard)
+  merge            Merge .pkl shards into a master training set
+  train            Train the ConvPredictor / MLPPredictor model
+  generate         Generate synthetic kinetic signals for PBSIM3 reads
+  evaluate         Evaluate a trained model (calibration report + plots)
+  analyze          Analyse a .pkl shard or dictionary (coverage, signals, sensitivity)
+  strip-kinetics   Copy a BAM and remove fi/fp/ri/rp tags from the copy
 
 Data preparation:
   Use 'kinsim-prep' for motif parsing, REBASE fetching, manifest tools,
@@ -93,6 +95,11 @@ def main(argv=None):
     # -- analyze --
     elif cmd == "analyze":
         from .analyze import main as run
+        run(rest)
+
+    # -- strip-kinetics --
+    elif cmd == "strip-kinetics":
+        from .strip_kinetics import main as run
         run(rest)
 
     # -- unknown --

@@ -535,12 +535,175 @@ def generate_directory(
 # CLI
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# BAM input mode
+# ---------------------------------------------------------------------------
+
+def generate_from_bam(
+    input_bam: str,
+    ref_path: str,
+    checkpoint_path: str,
+    motif_string: str,
+    output_bam: str,
+    circular: bool = True,
+    revcomp: bool = True,
+    device: str = "cuda",
+    batch_reads: int = 1000,
+    no_fuzznuc: bool = False,
+    deterministic: bool = False,
+) -> None:
+    """Generate kinetic signals for reads from an existing (aligned) BAM file.
+
+    Reads sequences and alignment coordinates directly from the BAM — no FASTQ
+    or MAF file needed.  Alignment info (reference_name, reference_start) is
+    used exactly as the MAF would be, giving accurate reference-context padding
+    at read edges.  Unaligned reads fall back to read-only context.
+
+    Use this with a BAM that has had fi/fp/ri/rp tags stripped.
+    Output BAM has the same reads + sequences as input, with fresh fi/fp/ri/rp.
+    """
+    device_obj = torch.device(device if torch.cuda.is_available() else "cpu")
+    log.info("Using device: %s", device_obj)
+
+    log.info("Loading reference: %s", ref_path)
+    ref_seqs = load_reference(ref_path)
+
+    backend = "regex (forced)" if no_fuzznuc else "fuzznuc (primary, regex fallback)"
+    log.info("Pre-scanning reference for methylation sites (%s)...", backend)
+    meth_map = build_reference_meth_map(ref_seqs, motif_string,
+                                        revcomp=revcomp, no_fuzznuc=no_fuzznuc)
+    frac_lookup    = _build_fraction_lookup(motif_string)
+    fallback_motifs = parse_motifs(motif_string, revcomp=revcomp)
+
+    log.info("Loading checkpoint: %s", checkpoint_path)
+    model = _load_model(checkpoint_path, device_obj)
+    mode_label = "deterministic (mean)" if deterministic else "stochastic (sample)"
+    log.info("Inference mode: %s", mode_label)
+
+    header_out = pysam.AlignmentHeader.from_dict({"HD": {"VN": "1.6", "SO": "unknown"}})
+
+    n_reads = n_mapped = n_unmapped = 0
+    batch: list = []
+    batch_maf: dict = {}
+
+    log.info("Reading reads from: %s", input_bam)
+
+    with pysam.AlignmentFile(input_bam, "rb", check_sq=False) as bam_in, \
+         pysam.AlignmentFile(output_bam, "wb", header=header_out) as bam_out:
+
+        for read in bam_in:
+            if read.query_sequence is None:
+                continue
+
+            seq      = read.query_sequence
+            qual     = read.query_qualities
+            qual_str = pysam.array_to_qualitystring(qual) if qual is not None \
+                       else "I" * len(seq)
+
+            batch.append({
+                "name": read.query_name,
+                "seq":  seq,
+                "qual": qual_str,
+                "len":  len(seq),
+            })
+
+            # Build maf_mapping entry from BAM alignment — same fields parse_maf returns
+            if (not read.is_unmapped
+                    and read.reference_name is not None
+                    and read.reference_name in ref_seqs):
+                ref_len = len(ref_seqs[read.reference_name])
+                batch_maf[read.query_name] = (
+                    read.reference_name, read.reference_start, "+", ref_len
+                )
+
+            n_reads += 1
+
+            if len(batch) >= batch_reads:
+                n_m, n_u = _process_batch(
+                    batch, ref_seqs, batch_maf, meth_map, frac_lookup,
+                    fallback_motifs, model, device_obj, deterministic,
+                    circular, bam_out, header_out,
+                )
+                n_mapped   += n_m
+                n_unmapped += n_u
+                batch = []
+                batch_maf = {}
+
+        if batch:
+            n_m, n_u = _process_batch(
+                batch, ref_seqs, batch_maf, meth_map, frac_lookup,
+                fallback_motifs, model, device_obj, deterministic,
+                circular, bam_out, header_out,
+            )
+            n_mapped   += n_m
+            n_unmapped += n_u
+
+    log.info("Done. %d reads processed (%d with ref context, %d without).",
+             n_reads, n_mapped, n_unmapped)
+    log.info("Output: %s", output_bam)
+
+
+def _main_from_bam(argv):
+    """CLI for BAM input mode: stripped real BAM → BAM with synthetic fi/fp/ri/rp."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="kinsim generate",
+        description=(
+            "Generate synthetic kinetic signals for reads in an existing BAM.\n\n"
+            "Input BAM must have fi/fp/ri/rp tags removed (use strip-kinetics first).\n"
+            "Alignment coordinates are read from the BAM — no MAF file needed.\n\n"
+            "Usage:\n"
+            "  kinsim generate <input.bam> <ref.fna> <checkpoint.pt> <motifs> <output.bam>"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("input_bam",   help="Aligned BAM with fi/fp/ri/rp stripped")
+    parser.add_argument("ref",         help="Reference genome FASTA (.fna / .fa / .gz)")
+    parser.add_argument("checkpoint",  help="Trained checkpoint (.pt)")
+    parser.add_argument("motifs",      help="Motif string, PacBio motifs.csv, or REBASE file")
+    parser.add_argument("output",      help="Output BAM with synthetic fi/fp/ri/rp tags")
+    parser.add_argument("--linear",       action="store_true",
+                        help="Treat genome as linear (default: circular for bacteria)")
+    parser.add_argument("--device",       default="cuda", choices=["cuda", "cpu"])
+    parser.add_argument("--batch-reads",  type=int, default=1000)
+    parser.add_argument("--no-revcomp",   action="store_true")
+    parser.add_argument("--no-fuzznuc",   action="store_true")
+    parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--min-fraction", type=float, default=0.40)
+    parser.add_argument("--min-detected", type=int, default=20)
+    args = parser.parse_args(argv)
+
+    motif_string = load_motif_string(args.motifs,
+                                     min_fraction=args.min_fraction,
+                                     min_detected=args.min_detected)
+    if not motif_string:
+        log.error("No motifs found from the provided source.")
+        sys.exit(1)
+
+    generate_from_bam(
+        input_bam=args.input_bam,
+        ref_path=args.ref,
+        checkpoint_path=args.checkpoint,
+        motif_string=motif_string,
+        output_bam=args.output,
+        circular=not args.linear,
+        revcomp=not args.no_revcomp,
+        device=args.device,
+        batch_reads=args.batch_reads,
+        no_fuzznuc=args.no_fuzznuc,
+        deterministic=args.deterministic,
+    )
+
+
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
 
     if argv and os.path.isdir(argv[0]):
         _main_directory(argv)
+    elif argv and argv[0].endswith(".bam"):
+        _main_from_bam(argv)
     else:
         _main_per_genome(argv)
 
