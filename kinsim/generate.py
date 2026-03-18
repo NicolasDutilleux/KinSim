@@ -137,23 +137,35 @@ def generate_signals_batch(
     Returns:
         np.ndarray of shape (N, 2) with raw [IPD, PW] values in [0, 255].
     """
-    kmer_tensor = torch.tensor(kmer_ids, dtype=torch.long, device=device)
+    N = len(kmer_ids)
+    CHUNK = 50_000  # positions per GPU forward pass — prevents OOM on long reads
 
-    # Build stoichiometric meth_probs from (meth_id, fraction) pairs.
-    # scatter_ places fraction[i] at meth_probs[i, meth_id[i]].
-    # For meth_id=0 (unmethylated), fraction=0.0 → row is all zeros.
-    # For meth_id=1, fraction=0.75 → [0, 0.75, 0, 0].
-    meth_ids_t   = torch.tensor(meth_ids,   dtype=torch.long,  device=device)
-    fractions_t  = torch.tensor(fractions,   dtype=torch.float, device=device)
-    meth_probs   = torch.zeros(len(meth_ids), 4, device=device)
-    meth_probs.scatter_(1, meth_ids_t.unsqueeze(1), fractions_t.unsqueeze(1))
+    if N <= CHUNK:
+        kmer_tensor = torch.tensor(kmer_ids, dtype=torch.long, device=device)
+        meth_ids_t  = torch.tensor(meth_ids,   dtype=torch.long,  device=device)
+        fractions_t = torch.tensor(fractions,   dtype=torch.float, device=device)
+        meth_probs  = torch.zeros(N, 4, device=device)
+        meth_probs.scatter_(1, meth_ids_t.unsqueeze(1), fractions_t.unsqueeze(1))
+        if deterministic:
+            return model.predict_mean(kmer_tensor, meth_probs).cpu().numpy()
+        else:
+            return model.sample(kmer_tensor, meth_probs).cpu().numpy()
 
-    if deterministic:
-        signals = model.predict_mean(kmer_tensor, meth_probs)
-    else:
-        signals = model.sample(kmer_tensor, meth_probs)
-
-    return signals.cpu().numpy()
+    # Large batch: process in position-level chunks to avoid OOM.
+    chunks = []
+    for start in range(0, N, CHUNK):
+        end = min(start + CHUNK, N)
+        k_t = torch.tensor(kmer_ids[start:end], dtype=torch.long, device=device)
+        m_t = torch.tensor(meth_ids[start:end], dtype=torch.long, device=device)
+        f_t = torch.tensor(fractions[start:end], dtype=torch.float, device=device)
+        mp  = torch.zeros(end - start, 4, device=device)
+        mp.scatter_(1, m_t.unsqueeze(1), f_t.unsqueeze(1))
+        if deterministic:
+            out = model.predict_mean(k_t, mp)
+        else:
+            out = model.sample(k_t, mp)
+        chunks.append(out.cpu().numpy())
+    return np.concatenate(chunks, axis=0)
 
 
 # ---------------------------------------------------------------------------
