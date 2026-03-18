@@ -640,6 +640,8 @@ def generate_from_bam(
                 n_unmapped += n_u
                 batch = []
                 batch_maf = {}
+                if n_reads % 1000 == 0:
+                    log.info("Progress: %d reads processed...", n_reads)
 
         if batch:
             n_m, n_u = _process_batch(
