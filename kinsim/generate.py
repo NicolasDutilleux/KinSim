@@ -284,7 +284,8 @@ def generate_signals(
     n_unmapped = 0
 
     header = pysam.AlignmentHeader.from_dict({
-        "HD": {"VN": "1.6", "SO": "unknown"}
+        "HD": {"VN": "1.6", "SO": "unknown"},
+        "RG": [{"ID": "kinsim", "PL": "PACBIO", "DS": "READTYPE=CCS"}],
     })
 
     open_func = gzip.open if fastq_path.endswith(".gz") else open
@@ -481,6 +482,7 @@ def _process_batch(
         seg.flag            = 4   # unmapped
         seg.query_sequence  = read_data["seq"]
         seg.query_qualities = pysam.qualitystring_to_array(read_data["qual"])
+        seg.set_tag("RG", "kinsim")
         seg.set_tag("fi", array.array("B", ipd_vals.tolist()))
         seg.set_tag("fp", array.array("B", pw_vals.tolist()))
         seg.set_tag("ri", array.array("B", ri_vals.tolist()))
@@ -592,7 +594,10 @@ def generate_from_bam(
     mode_label = "deterministic (mean)" if deterministic else "stochastic (sample)"
     log.info("Inference mode: %s", mode_label)
 
-    header_out = pysam.AlignmentHeader.from_dict({"HD": {"VN": "1.6", "SO": "unknown"}})
+    header_out = pysam.AlignmentHeader.from_dict({
+        "HD": {"VN": "1.6", "SO": "unknown"},
+        "RG": [{"ID": "kinsim", "PL": "PACBIO", "DS": "READTYPE=CCS"}],
+    })
 
     n_reads = n_mapped = n_unmapped = 0
     batch: list = []
