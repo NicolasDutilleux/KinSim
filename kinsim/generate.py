@@ -38,6 +38,7 @@ The methylation state (meth_id) is shared: the meth_map (built with revcomp=True
 already encodes both-strand methylation at each reference position.
 """
 
+import array
 import gzip
 import json
 import logging
@@ -468,10 +469,10 @@ def _process_batch(
         seg.flag            = 4   # unmapped
         seg.query_sequence  = read_data["seq"]
         seg.query_qualities = pysam.qualitystring_to_array(read_data["qual"])
-        seg.set_tag("fi", ipd_vals.tolist(), "B")
-        seg.set_tag("fp", pw_vals.tolist(),  "B")
-        seg.set_tag("ri", ri_vals.tolist(),  "B")
-        seg.set_tag("rp", rp_vals.tolist(),  "B")
+        seg.set_tag("fi", array.array("B", ipd_vals.tolist()))
+        seg.set_tag("fp", array.array("B", pw_vals.tolist()))
+        seg.set_tag("ri", array.array("B", ri_vals.tolist()))
+        seg.set_tag("rp", array.array("B", rp_vals.tolist()))
         bam_out.write(seg)
 
     return n_mapped, n_unmapped
