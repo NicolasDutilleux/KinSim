@@ -316,7 +316,7 @@ class KineticDataModule(L.LightningDataModule):
             indices = torch.randperm(len(dataset), generator=rng).tolist()
             self._train_subset = Subset(dataset, indices[:n_train])
             self._val_subset   = Subset(dataset, indices[n_train:])
-            log.info("Data split — train: %d keys, val: %d keys", n_train, n_val)
+            log.info("Data split — train: %d samples, val: %d samples", n_train, n_val)
         if stage in ("test", None) and self.test_pkl:
             self._test_dataset = MLPSignalDataset(self.test_pkl)
             log.info("Test set: %d keys from %s", len(self._test_dataset), self.test_pkl)
