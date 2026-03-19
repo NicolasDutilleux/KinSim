@@ -337,6 +337,7 @@ def generate_signals(
 def _process_batch(
     batch, ref_seqs, maf_mapping, meth_map, frac_lookup, fallback_motifs,
     model, device, deterministic, circular, bam_out, header,
+    use_ip_tags=False,
 ):
     """Process a batch of reads with batched MLP inference.
 
@@ -484,10 +485,17 @@ def _process_batch(
         seg.query_qualities = pysam.qualitystring_to_array(read_data["qual"])
         rg_id = header.to_dict().get("RG", [{}])[0].get("ID", "00000001")
         seg.set_tag("RG", rg_id)
-        seg.set_tag("fi", array.array("B", ipd_vals.tolist()))
-        seg.set_tag("fp", array.array("B", pw_vals.tolist()))
-        seg.set_tag("ri", array.array("B", ri_vals.tolist()))
-        seg.set_tag("rp", array.array("B", rp_vals.tolist()))
+        if use_ip_tags:
+            # Aligned-BAM mode: write ip/pw so pbcore/ipdSummary can find them.
+            # fi values (forward-strand IPD) are used as ip; pbmm2 does not
+            # convert fi→ip automatically, so we write ip directly.
+            seg.set_tag("ip", array.array("B", ipd_vals.tolist()))
+            seg.set_tag("pw", array.array("B", pw_vals.tolist()))
+        else:
+            seg.set_tag("fi", array.array("B", ipd_vals.tolist()))
+            seg.set_tag("fp", array.array("B", pw_vals.tolist()))
+            seg.set_tag("ri", array.array("B", ri_vals.tolist()))
+            seg.set_tag("rp", array.array("B", rp_vals.tolist()))
         bam_out.write(seg)
 
     return n_mapped, n_unmapped
@@ -595,19 +603,6 @@ def generate_from_bam(
     mode_label = "deterministic (mean)" if deterministic else "stochastic (sample)"
     log.info("Inference mode: %s", mode_label)
 
-    # Build output header: copy from input BAM but patch RG DS field so that
-    # pbcore reads fi/fp tags (not ip/pw which is the Revio-aligned convention).
-    _bam_tmp = pysam.AlignmentFile(input_bam, "rb", check_sq=False)
-    header_dict = _bam_tmp.header.to_dict()
-    _bam_tmp.close()
-    if "RG" in header_dict:
-        for rg in header_dict["RG"]:
-            if "DS" in rg:
-                rg["DS"] = (rg["DS"]
-                            .replace("Ipd:CodecV1=ip", "Ipd:CodecV1=fi")
-                            .replace("PulseWidth:CodecV1=pw", "PulseWidth:CodecV1=fp"))
-    header_out = pysam.AlignmentHeader.from_dict(header_dict)
-
     n_reads = n_mapped = n_unmapped = 0
     batch: list = []
     batch_maf: dict = {}
@@ -615,7 +610,8 @@ def generate_from_bam(
     log.info("Reading reads from: %s", input_bam)
 
     with pysam.AlignmentFile(input_bam, "rb", check_sq=False) as bam_in, \
-         pysam.AlignmentFile(output_bam, "wb", header=header_out) as bam_out:
+         pysam.AlignmentFile(output_bam, "wb", header=bam_in.header) as bam_out:
+        header_out = bam_in.header
 
         for read in bam_in:
             if read.query_sequence is None:
@@ -648,7 +644,7 @@ def generate_from_bam(
                 n_m, n_u = _process_batch(
                     batch, ref_seqs, batch_maf, meth_map, frac_lookup,
                     fallback_motifs, model, device_obj, deterministic,
-                    circular, bam_out, header_out,
+                    circular, bam_out, header_out, use_ip_tags=True,
                 )
                 n_mapped   += n_m
                 n_unmapped += n_u
@@ -661,7 +657,7 @@ def generate_from_bam(
             n_m, n_u = _process_batch(
                 batch, ref_seqs, batch_maf, meth_map, frac_lookup,
                 fallback_motifs, model, device_obj, deterministic,
-                circular, bam_out, header_out,
+                circular, bam_out, header_out, use_ip_tags=True,
             )
             n_mapped   += n_m
             n_unmapped += n_u
