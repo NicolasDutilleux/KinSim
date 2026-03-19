@@ -11,7 +11,12 @@ BAM=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation/bc20
 REF=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036/final_assembly.fasta
 CSV=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation/bc2036_generated_ipdSummary.csv
 
-# Index the BAM first
+# Index the reference FASTA (.fai)
+apptainer exec --bind /data \
+    /containers/apptainer/samtools-1.19.sif \
+    samtools faidx $REF
+
+# Index the BAM (.pbi)
 apptainer exec --bind /data \
     /containers/apptainer/pacbio-smrt-tools-25.1.sif \
     pbindex $BAM
