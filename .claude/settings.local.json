@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(scontrol show:*)"
+      "Bash(scontrol show:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
     ]
   }
 }
