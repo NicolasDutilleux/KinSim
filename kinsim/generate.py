@@ -595,6 +595,19 @@ def generate_from_bam(
     mode_label = "deterministic (mean)" if deterministic else "stochastic (sample)"
     log.info("Inference mode: %s", mode_label)
 
+    # Build output header: copy from input BAM but patch RG DS field so that
+    # pbcore reads fi/fp tags (not ip/pw which is the Revio-aligned convention).
+    _bam_tmp = pysam.AlignmentFile(input_bam, "rb", check_sq=False)
+    header_dict = _bam_tmp.header.to_dict()
+    _bam_tmp.close()
+    if "RG" in header_dict:
+        for rg in header_dict["RG"]:
+            if "DS" in rg:
+                rg["DS"] = (rg["DS"]
+                            .replace("Ipd:CodecV1=ip", "Ipd:CodecV1=fi")
+                            .replace("PulseWidth:CodecV1=pw", "PulseWidth:CodecV1=fp"))
+    header_out = pysam.AlignmentHeader.from_dict(header_dict)
+
     n_reads = n_mapped = n_unmapped = 0
     batch: list = []
     batch_maf: dict = {}
@@ -602,8 +615,7 @@ def generate_from_bam(
     log.info("Reading reads from: %s", input_bam)
 
     with pysam.AlignmentFile(input_bam, "rb", check_sq=False) as bam_in, \
-         pysam.AlignmentFile(output_bam, "wb", header=bam_in.header) as bam_out:
-        header_out = bam_in.header
+         pysam.AlignmentFile(output_bam, "wb", header=header_out) as bam_out:
 
         for read in bam_in:
             if read.query_sequence is None:
