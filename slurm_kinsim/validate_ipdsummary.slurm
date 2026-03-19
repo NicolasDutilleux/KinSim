@@ -10,6 +10,7 @@
 BAM=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation/bc2036_generated_aligned.bam
 REF=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036/final_assembly.fasta
 CSV=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation/bc2036_generated_ipdSummary.csv
+GFF=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation/bc2036_generated_ipdSummary.gff
 
 # Index the reference FASTA (.fai)
 apptainer exec --bind /data \
@@ -29,4 +30,5 @@ apptainer exec --bind /data \
         --identify m6A,m4C \
         --methylFraction \
         --csv $CSV \
+        --gff $GFF \
         --numWorkers 8
