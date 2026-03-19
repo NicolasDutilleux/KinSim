@@ -482,7 +482,8 @@ def _process_batch(
         seg.flag            = 4   # unmapped
         seg.query_sequence  = read_data["seq"]
         seg.query_qualities = pysam.qualitystring_to_array(read_data["qual"])
-        seg.set_tag("RG", "00000001")
+        rg_id = header.to_dict().get("RG", [{}])[0].get("ID", "00000001")
+        seg.set_tag("RG", rg_id)
         seg.set_tag("fi", array.array("B", ipd_vals.tolist()))
         seg.set_tag("fp", array.array("B", pw_vals.tolist()))
         seg.set_tag("ri", array.array("B", ri_vals.tolist()))
@@ -594,11 +595,6 @@ def generate_from_bam(
     mode_label = "deterministic (mean)" if deterministic else "stochastic (sample)"
     log.info("Inference mode: %s", mode_label)
 
-    header_out = pysam.AlignmentHeader.from_dict({
-        "HD": {"VN": "1.6", "SO": "unknown"},
-        "RG": [{"ID": "00000001", "PL": "PACBIO", "DS": "READTYPE=CCS"}],
-    })
-
     n_reads = n_mapped = n_unmapped = 0
     batch: list = []
     batch_maf: dict = {}
@@ -606,7 +602,8 @@ def generate_from_bam(
     log.info("Reading reads from: %s", input_bam)
 
     with pysam.AlignmentFile(input_bam, "rb", check_sq=False) as bam_in, \
-         pysam.AlignmentFile(output_bam, "wb", header=header_out) as bam_out:
+         pysam.AlignmentFile(output_bam, "wb", header=bam_in.header) as bam_out:
+        header_out = bam_in.header
 
         for read in bam_in:
             if read.query_sequence is None:
