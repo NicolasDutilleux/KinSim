@@ -404,10 +404,16 @@ def _process_batch(
                                 meth_id = int(ref_meth[ref_pos])
                             else:
                                 meth_id = 0
+                            frac = frac_lookup.get(meth_id, 0.0)
+                            if meth_id > 0:
+                                # Bernoulli: this read is either methylated
+                                # (prob=frac) or not — produces bimodal signal
+                                meth_id = meth_id if np.random.random() < frac else 0
+                                frac    = 1.0 if meth_id > 0 else 0.0
                             all_kmer_ids.append(current_kmer)
                             all_rc_kmer_ids.append(_rc_kmer(current_kmer))
                             all_meth_ids.append(meth_id)
-                            all_fractions.append(frac_lookup.get(meth_id, 0.0))
+                            all_fractions.append(frac)
 
             n_mapped += 1
 
@@ -433,10 +439,16 @@ def _process_batch(
                     is_n_context.append(False)
                     center  = i - MID
                     meth_id = int(meth_status[center])
+                    frac = frac_lookup.get(meth_id, 0.0)
+                    if meth_id > 0:
+                        # Bernoulli: this read is either methylated
+                        # (prob=frac) or not — produces bimodal signal
+                        meth_id = meth_id if np.random.random() < frac else 0
+                        frac    = 1.0 if meth_id > 0 else 0.0
                     all_kmer_ids.append(current_kmer)
                     all_rc_kmer_ids.append(_rc_kmer(current_kmer))
                     all_meth_ids.append(meth_id)
-                    all_fractions.append(frac_lookup.get(meth_id, 0.0))
+                    all_fractions.append(frac)
 
             n_unmapped += 1
 

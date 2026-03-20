@@ -11,6 +11,6 @@ apptainer exec --bind /data \
     /containers/apptainer/pbmm2-1.13.1.sif \
     pbmm2 align \
         /data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036/final_assembly.fasta \
-        /data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation/bc2036_generated.bam \
-        /data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation/bc2036_generated_aligned.bam \
+        /data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation/bc2036_generated_v2.bam \
+        /data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation/bc2036_generated_v2_aligned.bam \
         --preset CCS --sort --num-threads 8
