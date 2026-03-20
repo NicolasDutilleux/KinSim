@@ -7,10 +7,10 @@
 #SBATCH --time=02:00:00
 #SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/validate_ipdsummary_%J.log
 
-BAM=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation/bc2036_generated_aligned.bam
+BAM=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation/bc2036_generated_v2_aligned.bam
 REF=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036/final_assembly.fasta
-CSV=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation/bc2036_generated_ipdSummary.csv
-GFF=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation/bc2036_generated_ipdSummary.gff
+CSV=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation/bc2036_generated_v2_ipdSummary.csv
+GFF=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation/bc2036_generated_v2_ipdSummary.gff
 
 # Index the reference FASTA (.fai)
 apptainer exec --bind /data \

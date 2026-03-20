@@ -147,6 +147,93 @@ def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
 
 
 # ---------------------------------------------------------------------------
+# IPD-based binarization helpers
+# ---------------------------------------------------------------------------
+
+def _otsu_threshold(ipd_vals: np.ndarray) -> float:
+    """Otsu's optimal threshold splitting IPD values into low/high groups.
+
+    Evaluates candidate thresholds on a grid of percentiles (5th–95th) and
+    picks the one that minimises weighted intra-class variance.  Falls back
+    to the median when there are fewer than 6 samples.
+    """
+    if len(ipd_vals) < 6:
+        return float(np.median(ipd_vals))
+    candidates = np.unique(np.percentile(ipd_vals, np.arange(5, 96, 2)))
+    best_thresh = float(np.median(ipd_vals))
+    best_var    = float("inf")
+    n = len(ipd_vals)
+    for t in candidates:
+        low  = ipd_vals[ipd_vals <  t]
+        high = ipd_vals[ipd_vals >= t]
+        if len(low) < 3 or len(high) < 3:
+            continue
+        var = (len(low) * float(np.var(low)) + len(high) * float(np.var(high))) / n
+        if var < best_var:
+            best_var    = var
+            best_thresh = float(t)
+    return best_thresh
+
+
+def _binarize_by_ipd(result: dict) -> dict:
+    """Binarize methylated keys using per-read IPD signal (Otsu's method).
+
+    For each (kmer_id, meth_id) key with meth_id > 0, fits a 2-class
+    threshold on the IPD column:
+      - High-IPD samples  → (kmer_id, meth_id, frac=1.0)  [truly methylated]
+      - Low-IPD  samples  → (kmer_id, 0,       frac=0.0)  [unmethylated read]
+
+    This replaces the soft stoichiometric label (e.g. frac=0.7) with a
+    binary label inferred from the actual kinetic signal, giving the model
+    two well-separated distributions instead of a blurred average.
+
+    Keys with fewer than 6 samples are left unchanged (insufficient data).
+    """
+    new_result: dict = {}
+    none_extras: dict = {}   # (kmer_id, 0) → list[np.ndarray] to append
+
+    for key, arr in result.items():
+        if not isinstance(key, tuple):
+            new_result[key] = arr
+            continue
+        kmer_id, meth_id = key
+        if meth_id == 0:
+            new_result[key] = arr
+            continue
+
+        ipd_vals  = arr[:, 0]
+        thresh    = _otsu_threshold(ipd_vals)
+        high_mask = ipd_vals >= thresh
+        low_mask  = ~high_mask
+
+        if high_mask.sum() >= 3 and low_mask.sum() >= 3:
+            high_arr        = arr[high_mask].copy()
+            high_arr[:, 2]  = 1.0      # truly methylated
+            new_result[(kmer_id, meth_id)] = high_arr
+
+            low_arr        = arr[low_mask].copy()
+            low_arr[:, 2]  = 0.0       # unmethylated pass-through
+            none_key = (kmer_id, 0)
+            none_extras.setdefault(none_key, []).append(low_arr)
+
+            log.debug(
+                "binarize kmer=%d meth=%d  thresh=%.1f  high=%d meth  low=%d unmeth",
+                kmer_id, meth_id, thresh, high_mask.sum(), low_mask.sum(),
+            )
+        else:
+            new_result[key] = arr   # too few samples to split
+
+    for none_key, arrays in none_extras.items():
+        extra = np.concatenate(arrays, axis=0)
+        if none_key in new_result:
+            new_result[none_key] = np.concatenate([new_result[none_key], extra], axis=0)
+        else:
+            new_result[none_key] = extra
+
+    return new_result
+
+
+# ---------------------------------------------------------------------------
 # Extract: raw samples from one BAM file
 # ---------------------------------------------------------------------------
 
@@ -324,6 +411,13 @@ def extract_samples_from_bam(
     )
 
     result = {key: np.array(vals, dtype=np.float32) for key, vals in samples.items()}
+
+    # Binarize methylated keys: split by IPD signal (Otsu) so the model
+    # learns clean binary distributions instead of stoichiometric averages.
+    result = _binarize_by_ipd(result)
+    b_keys    = sum(1 for k in result if isinstance(k, tuple))
+    b_samples = sum(len(v) for k, v in result.items() if isinstance(k, tuple))
+    log.info("After IPD binarization: %d unique keys, %d total samples", b_keys, b_samples)
 
     # Attach provenance metadata so shards can be inspected and traced back.
     result["__meta__"] = {
