@@ -2,7 +2,6 @@
 #SBATCH --job-name=KinSim_MLP_Evaluate
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=16G
-#SBATCH --gres=gpu:1
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
 #SBATCH --time=01:00:00
