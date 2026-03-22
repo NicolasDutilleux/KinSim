@@ -123,7 +123,7 @@ def evaluate(
     all_sigma = []
     all_true  = []
 
-    for kmer_ids, meth_probs, signals in loader:
+    for kmer_ids, meth_probs, signals, _meth_ids in loader:
         kmer_ids   = kmer_ids.to(device)
         meth_probs = meth_probs.to(device)
 
