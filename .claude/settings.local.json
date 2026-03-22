@@ -4,7 +4,8 @@
       "Bash(scontrol show:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(ls c:/Dev/KinSim/slurm_kinsim/*.slurm)"
     ]
   }
 }
