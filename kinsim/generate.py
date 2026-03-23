@@ -52,8 +52,8 @@ import torch.nn as nn
 
 from .models.predictor import MLPPredictor, create_from_config
 from .utils.encoding import BASE_MAP, K, KMER_MASK
-from .utils.motifs import (build_reference_meth_map, load_motif_string,
-                     parse_motifs, scan_sequence)
+from .utils.motifs import (build_reference_frac_map, build_reference_meth_map,
+                     load_motif_string, parse_motifs, scan_sequence)
 from .utils.io import (MID, find_pbsim3_files, resolve_motifs_for_species,
                         get_extended_context, load_reference, parse_maf)
 
@@ -264,7 +264,12 @@ def generate_signals(
                                         revcomp=revcomp,
                                         no_fuzznuc=no_fuzznuc)
 
-    # Fraction lookup: meth_id → stoichiometric fraction from the motif string
+    # Per-position fraction map: each methylated site gets the fraction from
+    # the specific motif that matched it (avoids collapsing different fractions
+    # when multiple motifs share the same meth_id).
+    log.info("Building per-position fraction map...")
+    frac_map = build_reference_frac_map(ref_seqs, motif_string, revcomp=revcomp)
+    # Legacy lookup as fallback for unmapped reads (no reference context)
     frac_lookup = _build_fraction_lookup(motif_string)
 
     # Keep regex motifs for the fallback path (unmapped reads)
@@ -314,8 +319,8 @@ def generate_signals(
 
             if len(batch) >= batch_reads:
                 n_m, n_u = _process_batch(
-                    batch, ref_seqs, maf_mapping, meth_map, frac_lookup,
-                    fallback_motifs,
+                    batch, ref_seqs, maf_mapping, meth_map, frac_map,
+                    frac_lookup, fallback_motifs,
                     model, device, deterministic, circular, bam_out, header)
                 n_mapped   += n_m
                 n_unmapped += n_u
@@ -323,8 +328,8 @@ def generate_signals(
 
         if batch:
             n_m, n_u = _process_batch(
-                batch, ref_seqs, maf_mapping, meth_map, frac_lookup,
-                fallback_motifs,
+                batch, ref_seqs, maf_mapping, meth_map, frac_map,
+                frac_lookup, fallback_motifs,
                 model, device, deterministic, circular, bam_out, header)
             n_mapped   += n_m
             n_unmapped += n_u
@@ -335,7 +340,8 @@ def generate_signals(
 
 
 def _process_batch(
-    batch, ref_seqs, maf_mapping, meth_map, frac_lookup, fallback_motifs,
+    batch, ref_seqs, maf_mapping, meth_map, frac_map, frac_lookup,
+    fallback_motifs,
     model, device, deterministic, circular, bam_out, header,
     use_ip_tags=False,
 ):
@@ -346,7 +352,9 @@ def _process_batch(
     then writes each read to the BAM with its slice of the generated signals.
 
     Args:
-        frac_lookup: dict mapping meth_id → stoichiometric fraction.
+        frac_map:    dict[ref_name] -> np.float32 array of per-position
+                     stoichiometric fractions (from build_reference_frac_map).
+        frac_lookup: dict mapping meth_id → fraction (fallback for unmapped reads).
 
     Returns:
         Tuple (n_mapped, n_unmapped) — read counts for the batch.
@@ -373,6 +381,7 @@ def _process_batch(
             ref_seq  = ref_seqs[ref_name]
             ref_len  = len(ref_seq)
             ref_meth = meth_map[ref_name]
+            ref_frac = frac_map[ref_name] if ref_name in frac_map else None
 
             # Extended context pads K//2 bases on each side from the reference,
             # ensuring accurate 11-mer encoding at the read edges.
@@ -404,7 +413,13 @@ def _process_batch(
                                 meth_id = int(ref_meth[ref_pos])
                             else:
                                 meth_id = 0
-                            frac = frac_lookup.get(meth_id, 0.0)
+                            # Per-position fraction from frac_map (avoids
+                            # collapsing different fractions for same meth_id)
+                            if ref_frac is not None:
+                                pos_idx = ref_pos % ref_len if circular else ref_pos
+                                frac = float(ref_frac[pos_idx]) if 0 <= pos_idx < ref_len else 0.0
+                            else:
+                                frac = frac_lookup.get(meth_id, 0.0)
                             if meth_id > 0:
                                 # Bernoulli: this read is either methylated
                                 # (prob=frac) or not — produces bimodal signal
@@ -421,6 +436,7 @@ def _process_batch(
             # ---- Unmapped path: read-only context ----
             # Per-read regex scanning (fuzznuc is only used for the reference
             # pre-scan above; subprocess calls per read would be too slow).
+            # Uses frac_lookup (per-meth_id) since there is no reference context.
             meth_status  = scan_sequence(seq, fallback_motifs)
             current_kmer = 0
 
@@ -607,6 +623,9 @@ def generate_from_bam(
     log.info("Pre-scanning reference for methylation sites (%s)...", backend)
     meth_map = build_reference_meth_map(ref_seqs, motif_string,
                                         revcomp=revcomp, no_fuzznuc=no_fuzznuc)
+    log.info("Building per-position fraction map...")
+    frac_map       = build_reference_frac_map(ref_seqs, motif_string,
+                                              revcomp=revcomp)
     frac_lookup    = _build_fraction_lookup(motif_string)
     fallback_motifs = parse_motifs(motif_string, revcomp=revcomp)
 
@@ -654,8 +673,9 @@ def generate_from_bam(
 
             if len(batch) >= batch_reads:
                 n_m, n_u = _process_batch(
-                    batch, ref_seqs, batch_maf, meth_map, frac_lookup,
-                    fallback_motifs, model, device_obj, deterministic,
+                    batch, ref_seqs, batch_maf, meth_map, frac_map,
+                    frac_lookup, fallback_motifs, model, device_obj,
+                    deterministic,
                     circular, bam_out, header_out, use_ip_tags=True,
                 )
                 n_mapped   += n_m
@@ -667,8 +687,9 @@ def generate_from_bam(
 
         if batch:
             n_m, n_u = _process_batch(
-                batch, ref_seqs, batch_maf, meth_map, frac_lookup,
-                fallback_motifs, model, device_obj, deterministic,
+                batch, ref_seqs, batch_maf, meth_map, frac_map,
+                frac_lookup, fallback_motifs, model, device_obj,
+                deterministic,
                 circular, bam_out, header_out, use_ip_tags=True,
             )
             n_mapped   += n_m
