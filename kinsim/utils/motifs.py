@@ -357,6 +357,58 @@ def _build_meth_map_regex(ref_seqs, motif_string, revcomp=True):
     return {name: scan_sequence(seq, motifs) for name, seq in ref_seqs.items()}
 
 
+def build_reference_frac_map(ref_seqs, motif_string, revcomp=True):
+    """Build per-position stoichiometric fraction map for the reference genome.
+
+    Each methylated position gets the fraction from the specific motif that
+    matched it.  Unmethylated positions remain 0.0.  This avoids the problem
+    of collapsing different fractions for the same meth_id (e.g. two m6A
+    motifs with 99% and 10% fractions).
+
+    Uses Python regex scanning (fast enough for single-genome validation).
+
+    Args:
+        ref_seqs:     dict[name] -> sequence string (from load_reference).
+        motif_string: KinSim motif string with optional fraction field.
+        revcomp:      Also scan the reverse complement strand (default True).
+
+    Returns:
+        dict[ref_name] -> np.float32 array of shape (ref_len,)
+        Each position holds the stoichiometric fraction (0.0 = unmethylated).
+    """
+    # Parse motifs with their fractions
+    motif_entries = []
+    if motif_string:
+        for entry in motif_string.split(';'):
+            if not entry or ',' not in entry:
+                continue
+            parts = entry.split(',')
+            if len(parts) < 3:
+                continue
+            seq = parts[1]
+            mod_pos = int(parts[2]) - 1  # 1-based → 0-based
+            frac = float(parts[4]) if len(parts) >= 5 else 1.0
+
+            pairs = [(seq, mod_pos)]
+            if revcomp:
+                pairs.append((reverse_complement(seq), len(seq) - 1 - mod_pos))
+
+            for s, offset in pairs:
+                regex_pattern = re.compile(f'(?=({iupac_to_re(s)}))')
+                motif_entries.append((regex_pattern, offset, frac))
+
+    frac_map = {}
+    for name, seq in ref_seqs.items():
+        fmap = np.zeros(len(seq), dtype=np.float32)
+        for pattern, offset, frac in motif_entries:
+            for match in pattern.finditer(seq):
+                target_pos = match.start() + offset
+                if target_pos < len(seq):
+                    fmap[target_pos] = frac
+        frac_map[name] = fmap
+    return frac_map
+
+
 def _build_meth_map_fuzznuc(ref_seqs, motif_string, revcomp=True):
     """Build reference methylation map using EMBOSS fuzznuc (primary backend).
 
