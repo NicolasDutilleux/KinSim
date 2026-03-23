@@ -25,6 +25,7 @@ Motif string format:
 
 from __future__ import annotations
 
+import logging
 import sys
 import csv
 import os
@@ -33,6 +34,8 @@ import subprocess
 import tempfile
 import numpy as np
 from .encoding import METH_IDS
+
+log = logging.getLogger(__name__)
 
 IUPAC_TO_REGEX = {
     'A': 'A', 'C': 'C', 'G': 'G', 'T': 'T', 'N': '.',
@@ -347,10 +350,18 @@ def build_reference_meth_map(ref_seqs, motif_string, revcomp=True,
     """
     if not no_fuzznuc:
         try:
-            return _build_meth_map_fuzznuc(ref_seqs, motif_string, revcomp)
+            meth_map = _build_meth_map_fuzznuc(ref_seqs, motif_string, revcomp)
+            # Validate: if motifs were provided but fuzznuc found nothing,
+            # fall back to regex (fuzznuc can silently produce empty results)
+            total_hits = sum(int(np.count_nonzero(arr)) for arr in meth_map.values())
+            if total_hits == 0 and motif_string:
+                log.warning("fuzznuc returned 0 methylation sites — "
+                            "falling back to Python regex scanner")
+                return _build_meth_map_regex(ref_seqs, motif_string, revcomp)
+            return meth_map
         except FileNotFoundError:
-            print("  WARN: fuzznuc not found on PATH - falling back to "
-                  "Python regex scanner", file=sys.stderr)
+            log.warning("fuzznuc not found on PATH — "
+                        "falling back to Python regex scanner")
     return _build_meth_map_regex(ref_seqs, motif_string, revcomp)
 
 
@@ -433,13 +444,14 @@ def _build_meth_map_fuzznuc(ref_seqs, motif_string, revcomp=True):
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            print(f"  WARN: fuzznuc failed: {result.stderr.strip()}\n"
-                  f"  Falling back to Python regex scanner.", file=sys.stderr)
+            log.warning("fuzznuc failed (exit %d): %s — "
+                        "falling back to Python regex scanner",
+                        result.returncode, result.stderr.strip())
             return _build_meth_map_regex(ref_seqs, motif_string, revcomp)
 
         if not os.path.exists(out_gff):
-            print("  WARN: fuzznuc produced no output file - falling back to "
-                  "Python regex scanner", file=sys.stderr)
+            log.warning("fuzznuc produced no output file — "
+                        "falling back to Python regex scanner")
             return _build_meth_map_regex(ref_seqs, motif_string, revcomp)
 
         # Parse GFF output: extract pattern name from attributes to identify motif
