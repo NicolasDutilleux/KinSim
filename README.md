@@ -21,23 +21,22 @@ KinSim learns per-species IPD/PW distributions from real PacBio SMRT data, then 
 
 ## How it works
 
-PacBio sequencing records two kinetic values at every base — **IPD** (Inter-Pulse Duration) and **PW** (Pulse Width). These vary systematically with the local 11-mer sequence context and DNA methylation state. KinSim exploits this signal in three steps:
+PacBio sequencing records two kinetic values at every base — **IPD** (Inter-Pulse Duration) and **PW** (Pulse Width). These vary systematically with the local 11-mer sequence context and DNA methylation state. KinSim exploits this signal:
 
 ```
 Real PacBio BAMs  ──extract──►  kinetic library (.pkl)
-                  ──train───►   model (dictionary / MLP / cGAN)
+                  ──train───►   ConvPredictor / MLPPredictor model
 PBSIM3 reads      ──generate──► BAM with fi/fp tags
 ```
 
-Three models are available, from simplest to most expressive:
+The model predicts N(μ, σ²) per (11-mer, methylation) context using a supervised Gaussian NLL loss. At inference time, each base is sampled from its predicted distribution (stochastic) or assigned the predicted mean (deterministic).
 
-| Model | `--model` flag | Method | Hardware |
-|---|---|---|---|
-| **Dictionary** | `dictionary` | Gaussian sampling from per-kmer accumulators | CPU only |
-| **MLP** | `mlp` | MLP predicting N(μ, σ²) per context | GPU recommended |
-| **cGAN** | `cgan` | Conditional WGAN-GP (non-Gaussian distributions) | GPU required |
+| Architecture | Params | Method |
+|---|---|---|
+| **ConvPredictor** (default) | ~140K | Per-base + positional embeddings, FiLM methylation conditioning, Conv1D backbone |
+| **MLPPredictor** (legacy) | ~268M | Flat k-mer embedding + 2-layer MLP |
 
-All models share the same `extract → merge` data preparation pipeline and produce identical BAM output (`fi`/`fp` tags, uint8 [0, 255]).
+Both produce identical BAM output: `fi:B:C` (IPD) and `fp:B:C` (PW), uint8 `[0, 255]`.
 
 ---
 
@@ -46,17 +45,8 @@ All models share the same `extract → merge` data preparation pipeline and prod
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [CLI Reference](#cli-reference)
-  - [kinsim prepare](#kinsim-prepare)
-  - [kinsim extract](#kinsim-extract)
-  - [kinsim merge](#kinsim-merge)
-  - [kinsim train](#kinsim-train)
-  - [kinsim generate](#kinsim-generate)
-  - [kinsim analyze](#kinsim-analyze)
+- [Data Preparation](#data-preparation)
 - [Data Formats](#data-formats)
-  - [Manifest CSV](#manifest-csv)
-  - [YAML Config](#yaml-config)
-  - [Motif String](#motif-string)
-- [End-to-End Pipelines](#end-to-end-pipelines)
 - [SLURM (HPC Cluster)](#slurm-hpc-cluster)
 - [Output BAM Format](#output-bam-format)
 - [Repository Structure](#repository-structure)
@@ -66,36 +56,29 @@ All models share the same `extract → merge` data preparation pipeline and prod
 
 ## Installation
 
-### Recommended (editable install)
-
 ```bash
-git clone https://github.com/<user>/KinSim.git
+git clone https://github.com/NicolasDutilleux/KinSim.git
 cd KinSim
-pip install -e .
+pip install -e ".[ml]"
 ```
 
-The `kinsim` command is then available system-wide:
+This installs both CLI tools:
 
 ```bash
-kinsim --version
-```
-
-### Without installing
-
-```bash
-cd /path/to/KinSim
-python -m kinsim --version
+kinsim --version       # ML pipeline
+kinsim-prep --help     # Data preparation tools
 ```
 
 ### Optional dependencies
 
-| Feature | Command |
+| Feature | Install |
 |---|---|
-| MLP + cGAN training / generation | `pip install -e ".[cgan]"` — adds PyTorch ≥ 2.0 and TensorBoard |
-| YAML config files | `pip install -e ".[cluster]"` — adds PyYAML |
-| Faster motif scanning | `conda install -c bioconda emboss` — adds EMBOSS `fuzznuc` |
+| Hyperparameter optimization | `pip install -e ".[hpo]"` (adds Optuna) |
+| Plotting | `pip install -e ".[plot]"` (adds matplotlib) |
+| TensorBoard logging | `pip install -e ".[tb]"` |
+| Faster motif scanning | `conda install -c bioconda emboss` (adds EMBOSS fuzznuc) |
 
-> KinSim falls back to Python regex automatically if `fuzznuc` is not installed. Use `--no-fuzznuc` to force regex mode.
+> KinSim falls back to Python regex automatically if `fuzznuc` is not installed.
 
 ---
 
@@ -105,582 +88,240 @@ python -m kinsim --version
 # 1. Extract kinetic samples from a real PacBio BAM
 kinsim extract reads.bam "m6A,GATC,1" shard.pkl
 
-# 2. Train an MLP
-kinsim train shard.pkl checkpoints/ --model mlp --epochs 50
+# 2. Train the model
+kinsim train shard.pkl checkpoints/ --epochs 50
 
 # 3. Generate signals onto PBSIM3 reads
 kinsim generate pbsim3_output/ checkpoints/checkpoint_epoch50.pt \
-    "m6A,GATC,1" output/ --model mlp
+    "m6A,GATC,1" output/
 ```
 
-For multi-sample cluster runs, see [End-to-End Pipelines](#end-to-end-pipelines) and [SLURM](#slurm-hpc-cluster).
+For multi-sample cluster runs, see [SLURM](#slurm-hpc-cluster).
 
 ---
 
 ## CLI Reference
 
-### Global flags
+### `kinsim` — ML Pipeline
 
 ```
-kinsim --version         Print version and exit
-kinsim --help            List all commands
-kinsim <cmd> --help      Detailed help for one command
+kinsim --version           Print version
+kinsim <command> --help    Detailed help
+
+Commands:
+  extract          Extract raw IPD/PW samples from a BAM  (-> .pkl shard)
+  merge            Merge .pkl shards into a master training set
+  train            Train the ConvPredictor / MLPPredictor model
+  generate         Generate synthetic kinetic signals for PBSIM3 reads
+  evaluate         Evaluate a trained model (calibration report + plots)
+  analyze          Analyze a .pkl file (coverage, signals, sensitivity)
+  strip-kinetics   Copy a BAM and remove kinetic tags
 ```
-
----
-
-### `kinsim prepare`
-
-Validate and normalize a BAM/motif pairs file into a compact config. Resolves all motif sources (CSV, REBASE, string) to the unified KinSim motif string format.
-
-> **Note:** `prepare` is only needed for the **dictionary** pipeline. MLP and cGAN pipelines use a [manifest CSV](#manifest-csv) directly.
-
-```bash
-kinsim prepare <pairs_file> <output_config> [--min-fraction 0.40] [--min-detected 20]
-```
-
-| Argument | Description |
-|---|---|
-| `pairs_file` | Text file with alternating lines: BAM path, then motif source |
-| `output_config` | Output: BAM path + resolved motif string, alternating lines |
-
-```bash
-# pairs.txt:
-#   /data/Ecoli.bam
-#   /data/Ecoli/motifs.csv
-#   /data/Salmonella.bam
-#   m6A,GATC,1;m4C,CCWGG,2
-
-kinsim prepare pairs.txt config_strains.txt
-```
-
----
 
 ### `kinsim extract`
 
-Scan a PacBio BAM: slide an 11-mer window across every read, record raw IPD/PW values keyed by `(11-mer, methylation state)`. Reservoir-sampled to bound memory. Produces one `.pkl` shard per BAM.
-
-> The BAM is validated for `fi`/`fp` tags on the first 10 reads before extraction starts — **fail-fast**.
-
-#### Single-BAM mode (interactive / testing)
+Scan a PacBio BAM: slide an 11-mer window across every read, record raw IPD/PW values keyed by `(11-mer, methylation state)`. Produces one `.pkl` shard per BAM.
 
 ```bash
-kinsim extract <bam> <motifs> <output.pkl> [options]
+# Single-BAM mode
+kinsim extract <bam> <motifs> <output.pkl>
+
+# Manifest mode (for SLURM array jobs)
+kinsim extract --manifest manifest.csv --task $SLURM_ARRAY_TASK_ID --output-dir shards/
 ```
-
-```bash
-kinsim extract /data/Ecoli.bam /data/Ecoli/motifs.csv ecoli_shard.pkl
-```
-
-#### Manifest mode (parallel cluster jobs)
-
-```bash
-kinsim extract --manifest manifest.csv --task N --output-dir shards/ [options]
-```
-
-| Flag | Description |
-|---|---|
-| `--manifest` | CSV file: `sample_id,bam_path,motifs` — one row per BAM |
-| `--task` | 1-based row index — one SLURM array task per row |
-| `--output-dir` | Output directory; writes `<sample_id>_shard.pkl` |
-
-#### Common options
-
-| Flag | Default | Description |
-|---|---|---|
-| `--max-samples` | 10 000 | Max observations per (kmer, meth) key |
-| `--no-revcomp` | — | Skip reverse complement strand |
-| `--min-fraction` | 0.40 | PacBio CSV motif filter |
-| `--min-detected` | 20 | PacBio CSV motif filter |
-
-**Output `.pkl` format:**
-```
-dict[(kmer_id, meth_id)] → np.ndarray(N, 2)   # columns: [IPD, PW] raw uint8
-"__meta__"               → dict               # provenance: source BAM, motifs, timestamp
-```
-
----
 
 ### `kinsim merge`
 
-Concatenate multiple `.pkl` shards into a single master training file. Glob auto-detects shard naming: tries `*_shard.pkl` first, then `*_cgan.pkl` (legacy).
+Concatenate `.pkl` shards into a single master training file.
 
 ```bash
 kinsim merge <shards_dir> <output.pkl> [--max-samples 50000]
 ```
 
-| Argument | Description |
-|---|---|
-| `shards_dir` | Directory containing shard `.pkl` files |
-| `output.pkl` | Output master training file |
-
-```bash
-kinsim merge shards/ master_data.pkl --max-samples 50000
-```
-
----
-
 ### `kinsim train`
 
-Train a kinetic model on the merged dataset.
-
-```bash
-kinsim train <data> <output_dir> --model <dictionary|mlp|cgan> [options]
-# or with YAML config:
-kinsim train --model <mlp|cgan> --config config.yaml [overrides]
-```
-
-**Output structure (all models):**
-```
-output_dir/
-  model_config.json     architecture hyperparameters (saved before epoch 1)
-  checkpoint_epochN.pt  model weights + optimizer state
-  training_log.csv      per-epoch metrics (always written)
-  runs/                 TensorBoard logs
-```
-
----
-
-#### `--model dictionary`
-
-Builds Welford-style accumulators `[n, Σipd, Σipd², Σpw, Σpw²]` per `(kmer, meth)` key.
-
-```bash
-kinsim train reads.bam output_dir/ --model dictionary \
-    "m6A,GATC,1" [--min-fraction 0.40] [--min-detected 20]
-```
-
----
-
-#### `--model mlp`
-
-Supervised MLP with Gaussian NLL loss. Jointly learns mean μ and variance σ² per (kmer, meth) context.
+Train the model with Gaussian NLL loss.
 
 ```bash
 # Positional args
-kinsim train master_data.pkl checkpoints_mlp/ --model mlp \
-    [--epochs 50] [--batch-size 4096] [--lr 1e-3] \
-    [--kmer-embed-dim 64] [--hidden-dim 128] \
-    [--loss gnll|mse|huber] \
-    [--device cuda] [--resume checkpoint_epochN.pt]
+kinsim train <pkl> <output_dir> [--architecture conv|mlp] [--epochs 50] \
+    [--batch-size 4096] [--lr 1e-3] [--device cuda]
 
-# YAML config (recommended for cluster runs)
-kinsim train --model mlp --config config_mlp.yaml [--epochs 100]
+# YAML config (recommended for cluster)
+kinsim train --config config.yaml [--epochs 100]
 ```
 
-Precedence: **CLI flags > YAML > built-in defaults**.
-
-| Flag | Default | Description |
-|---|---|---|
-| `--config` | — | YAML config file (sets pkl, output_dir, and all hyperparameters) |
-| `--epochs` | 50 | Training epochs |
-| `--batch-size` | 4096 | Mini-batch size |
-| `--lr` | 1e-3 | Adam learning rate |
-| `--kmer-embed-dim` | 64 | 11-mer embedding dimension |
-| `--hidden-dim` | 128 | Hidden layer width |
-| `--loss` | `gnll` | `gnll` (Gaussian NLL), `mse`, or `huber` |
-| `--val-fraction` | 0.10 | Validation split fraction |
-| `--device` | `cuda` | `cuda` or `cpu` |
-| `--resume` | — | Resume training from checkpoint |
-
-Metrics per epoch: `train_loss`, `val_loss`, `mse_ipd`, `mse_pw`, `mae_ipd`, `mae_pw`, `pearson_ipd`, `pearson_pw`.
-
----
-
-#### `--model cgan`
-
-Conditional WGAN-GP. Captures non-Gaussian, multi-modal distributions.
-
-```bash
-# Positional args
-kinsim train master_data.pkl checkpoints_cgan/ --model cgan \
-    [--epochs 100] [--batch-size 4096] [--lr 1e-4] \
-    [--noise-dim 32] [--kmer-embed-dim 64] [--hidden-dim 128] \
-    [--n-critic 5] [--lambda-gp 10] \
-    [--device cuda] [--resume checkpoint_epochN.pt]
-
-# YAML config
-kinsim train --model cgan --config config_cgan.yaml
-```
-
-| Flag | Default | Description |
-|---|---|---|
-| `--config` | — | YAML config file |
-| `--epochs` | 100 | Training epochs |
-| `--n-critic` | 5 | Discriminator updates per Generator update |
-| `--lambda-gp` | 10 | Gradient penalty weight (WGAN-GP) |
-| `--noise-dim` | 32 | Generator latent noise dimension |
-
-```bash
-tensorboard --logdir checkpoints_cgan/runs
-```
-
----
+Key flags: `--architecture` (default: `conv`), `--config`, `--epochs`, `--batch-size`, `--lr`, `--device`, `--resume`, `--optuna` (HPO).
 
 ### `kinsim generate`
 
-Inject kinetic signals into PBSIM3 simulated reads. Two input modes are auto-detected.
+Inject kinetic signals into PBSIM3 reads. Three modes (auto-detected from arguments):
 
 ```bash
-# Directory mode — one job processes all species in the directory
-kinsim generate <pbsim3_dir> <checkpoint> <motifs> <output_dir> \
-    --model <dictionary|mlp|cgan> [options]
+# Directory mode — process all species in a PBSIM3 output directory
+kinsim generate <pbsim3_dir> <checkpoint.pt> <motifs> <output_dir>
 
-# Per-genome mode — single species
-kinsim generate <reads.fq.gz> <reads.maf.gz> <ref.fna> \
-    <checkpoint> <motifs> <output.bam> \
-    --model <dictionary|mlp|cgan> [options]
+# BAM mode — inject signals into an existing BAM
+kinsim generate <input.bam> <ref.fna> <checkpoint.pt> <motifs> <output.bam>
+
+# Per-genome mode — single species from raw PBSIM3 files
+kinsim generate <reads.fq.gz> <reads.maf.gz> <ref.fna> <checkpoint.pt> <motifs> <output.bam>
 ```
 
-| Flag | Default | Description |
-|---|---|---|
-| `--device` | `cuda` | `cuda` or `cpu` (mlp / cgan) |
-| `--batch-reads` | 1000 | Reads per GPU inference batch |
-| `--linear` | — | Treat genome as linear (default: circular) |
-| `--no-revcomp` | — | Skip reverse complement motif scanning |
-| `--no-fuzznuc` | — | Force Python regex (skip EMBOSS fuzznuc) |
-| `--deterministic` | — | Return predicted mean μ instead of sampling (MLP only) |
+Key flags: `--device`, `--batch-reads`, `--deterministic`, `--no-fuzznuc`.
 
-**Output:** `<species>_mlp.bam` / `<species>_cgan.bam` / `<species>_kinsim.bam`
+### `kinsim evaluate`
 
-**PBSIM3 directory layouts (both auto-detected):**
+Calibration report + per-kmer distribution plots.
 
-```
-Species subdirectories (recommended):    Flat layout:
-  pbsim3_output/                           pbsim3_output/
-    Ecoli/                                   Ecoli.fq.gz
-      reads.fq.gz                            Ecoli.maf.gz
-      reads.maf.gz                           Ecoli.fna
-      Ecoli.fna                              Salmonella.fq.gz ...
-    Salmonella/ ...
-```
-
-**Examples:**
 ```bash
-# Dictionary
-kinsim generate pbsim3_output/ master_dict.pkl "m6A,GATC,1" injected/ \
-    --model dictionary
+kinsim evaluate <checkpoint_dir> <pkl>
+```
 
-# MLP
-kinsim generate pbsim3_output/ checkpoints_mlp/checkpoint_epoch50.pt \
-    "m6A,GATC,1" generated_mlp/ --model mlp --device cuda
+### `kinsim analyze`
 
-# cGAN
-kinsim generate pbsim3_output/ checkpoints_cgan/checkpoint_epoch100.pt \
-    /data/Ecoli/motifs.csv generated_cgan/ --model cgan --device cuda
+Training data analysis: coverage, signal distributions, fraction breakdown, neighbor sensitivity.
+
+```bash
+kinsim analyze <pkl> [--output-dir reports/] [--no-html]
 ```
 
 ---
 
-### `kinsim analyze`
+## Data Preparation
 
-Coverage statistics, signal distributions, and neighbor-sensitivity analysis for a kinetic dictionary. Produces a text report and an interactive HTML report (Plotly).
+`kinsim-prep` handles motif parsing, REBASE fetching, and data filtering.
 
-```bash
-kinsim analyze <dict.pkl> [--output-dir <dir>] [--no-html]
+```
+kinsim-prep --help
+
+Commands:
+  parse            Parse any motif source and print KinSim motif string
+  rebase           Fetch/parse REBASE motifs (fetch, parse, patterns)
+  merge-motifs     Merge + filter + deduplicate motifs from multiple sources
+  manifest         Inspect manifest CSV (count, validate, list)
+  filter           Filter .pkl by coverage, mod type, max keys
+  balance          Balance .pkl by methylation type
+  prepare          Legacy BAM/motif pair validation
 ```
 
+### Typical data preparation workflow
+
 ```bash
-kinsim analyze master_dict.pkl
-# → master_dict_report.txt
-# → master_dict_report.html  (interactive)
+# 1. Fetch REBASE motifs for a species
+kinsim-prep rebase fetch 8360 --output rebase_ecoli.csv
+
+# 2. Merge with caller-derived motifs
+kinsim-prep merge-motifs caller_motifs.csv rebase_ecoli.csv --output final_motifs.csv
+
+# 3. Build manifest CSV
+#    → see slurm_kinsim/manifest_example.csv
+
+# 4. Validate manifest
+kinsim-prep manifest validate manifest.csv
+
+# 5. (Optional) Filter training data
+kinsim-prep filter master_data.pkl training_data.pkl --min-coverage 50
 ```
+
+### Supported motif caller formats
+
+| Format | Parser | Auto-detected by |
+|---|---|---|
+| PacBio `motifs.csv` | `pacbio` | `motifString` + `centerPos` columns |
+| modkit bedMethyl | `modkit` | 11+ tab-separated columns |
+| ipdSummary CSV/GFF | `ipd_summary` | `score` column or `##gff-version` header |
+| Combined CSV | `combined` | `mod_type` + `frac_mod` columns |
 
 ---
 
 ## Data Formats
-
-### Manifest CSV
-
-Used by MLP and cGAN pipelines for parallel extraction on a cluster.
-
-```csv
-sample_id,bam_path,motifs
-# Lines starting with # are skipped.
-Ecoli_K12,/data/bams/Ecoli_K12.bam,"m6A,GATC,1"
-Salmonella_LT2,/data/bams/Salmonella_LT2.bam,"m6A,GATC,1;m4C,CCWGG,1"
-Klebsiella,/data/bams/Klebsiella.bam,/data/motifs/Klebsiella/motifs.csv
-Pseudomonas,/data/bams/Pseudomonas.bam,/data/rebase/Pseudomonas.txt
-```
-
-Columns:
-- **`sample_id`** — unique name; used as shard filename prefix (`<sample_id>_shard.pkl`)
-- **`bam_path`** — absolute path to a PacBio HiFi BAM with `fi`/`fp` kinetic tags
-- **`motifs`** — any supported motif source: inline string, PacBio CSV path, or REBASE file path
-
-> Motif strings containing commas must be quoted: `"m6A,GATC,1"`.
-
-Count rows for the `--array` flag:
-```bash
-N=$(tail -n +2 manifest.csv | grep -cv '^#')
-sbatch --array=1-$N kinsim_extract.slurm manifest.csv shards/ master_data.pkl
-```
-
-See `slurm_kinsim/manifest_example.csv` for a complete example.
-
----
-
-### YAML Config
-
-Supported by `kinsim train --model mlp` and `kinsim train --model cgan`.
-All parameters are optional — omit a key to use the built-in default.
-**CLI flags always override YAML values.**
-
-**`config_mlp.yaml`:**
-```yaml
-# Input / Output
-pkl:        /data/master_data.pkl
-output_dir: /data/checkpoints_mlp/
-
-# Training
-epochs:          50
-batch_size:      4096
-lr:              0.001
-loss:            gnll        # gnll | mse | huber
-val_fraction:    0.10
-checkpoint_every: 10
-
-# Architecture
-kmer_embed_dim: 64           # 32 = ~0.5 GB VRAM, 64 = ~1 GB
-hidden_dim:     128
-
-# Device
-device: cuda                 # cuda | cpu
-
-# Resume (optional)
-# resume: /data/checkpoints_mlp/checkpoint_epoch25.pt
-```
-
-**`config_cgan.yaml`:**
-```yaml
-pkl:        /data/master_data.pkl
-output_dir: /data/checkpoints_cgan/
-
-epochs:          100
-batch_size:      4096
-lr:              0.0001
-n_critic:        5
-lambda_gp:       10
-checkpoint_every: 10
-
-noise_dim:      32
-kmer_embed_dim: 64
-hidden_dim:     128
-
-device: cuda
-```
-
-See `slurm_kinsim/config_mlp_example.yaml` and `slurm_kinsim/config_cgan_example.yaml`.
-
----
 
 ### Motif String
 
 KinSim's internal format. Semicolon-delimited entries:
 
 ```
-MOD_TYPE,IUPAC_MOTIF,POS[,nDetected[,fraction]]
+MOD_TYPE,IUPAC_MOTIF,POSITION
 ```
 
-```
-m6A,GCCGATC,5,3551,0.998;m4C,CCWGG,1,922,0.92;m5C,RGATCY,4,1138,0.76
-```
+Example: `"m6A,GATC,1;m4C,CCWGG,2"`
 
-- **`MOD_TYPE`** — `m6A`, `m4C`, or `m5C`
-- **`IUPAC_MOTIF`** — supports R, Y, W, S, K, M, B, D, H, V, N
-- **`POS`** — **0-based** index of the modified base within the motif
-- **`nDetected`**, **`fraction`** — optional (from PacBio CSV)
+- **MOD_TYPE** — `m6A`, `m4C`, or `m5C`
+- **IUPAC_MOTIF** — supports all IUPAC ambiguity codes (R, Y, W, S, K, M, B, D, H, V, N)
+- **POSITION** — 0-based index of the modified base within the motif
 
-#### Auto-detected motif sources
+### Manifest CSV
 
-| Input | Detection |
-|---|---|
-| `"m6A,GATC,1"` | Inline string (not a file path) |
-| `motifs.csv` | File ending in `.csv` → PacBio CSV (filtered by `--min-fraction`) |
-| Any other path | REBASE file (format auto-detected from content) |
-| `species\|motif_string` lines | Per-species mapping file (for multi-species generate jobs) |
-
-#### REBASE formats
-
-**Simplified two-column:**
-```
-GATC    2(6)        # m6A at 1-based position 2
-CCWGG   2(5)        # m5C at position 2
+```csv
+sample_id,bam_path,motifs
+Ecoli_K12,/data/bams/Ecoli_K12.bam,"m6A,GATC,1"
+Salmonella,/data/bams/Salmonella.bam,/data/motifs/Salmonella/motifs.csv
+Bacillus,/data/bams/Bacillus.bam,/data/rebase/Bacillus.txt
 ```
 
-**Format #19 (withrefm):**
-```
-RS   GAATTC, ?;
-MS   2(6mA);
-```
+- **`sample_id`** — unique name (used as shard filename prefix)
+- **`bam_path`** — PacBio HiFi BAM with `fi`/`fp` kinetic tags
+- **`motifs`** — inline motif string, PacBio CSV path, or REBASE file path
 
-Position notation: `X(Y)` — X is 1-based, Y is `6` (m6A), `5` (m5C), or `4` (m4C).
+### YAML Config
 
-Use `kinsim parse` to inspect any motif source:
-```bash
-kinsim parse /data/Ecoli/motifs.csv
-kinsim parse /data/rebase.txt
-kinsim parse "m6A,GATC,1;m4C,CCWGG,2"
-```
+```yaml
+pkl:        /data/master_data.pkl
+output_dir: /data/checkpoints/
 
----
-
-## End-to-End Pipelines
-
-### Dictionary pipeline
-
-```bash
-# 0. Simulate reads
-sbatch --array=1-10 slurm_kinsim/pbsim3_simulate.slurm \
-    genomes/ pbsim3_output/ /path/to/QSHMM-PACBIO-CCS.model
-
-# 1. Prepare motif config (pairs file → resolved config)
-kinsim prepare pairs.txt config_strains.txt
-
-# 2. Build dictionary shards (one per BAM, parallel)
-sbatch --array=1-53 slurm_kinsim/kinsim_train.slurm \
-    config_strains.txt shards/ master_dict.pkl
-
-# 3. Merge shards
-kinsim merge shards/ master_dict.pkl
-
-# 4. Inject signals
-kinsim generate pbsim3_output/ master_dict.pkl "m6A,GATC,1" injected/ \
-    --model dictionary
-
-# 5. (Optional) Analyze dictionary coverage
-kinsim analyze master_dict.pkl
+epochs:          50
+batch_size:      4096
+lr:              0.001
+architecture:    conv         # conv | mlp
+loss:            gnll         # gnll | mse | huber
+val_fraction:    0.10
+checkpoint_every: 10
+device:          cuda
 ```
 
----
-
-### MLP pipeline
-
-```bash
-# 1. Create manifest CSV (sample_id, bam_path, motifs)
-#    → see slurm_kinsim/manifest_example.csv
-
-# 2. Extract shards (one per BAM, manifest-driven)
-N=$(tail -n +2 manifest.csv | grep -cv '^#')
-kinsim extract --manifest manifest.csv --task 1 --output-dir shards/
-# ... repeat for each task, or use SLURM (see below)
-
-# 3. Merge
-kinsim merge shards/ master_data.pkl
-
-# 4. Train
-kinsim train master_data.pkl checkpoints_mlp/ --model mlp \
-    --epochs 50 --device cuda
-# — or with YAML config:
-kinsim train --model mlp --config config_mlp.yaml
-
-# 5. Monitor
-tensorboard --logdir checkpoints_mlp/runs
-
-# 6. Generate
-kinsim generate pbsim3_output/ checkpoints_mlp/checkpoint_epoch50.pt \
-    "m6A,GATC,1" generated_mlp/ --model mlp --device cuda
-```
-
----
-
-### cGAN pipeline
-
-```bash
-# Data preparation is identical to MLP — reuse the same master_data.pkl
-
-# 1. Train
-kinsim train master_data.pkl checkpoints_cgan/ --model cgan \
-    --epochs 100 --device cuda
-# — or with YAML config:
-kinsim train --model cgan --config config_cgan.yaml
-
-# 2. Monitor
-tensorboard --logdir checkpoints_cgan/runs
-
-# 3. Generate
-kinsim generate pbsim3_output/ checkpoints_cgan/checkpoint_epoch100.pt \
-    "m6A,GATC,1" generated_cgan/ --model cgan --device cuda
-```
+See `slurm_kinsim/config_example.yaml`.
 
 ---
 
 ## SLURM (HPC Cluster)
 
-All scripts are in `slurm_kinsim/`. Use `kinsim_pipeline.sh` to submit the entire pipeline from the login node with automatic SLURM dependency chaining.
+All SLURM scripts are in `slurm_kinsim/`.
+
+### End-to-end pipeline
 
 ```bash
-bash slurm_kinsim/kinsim_pipeline.sh <mode> <manifest> <N> \
-    <shards_dir> <master_pkl> \
-    <pbsim3_dir> <motifs> <M> <output_dir> \
-    [checkpoint_dir]   # required for mlp / cgan
+# 1. Count species in manifest
+N=$(kinsim-prep manifest count manifest.csv)
+
+# 2. Extract shards (array job — one task per species)
+sbatch --array=1-$N slurm_kinsim/kinsim_extract.slurm \
+    manifest.csv shards/ master_data.pkl
+
+# 3. Train (1 GPU)
+sbatch slurm_kinsim/kinsim_train.slurm master_data.pkl checkpoints/
+
+# 4. Generate (array job — one task per species)
+M=$(ls -d pbsim3_output/*/ | wc -l)
+sbatch --array=1-$M slurm_kinsim/kinsim_generate.slurm \
+    pbsim3_output/ checkpoints/checkpoint_epoch50.pt \
+    "m6A,GATC,1" generated/
 ```
 
-| Argument | Description |
-|---|---|
-| `mode` | `dictionary`, `mlp`, or `cgan` |
-| `manifest` | Manifest CSV (mlp/cgan) or pairs file (dictionary) |
-| `N` | Array size — number of rows in manifest / pairs |
-| `shards_dir` | Intermediate `.pkl` shard directory |
-| `master_pkl` | Path for the merged output |
-| `pbsim3_dir` | PBSIM3 output directory |
-| `motifs` | Motif source for the generate step |
-| `M` | Array size for generate jobs |
-| `output_dir` | Final BAM output directory |
-| `checkpoint_dir` | Checkpoint directory (mlp / cgan only) |
+### SLURM scripts
 
-**Examples:**
-
-```bash
-# Dictionary
-bash slurm_kinsim/kinsim_pipeline.sh dictionary \
-    pairs.txt 53 \
-    shards/ master_dict.pkl \
-    pbsim3_output/ "m6A,GATC,1" 10 injected/
-
-# MLP
-bash slurm_kinsim/kinsim_pipeline.sh mlp \
-    manifest.csv 53 \
-    shards/ master_data.pkl \
-    pbsim3_output/ "m6A,GATC,1" 10 generated_mlp/ \
-    checkpoints_mlp/
-
-# cGAN
-bash slurm_kinsim/kinsim_pipeline.sh cgan \
-    manifest.csv 53 \
-    shards/ master_data.pkl \
-    pbsim3_output/ "m6A,GATC,1" 10 generated_cgan/ \
-    checkpoints_cgan/
-```
-
-**Individual scripts:**
-
-| Script | Purpose |
-|---|---|
-| `pbsim3_simulate.slurm` | PBSIM3 read simulation (array) |
-| `kinsim_extract.slurm` | Manifest-based extract + auto-merge (array) |
-| `kinsim_prepare.slurm` | Dictionary: prepare pairs file |
-| `kinsim_train.slurm` | Dictionary: build shards (array) + auto-merge |
-| `kinsim_merge.slurm` | Dictionary: merge shards (standalone) |
-| `kinsim_inject.slurm` | Dictionary: generate BAMs (array) |
-| `kinsim_analyze.slurm` | Dictionary: analyze coverage |
-| `kinsim_mlp_train.slurm` | MLP: train (1 GPU, 24 h) |
-| `kinsim_mlp_generate.slurm` | MLP: generate BAMs (array) |
-| `kinsim_cgan_train.slurm` | cGAN: train (1 GPU, 24 h) |
-| `kinsim_cgan_generate.slurm` | cGAN: generate BAMs (array) |
-
-**Monitor jobs:**
-```bash
-squeue -u $USER
-tail -f logs/kinsim_mlp_train_<jobid>.log
-tensorboard --logdir checkpoints_mlp/runs
-```
+| Script | Purpose | Resources |
+|---|---|---|
+| `kinsim_extract.slurm` | Extract shards (array) + auto-merge | 1 CPU, 16 GB |
+| `kinsim_train.slurm` | Train model | 1 GPU, 32 GB |
+| `kinsim_generate.slurm` | Generate BAMs (array) | 1 GPU, 16 GB |
+| `kinsim_evaluate.slurm` | Evaluate model | 1 CPU, 16 GB |
+| `pbsim3_simulate.slurm` | PBSIM3 read simulation (array) | 1 CPU, 8 GB |
+| `validate_*.slurm` | Validation pipeline (align, ipdSummary, pbmotifmaker) | varies |
 
 ---
 
 ## Output BAM Format
-
-All three models produce structurally identical BAM files:
 
 | Field | Value |
 |---|---|
@@ -689,7 +330,7 @@ All three models produce structurally identical BAM files:
 | `fp:B:C` | PW per base, uint8 `[0, 255]`, length = read length |
 | Header | `HD VN:1.6 SO:unknown` |
 
-> The first and last 5 bases of each read (N-context, no reference alignment) receive a default signal of `1` — not `0`, which means "no data" in PacBio convention.
+> Bases without reference context (first/last 5 positions) receive a default signal of `1` — not `0`, which means "no data" in PacBio convention.
 
 ---
 
@@ -697,74 +338,51 @@ All three models produce structurally identical BAM files:
 
 ```
 KinSim/
-├── pyproject.toml                   entry point: kinsim = "kinsim.__main__:main"
+├── pyproject.toml               entry points: kinsim + kinsim-prep
 ├── requirements.txt
 │
-├── kinsim/
-│   ├── __main__.py                  CLI router — all commands dispatched here
-│   ├── encoding.py                  11-mer bit-packing, accumulator stats
-│   ├── motifs.py                    IUPAC parsing, sequence scanning, reference meth maps
-│   ├── rebase_parser.py             REBASE → KinSim motif string
-│   ├── prepare.py                   kinsim prepare — BAM/motif validation
-│   ├── config.py                    load_manifest(), load_yaml_config(), setup_logging()
-│   │
-│   ├── common/
-│   │   ├── dataset.py               log_transform, KmerSignalDataset, MLPSignalDataset
-│   │   └── extract.py               kinsim extract (single + manifest) / kinsim merge
-│   │
-│   ├── dictionary/
-│   │   ├── train.py                 kinsim train --model dictionary
-│   │   ├── inject.py                kinsim generate --model dictionary
-│   │   └── analyze.py               kinsim analyze
-│   │
-│   └── models/
-│       ├── cgan/
-│       │   ├── model.py             Generator + Discriminator (WGAN-GP)
-│       │   ├── train.py             kinsim train --model cgan
-│       │   ├── generate.py          kinsim generate --model cgan
-│       │   └── parse_train.py       backward-compat shim → common/extract.py
-│       └── mlp/
-│           ├── model.py             MLPPredictor (Gaussian NLL head)
-│           ├── train.py             kinsim train --model mlp
-│           └── generate.py          kinsim generate --model mlp
+├── kinsim/                      ML pipeline (v0.4.0)
+│   ├── __main__.py              CLI router
+│   ├── extract.py               BAM extraction + shard merging
+│   ├── train.py                 Model training (Gaussian NLL)
+│   ├── generate.py              BAM generation with trained model
+│   ├── evaluate.py              Calibration report + plots
+│   ├── analyze.py               Training data analysis
+│   ├── sample.py                Random subsampling
+│   ├── strip_kinetics.py        Remove kinetic tags from BAM
+│   ├── data/dataset.py          MLPSignalDataset, log_transform
+│   ├── models/predictor.py      ConvPredictor + MLPPredictor
+│   └── utils/                   encoding, motifs, config, io
 │
-└── slurm_kinsim/
-    ├── kinsim_pipeline.sh           Master pipeline script (login node)
-    ├── manifest_example.csv         Example manifest CSV
-    ├── config_mlp_example.yaml      Example MLP YAML config
-    ├── config_cgan_example.yaml     Example cGAN YAML config
-    ├── pbsim3_simulate.slurm
-    ├── kinsim_extract.slurm         Extract + auto-merge (manifest, array)
-    ├── kinsim_prepare.slurm
-    ├── kinsim_train.slurm           Dictionary train + auto-merge
-    ├── kinsim_merge.slurm
-    ├── kinsim_inject.slurm
-    ├── kinsim_analyze.slurm
-    ├── kinsim_cgan_train.slurm
-    ├── kinsim_cgan_generate.slurm
-    ├── kinsim_mlp_train.slurm
-    └── kinsim_mlp_generate.slurm
+├── prep/                        Data preparation (kinsim-prep)
+│   ├── __main__.py              CLI router
+│   ├── rebase.py                REBASE fetch + parse
+│   ├── motif_merge.py           Merge + filter + dedup motifs
+│   ├── manifest.py              Manifest CSV utilities
+│   ├── filter.py                Filter .pkl
+│   ├── balance.py               Balance .pkl by methylation type
+│   └── callers/                 Motif caller parsers (plugin registry)
+│
+├── archive/                     Archived code (dictionary, cGAN)
+└── slurm_kinsim/                SLURM job scripts
 ```
 
 ---
 
 ## Requirements
 
-**Core (always required):**
-- Python ≥ 3.10
-- numpy
-- pysam
+**Core:**
+- Python >= 3.10
+- numpy, pysam
 
-**Neural models (MLP + cGAN):** `pip install -e ".[cgan]"`
-- PyTorch ≥ 2.0
-- TensorBoard
+**ML (training + generation):**
+- PyTorch >= 2.0
+- PyTorch Lightning >= 2.0
 
-**YAML config files:** `pip install -e ".[cluster]"`
-- PyYAML
-
-**External tools:**
-- [PBSIM3](https://github.com/yukiteruono/pbsim3) — synthetic read simulator
-- [EMBOSS fuzznuc](https://emboss.sourceforge.net/) — fast IUPAC motif scanner (optional; auto-fallback to Python regex)
+**Optional:**
+- Optuna (HPO), matplotlib (plots), TensorBoard (logging)
+- [EMBOSS fuzznuc](https://emboss.sourceforge.net/) — fast IUPAC motif scanning (auto-fallback to Python regex)
+- [PBSIM3](https://github.com/yukiteruono/pbsim3) — synthetic read simulation
 
 ---
 

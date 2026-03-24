@@ -1,12 +1,12 @@
-"""Filter a General Dictionary .pkl into a Training Dictionary .pkl.
+"""Filter a .pkl training file by coverage, modification type, or key count.
 
-The two-dictionary architecture:
-  1. General Dictionary  -- extract ALL kinetic data from ALL BAMs for ALL motifs.
+Filtering workflow:
+  1. Master .pkl  -- extracted from ALL BAMs for ALL motifs (kinsim extract + merge).
      No filtering. Complete reference.
-  2. Training Dictionary -- filtered subset with configurable thresholds.
+  2. Training .pkl -- filtered subset with configurable thresholds.
 
-This module provides the filtering step between General -> Training, allowing
-reproducible and adjustable filtering without re-extracting from BAMs.
+This module provides the filtering step, allowing reproducible and adjustable
+filtering without re-extracting from BAMs.
 
 Filtering criteria (all optional, combinable):
   --min-coverage   Minimum samples per (kmer, meth) key

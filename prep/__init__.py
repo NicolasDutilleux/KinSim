@@ -10,7 +10,7 @@ Modules:
     motif_merge Merge, filter, and deduplicate motifs from multiple CSV sources.
     manifest    Manifest CSV inspection CLI (count / validate / list).
     prepare     Legacy BAM + motif-source pair validation (alternating-line format).
-    filter      General Dictionary -> Training Dictionary filtering.
+    filter      Filter .pkl by coverage, mod type, or key count.
 
 CLI (kinsim-prep <subcommand>):
     kinsim-prep parse        Parse any motif source to a KinSim motif string
@@ -18,5 +18,5 @@ CLI (kinsim-prep <subcommand>):
     kinsim-prep merge-motifs Merge, filter, and deduplicate motifs
     kinsim-prep manifest     Inspect and validate manifest CSVs
     kinsim-prep prepare      Validate BAM + motif-source pairs (legacy format)
-    kinsim-prep filter       Filter a General Dictionary .pkl into a Training set
+    kinsim-prep filter       Filter a .pkl by coverage, mod type, or key count
 """
