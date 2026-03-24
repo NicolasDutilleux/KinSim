@@ -12,9 +12,8 @@
 # ============================================================
 # KinSim — Extract raw kinetic samples + merge (manifest-based, two-phase)
 #
-# Replaces the legacy kinsim_cgan_extract.slurm.
-# Uses a manifest CSV (sample_id, bam_path, motifs) instead of an
-# alternating-line config file — cleaner, self-documenting, easier to audit.
+# Uses a manifest CSV (sample_id, bam_path, motifs) — one row per species BAM.
+# Cleaner, self-documenting, easier to audit than the old alternating-line format.
 #
 # Manifest format (manifest.csv):
 #   sample_id,bam_path,motifs
@@ -54,8 +53,7 @@
 #   sbatch --array=1-$N%16 kinsim_extract.slurm manifest.csv shards/ master_data.pkl
 #
 # Output consumed by:
-#   kinsim_train.slurm     (trains the MLPPredictor)
-#   kinsim_cgan_train.slurm    (trains the Generator + Discriminator)
+#   kinsim_train.slurm     (trains the ConvPredictor / MLPPredictor)
 # ============================================================
 
 # ---- Usage check ----
@@ -161,7 +159,7 @@ else
 
     mkdir -p "$(dirname "$MASTER_OUTPUT")"
 
-    # Auto-detects *_shard.pkl (new) then *_cgan.pkl (legacy)
+    # Auto-detects *_shard.pkl files
     kinsim merge "$SHARDS_DIR" "$MASTER_OUTPUT"
     EXIT_CODE=$?
 

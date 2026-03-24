@@ -14,7 +14,7 @@
 # KinSim MLP — Train MLP predictor on merged kinetic samples
 #
 # Trains the MLPPredictor with Gaussian NLL loss on the merged .pkl produced
-# by kinsim_extract.slurm (or kinsim_cgan_extract.slurm for legacy data).
+# by kinsim_extract.slurm.
 # Requires a single GPU.  Outputs checkpoints, model_config.json, and logs.
 #
 # Usage — with positional args:

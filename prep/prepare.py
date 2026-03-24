@@ -1,4 +1,4 @@
-"""Prepare config files for KinSim pipeline (dictionary and cGAN modes).
+"""Prepare config files for KinSim pipeline.
 
 Reads a text file with alternating lines:
   - Odd lines:  absolute path to a BAM file
@@ -22,7 +22,7 @@ Field layout per semicolon-delimited entry:
 
 Fields 4 and 5 are absent for REBASE-derived entries. Downstream tools
 (train, inject, generate) only read the first 3 fields. nDetected is
-additionally used by cGAN mode for optional per-motif weighting.
+additionally kept for provenance.
 """
 
 import logging

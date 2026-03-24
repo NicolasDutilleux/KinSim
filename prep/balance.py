@@ -1,4 +1,4 @@
-"""Balance a merged training dictionary for fair representation of methylation types.
+"""Balance a merged training .pkl for fair representation of methylation types.
 
 Addresses the natural imbalance in kinetic data where unmethylated contexts
 vastly outnumber methylated ones, and where one mod type (e.g. m6A) may dwarf

@@ -13,7 +13,7 @@
 # PBSIM3 — Simulate PacBio HiFi reads from reference genomes (array job)
 #
 # Takes a directory of .fna reference genomes and creates one species
-# subdirectory per genome, ready for kinsim dictionary metagenome.
+# subdirectory per genome, ready for kinsim generate.
 #
 # Usage:
 #   sbatch --array=1-N pbsim3_simulate.slurm <genomes_dir> <output_root> <model>
@@ -41,7 +41,7 @@
 #       ...
 #
 # After PBSIM3, place motifs.csv in each species subdirectory, then run:
-#   kinsim dictionary metagenome pbsim3_output/ master_dict.pkl injected/
+#   kinsim generate pbsim3_output/ checkpoint.pt motifs output/
 #
 # Optional PBSIM3 parameters (edit below):
 #   --depth        Read depth (default: 30)
@@ -145,4 +145,4 @@ echo "  reads.fq.gz:   $(du -sh "${OUTDIR}/reads.fq.gz" | cut -f1)"
 echo "  reads.maf.gz:  $(du -sh "${OUTDIR}/reads.maf.gz" | cut -f1)"
 echo ""
 echo "  Next: place motifs.csv in ${OUTDIR}/"
-echo "  Then: kinsim dictionary metagenome ${OUTPUT_ROOT}/ master_dict.pkl injected/"
+echo "  Then: kinsim generate ${OUTPUT_ROOT}/ checkpoint.pt motifs output/"
