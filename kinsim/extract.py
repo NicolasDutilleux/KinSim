@@ -1,7 +1,7 @@
 """Extract raw IPD/PW training samples from BAM files.
 
-This is the shared data-preparation pipeline used by ALL neural KinSim modes
-(MLP, cGAN, and future models).  It has no dependency on any specific model.
+This is the data-preparation pipeline for KinSim MLP training.
+It has no dependency on the model itself.
 
 Data format
 -----------
@@ -27,7 +27,7 @@ Why raw (not log-transformed)?
     The extract/merge pipeline stores raw values so that:
       - Shards can be inspected and plotted without model knowledge
       - Different models can apply their own transforms at load time
-      - KmerSignalDataset (common/dataset.py) applies log_transform once
+      - MLPSignalDataset (data/dataset.py) applies log_transform once
 
 CLI — single-BAM mode (original interface, unchanged):
     kinsim extract reads.bam "m6A,GATC,1" shard.pkl
@@ -451,8 +451,8 @@ def merge_shards(
     """Merge multiple shard pickle files into one master training set.
 
     Looks for shard files in input_dir using the following precedence:
-      1. ``*_shard.pkl`` (new convention, produced by ``kinsim extract --manifest``)
-      2. ``*_cgan.pkl``  (legacy naming, produced by ``kinsim cgan extract``)
+      1. ``*_shard.pkl`` (produced by ``kinsim extract --manifest``)
+      2. ``*_cgan.pkl``  (legacy naming, kept for backward compat)
 
     Override with ``glob_pattern`` to use a custom pattern.
 
@@ -630,9 +630,8 @@ def main(argv=None) -> None:
         description=(
             "Extract raw (IPD, PW) training samples from BAM files, or merge\n"
             "multiple shards into a master training set.\n\n"
-            "The output is consumed by BOTH:\n"
-            "  kinsim train --model mlp   master_data.pkl  checkpoints_mlp/\n"
-            "  kinsim train --model cgan  master_data.pkl  checkpoints_cgan/\n\n"
+            "The output is consumed by:\n"
+            "  kinsim train --model mlp  master_data.pkl  checkpoints_mlp/\n\n"
             "Single-BAM extract (simple/testing):\n"
             "  kinsim extract reads.bam \"m6A,GATC,1\" shard.pkl\n\n"
             "Manifest-based extract (recommended for SLURM array jobs):\n"
@@ -705,10 +704,10 @@ def main(argv=None) -> None:
     # -- merge subcommand --
     p_merge = sub.add_parser(
         "merge",
-        help="Merge multiple *_shard.pkl (or *_cgan.pkl) shards into one master",
+        help="Merge multiple *_shard.pkl shards into one master",
         description=(
             "Concatenate raw sample arrays from all shards in a directory.\n"
-            "Automatically detects *_shard.pkl (new) or *_cgan.pkl (legacy).\n"
+            "Detects *_shard.pkl files (also supports legacy *_cgan.pkl naming).\n"
             "Subsamples per key if total exceeds --max-samples."
         ),
     )

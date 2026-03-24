@@ -1,7 +1,6 @@
 """Generate kinetic signals for PBSIM3 reads using a trained MLP predictor.
 
-Mirrors cgan/generate.py but replaces the GAN Generator with MLPPredictor.
-The key difference: no noise vector — the model predicts (μ, σ) per context,
+The model predicts (μ, σ) per context,
 then either samples from N(μ, σ²) (stochastic, default) or returns μ directly
 (deterministic, via --deterministic flag).
 
@@ -24,8 +23,8 @@ fuzznuc as the primary backend (falls back to Python regex automatically if
 fuzznuc is not installed).  Results are cached in O(1)-lookup arrays,
 avoiding repeated per-read scanning.
 
-Output BAMs use the suffix _mlp.bam and are structurally identical to cGAN
-output: unaligned BAM (flag=4) with all four PacBio kinetic tags:
+Output BAMs use the suffix _mlp.bam: unaligned BAM (flag=4) with all four
+PacBio kinetic tags:
   fi:B:C  — forward strand IPD (polymerase on template strand)
   fp:B:C  — forward strand PW
   ri:B:C  — reverse strand IPD (polymerase on complementary strand)
@@ -846,10 +845,10 @@ def _main_per_genome(argv):
             "Uses the .maf alignment to resolve reference context for edge bases.\n"
             "The reference is pre-scanned once for methylation sites; per-read\n"
             "lookups are O(1). Outputs an unaligned BAM with fi (IPD) and fp (PW) tags.\n\n"
-            "Data preparation (same pipeline as cGAN):\n"
-            "  kinsim cgan extract reads.bam motifs shard.pkl\n"
-            "  kinsim cgan merge   shards/    master_data.pkl\n"
-            "  kinsim mlp  train   master_data.pkl checkpoints_mlp/"
+            "Data preparation:\n"
+            "  kinsim extract reads.bam motifs shard.pkl\n"
+            "  kinsim merge   shards/    master_data.pkl\n"
+            "  kinsim train --model mlp  master_data.pkl checkpoints_mlp/"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

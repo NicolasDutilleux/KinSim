@@ -81,8 +81,8 @@ def parse_motifs(motif_string, revcomp=True):
     """Parse a motif string and compile regex for forward + reverse complement.
 
     IN-MEMORY REGEX BACKEND — used for per-read scanning during BAM training
-    (dictionary/train.py, cgan/parse_train.py) and unmapped-read fallback in
-    inject/generate.  This function must remain regex-based because fuzznuc
+    and unmapped-read fallback in generate.  This function must remain
+    regex-based because fuzznuc
     subprocess calls per read are prohibitively slow.
 
     For reference-level scanning (done once per genome), use
@@ -130,8 +130,7 @@ def scan_sequence(seq, motifs):
     """Scan a DNA sequence for methylation motifs (in-memory regex backend).
 
     IN-MEMORY REGEX BACKEND — called per read during BAM training loops
-    (dictionary/train.py, cgan/parse_train.py) and as a fallback for unmapped
-    reads during injection (dictionary/inject.py, cgan/generate.py).
+    and as a fallback for unmapped reads during generation.
 
     For reference-level scanning (done once per genome), use
     build_reference_meth_map() which delegates to EMBOSS fuzznuc as the

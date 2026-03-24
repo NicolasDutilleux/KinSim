@@ -40,7 +40,7 @@ saved model_config.json.
 import torch
 import torch.nn as nn
 
-# Reuse log-space transforms from common — shared with cGAN.
+# Log-space transforms for training/inference signal conversion.
 from ..data.dataset import log_transform, inv_log_transform  # noqa: F401
 from ..utils.encoding import K as _DEFAULT_K, kmer_mask
 
