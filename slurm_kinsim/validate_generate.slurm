@@ -16,6 +16,6 @@ kinsim generate \
     /data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036/final_assembly.fasta \
     /data/projects/p774_MARSD/NDutilleux/training/checkpoints_binary/checkpoint_epoch50.pt \
     /data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036/motifs.csv \
-    /data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation/bc2036_generated_v2.bam \
+    /data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation/bc2036_generated_v3.bam \
     --batch-reads 100 \
     --deterministic
