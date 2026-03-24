@@ -9,7 +9,7 @@ A single merged .pkl file produced by the shared data pipeline:
 
 The .pkl maps (kmer_id: int, meth_id: int) → np.ndarray(N, 2) where columns
 are [IPD, PW] in raw uint8 space [0, 255] as read from BAM fi/fp tags.
-There is no separate extraction step for MLP — it reuses the cGAN pipeline.
+There is no separate extraction step — use kinsim extract + kinsim merge.
 
 Loss function
 -------------
@@ -927,7 +927,7 @@ def main(argv: list[str] | None = None) -> None:
             "  kinsim extract reads.bam motifs shard.pkl   # repeat per BAM\n"
             "  kinsim merge   shards/    master_data.pkl   # combine all shards\n\n"
             "The .pkl maps (kmer_id, meth_id) -> np.ndarray(N, 2) [IPD, PW].\n"
-            "MLP and cGAN share the same data pipeline — no separate extraction.\n\n"
+            "Use kinsim extract + kinsim merge to prepare the training data.\n\n"
             "All flags may be specified in a YAML config file (--config).\n"
             "Command-line flags override YAML values.\n\n"
             "Optuna HPO:\n"

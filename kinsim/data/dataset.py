@@ -1,7 +1,6 @@
-"""Shared dataset utilities for all neural KinSim modes (MLP, cGAN).
+"""Dataset and signal-space transforms for KinSim MLP training.
 
-Every neural mode operates on the same training data format produced by
-`kinsim extract` and `kinsim merge`:
+Training data format (produced by ``kinsim extract`` / ``kinsim merge``):
 
     dict[(kmer_id: int, meth_id: int)] -> np.ndarray(N, 3)
     columns: [IPD, PW, fraction]
@@ -13,28 +12,31 @@ without an explicit fraction, the value is 1.0 (fully methylated); for
 unmethylated positions (meth_id = 0) the fraction is 0.0.
 
 Backward compatibility: older .pkl files may have only 2 columns [IPD, PW].
-Both dataset classes detect this and default the fraction to 1.0 for
+The dataset class detects this and defaults the fraction to 1.0 for
 methylated keys (meth_id > 0) and 0.0 for unmethylated keys (meth_id == 0).
 
 This module provides:
 
   log_transform(x)     — map raw signals [0, 255] → log1p space for training
   inv_log_transform(x) — inverse: log1p → raw uint8 [0, 255]
-  KmerSignalDataset    — cGAN dataset: flattens all samples into flat tensors,
-                         returns (kmer_id, meth_id, log_signal) triples
   MLPSignalDataset     — MLP dataset: random-shot sampling with dynamic capping,
                          returns (kmer_id, meth_probs, log_signal) triples
 
-All models (Generator, MLPPredictor) operate in log1p space during training
-and call inv_log_transform at inference time to recover uint8 BAM values.
+The model operates in log1p space during training and calls
+inv_log_transform at inference time to recover uint8 BAM values.
 """
 
+from __future__ import annotations
+
+import logging
 import pickle
 from collections import defaultdict
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -69,62 +71,7 @@ def inv_log_transform(x: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# PyTorch Dataset — cGAN (flat, integer meth_id)
-# ---------------------------------------------------------------------------
-
-class KmerSignalDataset(Dataset):
-    """Dataset of raw (IPD, PW) samples keyed by (kmer_id, meth_id).
-
-    Loads the output of `kinsim data merge` and flattens it into flat
-    tensors for efficient mini-batch sampling.  Signals are log-transformed
-    once at load time so the transform is not repeated each epoch.
-
-    Handles both 2-column [IPD, PW] and 3-column [IPD, PW, fraction] data
-    transparently (the fraction column is ignored — cGAN uses integer meth_id).
-
-    Args:
-        pkl_path: Path to the merged .pkl file produced by `kinsim data merge`.
-                  Structure: dict[(kmer_id, meth_id)] -> np.ndarray(N, 2 or 3).
-    """
-
-    def __init__(self, pkl_path: str) -> None:
-        print(f"Loading training data from {pkl_path}...")
-        with open(pkl_path, "rb") as f:
-            data_dict = pickle.load(f)
-
-        kmer_ids: list = []
-        meth_ids: list = []
-        signals:  list = []
-
-        for key, samples in data_dict.items():
-            # Skip the provenance metadata key (string, not a tuple)
-            if not isinstance(key, tuple):
-                continue
-            kmer_id, meth_id = key
-            n = len(samples)
-            kmer_ids.extend([kmer_id] * n)
-            meth_ids.extend([meth_id] * n)
-            # Use only [IPD, PW] columns (ignore fraction if present)
-            signals.append(samples[:, :2])
-
-        self.kmer_ids = torch.tensor(kmer_ids, dtype=torch.long)
-        self.meth_ids = torch.tensor(meth_ids, dtype=torch.long)
-        self.signals  = log_transform(
-            torch.from_numpy(np.concatenate(signals, axis=0)).float()
-        )
-
-        print(f"Dataset loaded: {len(self):,} samples, "
-              f"{len(data_dict):,} unique (kmer, meth) contexts")
-
-    def __len__(self) -> int:
-        return len(self.kmer_ids)
-
-    def __getitem__(self, idx: int):
-        return self.kmer_ids[idx], self.meth_ids[idx], self.signals[idx]
-
-
-# ---------------------------------------------------------------------------
-# MLP-specific dataset (random-shot, dynamic capping, stoichiometric fractions)
+# PyTorch Dataset — MLP (random-shot, dynamic capping, stoichiometric fractions)
 # ---------------------------------------------------------------------------
 
 class MLPSignalDataset(Dataset):
@@ -165,7 +112,7 @@ class MLPSignalDataset(Dataset):
         max_meth:   int = 100,
         num_meth_types: int = 4,
     ) -> None:
-        print(f"Loading training data from {pkl_path}...")
+        log.info("Loading training data from %s ...", pkl_path)
         with open(pkl_path, "rb") as f:
             data_dict = pickle.load(f)
 
@@ -202,8 +149,8 @@ class MLPSignalDataset(Dataset):
         n_cols = first_val.shape[1]
         has_fraction = n_cols >= 3
         if not has_fraction:
-            print("  NOTE: .pkl has 2-column data (legacy format, no fraction). "
-                  "Defaulting fraction=1.0 for methylated, 0.0 for unmethylated.")
+            log.info("  .pkl has 2-column data (legacy format, no fraction). "
+                     "Defaulting fraction=1.0 for methylated, 0.0 for unmethylated.")
         # ──────────────────────────────────────────────────────────────────────
 
         self._num_meth_types = num_meth_types
@@ -257,13 +204,15 @@ class MLPSignalDataset(Dataset):
             for m in sorted(n_meth_counts)
             if n_meth_counts[m] > 0
         )
-        print(
-            f"MLPSignalDataset ready: {n_keys:,} unique (kmer, meth) keys "
-            f"[{meth_summary}]\n"
-            f"  Total capped samples: {n_total:,}  "
-            f"({n_subsampled:,} keys subsampled to cap, "
-            f"caps: unmeth={max_unmeth}, meth={max_meth})\n"
-            f"  Fraction column: {'from .pkl (stoichiometric)' if has_fraction else 'synthesised (legacy compat)'}"
+        log.info(
+            "MLPSignalDataset ready: %s unique (kmer, meth) keys [%s]\n"
+            "  Total capped samples: %s  "
+            "(%s keys subsampled to cap, "
+            "caps: unmeth=%d, meth=%d)\n"
+            "  Fraction column: %s",
+            f"{n_keys:,}", meth_summary, f"{n_total:,}",
+            f"{n_subsampled:,}", max_unmeth, max_meth,
+            "from .pkl (stoichiometric)" if has_fraction else "synthesised (legacy compat)",
         )
 
     def __len__(self) -> int:

@@ -1,17 +1,10 @@
-"""Comprehensive analysis of a KinSim dictionary or shard (.pkl).
+"""Comprehensive analysis of a KinSim training .pkl file.
 
-Supports both formats produced by the pipeline:
+Data format (produced by ``kinsim extract`` / ``kinsim merge``):
 
-  Raw-sample format  (new default):
     {(kmer_id, meth_id): np.ndarray(N, 2 or 3)}  columns: [IPD, PW, fraction?]
-    → produced by  kinsim extract  /  kinsim merge  /  kinsim-prep balance
-
-  Accumulator format  (legacy):
-    {(kmer_id, meth_id): np.ndarray(5,)}  fields: [n, Σipd, Σipd², Σpw, Σpw²]
-    → produced by the archived dictionary train command
 
 Auto-detects:
-  - File format          (raw-sample vs accumulator)
   - K-mer size           (from __meta__["kmer_size"] or inferred from key range)
   - Methylation types    (whatever is present in the file — no hardcoded list)
 
@@ -22,7 +15,7 @@ Generates:
 Analysis sections:
   1. Overview            — file size, format, kmer size, key/sample counts
   2. Per-type coverage   — unique kmers, %, sample count distributions,
-                           methylation fraction distributions
+                           methylation fraction distributions (incl. breakdown)
   3. Signal statistics   — IPD/PW mean and sigma per meth type
   4. Low-coverage keys   — keys with n < 5 / 10 / 50 samples
   5. Neighbor sensitivity — how a single base change in the k-mer context
@@ -31,7 +24,6 @@ Analysis sections:
 CLI usage:
     kinsim analyze bc2033_shard.pkl
     kinsim analyze master_data.pkl --output-dir reports/ --no-html
-    kinsim analyze balanced.pkl --max-neighbor-entries 500000
 """
 
 from __future__ import annotations
@@ -102,7 +94,6 @@ class MethGroupStats:
 class DictStats:
     """All statistics collected from one .pkl file."""
     pkl_path: str
-    fmt: str                      # 'samples' or 'accumulator'
     kmer_size: int
     total_possible_kmers: int     # 4 ** kmer_size
     total_entries: int
@@ -123,19 +114,8 @@ class NeighborSensitivity:
 
 
 # ---------------------------------------------------------------------------
-# Format and kmer-size auto-detection
+# K-mer size auto-detection
 # ---------------------------------------------------------------------------
-
-def _detect_format(data: dict) -> str:
-    """Return 'samples' for raw-sample arrays or 'accumulator' for legacy format."""
-    for k, v in data.items():
-        if isinstance(k, tuple) and isinstance(v, np.ndarray):
-            if v.ndim == 2:
-                return 'samples'
-            if v.ndim == 1 and len(v) >= 3:
-                return 'accumulator'
-    return 'samples'
-
 
 def _detect_kmer_size(data: dict, meta: dict) -> int:
     """Infer kmer size from __meta__ or from the range of kmer_ids in the data."""
@@ -169,18 +149,6 @@ def _key_stats_samples(arr: np.ndarray):
     return n, mu_ipd, sig_ipd, mu_pw, sig_pw, frac
 
 
-def _key_stats_accumulator(acc: np.ndarray):
-    """Extract (n, mu_ipd, sig_ipd, mu_pw, sig_pw, frac) from an accumulator."""
-    n = int(acc[0])
-    if n < 1:
-        return 0, 1.0, 0.1, 1.0, 0.1, float('nan')
-    mu_ipd  = float(acc[1] / n)
-    var_ipd = max(0.0, float(acc[2] / n) - mu_ipd ** 2)
-    mu_pw   = float(acc[3] / n)
-    var_pw  = max(0.0, float(acc[4] / n) - mu_pw ** 2)
-    return n, mu_ipd, float(np.sqrt(var_ipd)), mu_pw, float(np.sqrt(var_pw)), float('nan')
-
-
 # ---------------------------------------------------------------------------
 # Stats collection (single pass)
 # ---------------------------------------------------------------------------
@@ -191,11 +159,8 @@ def collect_stats(data: dict, pkl_path: str) -> DictStats:
     if not isinstance(meta, dict):
         meta = {}
 
-    fmt       = _detect_format(data)
     kmer_size = _detect_kmer_size(data, meta)
     total_possible = 4 ** kmer_size
-
-    extractor = _key_stats_samples if fmt == 'samples' else _key_stats_accumulator
 
     # Group items by meth_id
     partitions: dict[int, list] = {}
@@ -221,7 +186,7 @@ def collect_stats(data: dict, pkl_path: str) -> DictStats:
         kmer_ids       = np.empty(n, dtype=np.int64)
 
         for i, (kmer_id, arr) in enumerate(items):
-            cnt, mu_ipd, sig_ipd, mu_pw, sig_pw, frac = extractor(arr)
+            cnt, mu_ipd, sig_ipd, mu_pw, sig_pw, frac = _key_stats_samples(arr)
             sample_counts[i]  = cnt
             ipd_means[i]      = mu_ipd
             ipd_sigmas[i]     = sig_ipd
@@ -249,7 +214,6 @@ def collect_stats(data: dict, pkl_path: str) -> DictStats:
 
     return DictStats(
         pkl_path=pkl_path,
-        fmt=fmt,
         kmer_size=kmer_size,
         total_possible_kmers=total_possible,
         total_entries=n_data_keys,
@@ -279,20 +243,13 @@ def compute_neighbor_sensitivity(
     """
     rng = np.random.default_rng(42)
     K   = stats.kmer_size
-    fmt = stats.fmt
 
     # Build fast mean lookup: (kmer_id, meth_id) -> (mu_ipd, mu_pw)
     mean_lookup: dict = {}
     for k, v in data.items():
         if not (isinstance(k, tuple) and len(k) == 2 and isinstance(v, np.ndarray)):
             continue
-        if fmt == 'samples':
-            mean_lookup[k] = (float(np.mean(v[:, 0])), float(np.mean(v[:, 1])))
-        else:
-            n = int(v[0])
-            if n < 1:
-                continue
-            mean_lookup[k] = (float(v[1] / n), float(v[3] / n))
+        mean_lookup[k] = (float(np.mean(v[:, 0])), float(np.mean(v[:, 1])))
 
     categories = [
         ('unmethylated', [0]),
@@ -375,10 +332,10 @@ def render_txt_report(stats: DictStats, sensitivity: dict, output_path: str) -> 
 
     # ── 1. Overview ──────────────────────────────────────────────────────
     p('=' * W)
-    p('KinSim  —  Dictionary / Shard Analysis Report')
+    p('KinSim  —  Training Data Analysis Report')
     p('=' * W)
     p(f"File          : {stats.pkl_path}")
-    p(f"Format        : {stats.fmt}  (kmer_size = {K})")
+    p(f"K-mer size    : {K}  (4^{K} = {stats.total_possible_kmers:,} possible)")
     p(f"File size     : {stats.file_size_mb:.1f} MB")
     p(f"Total keys    : {stats.total_entries:,}")
     p(f"Total samples : {stats.total_samples:,}")
@@ -418,6 +375,14 @@ def render_txt_report(stats: DictStats, sensitivity: dict, output_path: str) -> 
                   f' mean={np.mean(valid):.3f}  median={np.median(valid):.3f}'
                   f'  p5={np.percentile(valid, 5):.3f}'
                   f'  p95={np.percentile(valid, 95):.3f}')
+                # Fraction breakdown: how many keys at 100%, 0%, in-between
+                n_full   = int(np.sum(valid >= 0.999))
+                n_zero   = int(np.sum(valid <= 0.001))
+                n_mixed  = len(valid) - n_full - n_zero
+                p(f'    Fraction split  :'
+                  f' frac=1.0: {n_full:,} ({_pct(n_full, len(valid))})'
+                  f'  frac=0.0: {n_zero:,} ({_pct(n_zero, len(valid))})'
+                  f'  mixed: {n_mixed:,} ({_pct(n_mixed, len(valid))})')
     p()
 
     # ── 3. Signal statistics ──────────────────────────────────────────────
@@ -785,7 +750,7 @@ def render_html_report(
         f'{lbl(m)}: {stats.groups[m].n_entries:,}' for m in meth_ids_sorted
     )
     cards = [
-        ('Format',         f'{stats.fmt} / K={K}'),
+        ('K-mer size',     f'K={K}'),
         ('Total keys',     f'{stats.total_entries:,}'),
         ('Total samples',  f'{stats.total_samples:,}'),
         ('Coverage',       _pct(stats.total_entries, stats.total_possible_kmers)),
@@ -832,7 +797,7 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
 </style></head><body>
 <div class="page">
 <div class="header">
-  <h1>KinSim Dictionary / Shard Analysis</h1>
+  <h1>KinSim Training Data Analysis</h1>
   <p>{Path(stats.pkl_path).name}</p>
   <p style="margin-top:6px;opacity:.65">{meth_summary}</p>
 </div>
@@ -900,8 +865,8 @@ def analyze_pkl(
     log.info("Collecting statistics...")
     stats = collect_stats(data, pkl_path)
     log.info(
-        "Format: %s  kmer_size: %d  keys: %d  samples: %d  types: %s",
-        stats.fmt, stats.kmer_size,
+        "kmer_size: %d  keys: %d  samples: %d  types: %s",
+        stats.kmer_size,
         stats.total_entries, stats.total_samples,
         [stats.groups[m].name for m in sorted(stats.groups)],
     )
@@ -944,12 +909,12 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
         prog='kinsim analyze',
         description=(
-            'Comprehensive analysis of a KinSim dictionary or shard (.pkl).\n\n'
-            'Auto-detects format (raw-sample or legacy accumulator), kmer size,\n'
-            'and all methylation types present.  Works on:\n'
+            'Comprehensive analysis of a KinSim training .pkl file.\n\n'
+            'Auto-detects kmer size and all methylation types present.\n'
+            'Works on:\n'
             '  · kinsim extract shards  (*_shard.pkl)\n'
             '  · kinsim merge output    (master_data.pkl)\n'
-            '  · kinsim-prep balance output  (balanced.pkl)\n\n'
+            '  · kinsim-prep filter output  (training_data.pkl)\n\n'
             'Outputs:\n'
             '  <basename>_report.txt   — text report (stdout + file)\n'
             '  <basename>_report.html  — interactive Plotly charts\n'
