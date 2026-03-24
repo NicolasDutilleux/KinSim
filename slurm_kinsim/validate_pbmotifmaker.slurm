@@ -37,10 +37,7 @@ fi
 # Run pbmotifmaker with 'find' subcommand
 apptainer exec --bind /data \
     /containers/apptainer/pacbio-smrt-tools-25.1.sif \
-    pbmotifmaker find \
-        -g "$GFF" \
-        -f "$REF" \
-        -o "$OUT"
+    pbmotifmaker find "$REF" "$GFF" "$OUT"
 
 RC=$?
 echo "pbmotifmaker exit code: $RC"
