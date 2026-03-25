@@ -342,7 +342,7 @@ def _process_batch(
     batch, ref_seqs, maf_mapping, meth_map, frac_map, frac_lookup,
     fallback_motifs,
     model, device, deterministic, circular, bam_out, header,
-    use_ip_tags=False,
+
 ):
     """Process a batch of reads with batched MLP inference.
 
@@ -512,17 +512,10 @@ def _process_batch(
         seg.query_qualities = pysam.qualitystring_to_array(read_data["qual"])
         rg_id = header.to_dict().get("RG", [{}])[0].get("ID", "00000001")
         seg.set_tag("RG", rg_id)
-        if use_ip_tags:
-            # Aligned-BAM mode: write ip/pw so pbcore/ipdSummary can find them.
-            # fi values (forward-strand IPD) are used as ip; pbmm2 does not
-            # convert fi→ip automatically, so we write ip directly.
-            seg.set_tag("ip", array.array("B", ipd_vals.tolist()))
-            seg.set_tag("pw", array.array("B", pw_vals.tolist()))
-        else:
-            seg.set_tag("fi", array.array("B", ipd_vals.tolist()))
-            seg.set_tag("fp", array.array("B", pw_vals.tolist()))
-            seg.set_tag("ri", array.array("B", ri_vals.tolist()))
-            seg.set_tag("rp", array.array("B", rp_vals.tolist()))
+        seg.set_tag("fi", array.array("B", ipd_vals.tolist()))
+        seg.set_tag("fp", array.array("B", pw_vals.tolist()))
+        seg.set_tag("ri", array.array("B", ri_vals.tolist()))
+        seg.set_tag("rp", array.array("B", rp_vals.tolist()))
         bam_out.write(seg)
 
     return n_mapped, n_unmapped
@@ -675,7 +668,7 @@ def generate_from_bam(
                     batch, ref_seqs, batch_maf, meth_map, frac_map,
                     frac_lookup, fallback_motifs, model, device_obj,
                     deterministic,
-                    circular, bam_out, header_out, use_ip_tags=True,
+                    circular, bam_out, header_out,
                 )
                 n_mapped   += n_m
                 n_unmapped += n_u
@@ -689,7 +682,7 @@ def generate_from_bam(
                 batch, ref_seqs, batch_maf, meth_map, frac_map,
                 frac_lookup, fallback_motifs, model, device_obj,
                 deterministic,
-                circular, bam_out, header_out, use_ip_tags=True,
+                circular, bam_out, header_out,
             )
             n_mapped   += n_m
             n_unmapped += n_u
