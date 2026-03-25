@@ -632,9 +632,20 @@ def generate_from_bam(
 
     log.info("Reading reads from: %s", input_bam)
 
+    # Build a clean unaligned header (no SQ entries) so pbmm2 treats
+    # the output as unaligned and properly converts fi/fp/ri/rp → ip/pw.
+    with pysam.AlignmentFile(input_bam, "rb", check_sq=False) as bam_in:
+        in_dict = bam_in.header.to_dict()
+        out_dict = {"HD": {"VN": "1.6", "SO": "unknown"}}
+        if "RG" in in_dict:
+            out_dict["RG"] = in_dict["RG"]
+        else:
+            out_dict["RG"] = [{"ID": "00000001", "PL": "PACBIO",
+                               "DS": "READTYPE=CCS"}]
+        header_out = pysam.AlignmentHeader.from_dict(out_dict)
+
     with pysam.AlignmentFile(input_bam, "rb", check_sq=False) as bam_in, \
-         pysam.AlignmentFile(output_bam, "wb", header=bam_in.header) as bam_out:
-        header_out = bam_in.header
+         pysam.AlignmentFile(output_bam, "wb", header=header_out) as bam_out:
 
         for read in bam_in:
             if read.query_sequence is None:
