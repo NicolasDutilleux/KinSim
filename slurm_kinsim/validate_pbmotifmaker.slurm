@@ -12,8 +12,8 @@
 
 VALDIR=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_validation
 REF=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036/final_assembly.fasta
-GFF=${VALDIR}/bc2036_generated_v3_ipdSummary.gff
-OUT=${VALDIR}/bc2036_generated_v3_motifs.csv
+GFF=${VALDIR}/bc2036_generated_v4_ipdSummary.gff
+OUT=${VALDIR}/bc2036_generated_v4_motifs.csv
 
 echo "=== pbmotifmaker validation ==="
 echo "GFF: $GFF"
