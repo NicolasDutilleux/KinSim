@@ -4,7 +4,7 @@
 #SBATCH --mem=16G
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
-#SBATCH --time=01:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/validate_pbmotifmaker_%J.log
 
 # Run pbmotifmaker on ipdSummary GFF to recover motifs from simulated data.
