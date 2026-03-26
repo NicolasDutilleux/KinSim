@@ -123,6 +123,12 @@ def generate_signals_batch(
 ) -> np.ndarray:
     """Generate IPD/PW signals for a batch of contexts using MLPPredictor.
 
+    Each position is assigned a **binary** methylation state: for a position
+    with meth_id > 0 and fraction F, a random coin-flip (Bernoulli(F)) decides
+    whether this specific read is methylated or not.  This matches the training
+    data where every sample is either 100% methylated or 100% unmethylated,
+    and reproduces population-level heterogeneity across reads.
+
     Args:
         model:         Trained MLPPredictor in eval mode.
         kmer_ids:      List of kmer integer IDs (22-bit encoded 11-mers).
@@ -139,10 +145,26 @@ def generate_signals_batch(
     N = len(kmer_ids)
     CHUNK = 50_000  # positions per GPU forward pass — prevents OOM on long reads
 
+    # Binarize fractions: for each methylated position, coin-flip whether
+    # this read is methylated (frac=1.0) or unmethylated (meth_id=0, frac=0.0).
+    meth_ids_bin  = np.array(meth_ids,  dtype=np.int64)
+    fractions_bin = np.array(fractions, dtype=np.float32)
+    partial_mask  = (meth_ids_bin > 0) & (fractions_bin < 1.0)
+    if partial_mask.any():
+        coins = np.random.random(partial_mask.sum())
+        thresholds = fractions_bin[partial_mask]
+        is_meth = coins < thresholds
+        # Positions where coin says methylated → frac=1.0
+        idx = np.where(partial_mask)[0]
+        fractions_bin[idx[is_meth]]  = 1.0
+        # Positions where coin says unmethylated → meth_id=0, frac=0.0
+        fractions_bin[idx[~is_meth]] = 0.0
+        meth_ids_bin[idx[~is_meth]]  = 0
+
     if N <= CHUNK:
-        kmer_tensor = torch.tensor(kmer_ids, dtype=torch.long, device=device)
-        meth_ids_t  = torch.tensor(meth_ids,   dtype=torch.long,  device=device)
-        fractions_t = torch.tensor(fractions,   dtype=torch.float, device=device)
+        kmer_tensor = torch.tensor(kmer_ids,      dtype=torch.long, device=device)
+        meth_ids_t  = torch.tensor(meth_ids_bin,   dtype=torch.long,  device=device)
+        fractions_t = torch.tensor(fractions_bin,   dtype=torch.float, device=device)
         meth_probs  = torch.zeros(N, 4, device=device)
         meth_probs.scatter_(1, meth_ids_t.unsqueeze(1), fractions_t.unsqueeze(1))
         if deterministic:
@@ -154,9 +176,9 @@ def generate_signals_batch(
     chunks = []
     for start in range(0, N, CHUNK):
         end = min(start + CHUNK, N)
-        k_t = torch.tensor(kmer_ids[start:end], dtype=torch.long, device=device)
-        m_t = torch.tensor(meth_ids[start:end], dtype=torch.long, device=device)
-        f_t = torch.tensor(fractions[start:end], dtype=torch.float, device=device)
+        k_t = torch.tensor(kmer_ids[start:end],      dtype=torch.long, device=device)
+        m_t = torch.tensor(meth_ids_bin[start:end],   dtype=torch.long, device=device)
+        f_t = torch.tensor(fractions_bin[start:end],   dtype=torch.float, device=device)
         mp  = torch.zeros(end - start, 4, device=device)
         mp.scatter_(1, m_t.unsqueeze(1), f_t.unsqueeze(1))
         if deterministic:
