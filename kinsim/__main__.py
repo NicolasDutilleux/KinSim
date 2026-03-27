@@ -12,7 +12,7 @@ __version__ = "0.4.0"
 
 COMMANDS = [
     "extract", "merge", "train", "generate", "evaluate", "analyze",
-    "strip-kinetics",
+    "sample", "strip-kinetics",
 ]
 
 USAGE = """\
@@ -27,6 +27,7 @@ Commands:
   generate         Generate synthetic kinetic signals for PBSIM3 reads
   evaluate         Evaluate a trained model (calibration report + plots)
   analyze          Analyse a .pkl shard or dictionary (coverage, signals, sensitivity)
+  sample           Subsample a .pkl for train/test splits
   strip-kinetics   Copy a BAM and remove fi/fp/ri/rp tags from the copy
 
 Data preparation:
@@ -95,6 +96,11 @@ def main(argv=None):
     # -- analyze --
     elif cmd == "analyze":
         from .analyze import main as run
+        run(rest)
+
+    # -- sample --
+    elif cmd == "sample":
+        from .sample import main as run
         run(rest)
 
     # -- strip-kinetics --
