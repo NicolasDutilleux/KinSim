@@ -1,0 +1,89 @@
+#!/bin/bash
+#SBATCH --job-name=msa_ipd
+#SBATCH --partition=pibu_el8
+#SBATCH --account=p774
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=12:00:00
+#SBATCH --output=/data/projects/p774_MARSD/NDutilleux/training/PB_MOCK/logs/01_ipdsummary_%j.log
+#SBATCH --error=/data/projects/p774_MARSD/NDutilleux/training/PB_MOCK/logs/01_ipdsummary_%j.err
+
+# STEP 01: ipdSummary per species on aligned BAMs
+# Uses apptainer pacbio-smrt-tools for ipdSummary + pbindex
+# Chemistry: Revio R/P1-C1/5.0-25M (auto-detected from BAM header)
+
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate kinsim_env
+
+OUTDIR="/data/projects/p774_MARSD/NDutilleux/training/PB_MOCK/species_aligned"
+REF="/data/projects/p774_MARSD/NDutilleux/training/PB_MOCK/Genomes/MSA1003_competitive_ref.fasta"
+SMRT_SIF="/containers/apptainer/pacbio-smrt-tools-25.1.sif"
+
+echo "========================================"
+echo "=== STEP 01: ipdSummary PER SPECIES ==="
+echo "=== $(date) ==="
+echo "========================================"
+echo ""
+
+TOTAL_OK=0
+TOTAL_FAIL=0
+TOTAL_SKIP=0
+
+for SPECIES_DIR in "${OUTDIR}"/*/; do
+    [ -d "$SPECIES_DIR" ] || continue
+    CONTIG=$(basename "$SPECIES_DIR")
+    BAM="${SPECIES_DIR}/${CONTIG}.bam"
+    CSV="${SPECIES_DIR}/${CONTIG}_ipdSummary.csv"
+    GFF="${SPECIES_DIR}/${CONTIG}_ipdSummary.gff"
+
+    [ -f "$BAM" ] || continue
+
+    # Skip if already done
+    if [ -f "$GFF" ] && [ -s "$GFF" ]; then
+        echo "SKIP $CONTIG: ipdSummary already done"
+        TOTAL_SKIP=$((TOTAL_SKIP+1))
+        continue
+    fi
+
+    READS=$(samtools view -c "$BAM")
+    echo "========================================"
+    echo "=== $CONTIG ($READS reads) ==="
+    echo "=== $(date +%H:%M:%S) ==="
+
+    # pbindex the BAM (required by ipdSummary)
+    if [ ! -f "${BAM}.pbi" ]; then
+        echo "  Creating .pbi index..."
+        apptainer exec --bind /data "$SMRT_SIF" pbindex "$BAM"
+    fi
+
+    # Run ipdSummary
+    echo "  Running ipdSummary..."
+    apptainer exec --bind /data "$SMRT_SIF" \
+        ipdSummary "$BAM" \
+            --reference "$REF" \
+            --identify m6A,m4C \
+            --methylFraction \
+            --csv "$CSV" \
+            --gff "$GFF" \
+            --numWorkers 8
+
+    RC=$?
+    if [ $RC -eq 0 ] && [ -f "$GFF" ] && [ -s "$GFF" ]; then
+        GFF_LINES=$(grep -c "^[^#]" "$GFF" || true)
+        echo "  OK: $GFF_LINES modifications detected"
+        TOTAL_OK=$((TOTAL_OK+1))
+    else
+        echo "  FAILED: ipdSummary exit=$RC"
+        TOTAL_FAIL=$((TOTAL_FAIL+1))
+    fi
+    echo ""
+done
+
+echo "========================================"
+echo "=== SUMMARY ==="
+echo "========================================"
+echo "OK     : $TOTAL_OK"
+echo "Failed : $TOTAL_FAIL"
+echo "Skipped: $TOTAL_SKIP"
+echo ""
+echo "=== DONE - $(date) ==="
