@@ -11,7 +11,7 @@ Output BAMs carry standard PacBio tags: `fi:B:C` (IPD) and `fp:B:C` (PW).
 
 Two CLI tools are installed from the same repository:
 - **`kinsim`**      — ML pipeline: extract, merge, train, generate, evaluate, analyze
-- **`kinsim-prep`** — Data preparation: rebase, merge-motifs, manifest, filter, prepare, parse
+- **`kinsim-prep`** — Data preparation: rebase, merge-motifs, manifest, filter, balance, parse
 
 ---
 
@@ -56,7 +56,6 @@ KinSim/
 │   ├── rebase.py                   REBASE web fetch + file parsing + fuzznuc patterns
 │   ├── motif_merge.py              merge/filter/dedup motifs -> standard PacBio CSV
 │   ├── manifest.py                 manifest CSV CLI (count / validate / list)
-│   ├── prepare.py                  legacy BAM/motif pair validation (alternating-line format)
 │   ├── balance.py                  balance .pkl by methylation type
 │   ├── filter.py                   filter .pkl by coverage, mod type, max keys
 │   └── callers/                    methylation caller output parsers (plugin registry)
@@ -70,15 +69,26 @@ KinSim/
 │
 ├── archive/                        archived code (dictionary, cGAN) — not active
 │
+├── baseline/                       baseline models for comparison
+│   ├── __init__.py
+│   ├── global_gaussian.py          4 Gaussians (one per meth type, no kmer context)
+│   ├── kmer_gaussian.py            per-kmer Gaussian + global IPD ratio shift
+│   └── conv_no_film.py             ConvPredictor without FiLM (post-hoc ratio shift)
+│
 └── slurm_kinsim/                   HPC SLURM job scripts
-    ├── kinsim_extract.slurm        extract (array job, manifest mode)
-    ├── kinsim_train.slurm          train (1 GPU, 24h)
-    ├── kinsim_generate.slurm       generate (array job)
-    ├── kinsim_evaluate.slurm       evaluate
+    ├── 00_extract.slurm            extract (array job, manifest mode)
+    ├── 01_train.slurm              train (1 GPU, 24h)
+    ├── 02_generate.slurm           generate (array job)
+    ├── 03a_validate_generate.slurm validation: generate
+    ├── 03b_validate_align.slurm    validation: pbmm2 alignment
+    ├── 03c_validate_ipdsummary.slurm validation: ipdSummary
+    ├── 03d_validate_pbmotifmaker.slurm validation: pbmotifmaker
+    ├── 04_evaluate.slurm           evaluate
+    ├── 05_baselines.slurm          run all 3 baseline models
     ├── config_example.yaml         training config example
     ├── manifest_example.csv        manifest CSV example
     ├── pbsim3_simulate.slurm       PBSIM3 read simulation
-    ├── validate_*.slurm            validation pipeline scripts
+    ├── msa1003_*.slurm             MSA1003 data extraction pipeline
     ├── prep_MSA1003_rebase.sh      fetch REBASE motifs for MSA1003 species
     └── prep_MSA1003_merge.sh       merge calling + REBASE motifs, build manifest
 ```
@@ -360,6 +370,7 @@ kinsim train                  -> kinsim/train.py
 kinsim generate               -> kinsim/generate.py
 kinsim evaluate               -> kinsim/evaluate.py
 kinsim analyze                -> kinsim/analyze.py
+kinsim sample                 -> kinsim/sample.py
 kinsim strip-kinetics         -> kinsim/strip_kinetics.py
 
 # kinsim-prep -- data preparation ----------------------------------------
@@ -367,8 +378,8 @@ kinsim-prep parse             -> kinsim/utils/motifs.py        (unified motif pa
 kinsim-prep rebase            -> prep/rebase.py                (REBASE fetch + parse)
 kinsim-prep merge-motifs      -> prep/motif_merge.py           (merge + filter + dedup)
 kinsim-prep manifest          -> prep/manifest.py              (count/validate/list)
-kinsim-prep prepare           -> prep/prepare.py               (legacy BAM/motif pairs)
 kinsim-prep filter            -> prep/filter.py                (filter .pkl)
+kinsim-prep balance           -> prep/balance.py               (balance .pkl by mod type)
 ```
 
 Typo suggestions via `difflib.get_close_matches` in both `__main__.py` files.
