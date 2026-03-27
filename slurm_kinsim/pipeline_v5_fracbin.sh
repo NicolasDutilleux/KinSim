@@ -42,7 +42,7 @@ echo "Species in manifest: $N"
 # STEP 1: Extract (array job, auto-merge disabled)
 # ============================================================
 EXTRACT_JOB=$(KINSIM_NO_AUTOMERGE=1 sbatch --parsable --array=1-${N}%4 \
-    slurm_kinsim/kinsim_extract.slurm \
+    slurm_kinsim/00_extract.slurm \
     $MANIFEST $SHARDS $MASTER)
 echo "1. Extract:      $EXTRACT_JOB (array 1-$N)"
 
@@ -51,7 +51,7 @@ echo "1. Extract:      $EXTRACT_JOB (array 1-$N)"
 # ============================================================
 MERGE_JOB=$(sbatch --parsable \
     --dependency=afterok:${EXTRACT_JOB} \
-    slurm_kinsim/kinsim_extract.slurm \
+    slurm_kinsim/00_extract.slurm \
     $MANIFEST $SHARDS $MASTER)
 echo "2. Merge:        $MERGE_JOB (after extract)"
 
@@ -60,7 +60,7 @@ echo "2. Merge:        $MERGE_JOB (after extract)"
 # ============================================================
 TRAIN_JOB=$(sbatch --parsable \
     --dependency=afterok:${MERGE_JOB} \
-    slurm_kinsim/kinsim_train.slurm \
+    slurm_kinsim/01_train.slurm \
     $MASTER $CKPT_NEW \
     --epochs 50 --test-pkl $TESTPKL)
 echo "3. Train:        $TRAIN_JOB (after merge)"
