@@ -11,12 +11,16 @@
 # STEP 01: ipdSummary per species on aligned BAMs
 # Uses apptainer pacbio-smrt-tools for ipdSummary + pbindex
 # Chemistry: Revio R/P1-C1/5.0-25M (auto-detected from BAM header)
+#
+# Prerequisites (from step 00b):
+#   - BAMs must have ip/pw tags (converted from fi/fp/ri/rp)
+#   - BAMs must be reheadered to single-contig @SQ
+#   - Per-species reference FASTA must exist (<contig>.fasta + .fai)
 
 source $(conda info --base)/etc/profile.d/conda.sh
 conda activate kinsim_env
 
 OUTDIR="/data/projects/p774_MARSD/NDutilleux/training/PB_MOCK/species_aligned"
-REF="/data/projects/p774_MARSD/NDutilleux/training/PB_MOCK/Genomes/MSA1003_competitive_ref.fasta"
 SMRT_SIF="/containers/apptainer/pacbio-smrt-tools-25.1.sif"
 
 echo "========================================"
@@ -32,11 +36,22 @@ TOTAL_SKIP=0
 for SPECIES_DIR in "${OUTDIR}"/*/; do
     [ -d "$SPECIES_DIR" ] || continue
     CONTIG=$(basename "$SPECIES_DIR")
-    BAM="${SPECIES_DIR}/${CONTIG}.bam"
+    BAM="${SPECIES_DIR}/${CONTIG}_ipd.bam"
+    REF="${SPECIES_DIR}/${CONTIG}.fasta"
     CSV="${SPECIES_DIR}/${CONTIG}_ipdSummary.csv"
     GFF="${SPECIES_DIR}/${CONTIG}_ipdSummary.gff"
 
-    [ -f "$BAM" ] || continue
+    # Verify prerequisites from step 00b
+    if [ ! -f "$BAM" ]; then
+        echo "FAIL $CONTIG: _ipd.bam not found (run step 00b first)"
+        TOTAL_FAIL=$((TOTAL_FAIL+1))
+        continue
+    fi
+    if [ ! -f "$REF" ]; then
+        echo "FAIL $CONTIG: per-species reference not found (run step 00b first)"
+        TOTAL_FAIL=$((TOTAL_FAIL+1))
+        continue
+    fi
 
     # Skip if already done
     if [ -f "$GFF" ] && [ -s "$GFF" ]; then
