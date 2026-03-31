@@ -2,25 +2,27 @@
 
 Training data format (produced by ``kinsim extract`` / ``kinsim merge``):
 
-    dict[(kmer_id: int, meth_id: int)] -> np.ndarray(N, 3)
-    columns: [IPD, PW, fraction]
+    dict[(kmer_id: int, meth_id: int)] -> np.ndarray(N, 14)
+    columns: [IPD, PW, fraction, mc_0, mc_1, ..., mc_10]
 
 IPD and PW are raw uint8 values from fi/fp BAM tags (range [0, 255]).
-The fraction column is the stoichiometric methylation fraction from the
-motif source (e.g., PacBio motifs.csv 'fraction' column).  For motifs
-without an explicit fraction, the value is 1.0 (fully methylated); for
-unmethylated positions (meth_id = 0) the fraction is 0.0.
+Column 2 is the stoichiometric methylation fraction.
+Columns 3–13 are the per-position methylation IDs (0=none, 1=m6A, 2=m4C,
+3=m5C) for each of the K=11 positions in the k-mer window.  The active site
+is at position 5 (K//2).
 
-Backward compatibility: older .pkl files may have only 2 columns [IPD, PW].
-The dataset class detects this and defaults the fraction to 1.0 for
-methylated keys (meth_id > 0) and 0.0 for unmethylated keys (meth_id == 0).
+Backward compatibility:
+  - 3-column .pkl  [IPD, PW, fraction]: meth-context columns zero-padded.
+  - 2-column .pkl  [IPD, PW]:           fraction synthesised + meth-context zero-padded.
 
 This module provides:
 
   log_transform(x)     — map raw signals [0, 255] → log1p space for training
   inv_log_transform(x) — inverse: log1p → raw uint8 [0, 255]
   MLPSignalDataset     — MLP dataset: random-shot sampling with dynamic capping,
-                         returns (kmer_id, meth_probs, log_signal) triples
+                         returns (kmer_id, meth_full, log_signal, meth_id) tuples
+                         where meth_full is Float[K, num_meth_types] with per-position
+                         one-hot methylation encoding.
 
 The model operates in log1p space during training and calls
 inv_log_transform at inference time to recover uint8 BAM values.
@@ -35,6 +37,8 @@ from collections import defaultdict
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+from ..utils.encoding import K
 
 log = logging.getLogger(__name__)
 
@@ -75,34 +79,38 @@ def inv_log_transform(x: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 class MLPSignalDataset(Dataset):
-    """Flat-sample dataset for MLP training with stoichiometric soft labels.
+    """Flat-sample dataset for MLP training with per-position methylation context.
 
     Loads the merged .pkl and pre-flattens all (kmer_id, meth_id, IPD, PW,
-    fraction) entries into contiguous arrays so that every sample is seen
-    exactly once per epoch.  The DataLoader shuffles the flat index each epoch,
-    giving the model full exposure to the training distribution.
+    fraction, meth_ctx) entries into contiguous arrays so that every sample is
+    seen exactly once per epoch.  The DataLoader shuffles the flat index each
+    epoch, giving the model full exposure to the training distribution.
 
     Dynamic capping prevents majority class bias at load time:
         meth_id = 0 (unmethylated) → keep at most max_unmeth samples (default 20)
         meth_id ∈ {1, 2, 3}        → keep at most max_meth  samples (default 100)
 
-    Stoichiometric soft labels
+    Methylation context output
     --------------------------
-    The methylation output is a Float[num_meth_types] probability vector built
-    from the per-sample stoichiometric fraction stored in column 3 of the data.
+    ``__getitem__`` returns ``meth_full``: a Float[K, num_meth_types] tensor
+    encoding the methylation state at each of the K=11 k-mer positions.
 
-    For a sample with meth_id = 1 (m6A) and fraction = 0.75:
-        meth_probs = [0, 0.75, 0, 0]
+    For a position with meth_id = 1 (m6A) at the center (pos 5):
+        meth_full[5, :] = [0, frac, 0, 0]   ← soft label at center
 
-    For an unmethylated sample (meth_id = 0, fraction = 0.0):
-        meth_probs = [0, 0, 0, 0]
+    For a flanking position with meth_id = 2 (m4C, pos 3):
+        meth_full[3, :] = [0, 0, 1.0, 0]    ← hard label at flanking
+
+    For an unmethylated position (meth_id = 0, any position):
+        meth_full[pos, :] = [0, 0, 0, 0]    ← all-zero (same as "no info")
 
     Args:
         pkl_path:       Path to a merged .pkl produced by `kinsim merge`.
-                        Structure: dict[(kmer_id, meth_id)] -> np.ndarray(N, 2 or 3).
+                        Structure: dict[(kmer_id, meth_id)] -> np.ndarray(N, 2/3/14).
         max_unmeth:     Maximum samples kept for unmethylated contexts (default 20).
         max_meth:       Maximum samples kept for methylated contexts (default 100).
         num_meth_types: Number of methylation states (default 4: none/m6A/m4C/m5C).
+        kmer_size:      K-mer window size (default K=11).
     """
 
     def __init__(
@@ -111,6 +119,7 @@ class MLPSignalDataset(Dataset):
         max_unmeth: int = 20,
         max_meth:   int = 100,
         num_meth_types: int = 4,
+        kmer_size: int = K,
     ) -> None:
         log.info("Loading training data from %s ...", pkl_path)
         with open(pkl_path, "rb") as f:
@@ -140,26 +149,34 @@ class MLPSignalDataset(Dataset):
             )
         if not isinstance(first_val, np.ndarray) or first_val.ndim != 2:
             raise TypeError(
-                f"Expected dict values of shape (N, 2 or 3), got shape "
+                f"Expected dict values of shape (N, 2/3/14), got shape "
                 f"{getattr(first_val, 'shape', '?')}.\n"
-                "Each value must be an np.ndarray with columns [IPD, PW] or "
-                "[IPD, PW, fraction]."
+                "Each value must be an np.ndarray with columns "
+                "[IPD, PW], [IPD, PW, fraction], or [IPD, PW, fraction, mc_0..mc_10]."
             )
 
         n_cols = first_val.shape[1]
-        has_fraction = n_cols >= 3
+        has_fraction    = n_cols >= 3
+        has_meth_ctx    = n_cols >= 3 + kmer_size  # 14 for K=11
+
         if not has_fraction:
             log.info("  .pkl has 2-column data (legacy format, no fraction). "
                      "Defaulting fraction=1.0 for methylated, 0.0 for unmethylated.")
+        if not has_meth_ctx:
+            log.info("  .pkl has %d-column data (no meth-context columns). "
+                     "Meth context will be zero-padded (legacy compat).", n_cols)
         # ──────────────────────────────────────────────────────────────────────
 
         self._num_meth_types = num_meth_types
+        self._kmer_size      = kmer_size
+        _center              = kmer_size // 2
 
         # ── Build flat arrays (all samples, capped per key) ───────────────────
-        kmer_ids_list:  list = []
-        meth_ids_list:  list = []
-        signals_list:   list = []
-        fractions_list: list = []
+        kmer_ids_list:   list = []
+        meth_ids_list:   list = []
+        signals_list:    list = []
+        fractions_list:  list = []
+        meth_ctx_list:   list = []
 
         n_subsampled  = 0
         n_keys        = 0
@@ -180,11 +197,17 @@ class MLPSignalDataset(Dataset):
             kmer_ids_list.append(np.full(n, kmer_id, dtype=np.int32))
             meth_ids_list.append(np.full(n, meth_id, dtype=np.int8))
             signals_list.append(samples[:, :2].astype(np.float32))
+
             if has_fraction:
                 fractions_list.append(samples[:, 2].astype(np.float32))
             else:
                 frac_val = 1.0 if meth_id > 0 else 0.0
                 fractions_list.append(np.full(n, frac_val, dtype=np.float32))
+
+            if has_meth_ctx:
+                meth_ctx_list.append(samples[:, 3:3 + kmer_size].astype(np.uint8))
+            else:
+                meth_ctx_list.append(np.zeros((n, kmer_size), dtype=np.uint8))
 
             n_meth_counts[meth_id] += 1
             n_keys += 1
@@ -196,11 +219,12 @@ class MLPSignalDataset(Dataset):
             torch.from_numpy(np.concatenate(signals_list, axis=0)).float()
         )
         self._fractions = np.concatenate(fractions_list)
+        self._meth_ctx  = np.concatenate(meth_ctx_list)   # (N_total, K) uint8
 
         n_total = len(self._kmer_ids)
         meth_labels = {0: "unmeth", 1: "m6A", 2: "m4C", 3: "m5C"}
         meth_summary = ", ".join(
-            f"{meth_labels[m]}={n_meth_counts[m]:,}"
+            f"{meth_labels.get(m, str(m))}={n_meth_counts[m]:,}"
             for m in sorted(n_meth_counts)
             if n_meth_counts[m] > 0
         )
@@ -209,10 +233,12 @@ class MLPSignalDataset(Dataset):
             "  Total capped samples: %s  "
             "(%s keys subsampled to cap, "
             "caps: unmeth=%d, meth=%d)\n"
-            "  Fraction column: %s",
+            "  Fraction column: %s\n"
+            "  Meth-context columns (11-pos): %s",
             f"{n_keys:,}", meth_summary, f"{n_total:,}",
             f"{n_subsampled:,}", max_unmeth, max_meth,
             "from .pkl (stoichiometric)" if has_fraction else "synthesised (legacy compat)",
+            "from .pkl" if has_meth_ctx else "zero-padded (legacy compat)",
         )
 
     def __len__(self) -> int:
@@ -227,25 +253,33 @@ class MLPSignalDataset(Dataset):
 
         Returns:
             Tuple of:
-              kmer_id    — Long scalar tensor (22-bit encoded 11-mer)
-              meth_probs — Float tensor of shape (num_meth_types,): stoichiometric
-                           methylation vector built from the stored fraction.
-                           e.g. m6A at 75% → [0, 0.75, 0, 0]
-              signal     — Float tensor of shape (2,): [IPD, PW] in log1p space
-              meth_id    — Long scalar tensor (for per-type metrics)
+              kmer_id   — Long scalar tensor (22-bit encoded 11-mer)
+              meth_full — Float tensor of shape (K, num_meth_types):
+                          per-position methylation encoding.
+                          Center (pos K//2): soft label using stored fraction.
+                          Flanking (all other positions): hard 0/1 one-hot.
+                          Unmethylated positions: all-zero row.
+              signal    — Float tensor of shape (2,): [IPD, PW] in log1p space
+              meth_id   — Long scalar tensor (for per-type metrics)
         """
-        kmer_id = int(self._kmer_ids[idx])
-        meth_id = int(self._meth_ids[idx])
-        signal  = self._signals[idx]                  # already log-transformed
-        frac    = float(self._fractions[idx])
+        kmer_id    = int(self._kmer_ids[idx])
+        meth_id    = int(self._meth_ids[idx])
+        signal     = self._signals[idx]               # already log-transformed
+        frac       = float(self._fractions[idx])
+        ctx_ids    = self._meth_ctx[idx]              # (K,) uint8 meth IDs
 
-        meth_probs = torch.zeros(self._num_meth_types, dtype=torch.float32)
-        if meth_id > 0:
-            meth_probs[meth_id] = frac
+        center = self._kmer_size // 2
+        meth_full = torch.zeros(self._kmer_size, self._num_meth_types, dtype=torch.float32)
+        for pos in range(self._kmer_size):
+            m = int(ctx_ids[pos])
+            if m > 0:
+                # Center position: soft label via stoichiometric fraction
+                # Flanking positions: hard 1.0 (reference methylation state)
+                meth_full[pos, m] = frac if pos == center else 1.0
 
         return (
             torch.tensor(kmer_id, dtype=torch.long),
-            meth_probs,
+            meth_full,
             signal,
             torch.tensor(meth_id, dtype=torch.long),
         )

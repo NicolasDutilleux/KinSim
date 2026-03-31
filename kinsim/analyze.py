@@ -2,7 +2,10 @@
 
 Data format (produced by ``kinsim extract`` / ``kinsim merge``):
 
-    {(kmer_id, meth_id): np.ndarray(N, 2 or 3)}  columns: [IPD, PW, fraction?]
+    {(kmer_id, meth_id): np.ndarray(N, 2/3/14)}
+        columns: [IPD, PW]              (legacy 2-col)
+                 [IPD, PW, fraction]    (legacy 3-col)
+                 [IPD, PW, fraction, mc_0..mc_10]  (current 14-col, K=11)
 
 Auto-detects:
   - K-mer size           (from __meta__["kmer_size"] or inferred from key range)

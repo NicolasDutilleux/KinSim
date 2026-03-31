@@ -126,14 +126,25 @@ for read in bam_in:
         try:
             ri = np.array(read.get_tag('ri'), dtype=np.uint8)
             rp = np.array(read.get_tag('rp'), dtype=np.uint8)
-            ip_vals = ri[::-1].copy()
-            pw_vals = rp[::-1].copy()
+            if len(ri) == read.query_length:
+                ip_vals = ri[::-1].copy()
+                pw_vals = rp[::-1].copy()
+            else:
+                # ri/rp present but wrong length (e.g. empty tag) — use fi/fp
+                ip_vals = fi.copy()
+                pw_vals = fp.copy()
         except KeyError:
             ip_vals = fi.copy()
             pw_vals = fp.copy()
     else:
         ip_vals = fi.copy()
         pw_vals = fp.copy()
+
+    # Final safety check — should never fire, but guards against edge cases
+    if len(ip_vals) != read.query_length:
+        bam_out.write(read)
+        n_skipped += 1
+        continue
 
     read.set_tag('ip', array.array('B', ip_vals.tolist()))
     read.set_tag('pw', array.array('B', pw_vals.tolist()))

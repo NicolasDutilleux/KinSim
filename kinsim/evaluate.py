@@ -233,7 +233,7 @@ def plot_kmer_distribution(
 
     Args:
         model:       MLPPredictor in eval mode.
-        data:        Raw dict from .pkl file: (kmer_id, meth_id) → np.ndarray(N, 2).
+        data:        Raw dict from .pkl file: (kmer_id, meth_id) → np.ndarray(N, 2/3/14).
         kmer_str:    11-mer string, e.g. "GGATCCTGCAT".
         meth_name:   One of "none", "m6A", "m4C", "m5C".
         device:      Torch device for model inference.
