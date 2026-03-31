@@ -1,12 +1,12 @@
 #!/bin/bash
 # =============================================================================
-# prep_MSA1003_rebase.sh
+# prep_rebase.sh
 #
 # Fetch REBASE motifs for species that have an org number assigned.
 # Copies rebase_motifs.csv into every experience folder.
 #
 # Usage:
-#   bash slurm_kinsim/prep_MSA1003_rebase.sh [SPLIT_DIR]
+#   bash slurm_kinsim/msa1003/prep_rebase.sh [SPLIT_DIR]
 #
 # Default: $BASE/trimmed_species_by_experience
 # =============================================================================
@@ -90,4 +90,4 @@ done
 
 echo ""
 echo "Done. rebase_motifs.csv written into all experience folders."
-echo "Next step: bash slurm_kinsim/prep_MSA1003_merge.sh $SPLIT"
+echo "Next step: bash slurm_kinsim/msa1003/prep_merge.sh $SPLIT"
