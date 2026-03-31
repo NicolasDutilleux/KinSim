@@ -76,6 +76,9 @@ KinSim/
 │   └── conv_no_film.py             ConvPredictor without FiLM (post-hoc ratio shift)
 │
 └── slurm_kinsim/                   HPC SLURM job scripts
+    ├── run_pipeline.sh             submit full pipeline with dependency chain
+    ├── pbsim3_simulate.slurm       PBSIM3 read simulation
+    │
     ├── 00_extract.slurm            extract (array job, manifest mode)
     ├── 01_train.slurm              train (1 GPU, 24h)
     ├── 02_generate.slurm           generate (array job)
@@ -85,12 +88,19 @@ KinSim/
     ├── 03d_validate_pbmotifmaker.slurm validation: pbmotifmaker
     ├── 04_evaluate.slurm           evaluate
     ├── 05_baselines.slurm          run all 3 baseline models
-    ├── config_example.yaml         training config example
-    ├── manifest_example.csv        manifest CSV example
-    ├── pbsim3_simulate.slurm       PBSIM3 read simulation
-    ├── msa1003_*.slurm             MSA1003 data extraction pipeline
-    ├── prep_MSA1003_rebase.sh      fetch REBASE motifs for MSA1003 species
-    └── prep_MSA1003_merge.sh       merge calling + REBASE motifs, build manifest
+    │
+    ├── config/                     example configuration files
+    │   ├── config_example.yaml     training config example
+    │   └── manifest_example.csv    manifest CSV example
+    │
+    └── msa1003/                    MSA1003 data extraction pipeline
+        ├── prep_rebase.sh          fetch REBASE motifs for each species
+        ├── prep_merge.sh           merge calling + REBASE motifs, build manifest
+        ├── 00_align_split.slurm    align bc2036 BAM + split by species
+        ├── 00b_add_ippw.slurm      convert fi/fp/ri/rp → ip/pw per species
+        ├── 01_ipdsummary.slurm     run ipdSummary per species
+        ├── 01b_modkit.slurm        run modkit as alternative caller
+        └── 02_pbmotifmaker.slurm   detect motifs from ipdSummary GFF
 ```
 
 ---
