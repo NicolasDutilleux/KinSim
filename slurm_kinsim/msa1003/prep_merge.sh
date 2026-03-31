@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# prep_MSA1003_merge.sh
+# prep_merge.sh
 #
 # For each species in each experience under SPLIT_DIR:
 #   1. Merge calling motifs + REBASE motifs into final_motifs.csv
@@ -9,7 +9,7 @@
 # Auto-discovers experiences (MSA1003.* subdirs) and species (subdirs within).
 #
 # Usage:
-#   bash slurm_kinsim/prep_MSA1003_merge.sh [SPLIT_DIR] [MANIFEST]
+#   bash slurm_kinsim/msa1003/prep_merge.sh [SPLIT_DIR] [MANIFEST]
 #
 # Defaults:
 #   SPLIT_DIR = $BASE/trimmed_species_by_experience

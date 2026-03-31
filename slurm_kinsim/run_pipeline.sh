@@ -7,7 +7,7 @@
 #   - No min-sample filter (all keys kept)
 #   - Binary coin-flip during generation (no fractional meth_probs)
 #
-# Usage: bash slurm_kinsim/pipeline_v5_fracbin.sh
+# Usage: bash slurm_kinsim/run_pipeline.sh
 # ============================================================
 
 set -euo pipefail
