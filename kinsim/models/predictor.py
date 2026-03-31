@@ -25,10 +25,14 @@ the effect of methylation is learned as a global modulation rule, not
 independently per k-mer.
 
 Both models share the same external interface:
-    forward(kmer_ids: Long[B], meth_probs: Float[B,M]) -> Float[B,4]
-    sample(kmer_ids, meth_probs) -> Float[B,2]       (stochastic)
+    forward(kmer_ids: Long[B], meth_probs: Float[B,K,M]) -> Float[B,4]
+    sample(kmer_ids, meth_probs) -> Float[B,2]        (stochastic)
     predict_mean(kmer_ids, meth_probs) -> Float[B,2]  (deterministic)
     get_config() -> dict                               (for model_config.json)
+
+``meth_probs`` is a Float[B, K, M] per-position methylation tensor where K is
+the k-mer window size (default 11) and M is num_meth_types (default 4).
+Legacy Float[B, M] center-only tensors are accepted for backward compatibility.
 
 Output (all in log1p space):
     [mu_ipd, mu_pw, log_sigma_ipd, log_sigma_pw]
@@ -53,14 +57,19 @@ class MLPPredictor(nn.Module):
     """Flat k-mer embedding + MLP.  Legacy architecture (architecture="mlp").
 
     The 22-bit encoded 11-mer is looked up in a 4.2M-row embedding table,
-    concatenated with a methylation projection, and fed through two hidden
-    layers to predict Gaussian (mu, log_sigma) for IPD and PW.
+    concatenated with a flattened per-position methylation projection, and fed
+    through two hidden layers to predict Gaussian (mu, log_sigma) for IPD/PW.
+
+    ``meth_probs`` is Float[B, K, M] (per-position, per-type).  It is flattened
+    to Float[B, K*M] before projection.  Legacy Float[B, M] center-only inputs
+    are also accepted (zero-padded at all non-center positions).
 
     Args:
         kmer_embed_dim: Embedding table column count (32 or 64).
         hidden_dim:     Width of the two hidden layers.
         meth_proj_dim:  Methylation linear projection output dim.
         dropout:        Dropout after each LeakyReLU (0.0 = disabled).
+        num_meth_types: Number of methylation types M (default 4).
     """
 
     def __init__(
@@ -70,6 +79,7 @@ class MLPPredictor(nn.Module):
         meth_proj_dim: int = 8,
         dropout: float = 0.0,
         kmer_size: int = _DEFAULT_K,
+        num_meth_types: int = 4,
     ):
         super().__init__()
 
@@ -78,10 +88,12 @@ class MLPPredictor(nn.Module):
         self.meth_proj_dim  = meth_proj_dim
         self.dropout        = dropout
         self.kmer_size      = kmer_size
+        self.num_meth_types = num_meth_types
 
         _num_kmers = 4 ** kmer_size
         self.kmer_embed = nn.Embedding(_num_kmers, kmer_embed_dim)
-        self.meth_proj = nn.Linear(4, meth_proj_dim, bias=False)
+        # Accepts full K*M flat context
+        self.meth_proj = nn.Linear(kmer_size * num_meth_types, meth_proj_dim, bias=False)
 
         input_dim = kmer_embed_dim + meth_proj_dim
         self.net = nn.Sequential(
@@ -114,8 +126,27 @@ class MLPPredictor(nn.Module):
         kmer_ids:   torch.Tensor,
         meth_probs: torch.Tensor,
     ) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            kmer_ids:   (B,) Long tensor.
+            meth_probs: (B, K, M) per-position methylation, or (B, M) legacy
+                        center-only (zero-padded to (B, K, M) internally).
+        """
         kmer_emb = self.kmer_embed(kmer_ids)
-        meth_emb = self.meth_proj(meth_probs)
+
+        if meth_probs.dim() == 2:
+            # Legacy (B, M): place at center position, zeros elsewhere
+            B, M = meth_probs.shape
+            full = torch.zeros(B, self.kmer_size, M,
+                               device=meth_probs.device, dtype=meth_probs.dtype)
+            full[:, self.kmer_size // 2, :] = meth_probs
+            meth_flat = full.view(B, -1)
+        else:
+            # (B, K, M) → flatten to (B, K*M)
+            meth_flat = meth_probs.reshape(meth_probs.shape[0], -1)
+
+        meth_emb = self.meth_proj(meth_flat)
         x = torch.cat([kmer_emb, meth_emb], dim=1)
         return self.net(x)
 
@@ -142,6 +173,7 @@ class MLPPredictor(nn.Module):
             "hidden_dim":     self.hidden_dim,
             "meth_proj_dim":  self.meth_proj_dim,
             "dropout":        self.dropout,
+            "num_meth_types": self.num_meth_types,
         }
 
 
@@ -495,6 +527,7 @@ def create_from_config(config: dict) -> nn.Module:
             meth_proj_dim=config.get("meth_proj_dim", 8),
             dropout=config.get("dropout", 0.0),
             kmer_size=kmer_size,
+            num_meth_types=config.get("num_meth_types", 4),
         )
     elif arch == "conv":
         return ConvPredictor(

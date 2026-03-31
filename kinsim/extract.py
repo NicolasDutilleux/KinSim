@@ -7,17 +7,18 @@ Data format
 -----------
 Each shard is a pickle file containing:
 
-    dict[(kmer_id: int, meth_id: int)] -> np.ndarray(N, 3)
+    dict[(kmer_id: int, meth_id: int)] -> np.ndarray(N, 14)
 
-where columns are [IPD, PW, fraction] as raw float32 values.  IPD and PW are
-read from the fi/fp BAM tags (uint8 [0, 255]).  The third column is the
-stoichiometric methylation fraction from the motif source (e.g., PacBio
-motifs.csv 'fraction' column).  For motifs without an explicit fraction,
-the value defaults to 1.0 (fully methylated); for unmethylated positions
-(meth_id = 0) the fraction is 0.0.
+where columns are [IPD, PW, fraction, mc_0, mc_1, ..., mc_10] as raw float32.
+IPD and PW are read from the fi/fp BAM tags (uint8 [0, 255]).
+Column 2 is the stoichiometric methylation fraction.
+Columns 3–13 are the methylation IDs (0=none,1=m6A,2=m4C,3=m5C) for each
+of the 11 positions in the k-mer window, with the active site at mc_5
+(index K//2 = 5).
 
-Backward compatibility: older shards may have only 2 columns [IPD, PW].
-Dataset classes (common/dataset.py) handle both formats transparently.
+Backward compatibility: older shards may have only 2 columns [IPD, PW] or
+3 columns [IPD, PW, fraction].  Dataset classes handle all three formats
+by zero-padding the missing meth-context columns.
 
 A special metadata key ``"__meta__"`` (string, not a tuple) may be present
 in any shard or master .pkl.  It holds provenance information (version,
@@ -221,6 +222,8 @@ def _binarize_by_ipd(result: dict) -> dict:
         if mean_frac <= 0.01:
             low_arr = arr.copy()
             low_arr[:, 2] = 0.0
+            if low_arr.shape[1] >= 14:
+                low_arr[:, 3 + K // 2] = 0  # center meth context → none
             none_key = (kmer_id, 0)
             none_extras.setdefault(none_key, []).append(low_arr)
             n_all_low += 1
@@ -242,6 +245,8 @@ def _binarize_by_ipd(result: dict) -> dict:
         if n_low > 0:
             low_arr       = arr_sorted[n_high:].copy()
             low_arr[:, 2] = 0.0
+            if low_arr.shape[1] >= 14:
+                low_arr[:, 3 + K // 2] = 0  # center meth context → none
             none_key = (kmer_id, 0)
             none_extras.setdefault(none_key, []).append(low_arr)
 
@@ -318,7 +323,8 @@ def extract_samples_from_bam(
 
     Returns:
         dict with:
-          - tuple keys ``(kmer_id, meth_id)`` → ``np.ndarray(N, 3)`` [IPD, PW, fraction]
+          - tuple keys ``(kmer_id, meth_id)`` → ``np.ndarray(N, 14)``
+            columns: [IPD, PW, fraction, mc_0..mc_10]
           - ``"__meta__"``                     → dict with provenance metadata
     """
     validate_bam_kinetics(bam_path)
@@ -369,15 +375,18 @@ def extract_samples_from_bam(
                     pw_val  = float(pws[center])
                     frac    = frac_lookup.get(meth_id, 0.0)
 
+                    # 11-position methylation context for the current window
+                    mc = meth_status[i - (kmer_size - 1) : i + 1].tolist()
+
                     counts[key] += 1
                     n = counts[key]
                     if n <= max_samples_per_key:
-                        samples[key].append([ipd_val, pw_val, frac])
+                        samples[key].append([ipd_val, pw_val, frac] + mc)
                     else:
                         # Reservoir sampling: replace a random existing entry
                         j = np.random.randint(0, n)
                         if j < max_samples_per_key:
-                            samples[key][j] = [ipd_val, pw_val, frac]
+                            samples[key][j] = [ipd_val, pw_val, frac] + mc
 
             # --- Reverse strand: slide RC 11-mer window, collect ri/rp ---
             #
@@ -417,14 +426,17 @@ def extract_samples_from_bam(
                             rp_val = float(rp_tags[fwd_center])
                             frac   = frac_lookup.get(rc_meth_id, 0.0)
 
+                            # 11-position meth context for the RC window
+                            rev_mc = rev_meth_status[j - (kmer_size - 1) : j + 1].tolist()
+
                             counts[rc_key] += 1
                             n = counts[rc_key]
                             if n <= max_samples_per_key:
-                                samples[rc_key].append([ri_val, rp_val, frac])
+                                samples[rc_key].append([ri_val, rp_val, frac] + rev_mc)
                             else:
                                 j2 = np.random.randint(0, n)
                                 if j2 < max_samples_per_key:
-                                    samples[rc_key][j2] = [ri_val, rp_val, frac]
+                                    samples[rc_key][j2] = [ri_val, rp_val, frac] + rev_mc
 
             n_reads_processed += 1
 

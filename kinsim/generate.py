@@ -118,26 +118,27 @@ def generate_signals_batch(
     kmer_ids: list,
     meth_ids: list,
     fractions: list,
+    meth_contexts: list,
     device: torch.device,
     deterministic: bool = False,
 ) -> np.ndarray:
     """Generate IPD/PW signals for a batch of contexts using MLPPredictor.
 
-    Each position is assigned a **binary** methylation state: for a position
-    with meth_id > 0 and fraction F, a random coin-flip (Bernoulli(F)) decides
-    whether this specific read is methylated or not.  This matches the training
-    data where every sample is either 100% methylated or 100% unmethylated,
-    and reproduces population-level heterogeneity across reads.
+    Each position is assigned a **binary** methylation state at the center:
+    for a position with meth_id > 0 and fraction F, a random coin-flip
+    (Bernoulli(F)) decides whether this specific read is methylated or not.
+    Flanking positions use the reference methylation state directly (hard).
 
     Args:
         model:         Trained MLPPredictor in eval mode.
         kmer_ids:      List of kmer integer IDs (22-bit encoded 11-mers).
-        meth_ids:      List of methylation IDs (0–3).
+        meth_ids:      List of methylation IDs (0–3) for center position.
         fractions:     List of stoichiometric fractions (0.0–1.0) per position.
-                       For unmethylated positions (meth_id=0), fraction is 0.0.
+        meth_contexts: List of np.ndarray(K,) int arrays — per-position meth IDs
+                       for the full 11-mer window.  Center (index K//2) will be
+                       overridden by the binarised meth_id after the coin flip.
         device:        Torch device.
         deterministic: If True, return the predicted mean μ (no sampling).
-                       If False, sample from N(μ, σ²) for biological realism.
 
     Returns:
         np.ndarray of shape (N, 2) with raw [IPD, PW] values in [0, 255].
@@ -145,8 +146,7 @@ def generate_signals_batch(
     N = len(kmer_ids)
     CHUNK = 50_000  # positions per GPU forward pass — prevents OOM on long reads
 
-    # Binarize fractions: for each methylated position, coin-flip whether
-    # this read is methylated (frac=1.0) or unmethylated (meth_id=0, frac=0.0).
+    # Binarize center fractions: coin-flip → each position is 100% meth or not.
     meth_ids_bin  = np.array(meth_ids,  dtype=np.int64)
     fractions_bin = np.array(fractions, dtype=np.float32)
     partial_mask  = (meth_ids_bin > 0) & (fractions_bin < 1.0)
@@ -154,38 +154,51 @@ def generate_signals_batch(
         coins = np.random.random(partial_mask.sum())
         thresholds = fractions_bin[partial_mask]
         is_meth = coins < thresholds
-        # Positions where coin says methylated → frac=1.0
         idx = np.where(partial_mask)[0]
         fractions_bin[idx[is_meth]]  = 1.0
-        # Positions where coin says unmethylated → meth_id=0, frac=0.0
         fractions_bin[idx[~is_meth]] = 0.0
         meth_ids_bin[idx[~is_meth]]  = 0
 
-    if N <= CHUNK:
-        kmer_tensor = torch.tensor(kmer_ids,      dtype=torch.long, device=device)
-        meth_ids_t  = torch.tensor(meth_ids_bin,   dtype=torch.long,  device=device)
-        fractions_t = torch.tensor(fractions_bin,   dtype=torch.float, device=device)
-        meth_probs  = torch.zeros(N, 4, device=device)
-        meth_probs.scatter_(1, meth_ids_t.unsqueeze(1), fractions_t.unsqueeze(1))
-        if deterministic:
-            return model.predict_mean(kmer_tensor, meth_probs).cpu().numpy()
-        else:
-            return model.sample(kmer_tensor, meth_probs).cpu().numpy()
+    # Build (N, K, M) meth context tensor.
+    # Flanking positions: hard one-hot from meth_contexts.
+    # Center position: binarised meth_id + fraction.
+    K_SIZE = K
+    CENTER = K_SIZE // 2
+    NUM_M  = 4
+    ctx_np = np.array(meth_contexts, dtype=np.int64)  # (N, K)
+    meth_full_np = np.zeros((N, K_SIZE, NUM_M), dtype=np.float32)
 
-    # Large batch: process in position-level chunks to avoid OOM.
+    # Flanking positions — hard one-hot (reference state)
+    for pos in range(K_SIZE):
+        if pos == CENTER:
+            continue
+        flanking_m = ctx_np[:, pos]       # (N,)
+        mask = flanking_m > 0
+        if mask.any():
+            rows = np.where(mask)[0]
+            meth_full_np[rows, pos, flanking_m[rows]] = 1.0
+
+    # Center position — binarised soft label
+    meth_full_np[np.arange(N), CENTER, meth_ids_bin] = fractions_bin
+
+    def _run_chunk(k_slice, mf_slice):
+        k_t  = torch.tensor(k_slice,  dtype=torch.long,  device=device)
+        mf_t = torch.tensor(mf_slice, dtype=torch.float, device=device)
+        if deterministic:
+            return model.predict_mean(k_t, mf_t).cpu().numpy()
+        else:
+            return model.sample(k_t, mf_t).cpu().numpy()
+
+    if N <= CHUNK:
+        return _run_chunk(np.array(kmer_ids), meth_full_np)
+
     chunks = []
     for start in range(0, N, CHUNK):
         end = min(start + CHUNK, N)
-        k_t = torch.tensor(kmer_ids[start:end],      dtype=torch.long, device=device)
-        m_t = torch.tensor(meth_ids_bin[start:end],   dtype=torch.long, device=device)
-        f_t = torch.tensor(fractions_bin[start:end],   dtype=torch.float, device=device)
-        mp  = torch.zeros(end - start, 4, device=device)
-        mp.scatter_(1, m_t.unsqueeze(1), f_t.unsqueeze(1))
-        if deterministic:
-            out = model.predict_mean(k_t, mp)
-        else:
-            out = model.sample(k_t, mp)
-        chunks.append(out.cpu().numpy())
+        chunks.append(_run_chunk(
+            np.array(kmer_ids[start:end]),
+            meth_full_np[start:end],
+        ))
     return np.concatenate(chunks, axis=0)
 
 
@@ -382,10 +395,14 @@ def _process_batch(
     """
     all_kmer_ids    = []
     all_meth_ids    = []
-    all_fractions   = []   # stoichiometric fraction per position
-    all_rc_kmer_ids = []   # RC kmer IDs for ri/rp inference
-    is_n_context    = []   # Per-position flag: True = N-context, use default signal
+    all_fractions   = []      # stoichiometric fraction per position
+    all_rc_kmer_ids = []      # RC kmer IDs for ri/rp inference
+    all_meth_ctxs   = []      # (K,) int array per position — full 11-mer meth context
+    is_n_context    = []      # Per-position flag: True = N-context, use default signal
     read_offsets    = [0]
+    _K      = K
+    _CENTER = K // 2
+    _ZERO_CTX = np.zeros(_K, dtype=np.int64)  # placeholder for N/unmapped positions
 
     n_mapped = n_unmapped = 0
 
@@ -426,6 +443,7 @@ def _process_batch(
                             all_rc_kmer_ids.append(0)
                             all_meth_ids.append(0)
                             all_fractions.append(0.0)
+                            all_meth_ctxs.append(_ZERO_CTX)
                         else:
                             ref_pos = ref_start + read_pos
                             if circular:
@@ -446,10 +464,20 @@ def _process_batch(
                                 # (prob=frac) or not — produces bimodal signal
                                 meth_id = meth_id if np.random.random() < frac else 0
                                 frac    = 1.0 if meth_id > 0 else 0.0
+                            # 11-position meth context from reference map
+                            ctx = np.zeros(_K, dtype=np.int64)
+                            for k_pos in range(_K):
+                                rp_k = ref_pos + k_pos - _CENTER
+                                if circular:
+                                    ctx[k_pos] = int(ref_meth[rp_k % ref_len])
+                                elif 0 <= rp_k < ref_len:
+                                    ctx[k_pos] = int(ref_meth[rp_k])
+                            ctx[_CENTER] = meth_id  # override center with binarised state
                             all_kmer_ids.append(current_kmer)
                             all_rc_kmer_ids.append(_rc_kmer(current_kmer))
                             all_meth_ids.append(meth_id)
                             all_fractions.append(frac)
+                            all_meth_ctxs.append(ctx)
 
             n_mapped += 1
 
@@ -472,6 +500,7 @@ def _process_batch(
                     all_rc_kmer_ids.append(0)
                     all_meth_ids.append(0)
                     all_fractions.append(0.0)
+                    all_meth_ctxs.append(_ZERO_CTX)
                 else:
                     is_n_context.append(False)
                     center  = i - MID
@@ -482,10 +511,14 @@ def _process_batch(
                         # (prob=frac) or not — produces bimodal signal
                         meth_id = meth_id if np.random.random() < frac else 0
                         frac    = 1.0 if meth_id > 0 else 0.0
+                    # 11-position meth context from per-read scan
+                    ctx = np.array(meth_status[i - (_K - 1) : i + 1], dtype=np.int64)
+                    ctx[_CENTER] = meth_id  # override center with binarised state
                     all_kmer_ids.append(current_kmer)
                     all_rc_kmer_ids.append(_rc_kmer(current_kmer))
                     all_meth_ids.append(meth_id)
                     all_fractions.append(frac)
+                    all_meth_ctxs.append(ctx)
 
             n_unmapped += 1
 
@@ -498,9 +531,11 @@ def _process_batch(
     # encodes both-strand methylation at each reference position.
     if len(all_kmer_ids) > 0:
         all_signals    = generate_signals_batch(model, all_kmer_ids, all_meth_ids,
-                                                all_fractions, device, deterministic)
+                                                all_fractions, all_meth_ctxs,
+                                                device, deterministic)
         all_rc_signals = generate_signals_batch(model, all_rc_kmer_ids, all_meth_ids,
-                                                all_fractions, device, deterministic)
+                                                all_fractions, all_meth_ctxs,
+                                                device, deterministic)
     else:
         all_signals    = np.zeros((0, 2), dtype=np.float32)
         all_rc_signals = np.zeros((0, 2), dtype=np.float32)

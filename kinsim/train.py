@@ -7,9 +7,11 @@ A single merged .pkl file produced by the shared data pipeline:
     kinsim extract <reads.bam> <motifs> <shard.pkl>   # one per BAM / SLURM task
     kinsim merge   <shards_dir/> <master_data.pkl>     # combine all shards
 
-The .pkl maps (kmer_id: int, meth_id: int) → np.ndarray(N, 2) where columns
-are [IPD, PW] in raw uint8 space [0, 255] as read from BAM fi/fp tags.
-There is no separate extraction step — use kinsim extract + kinsim merge.
+The .pkl maps (kmer_id: int, meth_id: int) → np.ndarray(N, 14) where columns
+are [IPD, PW, fraction, mc_0..mc_10] — raw uint8 signals, stoichiometric
+methylation fraction, and per-position methylation IDs for the 11-mer window.
+Legacy 2-col [IPD, PW] and 3-col [IPD, PW, fraction] .pkl files are also
+supported (meth context zero-padded).  Use kinsim extract + kinsim merge.
 
 Loss function
 -------------
@@ -926,7 +928,7 @@ def main(argv: list[str] | None = None) -> None:
             "Input: a merged .pkl from the shared extraction pipeline:\n"
             "  kinsim extract reads.bam motifs shard.pkl   # repeat per BAM\n"
             "  kinsim merge   shards/    master_data.pkl   # combine all shards\n\n"
-            "The .pkl maps (kmer_id, meth_id) -> np.ndarray(N, 2) [IPD, PW].\n"
+            "The .pkl maps (kmer_id, meth_id) -> np.ndarray(N, 14) [IPD, PW, fraction, mc_0..mc_10].\n"
             "Use kinsim extract + kinsim merge to prepare the training data.\n\n"
             "All flags may be specified in a YAML config file (--config).\n"
             "Command-line flags override YAML values.\n\n"
