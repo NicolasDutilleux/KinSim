@@ -19,14 +19,16 @@
 # SP3-C3 is the closest available null model to Revio chemistry.
 # Compare output to bc2036_bystrandify run (25.3 container default model).
 
+source /etc/profile.d/modules.sh
 module load SMRT-Link/12.0.0.177059-cli-tools-only
 
 TESTDIR=/data/users/ndutilleux/kinsim_test
 REF=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036/final_assembly.fasta
 INPUT=${TESTDIR}/bc2036.bam
 
-BYSTRAND=${TESTDIR}/bc2036_sp3_bystrandify.bam
-ALIGNED=${TESTDIR}/bc2036_sp3_aligned.bam
+# Reuse bystrandify BAM + alignment from previous run (already done)
+BYSTRAND=${TESTDIR}/bc2036_bystrandify.bam
+ALIGNED=${TESTDIR}/bc2036_bystrandify_aligned.bam
 GFF=${TESTDIR}/bc2036_sp3.gff
 CSV=${TESTDIR}/bc2036_sp3.csv
 MOTIFS=${TESTDIR}/bc2036_sp3_motifs.csv
@@ -38,21 +40,9 @@ echo "========================================"
 echo "=== bc2036 bystrandify + SP3-C3 pipeline ==="
 echo "========================================"
 
-echo ""
-echo "=== Step 1: ccs-kinetics-bystrandify ==="
-ccs-kinetics-bystrandify ${INPUT} ${BYSTRAND}
-echo "Exit: $?"
-
-echo ""
-echo "=== Step 2: pbmm2 align ==="
-pbmm2 align --sort --num-threads 8 --preset SUBREAD ${REF} ${BYSTRAND} ${ALIGNED}
-echo "Exit: $?"
-
-echo ""
-echo "=== Step 3: pbindex ==="
-apptainer exec --bind /data /containers/apptainer/pacbio-smrt-tools-25.3.sif \
-    pbindex ${ALIGNED}
-echo "Exit: $?"
+echo "Reusing existing bystrandify + alignment from previous run:"
+echo "  BAM:     ${ALIGNED}"
+echo "  PBI:     ${ALIGNED}.pbi"
 
 echo ""
 echo "=== Step 4: ipdSummary (SP3-C3 model) ==="
