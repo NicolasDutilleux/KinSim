@@ -2,6 +2,7 @@
 #SBATCH --job-name=msa_modkit
 #SBATCH --partition=pibu_el8
 #SBATCH --account=p774
+#SBATCH --exclude=binfservas18
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=06:00:00
