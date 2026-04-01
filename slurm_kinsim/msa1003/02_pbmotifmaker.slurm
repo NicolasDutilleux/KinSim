@@ -2,6 +2,7 @@
 #SBATCH --job-name=msa_motifs
 #SBATCH --partition=pibu_el8
 #SBATCH --account=p774
+#SBATCH --exclude=binfservas18
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=04:00:00
@@ -13,7 +14,7 @@
 
 OUTDIR="/data/projects/p774_MARSD/NDutilleux/training/PB_MOCK/species_aligned"
 REF="/data/projects/p774_MARSD/NDutilleux/training/PB_MOCK/Genomes/MSA1003_competitive_ref.fasta"
-SMRT_SIF="/containers/apptainer/pacbio-smrt-tools-25.1.sif"
+SMRT_SIF="/containers/apptainer/pacbio-smrt-tools-25.3.sif"
 
 echo "========================================"
 echo "=== STEP 02: pbmotifmaker PER SPECIES ==="
