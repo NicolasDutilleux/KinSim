@@ -2,6 +2,7 @@
 #SBATCH --job-name=msa_ipd
 #SBATCH --partition=pibu_el8
 #SBATCH --account=p774
+#SBATCH --exclude=binfservas18
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
@@ -21,7 +22,7 @@ source $(conda info --base)/etc/profile.d/conda.sh
 conda activate kinsim_env
 
 OUTDIR="/data/projects/p774_MARSD/NDutilleux/training/PB_MOCK/species_aligned"
-SMRT_SIF="/containers/apptainer/pacbio-smrt-tools-25.1.sif"
+SMRT_SIF="/containers/apptainer/pacbio-smrt-tools-25.3.sif"
 
 echo "========================================"
 echo "=== STEP 01: ipdSummary PER SPECIES ==="

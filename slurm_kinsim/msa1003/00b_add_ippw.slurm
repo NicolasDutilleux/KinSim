@@ -2,6 +2,7 @@
 #SBATCH --job-name=msa_ippw
 #SBATCH --partition=pibu_el8
 #SBATCH --account=p774
+#SBATCH --exclude=binfservas18
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=04:00:00
