@@ -62,3 +62,6 @@ slurm-*.out
 # ── Temporary / scratch ─────────────────────────────────────────────────────
 *.tmp
 *.bak
+
+# ── External repos (cloned for reference only) ───────────────────────────────
+gitthings/
