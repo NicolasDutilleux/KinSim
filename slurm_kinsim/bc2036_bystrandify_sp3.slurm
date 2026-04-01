@@ -40,7 +40,8 @@ GFF=${TESTDIR}/bc2036_sp3.gff
 CSV=${TESTDIR}/bc2036_sp3.csv
 MOTIFS=${TESTDIR}/bc2036_sp3_motifs.csv
 
-PARAMS=/mnt/ss/sib/ibu/rocky8/2023072800/software/SMRT-Link/12.0.0.177059-cli-tools-only/install/smrtlink-release_12.0.0.177059/bundles/smrttools/install/smrttools-release_12.0.0.177059/private/thirdparty/python3/python3_3.9.6/site-packages/kineticsTools/resources
+# SP3-C3 model path — bypasses chemistry auto-detection (which fails on Revio BAMs in SMRT Link 12.0)
+SP3_MODEL=/mnt/ss/sib/ibu/rocky8/2023072800/software/SMRT-Link/12.0.0.177059-cli-tools-only/install/smrtlink-release_12.0.0.177059/bundles/smrttools/install/smrttools-release_12.0.0.177059/private/thirdparty/python3/python3_3.9.6/site-packages/kineticsTools/resources/SP3-C3.npz.gz
 
 date && hostname
 echo "========================================"
@@ -60,7 +61,7 @@ ipdSummary ${ALIGNED} \
     --csv ${CSV} \
     --gff ${GFF} \
     --numWorkers 8 \
-    --paramsPath ${PARAMS}
+    --ipdModel ${SP3_MODEL}
 echo "Exit: $?"
 
 echo ""
