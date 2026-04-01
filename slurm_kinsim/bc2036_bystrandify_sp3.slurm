@@ -19,7 +19,7 @@
 # SP3-C3 is the closest available null model to Revio chemistry.
 # Compare output to bc2036_bystrandify run (25.3 container default model).
 
-set -x
+set -euxo pipefail
 source /etc/profile.d/modules.sh 2>/dev/null || true
 module load SMRT-Link/12.0.0.177059-cli-tools-only
 
