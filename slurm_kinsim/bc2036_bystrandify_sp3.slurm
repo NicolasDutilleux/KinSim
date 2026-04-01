@@ -5,7 +5,7 @@
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
 #SBATCH --time=08:00:00
-#SBATCH --output=/data/users/ndutilleux/kinsim_test/bc2036_sp3_%J.log
+#SBATCH --output=/home/ndutilleux/bc2036_sp3_%J.log
 
 # Full bc2036 methylation calling pipeline using bystrandify + SP3-C3 null model
 #
@@ -19,7 +19,8 @@
 # SP3-C3 is the closest available null model to Revio chemistry.
 # Compare output to bc2036_bystrandify run (25.3 container default model).
 
-source /etc/profile.d/modules.sh
+set -x
+source /etc/profile.d/modules.sh 2>/dev/null || true
 module load SMRT-Link/12.0.0.177059-cli-tools-only
 
 TESTDIR=/data/users/ndutilleux/kinsim_test
