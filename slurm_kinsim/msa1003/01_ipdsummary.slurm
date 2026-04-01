@@ -9,19 +9,21 @@
 #SBATCH --output=/data/projects/p774_MARSD/NDutilleux/training/PB_MOCK/logs/01_ipdsummary_%j.log
 #SBATCH --error=/data/projects/p774_MARSD/NDutilleux/training/PB_MOCK/logs/01_ipdsummary_%j.err
 
-# STEP 01: ipdSummary per species on aligned BAMs
+# STEP 01: ipdSummary per species on prepared BAMs
 # Uses apptainer pacbio-smrt-tools for ipdSummary + pbindex
-# Chemistry: Revio R/P1-C1/5.0-25M (auto-detected from BAM header)
 #
-# Prerequisites (from step 00b):
-#   - BAMs must have ip/pw tags (converted from fi/fp/ri/rp)
-#   - BAMs must be reheadered to single-contig @SQ
-#   - Per-species reference FASTA must exist (<contig>.fasta + .fai)
+# Usage:
+#   sbatch 01_ipdsummary.slurm [SPECIES_DIR]
+#   Default: species_bystrand (from 00_bystrandify.slurm)
+#
+# Prerequisites:
+#   - <contig>_ipd.bam with ip/pw tags + single-contig @SQ header + .pbi
+#   - <contig>.fasta + .fai per species
 
 source $(conda info --base)/etc/profile.d/conda.sh
 conda activate kinsim_env
 
-OUTDIR="/data/projects/p774_MARSD/NDutilleux/training/PB_MOCK/species_aligned"
+OUTDIR="${1:-/data/projects/p774_MARSD/NDutilleux/training/PB_MOCK/species_bystrand}"
 SMRT_SIF="/containers/apptainer/pacbio-smrt-tools-25.3.sif"
 
 echo "========================================"
