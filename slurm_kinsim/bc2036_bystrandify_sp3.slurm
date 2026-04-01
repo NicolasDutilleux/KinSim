@@ -4,6 +4,7 @@
 #SBATCH --mem=32G
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
+#SBATCH --exclude=binfservas18
 #SBATCH --time=08:00:00
 #SBATCH --output=/home/ndutilleux/bc2036_sp3_%J.log
 
@@ -19,9 +20,9 @@
 # SP3-C3 is the closest available null model to Revio chemistry.
 # Compare output to bc2036_bystrandify run (25.3 container default model).
 
-set -euxo pipefail
+set -uxo pipefail
 source /etc/profile.d/modules.sh 2>/dev/null || true
-module load SMRT-Link/12.0.0.177059-cli-tools-only
+module load SMRT-Link/12.0.0.177059-cli-tools-only || true
 
 TESTDIR=/data/users/ndutilleux/kinsim_test
 REF=${TESTDIR}/bc2036_ref.fasta
