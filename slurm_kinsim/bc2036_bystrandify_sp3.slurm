@@ -24,7 +24,13 @@ source /etc/profile.d/modules.sh 2>/dev/null || true
 module load SMRT-Link/12.0.0.177059-cli-tools-only
 
 TESTDIR=/data/users/ndutilleux/kinsim_test
-REF=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036/final_assembly.fasta
+REF=${TESTDIR}/bc2036_ref.fasta
+
+# Copy reference to TESTDIR if not already there (/data/projects not mounted on all nodes)
+if [ ! -f "${REF}" ]; then
+    cp /data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036/final_assembly.fasta ${REF}
+    samtools faidx ${REF}
+fi
 INPUT=${TESTDIR}/bc2036.bam
 
 # Reuse bystrandify BAM + alignment from previous run (already done)
@@ -47,7 +53,6 @@ echo "  PBI:     ${ALIGNED}.pbi"
 
 echo ""
 echo "=== Step 4: ipdSummary (SP3-C3 model) ==="
-samtools faidx ${REF}
 ipdSummary ${ALIGNED} \
     --reference ${REF} \
     --identify m6A,m4C \
@@ -70,7 +75,7 @@ cat ${MOTIFS}
 
 echo ""
 echo "=== Expected motifs ==="
-cat /data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036/motifs.csv 2>/dev/null \
+cat ${TESTDIR}/motifs.csv 2>/dev/null \
     || echo "(no reference motifs.csv found)"
 
 echo ""
