@@ -11,8 +11,12 @@
 
 # STEP 02: pbmotifmaker per species on ipdSummary GFF
 # Discovers methylation motifs from kinetic data
+#
+# Usage:
+#   sbatch 02_pbmotifmaker.slurm [SPECIES_DIR]
+#   Default: species_bystrand (from 00_bystrandify.slurm)
 
-OUTDIR="/data/projects/p774_MARSD/NDutilleux/training/PB_MOCK/species_aligned"
+OUTDIR="${1:-/data/projects/p774_MARSD/NDutilleux/training/PB_MOCK/species_bystrand}"
 REF="/data/projects/p774_MARSD/NDutilleux/training/PB_MOCK/Genomes/MSA1003_competitive_ref.fasta"
 SMRT_SIF="/containers/apptainer/pacbio-smrt-tools-25.3.sif"
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=bc2036_smrt251
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=128G
+#SBATCH --mem=900G
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
 #SBATCH --exclude=binfservas18
