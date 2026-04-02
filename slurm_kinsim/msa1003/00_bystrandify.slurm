@@ -97,49 +97,72 @@ echo "=== Alignment stats ==="
 samtools flagstat "$ALIGNED"
 echo ""
 
-# --- Step 3: Split by species ---
+# --- Step 3: Split by species using pysam (reliable for large BAMs) ---
 echo "=== Step 3: Split by species + prepare for ipdSummary ==="
 
-TOTAL_OK=0
-TOTAL_SKIP=0
+python -c "
+import pysam
+import subprocess
+import os
 
-samtools idxstats "$ALIGNED" | while read CONTIG LENGTH MAPPED UNMAPPED; do
-    [ "$CONTIG" = "*" ] && continue
-    [ "$MAPPED" -eq 0 ] && continue
+aligned = '${ALIGNED}'
+outdir  = '${OUTDIR}'
+ref     = '${REF}'
+smrt_sif = '${SMRT_SIF}'
 
-    SPECIES_DIR="${OUTDIR}/${CONTIG}"
-    mkdir -p "$SPECIES_DIR"
+bam_in = pysam.AlignmentFile(aligned)
 
-    OUT_BAM="${SPECIES_DIR}/${CONTIG}_ipd.bam"
-    SINGLE_REF="${SPECIES_DIR}/${CONTIG}.fasta"
+# Get contigs with mapped reads
+contigs = []
+for stat in bam_in.get_index_statistics():
+    if stat.mapped > 0:
+        contigs.append((stat.contig, stat.mapped))
+
+print(f'Found {len(contigs)} contigs with mapped reads')
+
+for contig, mapped in contigs:
+    species_dir = os.path.join(outdir, contig)
+    os.makedirs(species_dir, exist_ok=True)
+
+    out_bam_path = os.path.join(species_dir, f'{contig}_ipd.bam')
+    single_ref   = os.path.join(species_dir, f'{contig}.fasta')
 
     # Skip if fully processed
-    if [ -f "$OUT_BAM" ] && [ -f "${OUT_BAM}.pbi" ] && [ -f "$SINGLE_REF" ]; then
-        echo "  $CONTIG: already done"
+    if (os.path.isfile(out_bam_path)
+        and os.path.isfile(f'{out_bam_path}.pbi')
+        and os.path.isfile(single_ref)):
+        print(f'  {contig}: already done')
         continue
-    fi
 
-    echo "  $CONTIG: $MAPPED reads"
+    print(f'  {contig}: {mapped} reads')
 
-    # Extract reads for this contig
-    samtools view -b "$ALIGNED" "$CONTIG" > "${SPECIES_DIR}/tmp_extract.bam"
+    # Build new header with only this contig
+    old_header = bam_in.header.to_dict()
+    old_header['SQ'] = [sq for sq in old_header['SQ'] if sq['SN'] == contig]
 
-    # Reheader to single contig (pbcore requires FASTA contigs = superset of BAM @SQ)
-    samtools view -H "$ALIGNED" | grep -v '^@SQ' > "${SPECIES_DIR}/header.sam"
-    samtools view -H "$ALIGNED" | grep "^@SQ.*SN:${CONTIG}	" >> "${SPECIES_DIR}/header.sam"
-    samtools reheader "${SPECIES_DIR}/header.sam" "${SPECIES_DIR}/tmp_extract.bam" > "$OUT_BAM"
-    rm -f "${SPECIES_DIR}/header.sam" "${SPECIES_DIR}/tmp_extract.bam"
+    # Write split BAM with single-contig header
+    bam_out = pysam.AlignmentFile(out_bam_path, 'wb', header=old_header)
+    for read in bam_in.fetch(contig):
+        bam_out.write(read)
+    bam_out.close()
 
-    samtools index "$OUT_BAM"
+    # Index
+    pysam.index(out_bam_path)
 
     # Per-species reference FASTA
-    samtools faidx "$REF" "$CONTIG" > "$SINGLE_REF"
-    samtools faidx "$SINGLE_REF"
+    subprocess.run(['samtools', 'faidx', ref, contig],
+                   stdout=open(single_ref, 'w'), check=True)
+    subprocess.run(['samtools', 'faidx', single_ref], check=True)
 
     # pbindex (required by ipdSummary)
-    apptainer exec --bind /data "$SMRT_SIF" pbindex "$OUT_BAM"
+    subprocess.run([
+        'apptainer', 'exec', '--bind', '/data', smrt_sif,
+        'pbindex', out_bam_path
+    ], check=True)
 
-done
+bam_in.close()
+print('Split complete.')
+"
 
 echo ""
 echo "=== SUMMARY: species prepared ==="
@@ -158,5 +181,3 @@ echo "----------------------------------------"
 echo ""
 date
 echo "=== Done ==="
-echo ""
-echo "Next: sbatch slurm_kinsim/msa1003/01_ipdsummary.slurm $OUTDIR"
