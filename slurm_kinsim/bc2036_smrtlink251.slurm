@@ -18,7 +18,7 @@ export TMPDIR="$HOME/DATA/smrttempdir"
 mkdir -p "$TMPDIR"
 
 WORKDIR=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036_smrtlink251
-BAM=/data/projects/p774_MARSD/NDutilleux/training/Strepto/bc2036/bc2036.bam
+BAM=/data/users/ndutilleux/kinsim_test/bc2036.bam
 
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
