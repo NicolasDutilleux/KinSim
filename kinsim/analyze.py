@@ -811,7 +811,41 @@ def render_html_report(
             ),
             legend=dict(x=0.02, y=0.98),
         )
-        figures.append(('3D density surface', fig))
+        figures.append(('3D density surface (per type)', fig))
+
+        # ── Combined surface with height-based colormap ───────────────────
+        # KDE on ALL data points together, single surface colored by Z
+        max_kde_all = 100_000
+        total = len(all_ipd_vals)
+        if total > max_kde_all:
+            idx_all = rng.choice(total, max_kde_all, replace=False)
+            ipd_all_s = all_ipd_vals[idx_all]
+            pw_all_s  = all_pw_vals[idx_all]
+        else:
+            ipd_all_s = all_ipd_vals
+            pw_all_s  = all_pw_vals
+        try:
+            kde_all = gaussian_kde(np.vstack([ipd_all_s, pw_all_s]), bw_method=0.15)
+            z_all   = kde_all(grid_pts).reshape(grid_n, grid_n)
+
+            fig2 = go.Figure(go.Surface(
+                x=ipd_grid, y=pw_grid, z=z_all,
+                colorscale='Jet',
+                colorbar=dict(title='Density'),
+                opacity=0.95,
+            ))
+            fig2.update_layout(
+                title='3D Density Surface: Combined IPD × PW (all methylation types)',
+                scene=dict(
+                    xaxis_title='Mean IPD',
+                    yaxis_title='Mean PW',
+                    zaxis_title='Density',
+                    camera=dict(eye=dict(x=1.5, y=-1.5, z=1.2)),
+                ),
+            )
+            figures.append(('3D density surface (combined)', fig2))
+        except np.linalg.LinAlgError:
+            log.warning("KDE failed for combined surface — skipping.")
 
     # ── Assemble HTML ─────────────────────────────────────────────────────
     meth_summary = ', '.join(
@@ -897,6 +931,16 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
     with open(output_path, 'w') as fh:
         fh.write('\n'.join(html_parts))
     log.info("HTML report saved: %s", output_path)
+
+    # ── Export individual figures as standalone HTML files ─────────────────
+    export_dir = Path(output_path).parent / 'figures'
+    export_dir.mkdir(parents=True, exist_ok=True)
+    for i, (title, fig) in enumerate(figures):
+        slug = title.lower().replace(' ', '_').replace('/', '_')
+        slug = ''.join(c for c in slug if c.isalnum() or c == '_')
+        fig_path = export_dir / f'{i:02d}_{slug}.html'
+        pio.write_html(fig, str(fig_path), include_plotlyjs='cdn')
+    log.info("Individual figures exported to: %s/  (%d files)", export_dir, len(figures))
 
 
 # ---------------------------------------------------------------------------
