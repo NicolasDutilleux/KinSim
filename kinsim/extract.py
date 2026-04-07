@@ -151,78 +151,45 @@ def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
 # IPD-based binarization helpers
 # ---------------------------------------------------------------------------
 
-def _otsu_threshold(ipd_vals: np.ndarray) -> float:
-    """Otsu's optimal threshold splitting IPD values into low/high groups.
-
-    Evaluates candidate thresholds on a grid of percentiles (5th–95th) and
-    picks the one that minimises weighted intra-class variance.  Falls back
-    to the median when there are fewer than 6 samples.
-    """
-    if len(ipd_vals) < 6:
-        return float(np.median(ipd_vals))
-    candidates = np.unique(np.percentile(ipd_vals, np.arange(5, 96, 2)))
-    best_thresh = float(np.median(ipd_vals))
-    best_var    = float("inf")
-    n = len(ipd_vals)
-    for t in candidates:
-        low  = ipd_vals[ipd_vals <  t]
-        high = ipd_vals[ipd_vals >= t]
-        if len(low) < 3 or len(high) < 3:
-            continue
-        var = (len(low) * float(np.var(low)) + len(high) * float(np.var(high))) / n
-        if var < best_var:
-            best_var    = var
-            best_thresh = float(t)
-    return best_thresh
-
 
 def _binarize_by_ipd(result: dict) -> dict:
-    """Binarize methylated keys using per-kmer none reference thresholding.
+    """Binarize methylated keys using 2D GMM clustering (IPD + PW).
 
-    Strategy:
-      1. First pass: for each kmer_id that has unmethylated samples (≥ 10),
-         compute the IPD percentile-based threshold from the none
-         distribution:  thresh = percentile_95(none_ipd).
-         This is robust to outliers and learned from this kmer's own data.
+    For each (kmer_id, meth_id > 0) key with enough samples:
+      1. Fit a 2-component Gaussian Mixture Model on (IPD, PW).
+      2. The component with the higher IPD centroid = methylated cluster.
+      3. Each sample is assigned to the cluster with highest posterior
+         probability.  Only samples assigned to the methylated cluster
+         are kept as methylated; the rest are moved to unmethylated.
+      4. Validation: the methylated centroid's IPD must be > 1.5× the
+         unmethylated centroid's IPD.  If not, no clear bimodality exists
+         and all samples are moved to unmethylated.
 
-      2. Second pass: for each (kmer_id, meth_id > 0) key:
-         a. If the same kmer_id has a none reference:
-            - A sample is truly methylated if its IPD > thresh.
-            - Samples below thresh are false positives → moved to none.
-         b. If no none reference exists: keep all as methylated.
-         c. If fewer than 3 samples survive: all moved to none (too noisy).
+    Advantages:
+      - 2D: uses both IPD and PW jointly (important for m4C)
+      - Per-kmer: each sequence context gets its own GMM fit
+      - Data-driven: all parameters learned from the data, no hardcoded
+        thresholds or percentiles
+      - Handles asymmetric clusters (different sizes, different variances)
+      - Probabilistic assignment (not a hard threshold)
 
-    Per-kmer, data-driven, no arbitrary constants.  Each kmer's threshold
-    comes from its own unmethylated signal distribution.
+    For keys with < 20 samples: kept as methylated (too few for GMM).
+    For keys where GMM doesn't converge: kept as methylated.
     """
-    MIN_NONE_SAMPLES = 10
+    from sklearn.mixture import GaussianMixture
+
+    MIN_SAMPLES_FOR_GMM = 20
     MIN_METH_SURVIVORS = 3
-    NONE_PERCENTILE = 95.0
+    MIN_CENTROID_RATIO = 1.5  # only hard constraint: bimodality check
 
-    # ── Pass 1: none IPD threshold per kmer_id ────────────────────────────
-    none_thresh: dict = {}  # kmer_id → IPD threshold
-    for key, arr in result.items():
-        if not isinstance(key, tuple):
-            continue
-        kmer_id, meth_id = key
-        if meth_id != 0 or len(arr) < MIN_NONE_SAMPLES:
-            continue
-        ipd_vals = arr[:, 0]
-        none_thresh[kmer_id] = float(np.percentile(ipd_vals, NONE_PERCENTILE))
-
-    log.info(
-        "Binarization: %d unique kmers have none reference (≥%d samples, "
-        "threshold = p%.0f of none IPD)",
-        len(none_thresh), MIN_NONE_SAMPLES, NONE_PERCENTILE,
-    )
-
-    # ── Pass 2: classify methylated samples ───────────────────────────────
     new_result: dict = {}
     none_extras: dict = {}
     n_split      = 0
     n_kept_all   = 0
     n_all_false  = 0
-    n_no_ref     = 0
+    n_too_few    = 0
+    n_no_bimodal = 0
+    n_gmm_fail   = 0
 
     for key, arr in result.items():
         if not isinstance(key, tuple):
@@ -233,29 +200,68 @@ def _binarize_by_ipd(result: dict) -> dict:
             new_result[key] = arr
             continue
 
-        # No none reference → keep as methylated
-        if kmer_id not in none_thresh:
+        n_samples = len(arr)
+
+        # Too few samples for GMM — keep as methylated
+        if n_samples < MIN_SAMPLES_FOR_GMM:
             high_arr = arr.copy()
             high_arr[:, 2] = 1.0
             new_result[(kmer_id, meth_id)] = high_arr
-            n_no_ref += 1
+            n_too_few += 1
             continue
 
-        thresh = none_thresh[kmer_id]
-        ipd_vals = arr[:, 0]
+        # Fit 2-component GMM on (IPD, PW)
+        ipd_pw = arr[:, :2].astype(np.float64)
+        try:
+            gmm = GaussianMixture(
+                n_components=2,
+                covariance_type='full',
+                n_init=3,
+                random_state=42,
+                max_iter=100,
+            )
+            gmm.fit(ipd_pw)
+        except Exception:
+            # GMM failed to converge — keep as methylated
+            high_arr = arr.copy()
+            high_arr[:, 2] = 1.0
+            new_result[(kmer_id, meth_id)] = high_arr
+            n_gmm_fail += 1
+            continue
 
-        high_mask = ipd_vals > thresh
+        # Identify which component is "methylated" (higher IPD centroid)
+        centroids_ipd = gmm.means_[:, 0]  # IPD of each centroid
+        meth_comp = int(np.argmax(centroids_ipd))
+        none_comp = 1 - meth_comp
+
+        # Bimodality check: methylated centroid must have meaningfully
+        # higher IPD than unmethylated centroid
+        ratio = centroids_ipd[meth_comp] / max(centroids_ipd[none_comp], 1e-9)
+        if ratio < MIN_CENTROID_RATIO:
+            # No clear bimodality — likely all unmethylated
+            low_arr = arr.copy()
+            low_arr[:, 2] = 0.0
+            if low_arr.shape[1] >= 14:
+                low_arr[:, 3 + K // 2] = 0
+            none_key = (kmer_id, 0)
+            none_extras.setdefault(none_key, []).append(low_arr)
+            n_no_bimodal += 1
+            continue
+
+        # Assign each sample to the most probable component
+        labels = gmm.predict(ipd_pw)
+        high_mask = labels == meth_comp
         n_high = int(high_mask.sum())
 
-        # All truly methylated
-        if n_high == len(arr):
+        # All methylated
+        if n_high == n_samples:
             high_arr = arr.copy()
             high_arr[:, 2] = 1.0
             new_result[(kmer_id, meth_id)] = high_arr
             n_kept_all += 1
             continue
 
-        # Too few survivors → all false positives
+        # Too few survivors
         if n_high < MIN_METH_SURVIVORS:
             low_arr = arr.copy()
             low_arr[:, 2] = 0.0
@@ -279,9 +285,11 @@ def _binarize_by_ipd(result: dict) -> dict:
         none_extras.setdefault(none_key, []).append(low_arr)
 
         log.debug(
-            "binarize kmer=%d meth=%d  thresh=%.1f  "
+            "binarize kmer=%d meth=%d  centroids_ipd=(%.1f, %.1f) ratio=%.2f  "
             "n=%d → %d meth  %d unmeth",
-            kmer_id, meth_id, thresh, len(arr), n_high, int((~high_mask).sum()),
+            kmer_id, meth_id,
+            centroids_ipd[none_comp], centroids_ipd[meth_comp], ratio,
+            n_samples, n_high, int((~high_mask).sum()),
         )
         n_split += 1
 
@@ -293,10 +301,10 @@ def _binarize_by_ipd(result: dict) -> dict:
             new_result[none_key] = extra
 
     log.info(
-        "Binarization (per-kmer p%.0f none threshold): "
+        "Binarization (2D GMM, 2 components): "
         "%d keys split, %d all-methylated, %d all-false-positive, "
-        "%d no-reference (kept as meth)",
-        NONE_PERCENTILE, n_split, n_kept_all, n_all_false, n_no_ref,
+        "%d no-bimodality, %d too-few (<20), %d GMM-failed",
+        n_split, n_kept_all, n_all_false, n_no_bimodal, n_too_few, n_gmm_fail,
     )
     return new_result
 
@@ -487,9 +495,8 @@ def extract_samples_from_bam(
 
     result = {key: np.array(vals, dtype=np.float32) for key, vals in samples.items()}
 
-    # Binarize methylated keys: Otsu threshold on IPD separates truly
-    # methylated reads (high IPD) from unmethylated reads at motif sites.
-    # Requires high/low group IPD ratio >= 1.3 to accept the split.
+    # Binarize methylated keys: 2-component GMM on (IPD, PW) separates
+    # truly methylated reads from unmethylated reads at motif sites.
     result = _binarize_by_ipd(result)
     b_keys    = sum(1 for k in result if isinstance(k, tuple))
     b_samples = sum(len(v) for k, v in result.items() if isinstance(k, tuple))
