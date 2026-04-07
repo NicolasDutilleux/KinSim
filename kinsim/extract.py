@@ -177,26 +177,34 @@ def _otsu_threshold(ipd_vals: np.ndarray) -> float:
 
 
 def _binarize_by_ipd(result: dict) -> dict:
-    """Binarize methylated keys using fraction-guided IPD splitting.
+    """Binarize methylated keys using Otsu IPD thresholding.
 
     For each (kmer_id, meth_id) key with meth_id > 0:
-      1. Compute mean stoichiometric fraction F from the per-sample fraction column.
-      2. Sort samples by IPD descending.
-      3. Top  ceil(F × N) samples  → (kmer_id, meth_id, frac=1.0)  [truly methylated]
-      4. Remaining samples         → (kmer_id, 0,       frac=0.0)  [unmethylated read]
+      1. If too few samples (< 10): keep all as methylated (insufficient
+         data for clustering).
+      2. Otherwise, compute the Otsu threshold on IPD values to find the
+         natural split between low-IPD (unmethylated reads at a motif site)
+         and high-IPD (truly methylated reads).
+      3. Validate the split: the high group mean must be >= 1.3× the low
+         group mean (biological expectation for m6A/m4C).  If not, the
+         motif site is likely fully unmethylated and all samples go to none.
+      4. High-IPD samples → (kmer_id, meth_id, frac=1.0)
+         Low-IPD samples  → (kmer_id, 0,       frac=0.0)
 
-    This uses the known biological fraction to determine HOW MANY reads are
-    methylated, and the IPD signal to determine WHICH reads those are.
-    Each read in the output is either 100% methylated or 100% unmethylated.
-
-    All keys are kept regardless of sample count — even a single-sample key
-    with frac=1.0 is useful diversity for the model.
+    This replaces the previous fraction-based split, which used a single
+    global fraction per motif (from ipdSummary).  That fraction represents
+    the genome-wide ratio of detected sites, NOT a per-kmer methylation
+    probability, leading to false-positive methylation labels.
     """
     new_result: dict = {}
     none_extras: dict = {}   # (kmer_id, 0) → list[np.ndarray] to append
-    n_split   = 0
-    n_pure    = 0
-    n_all_low = 0
+    n_split      = 0
+    n_all_high   = 0
+    n_all_low    = 0
+    n_too_few    = 0
+
+    # Minimum IPD ratio between high/low groups to accept the split
+    MIN_IPD_RATIO = 1.3
 
     for key, arr in result.items():
         if not isinstance(key, tuple):
@@ -208,51 +216,75 @@ def _binarize_by_ipd(result: dict) -> dict:
             continue
 
         n_samples = len(arr)
-        mean_frac = float(arr[:, 2].mean())
+        ipd_vals  = arr[:, 0]
 
-        # Fraction ~1.0: all reads are methylated — no split needed
-        if mean_frac >= 0.99:
+        # Too few samples for meaningful clustering — keep as methylated
+        if n_samples < 10:
             high_arr = arr.copy()
             high_arr[:, 2] = 1.0
             new_result[(kmer_id, meth_id)] = high_arr
-            n_pure += 1
+            n_too_few += 1
             continue
 
-        # Fraction ~0.0: motif was called but no real methylation — all to unmethylated
-        if mean_frac <= 0.01:
+        # Otsu threshold on IPD
+        thresh = _otsu_threshold(ipd_vals)
+        high_mask = ipd_vals >= thresh
+        low_mask  = ~high_mask
+
+        n_high = int(high_mask.sum())
+        n_low  = int(low_mask.sum())
+
+        # Edge case: all on one side
+        if n_high == 0:
+            # No high-IPD samples — all unmethylated
             low_arr = arr.copy()
             low_arr[:, 2] = 0.0
             if low_arr.shape[1] >= 14:
-                low_arr[:, 3 + K // 2] = 0  # center meth context → none
+                low_arr[:, 3 + K // 2] = 0
+            none_key = (kmer_id, 0)
+            none_extras.setdefault(none_key, []).append(low_arr)
+            n_all_low += 1
+            continue
+        if n_low == 0:
+            # All high-IPD — all methylated
+            high_arr = arr.copy()
+            high_arr[:, 2] = 1.0
+            new_result[(kmer_id, meth_id)] = high_arr
+            n_all_high += 1
+            continue
+
+        # Validate: high group must be meaningfully higher than low group
+        mean_high = float(ipd_vals[high_mask].mean())
+        mean_low  = float(ipd_vals[low_mask].mean())
+
+        if mean_low > 0 and mean_high / mean_low < MIN_IPD_RATIO:
+            # No clear separation — likely all unmethylated at this kmer
+            low_arr = arr.copy()
+            low_arr[:, 2] = 0.0
+            if low_arr.shape[1] >= 14:
+                low_arr[:, 3 + K // 2] = 0
             none_key = (kmer_id, 0)
             none_extras.setdefault(none_key, []).append(low_arr)
             n_all_low += 1
             continue
 
-        # Sort by IPD descending — highest IPD = most likely methylated
-        order      = np.argsort(arr[:, 0])[::-1]
-        arr_sorted = arr[order]
-
-        n_high = max(1, int(np.ceil(mean_frac * n_samples)))
-        n_low  = n_samples - n_high
-
-        # Top n_high → methylated
-        high_arr       = arr_sorted[:n_high].copy()
+        # Split: high → methylated, low → unmethylated
+        high_arr = arr[high_mask].copy()
         high_arr[:, 2] = 1.0
         new_result[(kmer_id, meth_id)] = high_arr
 
-        # Bottom n_low → unmethylated (if any)
-        if n_low > 0:
-            low_arr       = arr_sorted[n_high:].copy()
-            low_arr[:, 2] = 0.0
-            if low_arr.shape[1] >= 14:
-                low_arr[:, 3 + K // 2] = 0  # center meth context → none
-            none_key = (kmer_id, 0)
-            none_extras.setdefault(none_key, []).append(low_arr)
+        low_arr = arr[low_mask].copy()
+        low_arr[:, 2] = 0.0
+        if low_arr.shape[1] >= 14:
+            low_arr[:, 3 + K // 2] = 0
+        none_key = (kmer_id, 0)
+        none_extras.setdefault(none_key, []).append(low_arr)
 
         log.debug(
-            "binarize kmer=%d meth=%d  frac=%.2f  n=%d → high=%d meth  low=%d unmeth",
-            kmer_id, meth_id, mean_frac, n_samples, n_high, n_low,
+            "binarize kmer=%d meth=%d  otsu=%.1f  ratio=%.2f  "
+            "n=%d → high=%d meth  low=%d unmeth",
+            kmer_id, meth_id, thresh, mean_high / max(mean_low, 1e-9),
+            n_samples, n_high, n_low,
         )
         n_split += 1
 
@@ -264,9 +296,9 @@ def _binarize_by_ipd(result: dict) -> dict:
             new_result[none_key] = extra
 
     log.info(
-        "Binarization: %d keys split by fraction, %d pure (frac≥0.99), "
-        "%d all-unmethylated (frac≤0.01)",
-        n_split, n_pure, n_all_low,
+        "Binarization (Otsu): %d keys split, %d all-methylated, "
+        "%d all-unmethylated (no separation), %d too-few (<10 samples)",
+        n_split, n_all_high, n_all_low, n_too_few,
     )
     return new_result
 
@@ -457,8 +489,9 @@ def extract_samples_from_bam(
 
     result = {key: np.array(vals, dtype=np.float32) for key, vals in samples.items()}
 
-    # Binarize methylated keys: split by IPD signal (Otsu) so the model
-    # learns clean binary distributions instead of stoichiometric averages.
+    # Binarize methylated keys: Otsu threshold on IPD separates truly
+    # methylated reads (high IPD) from unmethylated reads at motif sites.
+    # Requires high/low group IPD ratio >= 1.3 to accept the split.
     result = _binarize_by_ipd(result)
     b_keys    = sum(1 for k in result if isinstance(k, tuple))
     b_samples = sum(len(v) for k, v in result.items() if isinstance(k, tuple))
