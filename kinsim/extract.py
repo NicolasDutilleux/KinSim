@@ -177,34 +177,80 @@ def _otsu_threshold(ipd_vals: np.ndarray) -> float:
 
 
 def _binarize_by_ipd(result: dict) -> dict:
-    """Binarize methylated keys using Otsu IPD thresholding.
+    """Binarize methylated keys using 2D Mahalanobis distance with
+    data-driven per-kmer thresholds.
 
-    For each (kmer_id, meth_id) key with meth_id > 0:
-      1. If too few samples (< 10): keep all as methylated (insufficient
-         data for clustering).
-      2. Otherwise, compute the Otsu threshold on IPD values to find the
-         natural split between low-IPD (unmethylated reads at a motif site)
-         and high-IPD (truly methylated reads).
-      3. Validate the split: the high group mean must be >= 1.3× the low
-         group mean (biological expectation for m6A/m4C).  If not, the
-         motif site is likely fully unmethylated and all samples go to none.
-      4. High-IPD samples → (kmer_id, meth_id, frac=1.0)
-         Low-IPD samples  → (kmer_id, 0,       frac=0.0)
+    Strategy:
+      1. First pass: for each kmer_id with unmethylated samples (≥ 20),
+         compute the 2D (IPD, PW) mean, inverse covariance, and the
+         Mahalanobis distances of the none samples themselves.  The 99th
+         percentile of these distances becomes the per-kmer threshold.
 
-    This replaces the previous fraction-based split, which used a single
-    global fraction per motif (from ipdSummary).  That fraction represents
-    the genome-wide ratio of detected sites, NOT a per-kmer methylation
-    probability, leading to false-positive methylation labels.
+      2. Second pass: for each (kmer_id, meth_id > 0) key:
+         a. Compute Mahalanobis distance of each sample from the none
+            distribution of the same kmer.
+         b. A sample is truly methylated only if:
+            - Its distance exceeds the per-kmer threshold (99th percentile
+              of none distances), AND
+            - Its IPD is above the none mean IPD (directionality check:
+              methylation increases IPD, so an outlier with LOW IPD is
+              noise, not methylation).
+         c. If no none reference exists for this kmer, keep all as
+            methylated (no baseline to compare against).
+         d. If fewer than 3 samples survive, move all to unmethylated
+            (too noisy to learn from).
+
+    Advantages:
+      - 2D: uses both IPD and PW jointly
+      - Per-kmer: each sequence context has its own baseline and threshold
+      - Data-driven: threshold is derived from the none distribution itself
+      - Direction-aware: rejects outliers in the wrong direction
+      - Class-imbalance-proof: only uses none stats, ignores meth/none ratio
     """
-    new_result: dict = {}
-    none_extras: dict = {}   # (kmer_id, 0) → list[np.ndarray] to append
-    n_split      = 0
-    n_all_high   = 0
-    n_all_low    = 0
-    n_too_few    = 0
+    MIN_NONE_SAMPLES = 20
+    MIN_METH_SURVIVORS = 3
+    PERCENTILE = 99.0
 
-    # Minimum IPD ratio between high/low groups to accept the split
-    MIN_IPD_RATIO = 1.3
+    # ── Pass 1: none distribution stats + per-kmer threshold ──────────────
+    none_ref: dict = {}  # kmer_id → (mean_2d, inv_cov_2d, dist_threshold)
+    for key, arr in result.items():
+        if not isinstance(key, tuple):
+            continue
+        kmer_id, meth_id = key
+        if meth_id != 0 or len(arr) < MIN_NONE_SAMPLES:
+            continue
+        ipd_pw = arr[:, :2].astype(np.float64)
+        mean = ipd_pw.mean(axis=0)
+        cov  = np.cov(ipd_pw, rowvar=False)
+        # Regularize to avoid singularity
+        cov += np.eye(2) * 1e-6
+        try:
+            inv_cov = np.linalg.inv(cov)
+        except np.linalg.LinAlgError:
+            continue
+
+        # Mahalanobis distances of the none samples themselves
+        diff = ipd_pw - mean
+        m_dist_none = np.sqrt(np.sum((diff @ inv_cov) * diff, axis=1))
+        thresh = float(np.percentile(m_dist_none, PERCENTILE))
+        # Floor: threshold must be at least 2.0 to avoid overly tight cuts
+        thresh = max(thresh, 2.0)
+
+        none_ref[kmer_id] = (mean, inv_cov, thresh)
+
+    log.info(
+        "Binarization: %d unique kmers have none reference (≥%d samples, "
+        "threshold=p%.0f of none distances)",
+        len(none_ref), MIN_NONE_SAMPLES, PERCENTILE,
+    )
+
+    # ── Pass 2: classify methylated samples ───────────────────────────────
+    new_result: dict = {}
+    none_extras: dict = {}
+    n_split      = 0
+    n_kept_all   = 0
+    n_all_false  = 0
+    n_no_ref     = 0
 
     for key, arr in result.items():
         if not isinstance(key, tuple):
@@ -215,64 +261,51 @@ def _binarize_by_ipd(result: dict) -> dict:
             new_result[key] = arr
             continue
 
-        n_samples = len(arr)
-        ipd_vals  = arr[:, 0]
-
-        # Too few samples for meaningful clustering — keep as methylated
-        if n_samples < 10:
+        # No none reference → keep as methylated
+        if kmer_id not in none_ref:
             high_arr = arr.copy()
             high_arr[:, 2] = 1.0
             new_result[(kmer_id, meth_id)] = high_arr
-            n_too_few += 1
+            n_no_ref += 1
             continue
 
-        # Otsu threshold on IPD
-        thresh = _otsu_threshold(ipd_vals)
-        high_mask = ipd_vals >= thresh
-        low_mask  = ~high_mask
+        mean, inv_cov, thresh = none_ref[kmer_id]
+        ipd_pw = arr[:, :2].astype(np.float64)
+        diff   = ipd_pw - mean
+        m_dist = np.sqrt(np.sum((diff @ inv_cov) * diff, axis=1))
 
+        # Directionality: methylation increases IPD → sample IPD must be
+        # above none mean.  This rejects outliers in the wrong direction.
+        ipd_above_none = ipd_pw[:, 0] > mean[0]
+
+        high_mask = (m_dist > thresh) & ipd_above_none
         n_high = int(high_mask.sum())
-        n_low  = int(low_mask.sum())
 
-        # Edge case: all on one side
-        if n_high == 0:
-            # No high-IPD samples — all unmethylated
-            low_arr = arr.copy()
-            low_arr[:, 2] = 0.0
-            if low_arr.shape[1] >= 14:
-                low_arr[:, 3 + K // 2] = 0
-            none_key = (kmer_id, 0)
-            none_extras.setdefault(none_key, []).append(low_arr)
-            n_all_low += 1
-            continue
-        if n_low == 0:
-            # All high-IPD — all methylated
+        # All truly methylated
+        if n_high == len(arr):
             high_arr = arr.copy()
             high_arr[:, 2] = 1.0
             new_result[(kmer_id, meth_id)] = high_arr
-            n_all_high += 1
+            n_kept_all += 1
             continue
 
-        # Validate: high group must be meaningfully higher than low group
-        mean_high = float(ipd_vals[high_mask].mean())
-        mean_low  = float(ipd_vals[low_mask].mean())
-
-        if mean_low > 0 and mean_high / mean_low < MIN_IPD_RATIO:
-            # No clear separation — likely all unmethylated at this kmer
+        # Too few survivors → all false positives
+        if n_high < MIN_METH_SURVIVORS:
             low_arr = arr.copy()
             low_arr[:, 2] = 0.0
             if low_arr.shape[1] >= 14:
                 low_arr[:, 3 + K // 2] = 0
             none_key = (kmer_id, 0)
             none_extras.setdefault(none_key, []).append(low_arr)
-            n_all_low += 1
+            n_all_false += 1
             continue
 
-        # Split: high → methylated, low → unmethylated
+        # Split
         high_arr = arr[high_mask].copy()
         high_arr[:, 2] = 1.0
         new_result[(kmer_id, meth_id)] = high_arr
 
+        low_mask = ~high_mask
         low_arr = arr[low_mask].copy()
         low_arr[:, 2] = 0.0
         if low_arr.shape[1] >= 14:
@@ -281,10 +314,9 @@ def _binarize_by_ipd(result: dict) -> dict:
         none_extras.setdefault(none_key, []).append(low_arr)
 
         log.debug(
-            "binarize kmer=%d meth=%d  otsu=%.1f  ratio=%.2f  "
-            "n=%d → high=%d meth  low=%d unmeth",
-            kmer_id, meth_id, thresh, mean_high / max(mean_low, 1e-9),
-            n_samples, n_high, n_low,
+            "binarize kmer=%d meth=%d  thresh=%.1f  "
+            "n=%d → %d meth  %d unmeth",
+            kmer_id, meth_id, thresh, len(arr), n_high, int(low_mask.sum()),
         )
         n_split += 1
 
@@ -296,9 +328,10 @@ def _binarize_by_ipd(result: dict) -> dict:
             new_result[none_key] = extra
 
     log.info(
-        "Binarization (Otsu): %d keys split, %d all-methylated, "
-        "%d all-unmethylated (no separation), %d too-few (<10 samples)",
-        n_split, n_all_high, n_all_low, n_too_few,
+        "Binarization (Mahalanobis 2D, per-kmer p%.0f threshold): "
+        "%d keys split, %d all-methylated, %d all-false-positive, "
+        "%d no-reference (kept as meth)",
+        PERCENTILE, n_split, n_kept_all, n_all_false, n_no_ref,
     )
     return new_result
 
