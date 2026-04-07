@@ -188,6 +188,39 @@ def _compute_metrics(
         result[f"{prefix}_calib_2sig_{name}"]  = by_type[name]["calib_2sig"]
 
     result["_by_type"] = by_type   # human-readable, not logged as scalar
+
+    # ── Pearson oracle: theoretical ceiling for a perfect distributional model ─
+    # r_oracle = Var(μ) / (Var(μ) + E[σ²])
+    var_mu_ipd = np.var(all_mu[:, 0])
+    var_mu_pw  = np.var(all_mu[:, 1])
+    e_sig2_ipd = np.mean(all_sigma[:, 0] ** 2)
+    e_sig2_pw  = np.mean(all_sigma[:, 1] ** 2)
+    oracle_ipd = var_mu_ipd / (var_mu_ipd + e_sig2_ipd) if (var_mu_ipd + e_sig2_ipd) > 0 else 0.0
+    oracle_pw  = var_mu_pw  / (var_mu_pw  + e_sig2_pw)  if (var_mu_pw  + e_sig2_pw)  > 0 else 0.0
+    result[f"{prefix}_oracle_ipd"] = float(oracle_ipd)
+    result[f"{prefix}_oracle_pw"]  = float(oracle_pw)
+
+    # ── Distribution samples: 10 random per meth type ─────────────────────────
+    dist_samples: dict = {}
+    rng = np.random.default_rng(42)
+    for meth_id in sorted(np.unique(all_meth_ids)):
+        mask = all_meth_ids == meth_id
+        n_avail = int(mask.sum())
+        if n_avail < 1:
+            continue
+        n_pick = min(10, n_avail)
+        idx = rng.choice(n_avail, n_pick, replace=False)
+        mu_sel  = all_mu[mask][idx]     # (n_pick, 2)
+        sig_sel = all_sigma[mask][idx]  # (n_pick, 2)
+        name = _METH_NAMES.get(int(meth_id), f"meth{meth_id}")
+        dist_samples[name] = {
+            "mu_ipd":    mu_sel[:, 0],
+            "mu_pw":     mu_sel[:, 1],
+            "sigma_ipd": sig_sel[:, 0],
+            "sigma_pw":  sig_sel[:, 1],
+        }
+    result["_dist_samples"] = dist_samples
+
     return result
 
 
@@ -235,9 +268,15 @@ def _log_metrics(metrics: dict, prefix: str) -> None:
     if c2i > 99.0:
         calib_grade = "POOR"  # underconfident
 
+    o_ipd = metrics.get(f"{prefix}_oracle_ipd", 0.0)
+    o_pw  = metrics.get(f"{prefix}_oracle_pw",  0.0)
     log.info(
         "  Pearson  IPD=%.3f [%s ≥0.70]   PW=%.3f [%s ≥0.60]",
         p_ipd, _grade(p_ipd, 0.70, 0.50), p_pw, _grade(p_pw, 0.60, 0.40),
+    )
+    log.info(
+        "  Oracle   IPD=%.3f              PW=%.3f  (theoretical ceiling)",
+        o_ipd, o_pw,
     )
     log.info(
         "  MAE      IPD=%.4f               PW=%.4f  (log1p space)",
@@ -269,6 +308,19 @@ def _log_metrics(metrics: dict, prefix: str) -> None:
                 t["pearson_ipd"], _grade(t["pearson_ipd"], 0.70, 0.50),
                 t["pearson_pw"],  _grade(t["pearson_pw"],  0.60, 0.40),
                 t["calib_2sig"] * 100, cg,
+            )
+    # ── Distribution samples (10 per meth type) ─────────────────────────────
+    dist_samples = metrics.get("_dist_samples", {})
+    if dist_samples:
+        log.info("  Distribution samples (predicted μ ± σ in log1p space):")
+        for name, s in dist_samples.items():
+            mu_ipd_mean  = float(np.mean(s["mu_ipd"]))
+            mu_pw_mean   = float(np.mean(s["mu_pw"]))
+            sig_ipd_mean = float(np.mean(s["sigma_ipd"]))
+            sig_pw_mean  = float(np.mean(s["sigma_pw"]))
+            log.info(
+                "    %-6s  IPD: μ=%.3f ± σ=%.3f   PW: μ=%.3f ± σ=%.3f  (avg of %d samples)",
+                name, mu_ipd_mean, sig_ipd_mean, mu_pw_mean, sig_pw_mean, len(s["mu_ipd"]),
             )
     log.info("─" * W)
 
