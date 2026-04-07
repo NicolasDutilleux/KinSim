@@ -748,6 +748,71 @@ def render_html_report(
         )
         figures.append(('Sensitivity comparison', fig))
 
+    # ── Fig: 3D Density Surface (IPD × PW × density per meth type) ─────
+    try:
+        from scipy.stats import gaussian_kde
+        _HAS_SCIPY = True
+    except ImportError:
+        _HAS_SCIPY = False
+        log.warning("scipy not installed — skipping 3D density surface.")
+
+    if _HAS_SCIPY:
+        # Build a shared grid in raw signal space
+        all_ipd_vals = np.concatenate([
+            stats.groups[m].ipd_means for m in meth_ids_sorted
+        ])
+        all_pw_vals = np.concatenate([
+            stats.groups[m].pw_means for m in meth_ids_sorted
+        ])
+        ipd_lo = float(np.percentile(all_ipd_vals, 1))
+        ipd_hi = float(np.percentile(all_ipd_vals, 99))
+        pw_lo  = float(np.percentile(all_pw_vals, 1))
+        pw_hi  = float(np.percentile(all_pw_vals, 99))
+        grid_n = 80
+        ipd_grid = np.linspace(ipd_lo, ipd_hi, grid_n)
+        pw_grid  = np.linspace(pw_lo, pw_hi, grid_n)
+        ipd_mesh, pw_mesh = np.meshgrid(ipd_grid, pw_grid)
+        grid_pts = np.vstack([ipd_mesh.ravel(), pw_mesh.ravel()])
+
+        fig = go.Figure()
+        for m in meth_ids_sorted:
+            g = stats.groups[m]
+            n = g.n_entries
+            if n < 50:
+                continue
+            # Subsample for KDE performance
+            max_kde = 50_000
+            if n > max_kde:
+                idx = rng.choice(n, max_kde, replace=False)
+                ipd_s = g.ipd_means[idx]
+                pw_s  = g.pw_means[idx]
+            else:
+                ipd_s = g.ipd_means
+                pw_s  = g.pw_means
+            try:
+                kde = gaussian_kde(np.vstack([ipd_s, pw_s]), bw_method=0.15)
+                z   = kde(grid_pts).reshape(grid_n, grid_n)
+            except np.linalg.LinAlgError:
+                continue
+            fig.add_trace(go.Surface(
+                x=ipd_grid, y=pw_grid, z=z,
+                name=lbl(m), showscale=False,
+                opacity=0.7,
+                colorscale=[[0, clr(m)], [1, clr(m)]],
+                showlegend=True,
+            ))
+        fig.update_layout(
+            title='3D Density Surface: IPD × PW per Methylation Type',
+            scene=dict(
+                xaxis_title='Mean IPD',
+                yaxis_title='Mean PW',
+                zaxis_title='Density',
+                camera=dict(eye=dict(x=1.5, y=-1.5, z=1.2)),
+            ),
+            legend=dict(x=0.02, y=0.98),
+        )
+        figures.append(('3D density surface', fig))
+
     # ── Assemble HTML ─────────────────────────────────────────────────────
     meth_summary = ', '.join(
         f'{lbl(m)}: {stats.groups[m].n_entries:,}' for m in meth_ids_sorted
