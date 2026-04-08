@@ -293,6 +293,7 @@ def _binarize_by_ipd(result: dict) -> dict:
         )
         n_split += 1
 
+    # Merge reclassified samples into none keys
     for none_key, arrays in none_extras.items():
         extra = np.concatenate(arrays, axis=0)
         if none_key in new_result:
@@ -301,11 +302,60 @@ def _binarize_by_ipd(result: dict) -> dict:
             new_result[none_key] = extra
 
     log.info(
-        "Binarization (2D GMM, 2 components): "
+        "Binarization (2D GMM, per-kmer): "
         "%d keys split, %d all-methylated, %d all-false-positive, "
         "%d no-bimodality, %d too-few (<20), %d GMM-failed",
         n_split, n_kept_all, n_all_false, n_no_bimodal, n_too_few, n_gmm_fail,
     )
+
+    # --- Global post-GMM validation ---
+    # Compute the none IPD distribution and reject meth keys whose mean IPD
+    # falls within the unmethylated range.  This catches:
+    #   - too-few keys that were kept without GMM verification
+    #   - GMM splits where the "high" cluster is still close to none
+    # Threshold: none_mean + 2*none_std  (data-driven, no hardcoded value)
+    none_ipds = []
+    for key, arr in new_result.items():
+        if isinstance(key, tuple) and key[1] == 0:
+            none_ipds.append(arr[:, 0])
+    if none_ipds:
+        all_none_ipd = np.concatenate(none_ipds)
+        none_mean = float(np.mean(all_none_ipd))
+        none_std  = float(np.std(all_none_ipd))
+        ipd_floor = none_mean + 2.0 * none_std
+        log.info(
+            "Global validation: none IPD mean=%.1f std=%.1f → "
+            "meth keys must have mean IPD > %.1f",
+            none_mean, none_std, ipd_floor,
+        )
+
+        n_global_reject = 0
+        meth_keys_to_check = [
+            k for k in new_result
+            if isinstance(k, tuple) and k[1] > 0
+        ]
+        for key in meth_keys_to_check:
+            arr = new_result[key]
+            key_mean_ipd = float(np.mean(arr[:, 0]))
+            if key_mean_ipd < ipd_floor:
+                # Reclassify to none
+                low_arr = arr.copy()
+                low_arr[:, 2] = 0.0
+                if low_arr.shape[1] >= 14:
+                    low_arr[:, 3 + K // 2] = 0
+                none_key = (key[0], 0)
+                if none_key in new_result:
+                    new_result[none_key] = np.concatenate(
+                        [new_result[none_key], low_arr], axis=0,
+                    )
+                else:
+                    new_result[none_key] = low_arr
+                del new_result[key]
+                n_global_reject += 1
+
+        log.info("Global validation: %d meth keys rejected (mean IPD < %.1f)",
+                 n_global_reject, ipd_floor)
+
     return new_result
 
 
