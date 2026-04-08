@@ -215,26 +215,28 @@ def _binarize_by_ipd(result: dict) -> dict:
     )
 
     # ── Step 3: compute ratios, group by meth type ─────────────────────────
-    # meth_id → list of (key, ipd_ratio, pw_ratio)
+    # Only keys with a kmer-specific none reference get a ratio.
+    # Keys without a none counterpart are rejected — no reliable baseline.
     meth_type_entries: dict[int, list] = defaultdict(list)
-    n_no_ref = 0
+    keys_no_ref: set = set()
     for key, (m_ipd, m_pw) in key_means.items():
         kmer_id, meth_id = key
         if meth_id == 0:
             continue
-        ref_ipd, ref_pw = none_ref.get(kmer_id, (global_none_ipd, global_none_pw))
         if kmer_id not in none_ref:
-            n_no_ref += 1
+            keys_no_ref.add(key)
+            continue
+        ref_ipd, ref_pw = none_ref[kmer_id]
         ipd_ratio = m_ipd / max(ref_ipd, 1e-9)
         pw_ratio  = m_pw  / max(ref_pw,  1e-9)
         meth_type_entries[meth_id].append((key, ipd_ratio, pw_ratio))
 
-    if n_no_ref:
-        log.info("  %d meth keys used global fallback (no kmer-specific none ref)", n_no_ref)
+    if keys_no_ref:
+        log.info("  %d meth keys rejected (no kmer-specific none reference)", len(keys_no_ref))
 
     # ── Step 4: one GMM per meth type on (IPD_ratio, PW_ratio) ─────────────
     keys_keep:   set = set()
-    keys_reject: set = set()
+    keys_reject: set = set(keys_no_ref)  # pre-reject keys without none ref
     METH_NAMES = {1: 'm6A', 2: 'm4C', 3: 'm5C'}
 
     for meth_id, entries in sorted(meth_type_entries.items()):
@@ -291,32 +293,41 @@ def _binarize_by_ipd(result: dict) -> dict:
             log.info("    → no bimodality (gap %.2f < 1.3) — all %d keys rejected", centroid_gap, n_keys)
             continue
 
-        # Use posterior probabilities — only keep keys with high confidence
-        # of belonging to the methylated cluster (>= 0.9)
+        # Two filters:
+        # 1) Posterior probability >= 0.9 (GMM confidence)
+        # 2) IPD ratio >= midpoint between centroids (hard floor from GMM)
+        #    This is data-driven: derived from the GMM centroids, not hardcoded.
         MIN_POSTERIOR = 0.9
+        ratio_floor = (lo_ipd_r + hi_ipd_r) / 2.0
+
         proba   = gmm.predict_proba(ratios)  # shape (n_keys, 2)
-        is_meth = proba[:, meth_comp] >= MIN_POSTERIOR
-        n_meth  = int(is_meth.sum())
-        n_false = int((~is_meth).sum())
+        is_meth = (proba[:, meth_comp] >= MIN_POSTERIOR) & (ratios[:, 0] >= ratio_floor)
 
         kept_ratios = []
+        n_floor_reject = 0
         for i, key in enumerate(k_list):
             if is_meth[i]:
                 keys_keep.add(key)
                 kept_ratios.append(ratios[i, 0])
             else:
                 keys_reject.add(key)
+                if proba[i, meth_comp] >= MIN_POSTERIOR and ratios[i, 0] < ratio_floor:
+                    n_floor_reject += 1
+
+        n_meth  = len(kept_ratios)
+        n_false = len(k_list) - n_meth
 
         if kept_ratios:
             kr = np.array(kept_ratios)
             log.info(
-                "    → %d truly methylated (p≥%.1f),  %d false positive  |  "
+                "    → %d truly methylated,  %d rejected (%d by floor<%.2f)  |  "
                 "kept IPD_ratio: median=%.2f [min=%.2f max=%.2f]",
-                n_meth, MIN_POSTERIOR, n_false,
+                n_meth, n_false, n_floor_reject, ratio_floor,
                 float(np.median(kr)), float(np.min(kr)), float(np.max(kr)),
             )
         else:
-            log.info("    → 0 truly methylated,  %d all rejected", n_false)
+            log.info("    → 0 truly methylated,  %d all rejected (floor=%.2f)",
+                     n_false, ratio_floor)
 
     # ── Step 5: build new result + stage-2 per-kmer sample split ───────────
     new_result: dict  = {}
