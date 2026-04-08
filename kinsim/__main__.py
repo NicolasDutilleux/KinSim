@@ -12,7 +12,7 @@ __version__ = "0.4.0"
 
 COMMANDS = [
     "extract", "merge", "train", "generate", "evaluate", "analyze",
-    "sample", "strip-kinetics",
+    "sample", "strip-kinetics", "merge-bam",
 ]
 
 USAGE = """\
@@ -29,6 +29,7 @@ Commands:
   analyze          Analyse a .pkl shard or dictionary (coverage, signals, sensitivity)
   sample           Subsample a .pkl for train/test splits
   strip-kinetics   Copy a BAM and remove fi/fp/ri/rp tags from the copy
+  merge-bam        Merge multiple BAMs into one metagenomic BAM
 
 Data preparation:
   Use 'kinsim-prep' for motif parsing, REBASE fetching, manifest tools,
@@ -106,6 +107,11 @@ def main(argv=None):
     # -- strip-kinetics --
     elif cmd == "strip-kinetics":
         from .strip_kinetics import main as run
+        run(rest)
+
+    # -- merge-bam --
+    elif cmd == "merge-bam":
+        from .merge_bam import main as run
         run(rest)
 
     # -- unknown --
