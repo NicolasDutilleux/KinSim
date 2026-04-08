@@ -153,43 +153,163 @@ def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
 
 
 def _binarize_by_ipd(result: dict) -> dict:
-    """Binarize methylated keys using 2D GMM clustering (IPD + PW).
+    """Binarize methylated keys using IPD-ratio GMM, one per methylation type.
 
-    For each (kmer_id, meth_id > 0) key with enough samples:
-      1. Fit a 2-component Gaussian Mixture Model on (IPD, PW).
-      2. The component with the higher IPD centroid = methylated cluster.
-      3. Each sample is assigned to the cluster with highest posterior
-         probability.  Only samples assigned to the methylated cluster
-         are kept as methylated; the rest are moved to unmethylated.
-      4. Validation: the methylated centroid's IPD must be > 1.5× the
-         unmethylated centroid's IPD.  If not, no clear bimodality exists
-         and all samples are moved to unmethylated.
+    Two-stage approach that eliminates false-positive methylation labels:
 
-    Advantages:
-      - 2D: uses both IPD and PW jointly (important for m4C)
-      - Per-kmer: each sequence context gets its own GMM fit
-      - Data-driven: all parameters learned from the data, no hardcoded
-        thresholds or percentiles
-      - Handles asymmetric clusters (different sizes, different variances)
-      - Probabilistic assignment (not a hard threshold)
+    **Stage 1 — Key-level classification (global GMM per meth type):**
 
-    For keys with < 20 samples: kept as methylated (too few for GMM).
-    For keys where GMM doesn't converge: kept as methylated.
+    For each (kmer, meth_id > 0) key, compute the IPD ratio and PW ratio
+    relative to the same kmer's unmethylated baseline::
+
+        IPD_ratio = mean_IPD(kmer, meth) / mean_IPD(kmer, none)
+        PW_ratio  = mean_PW(kmer, meth) / mean_PW(kmer, none)
+
+    This normalizes out the sequence-context effect on kinetics. Then pool
+    all (IPD_ratio, PW_ratio) pairs for each methylation type (m6A, m4C, m5C)
+    and fit **one** 2-component GMM per type. The cluster with the higher IPD
+    ratio centroid = truly methylated; the other = false positives.
+
+    **Stage 2 — Sample-level split (per-kmer GMM within kept keys):**
+
+    Within each truly-methylated key that has >= 20 samples, fit a 2-component
+    GMM on raw (IPD, PW) to separate methylated reads (high IPD) from
+    unmethylated reads (low IPD) at the same motif site. This handles
+    stoichiometric / partial methylation.
+
+    Advantages over per-kmer-only GMM:
+      - One robust GMM per type instead of thousands of unstable small fits
+      - IPD ratio normalizes kmer baseline → no false positives from GC-rich kmers
+      - Works even for keys with very few samples (ratio still computable)
+      - Per-type: m6A and m4C get their own decision boundaries
     """
     from sklearn.mixture import GaussianMixture
 
-    MIN_SAMPLES_FOR_GMM = 20
-    MIN_METH_SURVIVORS = 3
-    MIN_CENTROID_RATIO = 1.5  # only hard constraint: bimodality check
+    MIN_KEYS_FOR_GMM  = 30   # minimum keys per meth type for reliable GMM
+    MIN_SAMPLES_SPLIT = 20   # minimum samples per key for stage-2 per-kmer GMM
+    MIN_SPLIT_SURVIVORS = 3  # minimum meth samples after per-kmer split
 
-    new_result: dict = {}
+    # ── Step 1: per-key mean IPD / PW ──────────────────────────────────────
+    key_means: dict[tuple, tuple[float, float]] = {}
+    for key, arr in result.items():
+        if not isinstance(key, tuple):
+            continue
+        key_means[key] = (float(np.mean(arr[:, 0])), float(np.mean(arr[:, 1])))
+
+    # ── Step 2: build none reference per kmer ──────────────────────────────
+    none_ref: dict[int, tuple[float, float]] = {}   # kmer_id → (mean_ipd, mean_pw)
+    none_ipd_list: list[float] = []
+    none_pw_list:  list[float] = []
+    for key, (m_ipd, m_pw) in key_means.items():
+        if key[1] == 0:
+            none_ref[key[0]] = (m_ipd, m_pw)
+            none_ipd_list.append(m_ipd)
+            none_pw_list.append(m_pw)
+
+    # Global fallback for kmers without a none counterpart
+    global_none_ipd = float(np.median(none_ipd_list)) if none_ipd_list else 1.0
+    global_none_pw  = float(np.median(none_pw_list))  if none_pw_list else 1.0
+    log.info(
+        "Binarization: %d none reference kmers  (global median IPD=%.1f  PW=%.1f)",
+        len(none_ref), global_none_ipd, global_none_pw,
+    )
+
+    # ── Step 3: compute ratios, group by meth type ─────────────────────────
+    # meth_id → list of (key, ipd_ratio, pw_ratio)
+    meth_type_entries: dict[int, list] = defaultdict(list)
+    n_no_ref = 0
+    for key, (m_ipd, m_pw) in key_means.items():
+        kmer_id, meth_id = key
+        if meth_id == 0:
+            continue
+        ref_ipd, ref_pw = none_ref.get(kmer_id, (global_none_ipd, global_none_pw))
+        if kmer_id not in none_ref:
+            n_no_ref += 1
+        ipd_ratio = m_ipd / max(ref_ipd, 1e-9)
+        pw_ratio  = m_pw  / max(ref_pw,  1e-9)
+        meth_type_entries[meth_id].append((key, ipd_ratio, pw_ratio))
+
+    if n_no_ref:
+        log.info("  %d meth keys used global fallback (no kmer-specific none ref)", n_no_ref)
+
+    # ── Step 4: one GMM per meth type on (IPD_ratio, PW_ratio) ─────────────
+    keys_keep:   set = set()
+    keys_reject: set = set()
+    METH_NAMES = {1: 'm6A', 2: 'm4C', 3: 'm5C'}
+
+    for meth_id, entries in sorted(meth_type_entries.items()):
+        mtype   = METH_NAMES.get(meth_id, f'type{meth_id}')
+        n_keys  = len(entries)
+        k_list  = [e[0] for e in entries]
+        ratios  = np.array([(e[1], e[2]) for e in entries], dtype=np.float64)
+
+        log.info(
+            "  %s: %d keys  IPD_ratio median=%.2f [p5=%.2f p95=%.2f]  "
+            "PW_ratio median=%.2f [p5=%.2f p95=%.2f]",
+            mtype, n_keys,
+            float(np.median(ratios[:, 0])),
+            float(np.percentile(ratios[:, 0], 5)),
+            float(np.percentile(ratios[:, 0], 95)),
+            float(np.median(ratios[:, 1])),
+            float(np.percentile(ratios[:, 1], 5)),
+            float(np.percentile(ratios[:, 1], 95)),
+        )
+
+        if n_keys < MIN_KEYS_FOR_GMM:
+            keys_keep.update(k_list)
+            log.info("    → kept all %d keys (< %d, too few for GMM)", n_keys, MIN_KEYS_FOR_GMM)
+            continue
+
+        try:
+            gmm = GaussianMixture(
+                n_components=2, covariance_type='full',
+                n_init=5, random_state=42, max_iter=200,
+            )
+            gmm.fit(ratios)
+        except Exception as exc:
+            keys_keep.update(k_list)
+            log.warning("    → GMM failed (%s) — kept all %d keys", exc, n_keys)
+            continue
+
+        # Higher IPD ratio centroid = truly methylated cluster
+        meth_comp = int(np.argmax(gmm.means_[:, 0]))
+        none_comp = 1 - meth_comp
+
+        hi_ipd_r, hi_pw_r = gmm.means_[meth_comp]
+        lo_ipd_r, lo_pw_r = gmm.means_[none_comp]
+        centroid_gap = hi_ipd_r / max(lo_ipd_r, 1e-9)
+
+        log.info(
+            "    GMM centroids: meth=(IPDr=%.2f, PWr=%.2f)  "
+            "false_pos=(IPDr=%.2f, PWr=%.2f)  gap=%.2fx",
+            hi_ipd_r, hi_pw_r, lo_ipd_r, lo_pw_r, centroid_gap,
+        )
+
+        if centroid_gap < 1.3:
+            # No bimodality — centroids too close, reject all as false positive
+            keys_reject.update(k_list)
+            log.info("    → no bimodality (gap %.2f < 1.3) — all %d keys rejected", centroid_gap, n_keys)
+            continue
+
+        labels  = gmm.predict(ratios)
+        n_meth  = int((labels == meth_comp).sum())
+        n_false = int((labels == none_comp).sum())
+
+        for i, key in enumerate(k_list):
+            if labels[i] == meth_comp:
+                keys_keep.add(key)
+            else:
+                keys_reject.add(key)
+
+        log.info("    → %d truly methylated,  %d false positive", n_meth, n_false)
+
+    # ── Step 5: build new result + stage-2 per-kmer sample split ───────────
+    new_result: dict  = {}
     none_extras: dict = {}
-    n_split      = 0
-    n_kept_all   = 0
-    n_all_false  = 0
-    n_too_few    = 0
-    n_no_bimodal = 0
-    n_gmm_fail   = 0
+    n_kept_keys    = 0
+    n_rejected_keys = 0
+    n_stage2_split = 0
+    n_stage2_skip  = 0
 
     for key, arr in result.items():
         if not isinstance(key, tuple):
@@ -200,98 +320,80 @@ def _binarize_by_ipd(result: dict) -> dict:
             new_result[key] = arr
             continue
 
-        n_samples = len(arr)
-
-        # Too few samples for GMM — keep as methylated
-        if n_samples < MIN_SAMPLES_FOR_GMM:
-            high_arr = arr.copy()
-            high_arr[:, 2] = 1.0
-            new_result[(kmer_id, meth_id)] = high_arr
-            n_too_few += 1
+        # Rejected by stage-1 → all samples to none
+        if key in keys_reject:
+            low_arr = arr.copy()
+            low_arr[:, 2] = 0.0
+            if low_arr.shape[1] >= 14:
+                low_arr[:, 3 + K // 2] = 0
+            none_extras.setdefault((kmer_id, 0), []).append(low_arr)
+            n_rejected_keys += 1
             continue
 
-        # Fit 2-component GMM on (IPD, PW)
+        # Kept by stage-1 — try stage-2 per-kmer sample split
+        n_samples = len(arr)
+        if n_samples < MIN_SAMPLES_SPLIT:
+            # Too few for per-kmer GMM, keep all as methylated
+            kept = arr.copy()
+            kept[:, 2] = 1.0
+            new_result[key] = kept
+            n_kept_keys += 1
+            n_stage2_skip += 1
+            continue
+
+        # Stage 2: per-kmer GMM on raw (IPD, PW) to split reads
         ipd_pw = arr[:, :2].astype(np.float64)
         try:
-            gmm = GaussianMixture(
-                n_components=2,
-                covariance_type='full',
-                n_init=3,
-                random_state=42,
-                max_iter=100,
+            gmm2 = GaussianMixture(
+                n_components=2, covariance_type='full',
+                n_init=3, random_state=42, max_iter=100,
             )
-            gmm.fit(ipd_pw)
+            gmm2.fit(ipd_pw)
         except Exception:
-            # GMM failed to converge — keep as methylated
-            high_arr = arr.copy()
-            high_arr[:, 2] = 1.0
-            new_result[(kmer_id, meth_id)] = high_arr
-            n_gmm_fail += 1
+            kept = arr.copy()
+            kept[:, 2] = 1.0
+            new_result[key] = kept
+            n_kept_keys += 1
+            n_stage2_skip += 1
             continue
 
-        # Identify which component is "methylated" (higher IPD centroid)
-        centroids_ipd = gmm.means_[:, 0]  # IPD of each centroid
-        meth_comp = int(np.argmax(centroids_ipd))
-        none_comp = 1 - meth_comp
+        centroids_ipd = gmm2.means_[:, 0]
+        hi = int(np.argmax(centroids_ipd))
+        lo = 1 - hi
+        ratio = centroids_ipd[hi] / max(centroids_ipd[lo], 1e-9)
 
-        # Bimodality check: methylated centroid must have meaningfully
-        # higher IPD than unmethylated centroid
-        ratio = centroids_ipd[meth_comp] / max(centroids_ipd[none_comp], 1e-9)
-        if ratio < MIN_CENTROID_RATIO:
-            # No clear bimodality — likely all unmethylated
-            low_arr = arr.copy()
+        # If no clear separation within this key, keep all as meth
+        if ratio < 1.3:
+            kept = arr.copy()
+            kept[:, 2] = 1.0
+            new_result[key] = kept
+            n_kept_keys += 1
+            n_stage2_skip += 1
+            continue
+
+        labels2   = gmm2.predict(ipd_pw)
+        high_mask = labels2 == hi
+        n_high    = int(high_mask.sum())
+
+        if n_high >= MIN_SPLIT_SURVIVORS:
+            high_arr = arr[high_mask].copy()
+            high_arr[:, 2] = 1.0
+            new_result[key] = high_arr
+            n_kept_keys += 1
+            n_stage2_split += 1
+
+            low_arr = arr[~high_mask].copy()
             low_arr[:, 2] = 0.0
             if low_arr.shape[1] >= 14:
                 low_arr[:, 3 + K // 2] = 0
-            none_key = (kmer_id, 0)
-            none_extras.setdefault(none_key, []).append(low_arr)
-            n_no_bimodal += 1
-            continue
-
-        # Assign each sample to the most probable component
-        labels = gmm.predict(ipd_pw)
-        high_mask = labels == meth_comp
-        n_high = int(high_mask.sum())
-
-        # All methylated
-        if n_high == n_samples:
-            high_arr = arr.copy()
-            high_arr[:, 2] = 1.0
-            new_result[(kmer_id, meth_id)] = high_arr
-            n_kept_all += 1
-            continue
-
-        # Too few survivors
-        if n_high < MIN_METH_SURVIVORS:
-            low_arr = arr.copy()
-            low_arr[:, 2] = 0.0
-            if low_arr.shape[1] >= 14:
-                low_arr[:, 3 + K // 2] = 0
-            none_key = (kmer_id, 0)
-            none_extras.setdefault(none_key, []).append(low_arr)
-            n_all_false += 1
-            continue
-
-        # Split
-        high_arr = arr[high_mask].copy()
-        high_arr[:, 2] = 1.0
-        new_result[(kmer_id, meth_id)] = high_arr
-
-        low_arr = arr[~high_mask].copy()
-        low_arr[:, 2] = 0.0
-        if low_arr.shape[1] >= 14:
-            low_arr[:, 3 + K // 2] = 0
-        none_key = (kmer_id, 0)
-        none_extras.setdefault(none_key, []).append(low_arr)
-
-        log.debug(
-            "binarize kmer=%d meth=%d  centroids_ipd=(%.1f, %.1f) ratio=%.2f  "
-            "n=%d → %d meth  %d unmeth",
-            kmer_id, meth_id,
-            centroids_ipd[none_comp], centroids_ipd[meth_comp], ratio,
-            n_samples, n_high, int((~high_mask).sum()),
-        )
-        n_split += 1
+            none_extras.setdefault((kmer_id, 0), []).append(low_arr)
+        else:
+            # Too few meth survivors — keep all as meth (stage-1 already validated)
+            kept = arr.copy()
+            kept[:, 2] = 1.0
+            new_result[key] = kept
+            n_kept_keys += 1
+            n_stage2_skip += 1
 
     # Merge reclassified samples into none keys
     for none_key, arrays in none_extras.items():
@@ -302,60 +404,10 @@ def _binarize_by_ipd(result: dict) -> dict:
             new_result[none_key] = extra
 
     log.info(
-        "Binarization (2D GMM, per-kmer): "
-        "%d keys split, %d all-methylated, %d all-false-positive, "
-        "%d no-bimodality, %d too-few (<20), %d GMM-failed",
-        n_split, n_kept_all, n_all_false, n_no_bimodal, n_too_few, n_gmm_fail,
+        "Binarization complete: %d meth keys kept (%d sample-split, %d kept-whole), "
+        "%d rejected as false positive",
+        n_kept_keys, n_stage2_split, n_stage2_skip, n_rejected_keys,
     )
-
-    # --- Global post-GMM validation ---
-    # Compute the none IPD distribution and reject meth keys whose mean IPD
-    # falls within the unmethylated range.  This catches:
-    #   - too-few keys that were kept without GMM verification
-    #   - GMM splits where the "high" cluster is still close to none
-    # Threshold: none_mean + 2*none_std  (data-driven, no hardcoded value)
-    none_ipds = []
-    for key, arr in new_result.items():
-        if isinstance(key, tuple) and key[1] == 0:
-            none_ipds.append(arr[:, 0])
-    if none_ipds:
-        all_none_ipd = np.concatenate(none_ipds)
-        none_mean = float(np.mean(all_none_ipd))
-        none_std  = float(np.std(all_none_ipd))
-        ipd_floor = none_mean + 2.0 * none_std
-        log.info(
-            "Global validation: none IPD mean=%.1f std=%.1f → "
-            "meth keys must have mean IPD > %.1f",
-            none_mean, none_std, ipd_floor,
-        )
-
-        n_global_reject = 0
-        meth_keys_to_check = [
-            k for k in new_result
-            if isinstance(k, tuple) and k[1] > 0
-        ]
-        for key in meth_keys_to_check:
-            arr = new_result[key]
-            key_mean_ipd = float(np.mean(arr[:, 0]))
-            if key_mean_ipd < ipd_floor:
-                # Reclassify to none
-                low_arr = arr.copy()
-                low_arr[:, 2] = 0.0
-                if low_arr.shape[1] >= 14:
-                    low_arr[:, 3 + K // 2] = 0
-                none_key = (key[0], 0)
-                if none_key in new_result:
-                    new_result[none_key] = np.concatenate(
-                        [new_result[none_key], low_arr], axis=0,
-                    )
-                else:
-                    new_result[none_key] = low_arr
-                del new_result[key]
-                n_global_reject += 1
-
-        log.info("Global validation: %d meth keys rejected (mean IPD < %.1f)",
-                 n_global_reject, ipd_floor)
-
     return new_result
 
 
