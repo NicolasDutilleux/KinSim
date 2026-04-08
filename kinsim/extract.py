@@ -291,17 +291,32 @@ def _binarize_by_ipd(result: dict) -> dict:
             log.info("    → no bimodality (gap %.2f < 1.3) — all %d keys rejected", centroid_gap, n_keys)
             continue
 
-        labels  = gmm.predict(ratios)
-        n_meth  = int((labels == meth_comp).sum())
-        n_false = int((labels == none_comp).sum())
+        # Use posterior probabilities — only keep keys with high confidence
+        # of belonging to the methylated cluster (>= 0.9)
+        MIN_POSTERIOR = 0.9
+        proba   = gmm.predict_proba(ratios)  # shape (n_keys, 2)
+        is_meth = proba[:, meth_comp] >= MIN_POSTERIOR
+        n_meth  = int(is_meth.sum())
+        n_false = int((~is_meth).sum())
 
+        kept_ratios = []
         for i, key in enumerate(k_list):
-            if labels[i] == meth_comp:
+            if is_meth[i]:
                 keys_keep.add(key)
+                kept_ratios.append(ratios[i, 0])
             else:
                 keys_reject.add(key)
 
-        log.info("    → %d truly methylated,  %d false positive", n_meth, n_false)
+        if kept_ratios:
+            kr = np.array(kept_ratios)
+            log.info(
+                "    → %d truly methylated (p≥%.1f),  %d false positive  |  "
+                "kept IPD_ratio: median=%.2f [min=%.2f max=%.2f]",
+                n_meth, MIN_POSTERIOR, n_false,
+                float(np.median(kr)), float(np.min(kr)), float(np.max(kr)),
+            )
+        else:
+            log.info("    → 0 truly methylated,  %d all rejected", n_false)
 
     # ── Step 5: build new result + stage-2 per-kmer sample split ───────────
     new_result: dict  = {}
