@@ -764,10 +764,10 @@ def render_html_report(
         all_pw_vals = np.concatenate([
             stats.groups[m].pw_means for m in meth_ids_sorted
         ])
-        ipd_lo = float(np.percentile(all_ipd_vals, 1))
-        ipd_hi = float(np.percentile(all_ipd_vals, 99))
-        pw_lo  = float(np.percentile(all_pw_vals, 1))
-        pw_hi  = float(np.percentile(all_pw_vals, 99))
+        ipd_lo = 0.0
+        ipd_hi = max(float(np.percentile(all_ipd_vals, 99.5)), 150.0)
+        pw_lo  = 0.0
+        pw_hi  = max(float(np.percentile(all_pw_vals, 99.5)), 80.0)
         grid_n = 80
         ipd_grid = np.linspace(ipd_lo, ipd_hi, grid_n)
         pw_grid  = np.linspace(pw_lo, pw_hi, grid_n)
