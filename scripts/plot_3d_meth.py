@@ -213,7 +213,11 @@ def main():
     fig = build_figure(groups, min_ipd_m6a=args.min_ipd_m6a, grid_n=args.grid)
 
     output = args.output or str(Path(args.pkl).stem + "_3d_meth.html")
-    fig.write_html(output)
+    ext = Path(output).suffix.lower()
+    if ext in (".png", ".jpg", ".jpeg", ".svg", ".pdf"):
+        fig.write_image(output, scale=3)
+    else:
+        fig.write_html(output)
     print(f"\nSaved: {output}")
 
 
