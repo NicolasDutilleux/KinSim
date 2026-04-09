@@ -70,6 +70,13 @@ def _meth_color(meth_id: int) -> str:
     return _COLORS[meth_id % len(_COLORS)]
 
 
+def _darken_hex(hex_color: str, factor: float) -> str:
+    """Darken a hex color by factor (0=black, 1=original)."""
+    h = hex_color.lstrip('#')
+    r, g, b = (int(h[i:i+2], 16) for i in (0, 2, 4))
+    return f'rgb({int(r*factor)},{int(g*factor)},{int(b*factor)})'
+
+
 def _pct(val, total) -> str:
     return f'{100.0 * val / total:.2f}%' if total else 'n/a'
 
@@ -806,22 +813,44 @@ def render_html_report(
                 z   = kde(grid_pts).reshape(grid_n, grid_n)
             except np.linalg.LinAlgError:
                 continue
+            # Normalize to [0, 1] for consistent visual height
+            z_max = z.max()
+            if z_max > 0:
+                z = z / z_max
+            color = clr(m)
             fig.add_trace(go.Surface(
                 x=ipd_grid, y=pw_grid, z=z,
-                name=lbl(m), showscale=False,
-                opacity=0.7,
-                colorscale=[[0, clr(m)], [1, clr(m)]],
+                name=f'{lbl(m)} (n={n:,})', showscale=False,
+                opacity=1.0,
+                colorscale=[
+                    [0.0, _darken_hex(color, 0.3)],
+                    [0.3, _darken_hex(color, 0.6)],
+                    [1.0, color],
+                ],
                 showlegend=True,
+                contours=dict(
+                    z=dict(show=True, usecolormap=True, project_z=False,
+                           highlightcolor='white', highlightwidth=1),
+                ),
             ))
+        title_text = '3D Density Surface: IPD × PW per Methylation Type'
+        if min_ipd_m6a > 0:
+            title_text += f'<br><sub>m6A filtered: IPD >= {min_ipd_m6a:.0f}</sub>'
         fig.update_layout(
-            title='3D Density Surface: IPD × PW per Methylation Type',
+            title=dict(text=title_text, x=0.5),
             scene=dict(
                 xaxis_title='Mean IPD',
                 yaxis_title='Mean PW',
-                zaxis_title='Density',
-                camera=dict(eye=dict(x=1.5, y=-1.5, z=1.2)),
+                zaxis_title='Normalized Density',
+                camera=dict(eye=dict(x=1.8, y=-1.5, z=1.0)),
+                bgcolor='rgb(240, 240, 240)',
             ),
-            legend=dict(x=0.02, y=0.98),
+            legend=dict(
+                x=0.01, y=0.99,
+                bgcolor='rgba(255,255,255,0.85)',
+                bordercolor='rgba(0,0,0,0.3)',
+                borderwidth=1,
+            ),
         )
         figures.append(('3D density surface (per type)', fig))
 
