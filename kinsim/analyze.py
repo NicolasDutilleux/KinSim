@@ -486,6 +486,7 @@ def render_html_report(
     sensitivity: dict,
     output_path: str,
     max_scatter: int = 10_000,
+    min_ipd_m6a: float = 0.0,
 ) -> None:
     """Generate a self-contained interactive HTML report using Plotly."""
     try:
@@ -777,18 +778,29 @@ def render_html_report(
         fig = go.Figure()
         for m in meth_ids_sorted:
             g = stats.groups[m]
-            n = g.n_entries
+            ipd_vals = g.ipd_means
+            pw_vals  = g.pw_means
+
+            # Apply m6A IPD cutoff if requested
+            if m == 1 and min_ipd_m6a > 0:
+                mask = ipd_vals >= min_ipd_m6a
+                ipd_vals = ipd_vals[mask]
+                pw_vals  = pw_vals[mask]
+                log.info("3D plot: m6A filtered to IPD >= %.0f (%d -> %d keys)",
+                         min_ipd_m6a, g.n_entries, len(ipd_vals))
+
+            n = len(ipd_vals)
             if n < 50:
                 continue
             # Subsample for KDE performance
             max_kde = 50_000
             if n > max_kde:
                 idx = rng.choice(n, max_kde, replace=False)
-                ipd_s = g.ipd_means[idx]
-                pw_s  = g.pw_means[idx]
+                ipd_s = ipd_vals[idx]
+                pw_s  = pw_vals[idx]
             else:
-                ipd_s = g.ipd_means
-                pw_s  = g.pw_means
+                ipd_s = ipd_vals
+                pw_s  = pw_vals
             try:
                 kde = gaussian_kde(np.vstack([ipd_s, pw_s]), bw_method=0.15)
                 z   = kde(grid_pts).reshape(grid_n, grid_n)
@@ -935,12 +947,24 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
     # ── Export individual figures as standalone HTML files ─────────────────
     export_dir = Path(output_path).parent / 'figures'
     export_dir.mkdir(parents=True, exist_ok=True)
+    has_kaleido = True
+    try:
+        import kaleido  # noqa: F401
+    except ImportError:
+        has_kaleido = False
+
     for i, (title, fig) in enumerate(figures):
         slug = title.lower().replace(' ', '_').replace('/', '_')
         slug = ''.join(c for c in slug if c.isalnum() or c == '_')
         fig_path = export_dir / f'{i:02d}_{slug}.html'
         pio.write_html(fig, str(fig_path), include_plotlyjs='cdn')
-    log.info("Individual figures exported to: %s/  (%d files)", export_dir, len(figures))
+        if has_kaleido:
+            png_path = export_dir / f'{i:02d}_{slug}.png'
+            fig.write_image(str(png_path), scale=3)
+    if has_kaleido:
+        log.info("Individual figures exported to: %s/  (%d HTML + %d PNG)", export_dir, len(figures), len(figures))
+    else:
+        log.info("Individual figures exported to: %s/  (%d HTML, install kaleido for PNG)", export_dir, len(figures))
 
 
 # ---------------------------------------------------------------------------
@@ -953,6 +977,7 @@ def analyze_pkl(
     no_html: bool = False,
     max_scatter: int = 10_000,
     max_neighbor_entries: int = 200_000,
+    min_ipd_m6a: float = 0.0,
 ) -> None:
     """Load a .pkl file, compute statistics, write TXT + HTML reports."""
     t0 = time.time()
@@ -1005,7 +1030,7 @@ def analyze_pkl(
 
     if not no_html:
         log.info("Generating HTML report...")
-        render_html_report(stats, sensitivity, html_path, max_scatter=max_scatter)
+        render_html_report(stats, sensitivity, html_path, max_scatter=max_scatter, min_ipd_m6a=min_ipd_m6a)
 
     log.info("Analysis complete in %.1fs", time.time() - t0)
 
@@ -1051,6 +1076,8 @@ def main(argv=None) -> None:
     parser.add_argument('--max-neighbor-entries', type=int, default=200_000, metavar='N',
                         help='Max kmers per category for neighbor sensitivity '
                              '(default: 200000; 0 = skip)')
+    parser.add_argument('--min-ipd-m6a', type=float, default=0.0, metavar='X',
+                        help='Min mean IPD for m6A keys in 3D plot (default: 0 = no filter)')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable DEBUG-level logging')
     args = parser.parse_args(argv)
@@ -1062,6 +1089,7 @@ def main(argv=None) -> None:
         no_html=args.no_html,
         max_scatter=args.max_scatter,
         max_neighbor_entries=args.max_neighbor_entries,
+        min_ipd_m6a=args.min_ipd_m6a,
     )
 
 
