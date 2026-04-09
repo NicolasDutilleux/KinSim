@@ -21,11 +21,15 @@
 # Arguments:
 #   $1  Checkpoint directory (contains model_config.json + checkpoint_epoch*.pt)
 #   $2  Merged training data .pkl file
-#   Additional flags:  --kmer, --meth, --plot, --batch-size, --device
+#   Additional flags:  --kmer, --meth, --plot, --baselines-dir, --batch-size, --device
 #
 # Examples:
 #   # Full calibration report:
 #   sbatch kinsim_evaluate.slurm checkpoints_mlp/ master_data.pkl
+#
+#   # With baseline comparison:
+#   sbatch kinsim_evaluate.slurm checkpoints_mlp/ master_data.pkl \
+#       --baselines-dir baselines_output/
 #
 #   # Per-kmer distribution plot:
 #   sbatch kinsim_evaluate.slurm checkpoints_mlp/ master_data.pkl \
