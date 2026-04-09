@@ -67,9 +67,6 @@ def extract_from_bam(bam_path: str, motif_string: str, max_reads: int = 5000) ->
                 if i >= K - 1:
                     center = i - mid
                     meth_id = int(meth_status[center])
-                    # Subsample unmethylated (keep ~5%)
-                    if meth_id == 0 and np.random.random() >= 0.05:
-                        continue
                     key = (current_kmer, meth_id)
                     result.setdefault(key, []).append([float(ipds[center]), float(pws[center])])
 
