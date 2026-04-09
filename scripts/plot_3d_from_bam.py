@@ -1,20 +1,16 @@
-"""Extract reads from a BAM, binarize with ratio thresholds, plot 3D density.
+"""Extract reads from a BAM, plot 3D density of IPD x PW per methylation type.
 
-Self-contained script for poster-quality 3D plots. Does NOT use .pkl shards —
-reads directly from a BAM file and applies the current binarization logic.
+Reads directly from a BAM + motifs CSV. No .pkl needed.
+Methylation labels come from motif scanning (sequence-based).
+Optional IPD floor filter for m6A keys removes noisy low-signal keys.
 
 Usage:
     python scripts/plot_3d_from_bam.py <bam> <motifs> [--max-reads 5000] [--min-ipd-m6a 70] [-o plot.html]
-
-Arguments:
-    bam      PacBio HiFi BAM with fi:B:C / fp:B:C tags
-    motifs   Motif CSV or motif string (e.g. "m6A,GATC,1;m4C,CCWGG,2")
 """
 
 import argparse
 import logging
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -30,7 +26,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)-8s] %(
 METH_NAMES = {v: k for k, v in METH_IDS.items()}
 
 
-# ── Step 1: Extract from BAM ────────────────────────────────────────────────
+# ── Extract from BAM ────────────────────────────────────────────────────────
 
 def extract_from_bam(bam_path: str, motif_string: str, max_reads: int = 5000) -> dict:
     """Extract per-(kmer, meth_id) samples from a BAM.
@@ -80,68 +76,7 @@ def extract_from_bam(bam_path: str, motif_string: str, max_reads: int = 5000) ->
     return {k: np.array(v, dtype=np.float32) for k, v in result.items()}
 
 
-# ── Step 2: Binarize with ratio thresholds ──────────────────────────────────
-
-def binarize(result: dict) -> dict:
-    """Apply per-type ratio threshold binarization. Returns clean dict."""
-
-    ACCEPT_RULES = {
-        1: lambda ir, pr: ir >= 1.5,                                    # m6A
-        2: lambda ir, pr: ir >= 1.3 or (ir >= 1.1 and pr >= 1.15),     # m4C
-        3: lambda ir, pr: ir >= 1.2,                                    # m5C
-    }
-
-    # Per-key means
-    key_means = {}
-    for key, arr in result.items():
-        key_means[key] = (float(arr[:, 0].mean()), float(arr[:, 1].mean()))
-
-    # None reference per kmer
-    none_ref = {}
-    for key, (m_ipd, m_pw) in key_means.items():
-        if key[1] == 0:
-            none_ref[key[0]] = (m_ipd, m_pw)
-
-    log.info("Binarization: %d none-ref kmers", len(none_ref))
-
-    # Classify
-    clean = {}
-    stats = defaultdict(lambda: {'kept': 0, 'rejected': 0, 'no_ref': 0})
-
-    for key, arr in result.items():
-        kmer_id, meth_id = key
-        if meth_id == 0:
-            clean[key] = arr
-            continue
-
-        ts = stats[meth_id]
-
-        if kmer_id not in none_ref:
-            ts['no_ref'] += 1
-            continue
-
-        ref_ipd, ref_pw = none_ref[kmer_id]
-        ipd_ratio = float(arr[:, 0].mean()) / max(ref_ipd, 1e-9)
-        pw_ratio = float(arr[:, 1].mean()) / max(ref_pw, 1e-9)
-
-        accept_fn = ACCEPT_RULES.get(meth_id, lambda ir, pr: ir >= 1.5)
-        if accept_fn(ipd_ratio, pw_ratio):
-            clean[key] = arr
-            ts['kept'] += 1
-        else:
-            ts['rejected'] += 1
-
-    for mid in sorted(stats):
-        ts = stats[mid]
-        name = METH_NAMES.get(mid, f"meth{mid}")
-        total = ts['kept'] + ts['rejected'] + ts['no_ref']
-        log.info("  %s: %d/%d kept, %d rejected, %d no-ref",
-                 name, ts['kept'], total, ts['rejected'], ts['no_ref'])
-
-    return clean
-
-
-# ── Step 3: Build per-type mean arrays ──────────────────────────────────────
+# ── Build per-type mean arrays ──────────────────────────────────────────────
 
 def compute_group_means(data: dict, min_ipd_m6a: float = 0.0) -> dict[int, tuple]:
     """Returns {meth_id: (ipd_means, pw_means)} from per-key means."""
@@ -164,7 +99,7 @@ def compute_group_means(data: dict, min_ipd_m6a: float = 0.0) -> dict[int, tuple
     }
 
 
-# ── Step 4: Plot 3D ────────────────────────────────────────────────────────
+# ── Plot 3D ─────────────────────────────────────────────────────────────────
 
 COLORS = {
     0: "#636EFA",   # none — blue
@@ -248,7 +183,7 @@ def build_figure(groups: dict, min_ipd_m6a: float, grid_n: int = 100):
             ),
         ))
 
-    title = '3D Density: IPD × PW per Methylation Type (ratio-threshold binarized)'
+    title = '3D Density: IPD x PW per Methylation Type'
     if min_ipd_m6a > 0:
         title += f'<br><sub>m6A filtered: mean IPD >= {min_ipd_m6a:.0f}</sub>'
 
@@ -278,7 +213,7 @@ def build_figure(groups: dict, min_ipd_m6a: float, grid_n: int = 100):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract from BAM + binarize + 3D density plot"
+        description="Extract from BAM + 3D density plot per methylation type"
     )
     parser.add_argument("bam", help="PacBio HiFi BAM with fi/fp tags")
     parser.add_argument("motifs", help="Motif CSV path or motif string")
@@ -298,22 +233,20 @@ def main():
     log.info("Extracting from BAM: %s (max %d reads)", args.bam, args.max_reads)
     raw = extract_from_bam(args.bam, motif_string, max_reads=args.max_reads)
 
-    # Count before binarization
     for mid in sorted(set(k[1] for k in raw)):
         n_keys = sum(1 for k in raw if k[1] == mid)
         name = METH_NAMES.get(mid, f"meth{mid}")
-        log.info("  Before binarization: %s = %d keys", name, n_keys)
-
-    log.info("Binarizing with ratio thresholds...")
-    clean = binarize(raw)
+        log.info("  Extracted: %s = %d keys", name, n_keys)
 
     log.info("Computing per-key means (m6A IPD >= %.0f)...", args.min_ipd_m6a)
-    groups = compute_group_means(clean, min_ipd_m6a=args.min_ipd_m6a)
+    groups = compute_group_means(raw, min_ipd_m6a=args.min_ipd_m6a)
 
     for mid, (ipds, pws) in sorted(groups.items()):
         name = METH_NAMES.get(mid, f"meth{mid}")
-        log.info("  %s: %d keys, IPD [%.1f - %.1f], PW [%.1f - %.1f]",
-                 name, len(ipds), ipds.min(), ipds.max(), pws.min(), pws.max())
+        n_filtered = sum(1 for k in raw if k[1] == mid) - len(ipds) if mid == 1 else 0
+        log.info("  %s: %d keys  IPD [%.1f - %.1f]  PW [%.1f - %.1f]%s",
+                 name, len(ipds), ipds.min(), ipds.max(), pws.min(), pws.max(),
+                 f"  ({n_filtered} filtered below IPD={args.min_ipd_m6a})" if n_filtered else "")
 
     log.info("Building 3D plot...")
     fig = build_figure(groups, min_ipd_m6a=args.min_ipd_m6a, grid_n=args.grid)
