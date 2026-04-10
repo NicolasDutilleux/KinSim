@@ -12,14 +12,18 @@
 # ============================================================
 # KinSim — Extract raw kinetic samples + merge (manifest-based, two-phase)
 #
-# Uses a manifest CSV (sample_id, bam_path, motifs) — one row per species BAM.
+# Uses a manifest CSV (sample_id, bam_path, motifs[, gff]) — one row per species BAM.
 # Cleaner, self-documenting, easier to audit than the old alternating-line format.
 #
 # Manifest format (manifest.csv):
-#   sample_id,bam_path,motifs
-#   strain1,/data/bams/strain1.bam,"m6A,GATC,1"
-#   strain2,/data/bams/strain2.bam,"m6A,GATC,1;m4C,CCWGG,1"
-#   strain3,/data/bams/strain3.bam,/data/motifs/strain3.csv
+#   sample_id,bam_path,motifs,gff
+#   strain1,/data/bams/strain1.bam,"m6A,GATC,1",
+#   strain2,/data/bams/strain2_aligned.bam,"m6A,GATC,1;m4C,CCWGG,1",/data/gff/strain2.gff
+#   strain3,/data/bams/strain3.bam,/data/motifs/strain3.csv,
+#
+# The 'gff' column is optional. When present and non-empty, extraction uses
+# ipdSummary GFF annotations instead of motif sequence scanning (more accurate,
+# generalizable to any modification type). The BAM must be aligned in GFF mode.
 #
 # Generate a manifest from an existing pairs file:
 #   kinsim prepare --to-manifest pairs.txt manifest.csv
