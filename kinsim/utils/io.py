@@ -1,6 +1,8 @@
-"""File I/O utilities for FASTA references, MAF alignments, and PBSIM3 discovery.
+"""File I/O utilities for FASTA references, MAF alignments, GFF annotations,
+and PBSIM3 discovery.
 
 Functions for loading FASTA references, parsing PBSIM3 MAF alignments,
+loading ipdSummary GFF annotations for read-level methylation labelling,
 extracting extended reference context for 11-mer encoding at read edges,
 and discovering PBSIM3 output directory layouts.
 """
@@ -9,9 +11,12 @@ import glob
 import gzip
 import logging
 import os
+import re
 import sys
 
-from .encoding import K
+import numpy as np
+
+from .encoding import K, METH_IDS
 from .motifs import load_motif_string
 
 log = logging.getLogger(__name__)
@@ -42,6 +47,169 @@ def load_reference(ref_path):
     if current_name:
         seqs[current_name] = ''.join(parts)
     return seqs
+
+
+# ---------------------------------------------------------------------------
+# GFF annotation loader (ipdSummary / kineticsTools)
+# ---------------------------------------------------------------------------
+
+_GFF_ATTR_RE = re.compile(r'(\w+)=([^;]+)')
+
+# Map ipdSummary "identificationQv" base context to KinSim meth type.
+# ipdSummary infers modification type from the modified base:
+#   A → m6A,  C → m4C (or m5C if indicated).
+# GFF records may also carry an explicit "modificationType" attribute.
+_BASE_TO_METH = {'A': 'm6A', 'C': 'm4C'}
+
+
+def load_gff_annotations(
+    gff_path: str,
+    min_score: float = 20.0,
+    min_ipd_ratio: float = 0.0,
+) -> dict[tuple[str, int, str], int]:
+    """Load ipdSummary GFF3 into a position → meth_id lookup.
+
+    Each qualifying GFF record is mapped to a (contig, 0-based position, strand)
+    key.  The value is the integer meth_id from METH_IDS.
+
+    New modification types appearing in the GFF that are not in METH_IDS are
+    registered dynamically so the system generalizes to future types.
+
+    Args:
+        gff_path:       Path to ipdSummary .gff or .gff3 file.
+        min_score:      Minimum kinetic score (-10*log10(pvalue)). Default 20
+                        corresponds roughly to p < 0.01.
+        min_ipd_ratio:  Optional minimum IPD ratio filter (0 = no filter).
+
+    Returns:
+        dict mapping (contig, pos_0based, strand) → meth_id.
+    """
+    annotations: dict[tuple[str, int, str], int] = {}
+    n_total = 0
+    n_kept = 0
+    type_counts: dict[str, int] = {}
+
+    open_func = gzip.open if gff_path.endswith('.gz') else open
+
+    with open_func(gff_path, 'rt') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            fields = line.split('\t')
+            if len(fields) < 9:
+                continue
+
+            feature = fields[2]
+            if feature not in ('modified_base', 'kinetic', 'm6A', 'm4C', 'm5C'):
+                continue
+
+            n_total += 1
+
+            # Score filter
+            try:
+                score = float(fields[5])
+            except ValueError:
+                continue
+            if score < min_score:
+                continue
+
+            contig = fields[0]
+            pos_1based = int(fields[3])
+            strand = fields[6]
+            attributes = fields[8]
+
+            attrs = dict(_GFF_ATTR_RE.findall(attributes))
+
+            # IPD ratio filter
+            if min_ipd_ratio > 0:
+                ipd_ratio_str = attrs.get('IPDRatio', '0')
+                try:
+                    if float(ipd_ratio_str) < min_ipd_ratio:
+                        continue
+                except ValueError:
+                    continue
+
+            # Determine modification type
+            mod_type = attrs.get('modificationType', '')
+
+            # If feature itself is a mod type, use it
+            if not mod_type and feature in METH_IDS:
+                mod_type = feature
+
+            # Fallback: infer from context base
+            if not mod_type:
+                context = attrs.get('context', '')
+                if context:
+                    mod_type = _BASE_TO_METH.get(context[0].upper(), '')
+
+            if not mod_type:
+                continue
+
+            # Resolve to meth_id (register new types dynamically)
+            if mod_type in METH_IDS:
+                meth_id = METH_IDS[mod_type]
+            else:
+                # Dynamic registration for unknown modification types
+                new_id = max(METH_IDS.values()) + 1
+                METH_IDS[mod_type] = new_id
+                log.info("Registered new modification type: %s -> id %d", mod_type, new_id)
+                meth_id = new_id
+
+            # GFF is 1-based, convert to 0-based
+            annotations[(contig, pos_1based - 1, strand)] = meth_id
+            n_kept += 1
+            type_counts[mod_type] = type_counts.get(mod_type, 0) + 1
+
+    log.info("GFF loaded: %s", gff_path)
+    log.info("  %d records total, %d kept (score >= %.0f)",
+             n_total, n_kept, min_score)
+    for mod_type, count in sorted(type_counts.items()):
+        log.info("  %s: %d positions", mod_type, count)
+
+    return annotations
+
+
+def build_read_meth_array(
+    annotations: dict[tuple[str, int, str], int],
+    contig: str,
+    ref_start: int,
+    read_len: int,
+    strand: str = '+',
+) -> np.ndarray:
+    """Build a per-base methylation array for one aligned read.
+
+    Maps each read position to the reference coordinate, looks up the
+    GFF annotation, and returns an int8 array of meth_ids (0 = unmethylated).
+
+    Args:
+        annotations: Output of load_gff_annotations().
+        contig:      Reference contig name.
+        ref_start:   0-based reference start of the alignment.
+        read_len:    Length of the read (aligned portion).
+        strand:      '+' or '-'.
+
+    Returns:
+        np.ndarray of shape (read_len,) with int8 meth_ids.
+    """
+    meth_array = np.zeros(read_len, dtype=np.int8)
+
+    if strand == '+':
+        for i in range(read_len):
+            ref_pos = ref_start + i
+            key = (contig, ref_pos, '+')
+            if key in annotations:
+                meth_array[i] = annotations[key]
+    else:
+        # Reverse strand: positions map in reverse order
+        for i in range(read_len):
+            ref_pos = ref_start + (read_len - 1 - i)
+            key = (contig, ref_pos, '-')
+            if key in annotations:
+                meth_array[i] = annotations[key]
+
+    return meth_array
 
 
 # ---------------------------------------------------------------------------
