@@ -1036,11 +1036,15 @@ def main(argv=None) -> None:
                            help="Output directory for shard .pkl files (manifest mode)")
 
     # GFF-based extraction (aligned BAM + ipdSummary GFF)
+    # Usage: kinsim extract <bam> --gff <gff> -o <output.pkl>
     p_extract.add_argument("--gff", default=None,
                            help="Path to ipdSummary GFF3 file. Enables GFF-based "
                                 "extraction: methylation labels come from GFF annotations "
                                 "instead of motif sequence scanning. Requires an aligned "
-                                "BAM. When used, the 'motifs' positional arg is ignored.")
+                                "BAM. Use -o/--output for the output path.")
+    p_extract.add_argument("-o", "--output", dest="output_file", default=None,
+                           help="Output .pkl shard file (used with --gff mode). "
+                                "In motif mode, use the positional 'output' arg instead.")
     p_extract.add_argument("--min-score", type=float, default=20.0,
                            help="Minimum GFF score for methylation calls "
                                 "(default: 20, i.e. p < 0.01). Only used with --gff.")
@@ -1137,13 +1141,15 @@ def main(argv=None) -> None:
             # ---- GFF-based extraction (aligned BAM + ipdSummary GFF) ----
             if not args.bam:
                 log.error(
-                    "GFF mode requires: kinsim extract <bam> --gff <gff_path> <output>\n"
+                    "GFF mode requires: kinsim extract <bam> --gff <gff> -o <output.pkl>\n"
                     "The BAM must be aligned (mapped to the reference used by ipdSummary)."
                 )
                 sys.exit(1)
-            if not args.output:
+            gff_output = args.output_file or args.output
+            if not gff_output:
                 log.error(
-                    "GFF mode requires an output path: kinsim extract <bam> --gff <gff> <output>"
+                    "GFF mode requires an output path:\n"
+                    "  kinsim extract <bam> --gff <gff> -o <output.pkl>"
                 )
                 sys.exit(1)
 
@@ -1158,14 +1164,14 @@ def main(argv=None) -> None:
                 min_ipd_ratio=args.min_ipd_ratio,
             )
 
-            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-            with open(args.output, "wb") as f:
+            Path(gff_output).parent.mkdir(parents=True, exist_ok=True)
+            with open(gff_output, "wb") as f:
                 pickle.dump(result, f)
 
             meta = result.get("__meta__", {})
             log.info(
                 "Shard saved: %s (%d contexts, %d samples)",
-                args.output,
+                gff_output,
                 meta.get("n_unique_keys", "?"),
                 meta.get("n_total_samples", "?"),
             )
