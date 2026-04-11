@@ -131,18 +131,19 @@ def load_gff_annotations(
                 except ValueError:
                     continue
 
-            # Determine modification type
+            # Determine modification type — only accept explicitly typed records.
+            # 'modified_base' is a generic catch-all from ipdSummary meaning
+            # "kinetically unusual" — NOT a confirmed modification type.
+            # Only trust: (a) explicit feature type m6A/m4C/m5C, or
+            #             (b) modificationType attribute in the GFF record.
             mod_type = attrs.get('modificationType', '')
 
-            # If feature itself is a mod type, use it
+            # If feature itself is a known mod type, use it
             if not mod_type and feature in METH_IDS:
                 mod_type = feature
 
-            # Fallback: infer from context base
-            if not mod_type:
-                context = attrs.get('context', '')
-                if context:
-                    mod_type = _BASE_TO_METH.get(context[0].upper(), '')
+            # Do NOT infer from context base — that was producing false labels
+            # for generic 'modified_base' records.
 
             if not mod_type:
                 continue
