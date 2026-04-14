@@ -11,9 +11,10 @@
 #   /data/projects/p774_MARSD/NDutilleux/training/Vega/blast_results.txt
 # ============================================================
 
-set -euo pipefail
+set +u
 source ~/.bashrc
 conda activate kinsim_env
+set -euo pipefail
 
 VEGA=/data/projects/p774_MARSD/NDutilleux/training/Vega
 BLASTDB=/data/databases/ncbi-blastdbs

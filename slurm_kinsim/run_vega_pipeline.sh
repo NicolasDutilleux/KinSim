@@ -8,6 +8,9 @@
 #   bash slurm_kinsim/run_vega_pipeline.sh
 # ============================================================
 
+set +u
+source ~/.bashrc
+conda activate kinsim_env
 set -euo pipefail
 
 VEGA=/data/projects/p774_MARSD/NDutilleux/training/Vega
@@ -17,9 +20,6 @@ MANIFEST=${VEGA}/manifest_vega_gff.csv
 SHARDS=${BASEDIR}/shards_vega_train
 MASTER=${BASEDIR}/master_vega_train.pkl
 LOGS=/data/projects/p774_MARSD/NDutilleux/logs
-
-source ~/.bashrc
-conda activate kinsim_env
 
 echo "========================================================"
 echo "  Vega HMB Full Pipeline"
