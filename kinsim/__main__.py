@@ -12,7 +12,7 @@ __version__ = "0.4.0"
 
 COMMANDS = [
     "extract", "merge", "train", "generate", "evaluate", "analyze",
-    "sample", "strip-kinetics", "merge-bam",
+    "compare", "inspect-model", "sample", "strip-kinetics", "merge-bam",
 ]
 
 USAGE = """\
@@ -27,6 +27,8 @@ Commands:
   generate         Generate synthetic kinetic signals for PBSIM3 reads
   evaluate         Evaluate a trained model (calibration report + plots)
   analyze          Analyse a .pkl shard or dictionary (coverage, signals, sensitivity)
+  compare          Compare per-kmer kinetics across datasets (Vega vs Revio etc.)
+  inspect-model    Inspect ipdSummary null model (.npz.gz) internals
   sample           Subsample a .pkl for train/test splits
   strip-kinetics   Copy a BAM and remove fi/fp/ri/rp tags from the copy
   merge-bam        Merge multiple BAMs into one metagenomic BAM
@@ -97,6 +99,16 @@ def main(argv=None):
     # -- analyze --
     elif cmd == "analyze":
         from .analyze import main as run
+        run(rest)
+
+    # -- compare --
+    elif cmd == "compare":
+        from .compare import main as run
+        run(rest)
+
+    # -- inspect-model --
+    elif cmd == "inspect-model":
+        from .inspect_null_model import main as run
         run(rest)
 
     # -- sample --
