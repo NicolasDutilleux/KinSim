@@ -14,6 +14,8 @@
 set +u
 source ~/.bashrc
 conda activate kinsim_env
+source /etc/profile.d/modules.sh 2>/dev/null || true
+module load BLAST+/2.15.0-gompi-2021a 2>/dev/null || true
 set -euo pipefail
 
 VEGA=/data/projects/p774_MARSD/NDutilleux/training/Vega
@@ -33,10 +35,16 @@ echo "=== BLAST database ==="
 ls "$BLASTDB"/ | head -20
 echo ""
 
-# Find the nt database
+# Find a BLAST database (prefer smaller prokaryote DB for speed)
 NTDB=""
-for candidate in "${BLASTDB}/nt" "${BLASTDB}/nt/nt" "${BLASTDB}/core_nt/core_nt"; do
-    if [ -f "${candidate}.nsq" ] || [ -f "${candidate}.00.nsq" ] || [ -f "${candidate}.nal" ]; then
+for candidate in \
+    "${BLASTDB}/ref_prok_rep_genomes_2021-02/ref_prok_rep_genomes" \
+    "${BLASTDB}/ref_prok_rep_genomes/ref_prok_rep_genomes" \
+    "${BLASTDB}/nt_20260224/nt" \
+    "${BLASTDB}/nt_2022-05-19/nt" \
+    "${BLASTDB}/nt_2021_04_01/nt" \
+    "${BLASTDB}/nt/nt"; do
+    if [ -f "${candidate}.nal" ] || [ -f "${candidate}.nsq" ] || [ -f "${candidate}.00.nsq" ]; then
         NTDB="$candidate"
         break
     fi
@@ -44,10 +52,9 @@ done
 
 if [ -z "$NTDB" ]; then
     echo "Available databases:"
-    find "$BLASTDB" -name "*.nal" -o -name "*.nsq" 2>/dev/null | head -20
+    find "$BLASTDB" -name "*.nal" 2>/dev/null | head -20
     echo ""
-    echo "ERROR: Could not find nt BLAST database. Check /data/databases/ncbi-blastdbs/"
-    echo "You may need to adjust NTDB path in this script."
+    echo "ERROR: Could not find BLAST database."
     exit 1
 fi
 echo "Using BLAST db: $NTDB"
@@ -75,16 +82,12 @@ echo ""
 echo "=== Running BLAST ==="
 echo "Started: $(date '+%H:%M:%S')"
 
-# Check if blastn is available
-if command -v blastn &>/dev/null; then
-    BLASTN=blastn
-elif [ -f /usr/bin/blastn ]; then
-    BLASTN=/usr/bin/blastn
-else
-    # Try via module
-    module load BLAST+ 2>/dev/null || module load blast 2>/dev/null || true
-    BLASTN=blastn
+# Check if blastn is available (loaded via module above)
+if ! command -v blastn &>/dev/null; then
+    echo "ERROR: blastn not found. Try: module load BLAST+/2.15.0-gompi-2021a"
+    exit 1
 fi
+BLASTN=blastn
 
 $BLASTN -query "$QUERY" \
     -db "$NTDB" \
