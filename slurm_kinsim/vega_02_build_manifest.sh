@@ -6,9 +6,10 @@
 #   bash slurm_kinsim/vega_02_build_manifest.sh
 # ============================================================
 
-set -euo pipefail
+set +u
 source ~/.bashrc
 conda activate kinsim_env
+set -euo pipefail
 
 VEGA=/data/projects/p774_MARSD/NDutilleux/training/Vega
 PROCESSED=${VEGA}/processed
