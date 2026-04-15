@@ -387,6 +387,7 @@ def extract_samples_from_bam(
     max_reads: int = 0,
     kmer_size: int = K,
     unmeth_subsample_rate: float = 0.05,
+    binarize: bool = True,
 ) -> dict:
     """Extract raw (IPD, PW) pairs from a BAM file for each k-mer context.
 
@@ -562,10 +563,13 @@ def extract_samples_from_bam(
 
     # Binarize methylated keys: 2-component GMM on (IPD, PW) separates
     # truly methylated reads from unmethylated reads at motif sites.
-    result = _binarize_by_ipd(result)
-    b_keys    = sum(1 for k in result if isinstance(k, tuple))
-    b_samples = sum(len(v) for k, v in result.items() if isinstance(k, tuple))
-    log.info("After IPD binarization: %d unique keys, %d total samples", b_keys, b_samples)
+    if binarize:
+        result = _binarize_by_ipd(result)
+        b_keys    = sum(1 for k in result if isinstance(k, tuple))
+        b_samples = sum(len(v) for k, v in result.items() if isinstance(k, tuple))
+        log.info("After IPD binarization: %d unique keys, %d total samples", b_keys, b_samples)
+    else:
+        log.info("Binarization skipped (--no-binarize): keeping raw methylation labels")
 
     # Attach provenance metadata so shards can be inspected and traced back.
     result["__meta__"] = {
@@ -896,6 +900,7 @@ def extract_from_manifest_task(
     unmeth_subsample_rate: float = 0.05,
     min_score: float = 20.0,
     min_ipd_ratio: float = 0.0,
+    binarize: bool = True,
 ) -> None:
     """Extract one BAM from a manifest CSV (for SLURM array jobs).
 
@@ -966,6 +971,7 @@ def extract_from_manifest_task(
             max_reads=max_reads,
             kmer_size=kmer_size,
             unmeth_subsample_rate=unmeth_subsample_rate,
+            binarize=binarize,
         )
 
     with open(output_pkl, "wb") as f:
@@ -1078,6 +1084,10 @@ def main(argv=None) -> None:
     p_extract.add_argument("--max-reads", type=int, default=0,
                            help="Stop after N reads (0 = no limit). "
                                 "Smoke-test only — biases reservoir sampling.")
+    p_extract.add_argument("--no-binarize", action="store_true",
+                           help="Skip GMM binarization of methylated keys. "
+                                "Keeps raw motif-based labels so distributions "
+                                "can be inspected before filtering.")
     p_extract.add_argument("--verbose", "-v", action="store_true",
                            help="Enable DEBUG-level logging")
 
@@ -1135,6 +1145,7 @@ def main(argv=None) -> None:
                 unmeth_subsample_rate= args.unmeth_subsample_rate,
                 min_score            = args.min_score,
                 min_ipd_ratio        = args.min_ipd_ratio,
+                binarize             = not args.no_binarize,
             )
 
         elif args.gff:
@@ -1205,6 +1216,7 @@ def main(argv=None) -> None:
                 max_reads=args.max_reads,
                 kmer_size=args.kmer_size or K,
                 unmeth_subsample_rate=args.unmeth_subsample_rate,
+                binarize=not args.no_binarize,
             )
 
             Path(args.output).parent.mkdir(parents=True, exist_ok=True)
