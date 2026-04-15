@@ -128,7 +128,9 @@ if [ -n "$SLURM_ARRAY_TASK_ID" ]; then
     kinsim extract \
         --manifest "$MANIFEST" \
         --task     "$SLURM_ARRAY_TASK_ID" \
-        --output-dir "$SHARDS_DIR"
+        --output-dir "$SHARDS_DIR" \
+        --max-samples 1000 \
+        --no-binarize
     EXIT_CODE=$?
 
     if [ $EXIT_CODE -ne 0 ]; then
