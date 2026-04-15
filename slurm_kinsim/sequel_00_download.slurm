@@ -9,11 +9,12 @@
 
 # Download PacBio Sequel II Microbial Multiplexing 48-plex dataset
 # Source: https://downloads.pacbcloud.com/public/dataset/MicrobialMultiplexing_48plex/
+# Files: 48 demultiplexed BAMs (lima.bcXXXX--bcXXXX.bam.gz) + PBI indexes
 
 set -euo pipefail
 
 DEST=/data/projects/p774_MARSD/NDutilleux/training/Sequel
-BASE_URL=https://downloads.pacbcloud.com/public/dataset/MicrobialMultiplexing_48plex
+BASE_URL=https://downloads.pacbcloud.com/public/dataset/MicrobialMultiplexing_48plex/48-plex_bam
 
 echo "========================================================"
 echo "  Download Sequel II 48-plex Microbial Multiplexing"
@@ -24,58 +25,47 @@ echo ""
 mkdir -p "$DEST"
 cd "$DEST"
 
-# Download metadata files
-echo "=== Downloading metadata ==="
-for f in sample_list.tsv readme.txt; do
-    if [ ! -f "$f" ]; then
-        wget -q --show-progress "${BASE_URL}/${f}" -O "$f" 2>&1 || echo "WARN: $f not found"
-    else
-        echo "  $f already exists, skipping"
-    fi
-done
+# All 48 barcodes from the dataset
+BARCODES=(
+    1018 1019 1031 1034 1037 1040 1043 1044
+    1046 1047 1050 1052 1053 1054 1055 1058
+    1059 1060 1061 1062 1065 1066 1068 1070
+    1074 1076 1077 1078 1079 1081 1082 1083
+    1084 1087 1091 1092 1094 1095 1099 1101
+    1102 1106 1109 1111 1117 1118 1119 1126
+)
 
-# Download all subread BAMs + PBI indexes
-echo ""
-echo "=== Downloading subread BAMs ==="
-
-# Get file listing from the BAM directory
-INDEX_HTML=$(mktemp)
-wget -q "${BASE_URL}/48-plex_bam/" -O "$INDEX_HTML" 2>&1 || true
-
-# Extract .bam and .bam.pbi filenames from the directory listing
-BAM_FILES=$(grep -oP 'href="\K[^"]+\.subreads\.bam(\.pbi)?"' "$INDEX_HTML" | sort -u)
-
-if [ -z "$BAM_FILES" ]; then
-    echo "WARN: Could not parse directory listing. Trying direct pattern..."
-    # Fallback: try numbered pattern m54081_*
-    # We know there are 48-plex BAMs, try listing
-    wget -q "${BASE_URL}/48-plex_bam/" -O - 2>/dev/null | grep -oP 'href="\K[^"]+\.bam[^"]*' | sort -u > "$INDEX_HTML"
-    BAM_FILES=$(cat "$INDEX_HTML")
-fi
-
-N_FILES=$(echo "$BAM_FILES" | wc -l)
-echo "Found $N_FILES files to download"
+echo "Downloading ${#BARCODES[@]} demultiplexed BAMs + PBI indexes"
 echo ""
 
 DOWNLOADED=0
 SKIPPED=0
-for fname in $BAM_FILES; do
-    if [ -f "$fname" ]; then
-        echo "  SKIP: $fname (exists)"
-        SKIPPED=$((SKIPPED + 1))
-    else
-        echo "  GET:  $fname"
-        wget -q --show-progress "${BASE_URL}/48-plex_bam/${fname}" -O "$fname" 2>&1
-        DOWNLOADED=$((DOWNLOADED + 1))
-    fi
-done
+FAILED=0
 
-rm -f "$INDEX_HTML"
+for bc in "${BARCODES[@]}"; do
+    for ext in bam.gz bam.pbi.gz; do
+        fname="lima.bc${bc}--bc${bc}.${ext}"
+        if [ -f "$fname" ]; then
+            echo "  SKIP: $fname"
+            SKIPPED=$((SKIPPED + 1))
+        else
+            echo "  GET:  $fname"
+            if wget -q "${BASE_URL}/${fname}" -O "$fname" 2>&1; then
+                DOWNLOADED=$((DOWNLOADED + 1))
+            else
+                echo "  FAIL: $fname"
+                rm -f "$fname"
+                FAILED=$((FAILED + 1))
+            fi
+        fi
+    done
+done
 
 echo ""
 echo "=== Summary ==="
 echo "Downloaded: $DOWNLOADED files"
 echo "Skipped:    $SKIPPED files (already existed)"
+echo "Failed:     $FAILED files"
 echo "Location:   $DEST"
 du -sh "$DEST"
 echo ""

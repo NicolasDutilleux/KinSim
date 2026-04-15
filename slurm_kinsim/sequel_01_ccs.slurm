@@ -7,48 +7,33 @@
 #SBATCH --time=12:00:00
 #SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/sequel_ccs_%A_%a.log
 
-# Convert Sequel II subreads to HiFi reads with kinetics (fi/fp/ri/rp tags)
-# Requires: ccs (from SMRT-Link or pb-ccs conda package)
+# Convert Sequel II demultiplexed subreads to HiFi reads with kinetics
+# Input:  lima.bcXXXX--bcXXXX.bam.gz  (compressed subreads)
+# Output: hifi/lima.bcXXXX--bcXXXX.hifi.bam (HiFi with fi/fp/ri/rp tags)
 #
 # Usage:
-#   # First count BAMs:
-#   N=$(ls /data/projects/p774_MARSD/NDutilleux/training/Sequel/*.subreads.bam 2>/dev/null | wc -l)
-#   sbatch --array=1-${N}%5 slurm_kinsim/sequel_01_ccs.slurm
+#   sbatch --array=1-48%5 slurm_kinsim/sequel_01_ccs.slurm
 
 set +u
 source ~/.bashrc
 conda activate kinsim_env
 set -euo pipefail
 
-# Try to load ccs — multiple possible module names
-CCS_FOUND=false
+# Try to find ccs
 for mod in "SMRT-Link/13.0.0" "SMRT-Link/12.0.0" "smrtlink/13.0" "smrtlink/12.0" \
            "pb-ccs/7.0.0" "pb-ccs/6.4.0" "ccs/7.0.0" "ccs/6.4.0"; do
     if module load "$mod" 2>/dev/null; then
         echo "Loaded module: $mod"
-        CCS_FOUND=true
         break
     fi
 done
 
-# Check if ccs is available (maybe via conda or PATH)
-if ! $CCS_FOUND; then
-    if command -v ccs &>/dev/null; then
-        echo "ccs found in PATH: $(which ccs)"
-        CCS_FOUND=true
-    fi
-fi
-
-if ! $CCS_FOUND; then
-    echo "ERROR: ccs not found. Install via:"
-    echo "  conda install -c bioconda pbccs"
-    echo "  OR load a SMRT-Link module"
-    echo ""
-    echo "Available modules matching 'smrt' or 'ccs':"
-    module avail 2>&1 | grep -iE "smrt|ccs" || echo "  (none found)"
+if ! command -v ccs &>/dev/null; then
+    echo "ERROR: ccs not found. Install via: conda install -c bioconda pbccs"
+    echo "Available modules:"
+    module avail 2>&1 | grep -iE "smrt|ccs" || echo "  (none)"
     exit 1
 fi
-
 echo "ccs version: $(ccs --version 2>&1 | head -1)"
 
 SEQUEL=/data/projects/p774_MARSD/NDutilleux/training/Sequel
@@ -61,26 +46,27 @@ echo "  $(date '+%Y-%m-%d %H:%M:%S')"
 echo "========================================================"
 echo ""
 
-# Find the Nth subread BAM
-mapfile -t BAMS < <(ls "${SEQUEL}"/*.subreads.bam 2>/dev/null | sort)
-N_BAMS=${#BAMS[@]}
+# Find the Nth .bam.gz file
+mapfile -t GZBAMS < <(ls "${SEQUEL}"/lima.bc*--bc*.bam.gz 2>/dev/null | sort)
+N_BAMS=${#GZBAMS[@]}
 
 if [ "$N_BAMS" -eq 0 ]; then
-    echo "ERROR: No .subreads.bam files found in $SEQUEL"
+    echo "ERROR: No lima.bc*--bc*.bam.gz files found in $SEQUEL"
     exit 1
 fi
 
 IDX=$((SLURM_ARRAY_TASK_ID - 1))
 if [ "$IDX" -ge "$N_BAMS" ]; then
-    echo "Task $SLURM_ARRAY_TASK_ID exceeds number of BAMs ($N_BAMS). Exiting."
+    echo "Task $SLURM_ARRAY_TASK_ID > $N_BAMS BAMs. Nothing to do."
     exit 0
 fi
 
-SUBREADS_BAM="${BAMS[$IDX]}"
-BASENAME=$(basename "$SUBREADS_BAM" .subreads.bam)
+GZ_BAM="${GZBAMS[$IDX]}"
+BASENAME=$(basename "$GZ_BAM" .bam.gz)
+SUBREADS_BAM="${SEQUEL}/${BASENAME}.bam"
 HIFI_BAM="${HIFI_DIR}/${BASENAME}.hifi.bam"
 
-echo "Input:  $SUBREADS_BAM"
+echo "Input:  $GZ_BAM"
 echo "Output: $HIFI_BAM"
 echo ""
 
@@ -89,16 +75,13 @@ if [ -f "$HIFI_BAM" ]; then
     exit 0
 fi
 
-# Check if input is compressed (.bam.gz) — decompress if needed
-if [ -f "${SUBREADS_BAM}.gz" ] && [ ! -f "$SUBREADS_BAM" ]; then
-    echo "Decompressing ${SUBREADS_BAM}.gz ..."
-    gunzip -k "${SUBREADS_BAM}.gz"
-    DECOMPRESSED=true
-else
-    DECOMPRESSED=false
-fi
+# Decompress
+echo "Decompressing $(basename "$GZ_BAM") ..."
+gunzip -k "$GZ_BAM"
+echo "  -> $(ls -lh "$SUBREADS_BAM" | awk '{print $5}')"
 
-# Run CCS with all kinetics preserved
+# Run CCS
+echo ""
 echo "Running CCS ($(date '+%H:%M:%S')) ..."
 ccs "$SUBREADS_BAM" "$HIFI_BAM" \
     --all-kinetics \
@@ -110,35 +93,30 @@ ccs "$SUBREADS_BAM" "$HIFI_BAM" \
 echo ""
 echo "CCS done: $(date '+%H:%M:%S')"
 
-# Index the output
+# Index
 if command -v pbindex &>/dev/null; then
     pbindex "$HIFI_BAM" 2>/dev/null || true
 fi
 
 # Clean up decompressed BAM (keep the .gz)
-if $DECOMPRESSED && [ -f "$HIFI_BAM" ]; then
-    echo "Removing decompressed subreads BAM (keeping .gz)"
+if [ -f "$HIFI_BAM" ]; then
+    echo "Removing decompressed subreads (keeping .gz)"
     rm -f "$SUBREADS_BAM"
 fi
 
-# Quick stats
+# Quick verification
 echo ""
-echo "=== Stats ==="
-echo "Input subreads:"
-ls -lh "$SUBREADS_BAM" 2>/dev/null || ls -lh "${SUBREADS_BAM}.gz" 2>/dev/null || true
-echo "Output HiFi:"
+echo "=== Verification ==="
 ls -lh "$HIFI_BAM"
-
-# Verify kinetic tags
 python -c "
 import pysam
 bam = pysam.AlignmentFile('${HIFI_BAM}', check_sq=False)
 read = next(iter(bam))
 tags = {t[0] for t in read.get_tags()}
-kinetic_tags = tags & {'fi', 'fp', 'ri', 'rp', 'ip', 'pw'}
+kinetic = tags & {'fi', 'fp', 'ri', 'rp', 'ip', 'pw'}
 print(f'Read length: {read.query_length}bp')
-print(f'Kinetic tags: {sorted(kinetic_tags)}')
-if 'fi' in tags or 'ip' in tags:
+print(f'Kinetic tags: {sorted(kinetic)}')
+if kinetic:
     print('OK: Kinetic data preserved')
 else:
     print('WARNING: No kinetic tags found!')
