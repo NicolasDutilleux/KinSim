@@ -39,8 +39,6 @@
 set +u
 source ~/.bashrc
 conda activate kinsim_env
-source /etc/profile.d/modules.sh 2>/dev/null || true
-module load SMRT-Link/12.0.0.177059-cli-tools-only 2>/dev/null || true
 set -euo pipefail
 
 # ---- Config ----
@@ -48,7 +46,8 @@ SEQUEL=/data/projects/p774_MARSD/NDutilleux/training/Sequel
 HIFI_DIR=${SEQUEL}/hifi
 OUTBASE=${SEQUEL}/assembly
 SMRT_SIF="/containers/apptainer/pacbio-smrt-tools-25.3.sif"
-SP3_MODEL="/mnt/ss/sib/ibu/rocky8/2023072800/software/SMRT-Link/12.0.0.177059-cli-tools-only/install/smrtlink-release_12.0.0.177059/bundles/smrttools/install/smrttools-release_12.0.0.177059/private/thirdparty/python3/python3_3.9.6/site-packages/kineticsTools/resources/SP3-C3.npz.gz"
+# All PacBio tools (pbindex, ipdSummary) run via apptainer
+# hifiasm, pbmm2, samtools run from conda
 
 # ---- Select BAM for this task ----
 mapfile -t HIFI_BAMS < <(ls "${HIFI_DIR}"/*.hifi.bam 2>/dev/null | sort)
@@ -176,20 +175,14 @@ else
     echo "=== Step 4: ipdSummary ==="
     echo "Started: $(date '+%H:%M:%S')"
 
-    # Use SP3-C3 model if available, otherwise let ipdSummary auto-detect
-    IPD_ARGS=("$ALIGNED"
-        --reference "$ASM_FASTA"
-        --identify m6A,m4C
-        --methylFraction
-        --csv "$CSV"
-        --gff "$GFF"
-        --numWorkers "${SLURM_CPUS_PER_TASK}")
-
-    if [ -f "$SP3_MODEL" ]; then
-        IPD_ARGS+=(--ipdModel "$SP3_MODEL")
-    fi
-
-    ipdSummary "${IPD_ARGS[@]}"
+    apptainer exec --bind /data "$SMRT_SIF" \
+        ipdSummary "$ALIGNED" \
+            --reference "$ASM_FASTA" \
+            --identify m6A,m4C \
+            --methylFraction \
+            --csv "$CSV" \
+            --gff "$GFF" \
+            --numWorkers "${SLURM_CPUS_PER_TASK}"
 
     RC=$?
     if [ $RC -ne 0 ]; then

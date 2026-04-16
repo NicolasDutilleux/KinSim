@@ -31,15 +31,14 @@
 set +u
 source ~/.bashrc
 conda activate kinsim_env
-source /etc/profile.d/modules.sh 2>/dev/null || true
-module load SMRT-Link/12.0.0.177059-cli-tools-only 2>/dev/null || true
 set -euo pipefail
 
 # ---- Config ----
 VEGA=/data/projects/p774_MARSD/NDutilleux/training/Vega
 OUTBASE=${VEGA}/assembly
 SMRT_SIF="/containers/apptainer/pacbio-smrt-tools-25.3.sif"
-SP3_MODEL="/mnt/ss/sib/ibu/rocky8/2023072800/software/SMRT-Link/12.0.0.177059-cli-tools-only/install/smrtlink-release_12.0.0.177059/bundles/smrttools/install/smrttools-release_12.0.0.177059/private/thirdparty/python3/python3_3.9.6/site-packages/kineticsTools/resources/SP3-C3.npz.gz"
+# All PacBio tools (pbindex, ccs-kinetics-bystrandify, ipdSummary) run via apptainer
+# hifiasm, pbmm2, samtools run from conda
 
 # All 16 Vega barcodes (bc2033-bc2048)
 BARCODES=(2033 2034 2035 2036 2037 2038 2039 2040
@@ -186,17 +185,17 @@ if [ -f "$GFF" ] && [ -s "$GFF" ]; then
     GFF_LINES=$(grep -c "^[^#]" "$GFF" || true)
     echo "  Existing GFF: $GFF_LINES records"
 else
-    echo "=== Step 5: ipdSummary (SP3-C3) ==="
+    echo "=== Step 5: ipdSummary ==="
     echo "Started: $(date '+%H:%M:%S')"
 
-    ipdSummary "$ALIGNED" \
-        --reference "$ASM_FASTA" \
-        --identify m6A,m4C \
-        --methylFraction \
-        --csv "$CSV" \
-        --gff "$GFF" \
-        --numWorkers "${SLURM_CPUS_PER_TASK}" \
-        --ipdModel "$SP3_MODEL"
+    apptainer exec --bind /data "$SMRT_SIF" \
+        ipdSummary "$ALIGNED" \
+            --reference "$ASM_FASTA" \
+            --identify m6A,m4C \
+            --methylFraction \
+            --csv "$CSV" \
+            --gff "$GFF" \
+            --numWorkers "${SLURM_CPUS_PER_TASK}"
 
     RC=$?
     if [ $RC -ne 0 ]; then
