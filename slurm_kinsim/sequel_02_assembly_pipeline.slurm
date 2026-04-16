@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=sequel_asm
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=16G
+#SBATCH --mem=32G
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
 #SBATCH --time=06:00:00
