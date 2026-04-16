@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=vega_asm
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=16G
+#SBATCH --mem=32G
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
 #SBATCH --time=04:00:00
@@ -113,47 +113,46 @@ else
 fi
 echo ""
 
-# ---- Step 2: ccs-kinetics-bystrandify ----
-BYSTRAND="${SPECIES_DIR}/${SAMPLE}_bystrandify.bam"
+# ---- Step 2: pbmm2 align (original BAM to assembly) ----
+ALIGNED_RAW="${SPECIES_DIR}/${SAMPLE}_aligned_raw.bam"
 
-if [ -f "$BYSTRAND" ] && [ -s "$BYSTRAND" ]; then
-    echo "=== Step 2: SKIP — bystrandify BAM already exists ==="
+if [ -f "$ALIGNED_RAW" ] && [ -s "$ALIGNED_RAW" ]; then
+    echo "=== Step 2: SKIP — aligned BAM already exists ==="
 else
-    echo "=== Step 2: ccs-kinetics-bystrandify ==="
+    echo "=== Step 2: pbmm2 align ==="
     echo "Started: $(date '+%H:%M:%S')"
 
-    apptainer exec --bind /data "$SMRT_SIF" \
-        ccs-kinetics-bystrandify "$BAM" "$BYSTRAND"
+    if [ ! -f "${ASM_FASTA}.fai" ]; then
+        samtools faidx "$ASM_FASTA"
+    fi
+
+    pbmm2 align "$ASM_FASTA" "$BAM" "$ALIGNED_RAW" \
+        --preset CCS --sort --num-threads "${SLURM_CPUS_PER_TASK}"
 
     RC=$?
-    if [ $RC -ne 0 ] || [ ! -f "$BYSTRAND" ]; then
-        echo "FAILED: bystrandify exit=$RC"
+    if [ $RC -ne 0 ] || [ ! -f "$ALIGNED_RAW" ]; then
+        echo "FAILED: pbmm2 align exit=$RC"
         exit 1
     fi
     echo "Done: $(date '+%H:%M:%S')"
 fi
 echo ""
 
-# ---- Step 3: pbmm2 align ----
+# ---- Step 3: ccs-kinetics-bystrandify (on aligned BAM) ----
 ALIGNED="${SPECIES_DIR}/${SAMPLE}_aligned.bam"
 
 if [ -f "$ALIGNED" ] && [ -s "$ALIGNED" ]; then
-    echo "=== Step 3: SKIP — aligned BAM already exists ==="
+    echo "=== Step 3: SKIP — bystrandified aligned BAM already exists ==="
 else
-    echo "=== Step 3: pbmm2 align ==="
+    echo "=== Step 3: ccs-kinetics-bystrandify ==="
     echo "Started: $(date '+%H:%M:%S')"
 
-    # Index reference
-    if [ ! -f "${ASM_FASTA}.fai" ]; then
-        samtools faidx "$ASM_FASTA"
-    fi
-
-    pbmm2 align "$ASM_FASTA" "$BYSTRAND" "$ALIGNED" \
-        --preset CCS --sort --num-threads "${SLURM_CPUS_PER_TASK}"
+    apptainer exec --bind /data "$SMRT_SIF" \
+        ccs-kinetics-bystrandify "$ALIGNED_RAW" "$ALIGNED"
 
     RC=$?
     if [ $RC -ne 0 ] || [ ! -f "$ALIGNED" ]; then
-        echo "FAILED: pbmm2 align exit=$RC"
+        echo "FAILED: bystrandify exit=$RC"
         exit 1
     fi
     echo "Done: $(date '+%H:%M:%S')"
