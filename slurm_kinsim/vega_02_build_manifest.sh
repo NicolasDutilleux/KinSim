@@ -12,7 +12,7 @@ conda activate kinsim_env
 set -euo pipefail
 
 VEGA=/data/projects/p774_MARSD/NDutilleux/training/Vega
-PROCESSED=${VEGA}/processed
+PROCESSED=${VEGA}/assembly
 MANIFEST=${VEGA}/manifest_vega_gff.csv
 SPECIES_FILE=${VEGA}/species_id.txt
 
