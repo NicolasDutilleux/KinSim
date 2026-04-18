@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=vega_asm
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --mem=64G
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
-#SBATCH --time=04:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/vega_assembly_%A_%a.log
 #SBATCH --mail-user=nicolas.dutilleux@unifr.ch
 #SBATCH --mail-type=FAIL
@@ -19,7 +19,7 @@
 #   4. ipdSummary SP3-C3    → GFF methylation calls
 #
 # Usage:
-#   sbatch --array=1-16%5 slurm_kinsim/vega_01_assembly_pipeline.slurm
+#   sbatch --array=1-16 slurm_kinsim/vega_01_assembly_pipeline.slurm
 #
 # Prereqs:
 #   - hifiasm in conda (kinsim_env)
