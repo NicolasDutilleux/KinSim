@@ -23,7 +23,7 @@
 # same reference, so coordinates are valid.
 #
 # Usage:
-#   sbatch --array=1-48%5 slurm_kinsim/sequel_03_align_hifi.slurm
+#   sbatch --array=1-48 slurm_kinsim/sequel_03_align_hifi.slurm
 # ============================================================
 
 set +u

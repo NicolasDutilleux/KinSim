@@ -36,8 +36,8 @@ echo "============================================================"
 # SEQUEL pipeline
 # ============================================================
 echo ""
-echo "=== [Sequel] Step 1: Align HiFi BAMs (48 barcodes, 5 parallel) ==="
-SEQUEL_ALIGN_JOB=$(sbatch --parsable --array=1-48%5 "${SLURMDIR}/sequel_03_align_hifi.slurm")
+echo "=== [Sequel] Step 1: Align HiFi BAMs (48 barcodes, all parallel) ==="
+SEQUEL_ALIGN_JOB=$(sbatch --parsable --array=1-48 "${SLURMDIR}/sequel_03_align_hifi.slurm")
 echo "  Job ID: $SEQUEL_ALIGN_JOB"
 
 echo ""
@@ -62,7 +62,7 @@ SEQUEL_EXTRACT_SUBMIT=$(sbatch --parsable --dependency=afterok:${SEQUEL_MANIFEST
         conda activate kinsim_env
         N=\$(kinsim-prep manifest count ${SEQUEL}/manifest_sequel_gff.csv)
         echo \"Submitting Sequel extract: N=\$N tasks\"
-        sbatch --array=1-\${N}%5 ${SLURMDIR}/00_extract.slurm \
+        sbatch --array=1-\${N} ${SLURMDIR}/00_extract.slurm \
             ${SEQUEL}/manifest_sequel_gff.csv \
             ${SEQUEL}/shards \
             ${SEQUEL}/master_raw.pkl
@@ -93,7 +93,7 @@ VEGA_EXTRACT_SUBMIT=$(sbatch --parsable --dependency=afterok:${VEGA_MANIFEST_JOB
         conda activate kinsim_env
         N=\$(kinsim-prep manifest count ${VEGA}/manifest_vega_gff.csv)
         echo \"Submitting Vega extract: N=\$N tasks\"
-        sbatch --array=1-\${N}%5 ${SLURMDIR}/00_extract.slurm \
+        sbatch --array=1-\${N} ${SLURMDIR}/00_extract.slurm \
             ${VEGA}/manifest_vega_gff.csv \
             ${VEGA}/shards \
             ${VEGA}/master_raw.pkl
