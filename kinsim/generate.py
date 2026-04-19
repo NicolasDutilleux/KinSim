@@ -37,6 +37,8 @@ The methylation state (meth_id) is shared: the meth_map (built with revcomp=True
 already encodes both-strand methylation at each reference position.
 """
 
+from __future__ import annotations
+
 import array
 import gzip
 import json
