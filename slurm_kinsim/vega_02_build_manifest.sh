@@ -34,7 +34,9 @@ if Path(species_file).exists():
         for row in reader:
             species_map[row['barcode']] = row.get('species', row['barcode'])
 
-barcodes = [f'bc{i}' for i in range(2033, 2049)]
+EXCLUDED = {'bc2038'}  # moved to assembly/removed/ — fragmented (146 contigs, 12.82 Mb, likely contamination)
+
+barcodes = [f'bc{i}' for i in range(2033, 2049) if f'bc{i}' not in EXCLUDED]
 
 with open(manifest, 'w') as out:
     out.write('sample_id,bam_path,motifs,gff\n')
