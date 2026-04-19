@@ -66,6 +66,7 @@ def load_gff_annotations(
     gff_path: str,
     min_score: float = 20.0,
     min_ipd_ratio: float = 0.0,
+    allowed_mods: set[str] | None = None,
 ) -> dict[tuple[str, int, str], int]:
     """Load ipdSummary GFF3 into a position → meth_id lookup.
 
@@ -80,6 +81,12 @@ def load_gff_annotations(
         min_score:      Minimum kinetic score (-10*log10(pvalue)). Default 20
                         corresponds roughly to p < 0.01.
         min_ipd_ratio:  Optional minimum IPD ratio filter (0 = no filter).
+        allowed_mods:   If provided, only keep records whose modification type
+                        is in this set (e.g. {"m6A", "m4C"}).  Positions with
+                        excluded types are SKIPPED entirely (not relabelled as
+                        unmethylated), so they never appear in the training
+                        data and cannot contaminate the unmeth class.
+                        None (default) = accept all recognised types.
 
     Returns:
         dict mapping (contig, pos_0based, strand) → meth_id.
@@ -148,6 +155,13 @@ def load_gff_annotations(
             if not mod_type:
                 continue
 
+            # Type-filter: skip records whose mod type is not in allowed_mods.
+            # Skipping (rather than relabelling as unmeth) is intentional — it
+            # prevents contaminating the unmeth class with truly-modified sites
+            # the user has chosen to exclude.
+            if allowed_mods is not None and mod_type not in allowed_mods:
+                continue
+
             # Resolve to meth_id (register new types dynamically)
             if mod_type in METH_IDS:
                 meth_id = METH_IDS[mod_type]
@@ -166,6 +180,8 @@ def load_gff_annotations(
     log.info("GFF loaded: %s", gff_path)
     log.info("  %d records total, %d kept (score >= %.0f)",
              n_total, n_kept, min_score)
+    if allowed_mods is not None:
+        log.info("  allowed_mods filter: %s", sorted(allowed_mods))
     for mod_type, count in sorted(type_counts.items()):
         log.info("  %s: %d positions", mod_type, count)
 

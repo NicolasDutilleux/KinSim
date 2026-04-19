@@ -74,6 +74,56 @@ def reverse_complement(seq):
 
 
 # ---------------------------------------------------------------------------
+# Modification-type filter
+# ---------------------------------------------------------------------------
+
+def parse_meth_types_arg(arg: str | None) -> set[str] | None:
+    """Parse a ``--meth-types`` CLI value into a set of mod type strings.
+
+    Accepts ``"m6A,m4C"``, ``"m6A"``, ``"all"`` (synonym for None / no filter),
+    or None.  Empty string → None.
+
+    Returns:
+        A set like ``{"m6A", "m4C"}``, or ``None`` to mean "no filter".
+    """
+    if arg is None:
+        return None
+    s = arg.strip()
+    if not s or s.lower() == 'all':
+        return None
+    return {tok.strip() for tok in s.split(',') if tok.strip()}
+
+
+def filter_motif_string_by_types(motif_string: str,
+                                  allowed_mods: set[str] | None) -> str:
+    """Keep only motif entries whose mod type is in ``allowed_mods``.
+
+    Used at both extract time (upstream of motif-based scanning) and generate
+    time (upstream of reference pre-scan) to enforce the active mod alphabet.
+    A skipped entry simply never appears in the scan output — positions are
+    NOT relabelled as unmethylated.
+
+    Args:
+        motif_string:  Semicolon-delimited motif entries.
+        allowed_mods:  ``None`` → no filter.  Otherwise a set of mod type
+                       strings (e.g. ``{"m6A", "m4C"}``).
+
+    Returns:
+        Filtered motif string.  Empty string if all entries were filtered out.
+    """
+    if not motif_string or allowed_mods is None:
+        return motif_string
+    kept = []
+    for entry in motif_string.split(';'):
+        if not entry or ',' not in entry:
+            continue
+        mod_type = entry.split(',', 1)[0].strip()
+        if mod_type in allowed_mods:
+            kept.append(entry)
+    return ';'.join(kept)
+
+
+# ---------------------------------------------------------------------------
 # KinSim motif string: parse and scan (in-memory regex backend)
 # ---------------------------------------------------------------------------
 
