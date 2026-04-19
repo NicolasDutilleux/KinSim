@@ -16,9 +16,10 @@
 # Edit the CONFIG block below to modulate paths / concurrency.
 # ============================================================
 
-set -euo pipefail
+set +u
 source ~/.bashrc
 conda activate kinsim_env
+set -euo pipefail
 
 # ============ CONFIG ============
 BASE=/data/projects/p774_MARSD/NDutilleux/training
