@@ -2,9 +2,12 @@
 # ============================================================
 # Build manifest for Sequel II 48-plex extraction
 #
-# Uses:
-#   - HiFi aligned BAMs from sequel_03_align_hifi.slurm
-#   - GFF annotations from sequel_02_ipdsummary.slurm (on subreads)
+# Uses the subreads-aligned BAM that ipdSummary ran on (kinetics
+# stored as ip/pw on single-strand subread records).  GFF is the
+# sibling file produced by the same ipdSummary call.
+#
+#   ipdsummary/bcXXXX/bcXXXX_subreads_aligned.bam
+#   ipdsummary/bcXXXX/bcXXXX_ipdSummary.gff
 #
 # Output: manifest_sequel_gff.csv  (sample_id, bam_path, motifs, gff)
 #
@@ -18,8 +21,7 @@ conda activate kinsim_env
 set -euo pipefail
 
 SEQUEL=/data/projects/p774_MARSD/NDutilleux/training/Sequel
-ALIGNED_DIR=${SEQUEL}/aligned_hifi
-GFF_DIR=${SEQUEL}/ipdsummary
+IPD_DIR=${SEQUEL}/ipdsummary
 MANIFEST=${SEQUEL}/manifest_sequel_gff.csv
 SAMPLE_LIST=${SEQUEL}/48-plex_sample_list.tsv
 
@@ -29,12 +31,11 @@ python - <<PYEOF
 import csv
 from pathlib import Path
 
-aligned_dir = Path("${ALIGNED_DIR}")
-gff_dir = Path("${GFF_DIR}")
+ipd_dir = Path("${IPD_DIR}")
 manifest = "${MANIFEST}"
 sample_list = Path("${SAMPLE_LIST}")
 
-# Load species names from PacBio metadata if available
+# Optional species-name mapping from PacBio metadata
 bc_to_species = {}
 if sample_list.exists():
     with open(sample_list) as f:
@@ -46,7 +47,10 @@ if sample_list.exists():
                 bc_key = "bc" + bc.lstrip("bc").lstrip("0")
                 bc_to_species[bc_key] = sp.replace(" ", "_").replace(",", "_")
 
-barcodes = sorted([d.name for d in aligned_dir.iterdir() if d.is_dir() and d.name.startswith("bc")])
+barcodes = sorted(
+    d.name for d in ipd_dir.iterdir()
+    if d.is_dir() and d.name.startswith("bc")
+)
 
 with open(manifest, "w") as out:
     out.write("sample_id,bam_path,motifs,gff\n")
@@ -54,8 +58,8 @@ with open(manifest, "w") as out:
     skipped = []
 
     for bc in barcodes:
-        aligned = aligned_dir / bc / f"{bc}_hifi_aligned.bam"
-        gff = gff_dir / bc / f"{bc}_ipdSummary.gff"
+        aligned = ipd_dir / bc / f"{bc}_subreads_aligned.bam"
+        gff     = ipd_dir / bc / f"{bc}_ipdSummary.gff"
 
         if not aligned.exists() or aligned.stat().st_size == 0:
             skipped.append((bc, "no aligned BAM"))
@@ -65,7 +69,6 @@ with open(manifest, "w") as out:
             continue
 
         sample_id = bc_to_species.get(bc, bc)
-        # ensure barcode suffix if species name used (for uniqueness)
         if sample_id != bc:
             sample_id = f"{sample_id}_{bc}"
 

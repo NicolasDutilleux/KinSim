@@ -15,10 +15,9 @@ set -euo pipefail
 
 VEGA=/data/projects/p774_MARSD/NDutilleux/training/Vega
 BASEDIR=/data/projects/p774_MARSD/NDutilleux/training
-PROCESSED=${VEGA}/processed
 MANIFEST=${VEGA}/manifest_vega_gff.csv
-SHARDS=${BASEDIR}/shards_vega_train
-MASTER=${BASEDIR}/master_vega_train.pkl
+SHARDS=${VEGA}/shards_gff
+MASTER=${VEGA}/master_vega_gff.pkl
 LOGS=/data/projects/p774_MARSD/NDutilleux/logs
 
 echo "========================================================"

@@ -24,22 +24,23 @@ set -euo pipefail
 # ============================================================
 
 BASEDIR=/data/projects/p774_MARSD/NDutilleux/training
+STREPTO=${BASEDIR}/Strepto
 
-# Input: existing motif-based training manifest
-ORIG_MANIFEST=${BASEDIR}/manifest_combined_train.csv
+# Input: existing Streptomyces sample manifest (raw HiFi BAMs per strain)
+ORIG_MANIFEST=${STREPTO}/manifest_strepto.csv
 
 # ipdSummary working directory (bystrandify + aligned BAMs + GFF outputs)
-IPD_DIR=${BASEDIR}/Strepto/gff_pipeline
+IPD_DIR=${STREPTO}/gff_pipeline
 
 # GFF manifest (auto-generated after ipdSummary)
-GFF_MANIFEST=${BASEDIR}/manifest_strepto_gff.csv
+GFF_MANIFEST=${STREPTO}/manifest_strepto_gff.csv
 
 # Extract shards + merged output
-SHARDS=${BASEDIR}/shards_gff_train
-MASTER=${BASEDIR}/master_gff_train.pkl
+SHARDS=${STREPTO}/shards_gff
+MASTER=${STREPTO}/master_strepto_gff.pkl
 
 # Training checkpoints
-CKPT=${BASEDIR}/checkpoints_gff
+CKPT=${STREPTO}/checkpoints_gff
 
 # Validation (bc2036)
 VALDIR=${BASEDIR}/Strepto/bc2036_validation
