@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import json
 import logging
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -623,17 +624,46 @@ class LegacyCheckpointCallback(Callback):
 # Helper
 # ---------------------------------------------------------------------------
 
-def _save_model_config(output_dir: Path, model: nn.Module) -> None:
+def _read_pkl_meta(pkl_path: str) -> dict:
+    """Return the ``__meta__`` provenance dict from a training .pkl, or {}.
+
+    Reads only the top-level dict without loading the full training tensors —
+    we just need the metadata key.
+    """
+    try:
+        with open(pkl_path, "rb") as f:
+            data = pickle.load(f)
+    except (OSError, pickle.UnpicklingError) as exc:
+        log.warning("Could not read __meta__ from %s: %s", pkl_path, exc)
+        return {}
+    return data.get("__meta__", {}) if isinstance(data, dict) else {}
+
+
+def _save_model_config(
+    output_dir: Path,
+    model: nn.Module,
+    meth_types: list[str] | None = None,
+) -> None:
     """Write model_config.json before training starts.
 
     generate.py and evaluate.py both require this file to reconstruct the
     model architecture.  Writing it before the first epoch ensures it
     exists even if training is interrupted.
+
+    ``meth_types`` — the alphabet the training .pkl was extracted with — is
+    persisted so that generate.py can warn when the caller tries to simulate a
+    type that the model never saw during training.
     """
     cfg = model.get_config()
+    if meth_types is not None:
+        cfg["meth_types"] = sorted(meth_types)
     path = output_dir / "model_config.json"
     path.write_text(json.dumps(cfg, indent=2))
-    log.info("Model config saved: %s  (architecture=%s)", path, cfg.get("architecture"))
+    log.info(
+        "Model config saved: %s  (architecture=%s, meth_types=%s)",
+        path, cfg.get("architecture"),
+        cfg.get("meth_types", "all"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -889,8 +919,19 @@ def train_mlp(
     n_params = sum(p.numel() for p in model.parameters())
     log.info("Model parameters: %s (%s)", f"{n_params:,}", architecture)
 
+    # Surface the meth-alphabet used for extraction so training logs make it
+    # explicit which modification types this checkpoint is valid for.
+    meta = _read_pkl_meta(pkl_path)
+    pkl_meth_types = meta.get("meth_types")  # list[str] | None
+    if pkl_meth_types:
+        log.info("Training alphabet (from %s __meta__): %s",
+                 Path(pkl_path).name, pkl_meth_types)
+    else:
+        log.info("Training alphabet: all types in .pkl (no --meth-types filter "
+                 "was applied during extraction)")
+
     # Save model config BEFORE first epoch — generate.py needs it even if interrupted
-    _save_model_config(output_dir, model)
+    _save_model_config(output_dir, model, meth_types=pkl_meth_types)
 
     if resume_ckpt:
         log.info("Loading weights from: %s", resume_ckpt)

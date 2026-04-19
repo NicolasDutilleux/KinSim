@@ -62,7 +62,7 @@ echo ""
 echo "Output dir: $OUTDIR"
 echo ""
 
-kinsim compare "${ARGS[@]}" --output-dir "$OUTDIR"
+kinsim compare "${ARGS[@]}" --output-dir "$OUTDIR" --bimodality
 
 echo ""
 echo "========================================================"

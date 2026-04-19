@@ -54,6 +54,10 @@ htmlcov/
 # ── KinSim generated reports ────────────────────────────────────────────────
 # Analyze and evaluate output; keep source CSV data in prep/ if needed
 *.html
+reports/
+reports_*/
+dictionary_test/
+comparison_*/
 
 # ── SLURM logs ──────────────────────────────────────────────────────────────
 *.log

@@ -52,7 +52,8 @@ import torch.nn as nn
 from .models.predictor import MLPPredictor, create_from_config
 from .utils.encoding import BASE_MAP, K, KMER_MASK
 from .utils.motifs import (build_reference_frac_map, build_reference_meth_map,
-                     load_motif_string, parse_motifs, scan_sequence)
+                     filter_motif_string_by_types, load_motif_string,
+                     parse_meth_types_arg, parse_motifs, scan_sequence)
 from .utils.io import (MID, find_pbsim3_files, resolve_motifs_for_species,
                         get_extended_context, load_reference, parse_maf)
 
@@ -205,6 +206,78 @@ def generate_signals_batch(
 # ---------------------------------------------------------------------------
 # Model loading helper
 # ---------------------------------------------------------------------------
+
+def _read_ckpt_meth_types(checkpoint_path: str) -> list[str] | None:
+    """Return the ``meth_types`` list stored in the checkpoint's model_config.json.
+
+    ``None`` means the checkpoint was trained on the full alphabet (no filter).
+    Missing config file is treated as ``None`` — the caller reports any hard
+    errors when actually loading the model.
+    """
+    config_path = os.path.join(os.path.dirname(checkpoint_path), "model_config.json")
+    if not os.path.exists(config_path):
+        return None
+    try:
+        with open(config_path, "r") as f:
+            return json.load(f).get("meth_types")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _resolve_meth_types(
+    cli_meth_types: set[str] | None,
+    ckpt_meth_types: list[str] | None,
+) -> set[str] | None:
+    """Reconcile the CLI ``--meth-types`` override with the checkpoint's alphabet.
+
+    Policy:
+      - If the user passes ``--meth-types`` on the CLI, use it verbatim (and
+        warn if it requests a type the model never saw during training).
+      - Otherwise fall back to the checkpoint's recorded alphabet.
+      - ``None`` at either level means "no filter" (accept all types).
+
+    Warnings are important because silently generating signal for an unseen
+    methylation type produces garbage — the model has no learned distribution
+    for it and will emit whatever the unmethylated head defaults to.
+    """
+    ckpt_set = set(ckpt_meth_types) if ckpt_meth_types else None
+
+    if cli_meth_types is None:
+        if ckpt_set is not None:
+            log.info("Using checkpoint alphabet: %s", sorted(ckpt_set))
+        else:
+            log.info("No --meth-types filter; using all types from the motif source")
+        return ckpt_set
+
+    if ckpt_set is not None:
+        extra = cli_meth_types - ckpt_set
+        if extra:
+            log.warning(
+                "--meth-types requests %s but checkpoint was trained on %s. "
+                "Signal for the extra type(s) %s will be unreliable.",
+                sorted(cli_meth_types), sorted(ckpt_set), sorted(extra),
+            )
+    log.info("Using CLI --meth-types override: %s", sorted(cli_meth_types))
+    return cli_meth_types
+
+
+def _apply_meth_types(
+    motif_string: str,
+    meth_types: set[str] | None,
+) -> str:
+    """Filter the motif string by allowed mod types and fail fast on empties."""
+    if meth_types is None:
+        return motif_string
+    filtered = filter_motif_string_by_types(motif_string, meth_types)
+    if not filtered:
+        log.error(
+            "After --meth-types filter (%s) no motifs remain. "
+            "Check that your motif source contains the requested types.",
+            sorted(meth_types),
+        )
+        sys.exit(1)
+    return filtered
+
 
 def _load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
     """Load a trained model from a checkpoint file.
@@ -595,6 +668,7 @@ def generate_directory(
     deterministic: bool = False,
     min_fraction: float = 0.40,
     min_detected: int = 20,
+    meth_types: set[str] | None = None,
 ) -> None:
     """Generate signals for all species found under pbsim3_dir.
 
@@ -618,6 +692,8 @@ def generate_directory(
         if not motif_string:
             log.error("No motifs found for species '%s'.", species)
             sys.exit(1)
+
+        motif_string = _apply_meth_types(motif_string, meth_types)
 
         out_bam = os.path.join(output_dir, species + "_mlp.bam")
         log.info("--- %s ---", species)
@@ -789,6 +865,11 @@ def _main_from_bam(argv):
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--min-fraction", type=float, default=0.40)
     parser.add_argument("--min-detected", type=int, default=20)
+    parser.add_argument("--meth-types", default=None,
+                        help="Comma-separated methylation types to simulate "
+                             "(e.g. 'm6A,m4C'). Filters the motif source "
+                             "before generation. Default: use the checkpoint's "
+                             "training alphabet. 'all' disables the filter.")
     args = parser.parse_args(argv)
 
     motif_string = load_motif_string(args.motifs,
@@ -797,6 +878,12 @@ def _main_from_bam(argv):
     if not motif_string:
         log.error("No motifs found from the provided source.")
         sys.exit(1)
+
+    meth_types = _resolve_meth_types(
+        parse_meth_types_arg(args.meth_types),
+        _read_ckpt_meth_types(args.checkpoint),
+    )
+    motif_string = _apply_meth_types(motif_string, meth_types)
 
     generate_from_bam(
         input_bam=args.input_bam,
@@ -877,7 +964,17 @@ def _main_directory(argv):
                         help="Minimum fraction threshold (PacBio CSV only, default: 0.40)")
     parser.add_argument("--min-detected", type=int, default=20,
                         help="Minimum nDetected threshold (PacBio CSV only, default: 20)")
+    parser.add_argument("--meth-types", default=None,
+                        help="Comma-separated methylation types to simulate "
+                             "(e.g. 'm6A,m4C'). Filters each species' motif "
+                             "string before generation. Default: use the "
+                             "checkpoint's training alphabet. 'all' disables "
+                             "the filter.")
     args = parser.parse_args(argv)
+
+    cli_meth_types = parse_meth_types_arg(args.meth_types)
+    ckpt_meth_types = _read_ckpt_meth_types(args.checkpoint)
+    meth_types = _resolve_meth_types(cli_meth_types, ckpt_meth_types)
 
     generate_directory(
         pbsim3_dir=args.pbsim3_dir,
@@ -892,6 +989,7 @@ def _main_directory(argv):
         deterministic=args.deterministic,
         min_fraction=args.min_fraction,
         min_detected=args.min_detected,
+        meth_types=meth_types,
     )
 
 
@@ -943,6 +1041,11 @@ def _main_per_genome(argv):
                         help="Minimum fraction threshold (PacBio CSV only, default: 0.40)")
     parser.add_argument("--min-detected", type=int, default=20,
                         help="Minimum nDetected threshold (PacBio CSV only, default: 20)")
+    parser.add_argument("--meth-types", default=None,
+                        help="Comma-separated methylation types to simulate "
+                             "(e.g. 'm6A,m4C'). Filters the motif source "
+                             "before generation. Default: use the checkpoint's "
+                             "training alphabet. 'all' disables the filter.")
     args = parser.parse_args(argv)
 
     motif_string = load_motif_string(args.motifs,
@@ -951,6 +1054,12 @@ def _main_per_genome(argv):
     if not motif_string:
         log.error("No motifs found from the provided source.")
         sys.exit(1)
+
+    meth_types = _resolve_meth_types(
+        parse_meth_types_arg(args.meth_types),
+        _read_ckpt_meth_types(args.checkpoint),
+    )
+    motif_string = _apply_meth_types(motif_string, meth_types)
 
     generate_signals(
         fastq_path=args.fastq,

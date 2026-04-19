@@ -56,7 +56,9 @@ import numpy as np
 import pysam
 
 from .utils.encoding import BASE_MAP, K, KMER_MASK, METH_IDS, kmer_mask
-from .utils.motifs import load_motif_string, parse_motifs, reverse_complement, scan_sequence
+from .utils.motifs import (filter_motif_string_by_types, load_motif_string,
+                           parse_meth_types_arg, parse_motifs,
+                           reverse_complement, scan_sequence)
 
 try:
     from . import __version__ as _KINSIM_VERSION
@@ -388,6 +390,7 @@ def extract_samples_from_bam(
     kmer_size: int = K,
     unmeth_subsample_rate: float = 0.05,
     binarize: bool = True,
+    meth_types: set[str] | None = None,
 ) -> dict:
     """Extract raw (IPD, PW) pairs from a BAM file for each k-mer context.
 
@@ -432,6 +435,12 @@ def extract_samples_from_bam(
           - ``"__meta__"``                     → dict with provenance metadata
     """
     validate_bam_kinetics(bam_path)
+
+    # Apply mod-type filter upstream: excluded motifs will never match,
+    # so positions carrying those mod types stay unlabelled (= meth_id 0).
+    # This matches the GFF-path behaviour where excluded positions are skipped.
+    if meth_types is not None:
+        motif_string = filter_motif_string_by_types(motif_string, meth_types)
 
     _mask  = kmer_mask(kmer_size)
     mid    = kmer_size // 2
@@ -574,8 +583,10 @@ def extract_samples_from_bam(
     # Attach provenance metadata so shards can be inspected and traced back.
     result["__meta__"] = {
         "kinsim_version":          _KINSIM_VERSION,
+        "extraction_mode":         "motif",
         "source_bam":              str(bam_path),
         "motifs":                  motif_string,
+        "meth_types":              sorted(meth_types) if meth_types else None,
         "kmer_size":               kmer_size,
         "unmeth_subsample_rate":   unmeth_subsample_rate,
         "use_reverse_strand":      use_reverse_strand,
@@ -603,6 +614,7 @@ def extract_from_aligned_bam(
     unmeth_subsample_rate: float = 0.05,
     min_score: float = 20.0,
     min_ipd_ratio: float = 0.0,
+    meth_types: set[str] | None = None,
 ) -> dict:
     """Extract raw (IPD, PW) pairs using GFF annotations for methylation labels.
 
@@ -647,9 +659,13 @@ def extract_from_aligned_bam(
     _mask = kmer_mask(kmer_size)
     mid   = kmer_size // 2
 
-    # Load GFF annotations
+    # Load GFF annotations (with optional mod-type filter).  Excluded types
+    # are SKIPPED during load, so those genomic positions look like "no
+    # annotation" downstream and end up labelled meth_id=0 (unmeth) in the
+    # per-read map.  This keeps the unmeth class consistent with the filter.
     annotations = load_gff_annotations(
         gff_path, min_score=min_score, min_ipd_ratio=min_ipd_ratio,
+        allowed_mods=meth_types,
     )
     if not annotations:
         log.error("No methylation annotations found in GFF: %s", gff_path)
@@ -768,6 +784,7 @@ def extract_from_aligned_bam(
         "extraction_mode":        "gff",
         "source_bam":             str(bam_path),
         "gff_path":               str(gff_path),
+        "meth_types":             sorted(meth_types) if meth_types else None,
         "min_score":              min_score,
         "min_ipd_ratio":          min_ipd_ratio,
         "kmer_size":              kmer_size,
@@ -862,10 +879,25 @@ def merge_shards(
             n_subsampled += 1
         result[key] = combined
 
+    # Consolidate meth_types across shards — all shards must agree on the
+    # active alphabet, otherwise training labels are inconsistent.
+    shard_meth_types = [
+        tuple(m["meth_types"]) if m.get("meth_types") else None
+        for m in shard_metas
+    ]
+    unique_meth_types = set(shard_meth_types)
+    if len(unique_meth_types) > 1:
+        log.warning("Shards were extracted with different --meth-types: %s. "
+                    "Training on this merged file will mix alphabets.",
+                    unique_meth_types)
+    merged_meth_types = (sorted(shard_meth_types[0]) if shard_meth_types and
+                         shard_meth_types[0] is not None else None)
+
     # Merged metadata
     result["__meta__"] = {
         "kinsim_version":     _KINSIM_VERSION,
         "merged_from":        [m.get("source_bam", "?") for m in shard_metas],
+        "meth_types":         merged_meth_types,
         "n_shards":           len(files),
         "max_samples_per_key": max_samples_per_key,
         "created":            datetime.datetime.now().isoformat(timespec="seconds"),
@@ -901,6 +933,7 @@ def extract_from_manifest_task(
     min_score: float = 20.0,
     min_ipd_ratio: float = 0.0,
     binarize: bool = True,
+    meth_types: set[str] | None = None,
 ) -> None:
     """Extract one BAM from a manifest CSV (for SLURM array jobs).
 
@@ -943,6 +976,9 @@ def extract_from_manifest_task(
     output_pkl = os.path.join(output_dir, f"{entry.sample_id}_shard.pkl")
     log.info("  Output: %s", output_pkl)
 
+    if meth_types is not None:
+        log.info("  Meth types filter: %s", sorted(meth_types))
+
     if entry.gff:
         # ---- GFF-based extraction ----
         log.info("  GFF:    %s (GFF mode)", entry.gff)
@@ -954,6 +990,7 @@ def extract_from_manifest_task(
             unmeth_subsample_rate=unmeth_subsample_rate,
             min_score=min_score,
             min_ipd_ratio=min_ipd_ratio,
+            meth_types=meth_types,
         )
     else:
         # ---- Motif-based extraction ----
@@ -972,6 +1009,7 @@ def extract_from_manifest_task(
             kmer_size=kmer_size,
             unmeth_subsample_rate=unmeth_subsample_rate,
             binarize=binarize,
+            meth_types=meth_types,
         )
 
     with open(output_pkl, "wb") as f:
@@ -1088,6 +1126,14 @@ def main(argv=None) -> None:
                            help="Skip GMM binarization of methylated keys. "
                                 "Keeps raw motif-based labels so distributions "
                                 "can be inspected before filtering.")
+    p_extract.add_argument("--meth-types", default=None,
+                           help="Comma-separated list of methylation types to "
+                                "include (e.g. 'm6A,m4C'). Other types are "
+                                "SKIPPED: excluded positions do not appear in "
+                                "the training data at all (never relabelled as "
+                                "unmeth). Default: accept all types recognised "
+                                "by ipdSummary / PacBio motif files. 'all' is "
+                                "an explicit synonym for no filter.")
     p_extract.add_argument("--verbose", "-v", action="store_true",
                            help="Enable DEBUG-level logging")
 
@@ -1125,6 +1171,8 @@ def main(argv=None) -> None:
         )
 
     else:   # extract
+        meth_types = parse_meth_types_arg(args.meth_types)
+
         if args.manifest:
             # ---- Manifest mode ----
             if args.task is None:
@@ -1146,6 +1194,7 @@ def main(argv=None) -> None:
                 min_score            = args.min_score,
                 min_ipd_ratio        = args.min_ipd_ratio,
                 binarize             = not args.no_binarize,
+                meth_types           = meth_types,
             )
 
         elif args.gff:
@@ -1165,6 +1214,8 @@ def main(argv=None) -> None:
                 sys.exit(1)
 
             log.info("GFF-based extraction from: %s", os.path.basename(args.bam))
+            if meth_types is not None:
+                log.info("Meth types filter: %s", sorted(meth_types))
             result = extract_from_aligned_bam(
                 args.bam, args.gff,
                 max_samples_per_key=args.max_samples,
@@ -1173,6 +1224,7 @@ def main(argv=None) -> None:
                 unmeth_subsample_rate=args.unmeth_subsample_rate,
                 min_score=args.min_score,
                 min_ipd_ratio=args.min_ipd_ratio,
+                meth_types=meth_types,
             )
 
             Path(gff_output).parent.mkdir(parents=True, exist_ok=True)
@@ -1208,6 +1260,8 @@ def main(argv=None) -> None:
                 sys.exit(1)
 
             log.info("Extracting samples from: %s", os.path.basename(args.bam))
+            if meth_types is not None:
+                log.info("Meth types filter: %s", sorted(meth_types))
             result = extract_samples_from_bam(
                 args.bam, motif_string,
                 max_samples_per_key=args.max_samples,
@@ -1217,6 +1271,7 @@ def main(argv=None) -> None:
                 kmer_size=args.kmer_size or K,
                 unmeth_subsample_rate=args.unmeth_subsample_rate,
                 binarize=not args.no_binarize,
+                meth_types=meth_types,
             )
 
             Path(args.output).parent.mkdir(parents=True, exist_ok=True)
