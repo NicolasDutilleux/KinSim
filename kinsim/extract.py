@@ -77,19 +77,23 @@ log = logging.getLogger(__name__)
 # Fail-fast BAM validation
 # ---------------------------------------------------------------------------
 
-def validate_bam_kinetics(bam_path: str, n_check: int = 10) -> None:
-    """Raise ValueError if the BAM has no fi/fp kinetic tags.
+def validate_bam_kinetics(bam_path: str, n_check: int = 10) -> str:
+    """Raise ValueError if the BAM has no kinetic tags, return which pair it has.
 
-    Reads up to *n_check* reads from the BAM and checks for the ``fi`` tag.
-    Exits early (fast path) as soon as one read with ``fi`` is found.
+    Accepts either ``fi``/``fp`` (unaligned BAM convention) or ``ip``/``pw``
+    (aligned BAM convention after pbmm2).  Returns ``"fi"`` or ``"ip"`` to
+    tell the caller which tag pair to read.
 
     Args:
         bam_path: Path to the BAM file.
         n_check:  Maximum reads to scan before giving up.
 
+    Returns:
+        "fi" if the BAM carries fi/fp; "ip" if it carries ip/pw.
+
     Raises:
         FileNotFoundError: If the BAM does not exist.
-        ValueError: If no reads with ``fi`` kinetic tags are found.
+        ValueError: If no reads with a supported kinetic tag pair are found.
     """
     if not os.path.exists(bam_path):
         raise FileNotFoundError(f"BAM file not found: {bam_path}")
@@ -101,17 +105,20 @@ def validate_bam_kinetics(bam_path: str, n_check: int = 10) -> None:
             if not read.query_sequence:
                 continue
             if read.has_tag("fi"):
-                log.debug("fi tag confirmed in read %s", read.query_name)
-                return   # all good
+                log.debug("fi/fp tags confirmed in read %s", read.query_name)
+                return "fi"
+            if read.has_tag("ip"):
+                log.debug("ip/pw tags confirmed in read %s", read.query_name)
+                return "ip"
             reads_seen += 1
             if reads_seen >= n_check:
                 break
 
     raise ValueError(
-        f"BAM file has no 'fi' kinetic tags (checked {reads_seen} reads): {bam_path}\n"
+        f"BAM file has no kinetic tags (checked {reads_seen} reads): {bam_path}\n"
+        "Looked for fi/fp (unaligned) or ip/pw (aligned after pbmm2).\n"
         "Kinetic tags are written by the PacBio instrument during primary analysis.\n"
-        "Ensure the BAM was produced with --emit-kinetics (or equivalent).\n"
-        "Check: samtools view -H '"  + bam_path + "' | grep -i kinetics"
+        "Ensure the BAM was produced with --emit-kinetics (or equivalent)."
     )
 
 
@@ -656,7 +663,10 @@ def extract_from_aligned_bam(
     """
     from .utils.io import load_gff_annotations
 
-    validate_bam_kinetics(bam_path)
+    kinetic_tag = validate_bam_kinetics(bam_path)
+    ipd_tag = kinetic_tag                              # "fi" or "ip"
+    pw_tag  = "fp" if kinetic_tag == "fi" else "pw"
+    log.info("Using kinetic tags: %s/%s", ipd_tag, pw_tag)
 
     _mask = kmer_mask(kmer_size)
     mid   = kmer_size // 2
@@ -692,11 +702,11 @@ def extract_from_aligned_bam(
                 continue
 
             seq = read.query_sequence
-            if not (seq and len(seq) >= kmer_size and read.has_tag("fi")):
+            if not (seq and len(seq) >= kmer_size and read.has_tag(ipd_tag)):
                 continue
 
-            ipds = read.get_tag("fi")
-            pws  = read.get_tag("fp")
+            ipds = read.get_tag(ipd_tag)
+            pws  = read.get_tag(pw_tag)
             min_len = min(len(seq), len(ipds), len(pws))
 
             # Build per-base meth_id array from alignment + GFF
