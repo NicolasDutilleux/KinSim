@@ -7,6 +7,8 @@ extracting extended reference context for 11-mer encoding at read edges,
 and discovering PBSIM3 output directory layouts.
 """
 
+from __future__ import annotations
+
 import glob
 import gzip
 import logging

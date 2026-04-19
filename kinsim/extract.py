@@ -44,6 +44,8 @@ Manifest CSV format (see kinsim/config.py):
     strain2,/data/bam2.bam,/data/motifs/strain2.csv
 """
 
+from __future__ import annotations
+
 import datetime
 import logging
 import os
