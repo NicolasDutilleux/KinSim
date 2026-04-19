@@ -31,9 +31,9 @@ BASE=/data/projects/p774_MARSD/NDutilleux/training
 OUTDIR=${BASE}/comparison_$(date +%Y%m%d)
 mkdir -p "$OUTDIR"
 
-STREPTO=${BASE}/Strepto/master_raw.pkl
-VEGA=${BASE}/Vega/master_raw.pkl
-SEQUEL=${BASE}/Sequel/master_raw.pkl
+STREPTO=${BASE}/Strepto/master_strepto_gff.pkl
+VEGA=${BASE}/Vega/master_vega_gff.pkl
+SEQUEL=${BASE}/Sequel/master_sequel_gff.pkl
 
 echo "========================================================"
 echo "  Cross-Dataset Kinetic Comparison"
