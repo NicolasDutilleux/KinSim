@@ -33,12 +33,20 @@ source ~/.bashrc
 conda activate kinsim_env
 set -euo pipefail
 
+# Load SMRT-Link for ipdSummary (SP3-C3 model — host binary, not container)
+source /etc/profile.d/modules.sh 2>/dev/null || true
+module load SMRT-Link/12.0.0.177059-cli-tools-only 2>/dev/null || true
+
 # ---- Config ----
 VEGA=/data/projects/p774_MARSD/NDutilleux/training/Vega
 OUTBASE=${VEGA}/assembly
 SMRT_SIF="/containers/apptainer/pacbio-smrt-tools-25.3.sif"
-# All PacBio tools (pbindex, ccs-kinetics-bystrandify, ipdSummary) run via apptainer
-# hifiasm, pbmm2, samtools run from conda
+# hifiasm, pbmm2, samtools from conda
+# pbindex + ccs-kinetics-bystrandify run via apptainer (SMRT-Tools 25.3)
+# ipdSummary runs from the SMRT-Link module so we can pass --ipdModel SP3-C3
+
+# SP3-C3 model — closest available null model to Revio chemistry
+SP3_MODEL="/mnt/ss/sib/ibu/rocky8/2023072800/software/SMRT-Link/12.0.0.177059-cli-tools-only/install/smrtlink-release_12.0.0.177059/bundles/smrttools/install/smrttools-release_12.0.0.177059/private/thirdparty/python3/python3_3.9.6/site-packages/kineticsTools/resources/SP3-C3.npz.gz"
 
 # All 16 Vega barcodes (bc2033-bc2048)
 BARCODES=(2033 2034 2035 2036 2037 2038 2039 2040
@@ -187,14 +195,14 @@ else
     echo "=== Step 5: ipdSummary ==="
     echo "Started: $(date '+%H:%M:%S')"
 
-    apptainer exec --bind /data "$SMRT_SIF" \
-        ipdSummary "$ALIGNED" \
-            --reference "$ASM_FASTA" \
-            --identify m6A,m4C \
-            --methylFraction \
-            --csv "$CSV" \
-            --gff "$GFF" \
-            --numWorkers "${SLURM_CPUS_PER_TASK}"
+    ipdSummary "$ALIGNED" \
+        --reference "$ASM_FASTA" \
+        --identify m6A,m4C \
+        --methylFraction \
+        --csv "$CSV" \
+        --gff "$GFF" \
+        --numWorkers "${SLURM_CPUS_PER_TASK}" \
+        --ipdModel "$SP3_MODEL"
 
     RC=$?
     if [ $RC -ne 0 ]; then

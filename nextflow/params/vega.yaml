@@ -1,0 +1,13 @@
+# Vega HMB preparation — parameters.
+# Run: nextflow run nextflow/main.nf -profile vega,slurm -params-file nextflow/params/vega.yaml
+
+samplesheet: nextflow/samplesheets/vega.csv
+outdir:      /data/projects/p774_MARSD/NDutilleux/training/Vega/prepare
+
+# Tool tuning — uncomment + edit to override defaults
+# hifiasm_extra:       '-l0'            # homozygous / inbred mode
+# pbmm2_extra:         ''
+ipd_identify:          'm6A,m4C'
+ipd_methyl_fraction:   true
+# ipd_min_coverage:    5
+# ipd_pvalue:          0.001
