@@ -34,6 +34,16 @@ LOGS=${BASE}/logs
 N_SPECIES=16
 PROC_CONCURRENT=4
 EXTRACT_CONCURRENT=4
+
+# Nextflow (alternative to the bash `process` + `manifest` steps).
+# When using `nf`, the pipeline writes its own manifest at
+#   ${NF_OUTDIR}/${NF_MANIFEST_NAME}
+# which is what MANIFEST above should point to if you want `extract`/`merge`
+# to consume it directly. Tweak these + nextflow/params/vega.yaml together.
+NF_OUTDIR=${VEGA}/prepare
+NF_PARAMS=nextflow/params/vega.yaml
+NF_PROFILE=vega,slurm
+NF_MANIFEST_NAME=manifest_vega_gff.csv
 # ================================
 
 mkdir -p "$LOGS"
@@ -45,7 +55,26 @@ mkdir -p "$LOGS"
 submit_process() {
     local dep=${1:-}; local d=""; [ -n "$dep" ] && d="--dependency=afterok:${dep}"
     sbatch --parsable $d --array=1-${N_SPECIES}%${PROC_CONCURRENT} \
-        slurm_kinsim/vega_01_process_all.slurm
+        slurm_kinsim/vega_01_assembly_pipeline.slurm
+}
+
+# Nextflow launcher — runs the full PREPARE workflow (decompress → bystrandify
+# → hifiasm → pbmm2 → index → ipdSummary) and writes the GFF manifest to
+# $NF_OUTDIR/$NF_MANIFEST_NAME. Replaces bash `process` + `manifest` steps.
+submit_nf() {
+    local dep=${1:-}; local d=""; [ -n "$dep" ] && d="--dependency=afterok:${dep}"
+    sbatch --parsable $d \
+        --partition=pibu_el8 --account=p774 --mem=8G --cpus-per-task=2 --time=48:00:00 \
+        --job-name=vega_nf \
+        --output=${LOGS}/vega_nf_%J.log \
+        --wrap="set +u && source ~/.bashrc && conda activate kinsim_env && set -euo pipefail && \
+cd \"\$(git rev-parse --show-toplevel 2>/dev/null || pwd)\" && \
+nextflow run nextflow/main.nf -profile ${NF_PROFILE} \
+    -params-file ${NF_PARAMS} \
+    --outdir '${NF_OUTDIR}' \
+    --manifest_name '${NF_MANIFEST_NAME}' \
+    -resume && \
+ln -sf '${NF_OUTDIR}/${NF_MANIFEST_NAME}' '${MANIFEST}'"
 }
 
 submit_manifest() {
@@ -98,6 +127,7 @@ STEP=${1:-}
 case "$STEP" in
     process)  J=$(submit_process);  echo "vega.process:  $J (array 1-${N_SPECIES})" ;;
     manifest) J=$(submit_manifest); echo "vega.manifest: $J" ;;
+    nf)       J=$(submit_nf);       echo "vega.nf:       $J (Nextflow PREPARE → $NF_OUTDIR)" ;;
     extract)  J=$(submit_extract);  echo "vega.extract:  $J (array)" ;;
     merge)    J=$(submit_merge);    echo "vega.merge:    $J" ;;
     all)
@@ -108,21 +138,33 @@ case "$STEP" in
         echo "monitor: squeue -u \$USER"
         echo "logs:    ls -lt ${LOGS}/vega_*.log | head"
         ;;
+    all_nf)
+        J1=$(submit_nf);                         echo "vega.nf:        $J1 (Nextflow PREPARE)"
+        J2=$(submit_extract_merge_wrapper "$J1");echo "vega.ext+mrg:   $J2 (submits extract+merge after $J1)"
+        echo ""
+        echo "monitor: squeue -u \$USER"
+        echo "logs:    ls -lt ${LOGS}/vega_*.log | head"
+        ;;
     *)
         cat <<EOF
 Usage: bash slurm_kinsim/run_vega.sh <step>
 
 Steps:
-  process    assemble + bystrandify + align + ipdSummary  (array 1-${N_SPECIES})
-  manifest   build GFF manifest from processed outputs
+  process    assemble + bystrandify + align + ipdSummary  (bash, array 1-${N_SPECIES})
+  manifest   build GFF manifest from processed outputs    (bash)
+  nf         Nextflow PREPARE — replaces process+manifest (writes $NF_OUTDIR/$NF_MANIFEST_NAME
+             and symlinks it to \$MANIFEST)
   extract    kinsim extract per species                   (array)
   merge      kinsim merge → master pkl
-  all        chain everything with --dependency=afterok
+  all        chain bash: process → manifest → extract → merge
+  all_nf     chain nf:   nf      → extract → merge
 
 Paths (edit CONFIG at top of file to change):
-  manifest   $MANIFEST
-  shards     $SHARDS
-  master     $MASTER
+  manifest       $MANIFEST
+  shards         $SHARDS
+  master         $MASTER
+  nf outdir      $NF_OUTDIR
+  nf params      $NF_PARAMS
 EOF
         exit 1
         ;;

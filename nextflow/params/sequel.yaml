@@ -1,0 +1,11 @@
+# Sequel II 48-plex preparation — parameters.
+# Run: nextflow run nextflow/main.nf -profile sequel,slurm -params-file nextflow/params/sequel.yaml
+
+samplesheet: nextflow/samplesheets/sequel.csv
+outdir:      /data/projects/p774_MARSD/NDutilleux/training/Sequel/prepare
+
+ipd_identify:          'm6A,m4C'
+ipd_methyl_fraction:   true
+# ipd_min_coverage:    5
+# ipd_pvalue:          0.001
+# pbmm2_extra:         ''

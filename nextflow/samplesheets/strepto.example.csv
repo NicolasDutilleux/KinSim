@@ -1,0 +1,5 @@
+sample_id,reads,reference
+Streptomyces_clavuligerus_ATCC27064,/data/projects/p774_MARSD/NDutilleux/data/Strepto/hifi/S_clavuligerus.hifi_reads.bam,/data/projects/p774_MARSD/NDutilleux/data/Strepto/refs/S_clavuligerus.fna
+Streptomyces_coelicolor_A32,/data/projects/p774_MARSD/NDutilleux/data/Strepto/hifi/S_coelicolor.hifi_reads.bam,/data/projects/p774_MARSD/NDutilleux/data/Strepto/refs/S_coelicolor.fna
+Streptomyces_lividans_TK24,/data/projects/p774_MARSD/NDutilleux/data/Strepto/hifi/S_lividans.hifi_reads.bam,/data/projects/p774_MARSD/NDutilleux/data/Strepto/refs/S_lividans.fna
+Streptomyces_venezuelae_ATCC10712,/data/projects/p774_MARSD/NDutilleux/data/Strepto/hifi/S_venezuelae.hifi_reads.bam,/data/projects/p774_MARSD/NDutilleux/data/Strepto/refs/S_venezuelae.fna

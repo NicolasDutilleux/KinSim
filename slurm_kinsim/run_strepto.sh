@@ -42,21 +42,64 @@ LOGS=${BASE}/logs
 
 PROC_CONCURRENT=4
 EXTRACT_CONCURRENT=4
+
+# Nextflow (alternative to the bash `process` + `manifest` steps)
+NF_OUTDIR=${STREPTO}/prepare
+NF_PARAMS=nextflow/params/strepto.yaml
+NF_PROFILE=strepto,slurm
+NF_MANIFEST_NAME=manifest_strepto_gff.csv
 # ================================
 
 mkdir -p "$LOGS"
 
 count_rows() { kinsim-prep manifest count "$1"; }
 
+# Apptainer `--bind /data` can only follow symlinks whose real path is
+# also under /data. ORIG_MANIFEST bam_path entries are sometimes symlinks
+# out of /data (e.g. to /home/...). Rewrite bam_path in-place with
+# `readlink -f` so the container can actually see the file.
+resolve_manifest_symlinks() {
+    local m="$1"
+    [ -s "$m" ] || { echo "ERROR: manifest missing ($m)" >&2; exit 1; }
+    if ! grep -q '^[^,]*,/,' <(sed -n '2p' "$m") 2>/dev/null && \
+       [ "$(awk -F, 'NR>1 && $2 ~ /^\// {c++} END{print c+0}' "$m")" -gt 0 ]; then
+        cp -n "$m" "${m}.bak" 2>/dev/null || true
+        awk -F, 'BEGIN{OFS=","} NR==1{print; next}
+                 {cmd="readlink -f "$2; cmd|getline real; close(cmd);
+                  if (real != "") $2=real; print}' \
+            "${m}.bak" > "$m.tmp" && mv "$m.tmp" "$m"
+        echo "Resolved bam_path symlinks in $m (backup: ${m}.bak)"
+    fi
+}
+
 # ============ STEP SUBMITTERS ============
 
 submit_process() {
     local dep=${1:-}; local d=""; [ -n "$dep" ] && d="--dependency=afterok:${dep}"
     [ -s "$ORIG_MANIFEST" ] || { echo "ERROR: ORIG_MANIFEST missing ($ORIG_MANIFEST)" >&2; exit 1; }
+    resolve_manifest_symlinks "$ORIG_MANIFEST"
     local n; n=$(count_rows "$ORIG_MANIFEST")
     sbatch --parsable $d --array=1-${n}%${PROC_CONCURRENT} \
         slurm_kinsim/strepto_00_bystrandify_ipd.slurm \
         "$ORIG_MANIFEST" "$IPD_DIR"
+}
+
+# Nextflow launcher — runs the full PREPARE workflow (bystrandify → pbmm2 →
+# index → ipdSummary) and writes the GFF manifest.  Replaces bash process+manifest.
+submit_nf() {
+    local dep=${1:-}; local d=""; [ -n "$dep" ] && d="--dependency=afterok:${dep}"
+    sbatch --parsable $d \
+        --partition=pibu_el8 --account=p774 --mem=8G --cpus-per-task=2 --time=24:00:00 \
+        --job-name=strepto_nf \
+        --output=${LOGS}/strepto_nf_%J.log \
+        --wrap="set +u && source ~/.bashrc && conda activate kinsim_env && set -euo pipefail && \
+cd \"\$(git rev-parse --show-toplevel 2>/dev/null || pwd)\" && \
+nextflow run nextflow/main.nf -profile ${NF_PROFILE} \
+    -params-file ${NF_PARAMS} \
+    --outdir '${NF_OUTDIR}' \
+    --manifest_name '${NF_MANIFEST_NAME}' \
+    -resume && \
+ln -sf '${NF_OUTDIR}/${NF_MANIFEST_NAME}' '${MANIFEST}'"
 }
 
 submit_manifest() {
@@ -107,6 +150,7 @@ STEP=${1:-}
 case "$STEP" in
     process)  J=$(submit_process);  echo "strepto.process:  $J" ;;
     manifest) J=$(submit_manifest); echo "strepto.manifest: $J" ;;
+    nf)       J=$(submit_nf);       echo "strepto.nf:       $J (Nextflow PREPARE → $NF_OUTDIR)" ;;
     extract)  J=$(submit_extract);  echo "strepto.extract:  $J" ;;
     merge)    J=$(submit_merge);    echo "strepto.merge:    $J" ;;
     all)
@@ -117,16 +161,25 @@ case "$STEP" in
         echo "monitor: squeue -u \$USER"
         echo "logs:    ls -lt ${LOGS}/strepto_*.log | head"
         ;;
+    all_nf)
+        J1=$(submit_nf);                          echo "strepto.nf:        $J1"
+        J2=$(submit_extract_merge_wrapper "$J1"); echo "strepto.ext+mrg:   $J2 (after $J1)"
+        echo ""
+        echo "monitor: squeue -u \$USER"
+        echo "logs:    ls -lt ${LOGS}/strepto_*.log | head"
+        ;;
     *)
         cat <<EOF
 Usage: bash slurm_kinsim/run_strepto.sh <step>
 
 Steps:
-  process    bystrandify + align + ipdSummary    (array from ORIG_MANIFEST)
-  manifest   build GFF manifest from processed outputs
+  process    bystrandify + align + ipdSummary    (bash, array from ORIG_MANIFEST)
+  manifest   build GFF manifest from processed outputs  (bash)
+  nf         Nextflow PREPARE — replaces process+manifest
   extract    kinsim extract per species          (array)
   merge      kinsim merge → master pkl
-  all        chain everything with --dependency=afterok
+  all        chain bash: process → manifest → extract → merge
+  all_nf     chain nf:   nf      → extract → merge
 
 Paths (edit CONFIG at top of file to change):
   orig_manifest $ORIG_MANIFEST
@@ -134,6 +187,8 @@ Paths (edit CONFIG at top of file to change):
   manifest      $MANIFEST
   shards        $SHARDS
   master        $MASTER
+  nf outdir     $NF_OUTDIR
+  nf params     $NF_PARAMS
 EOF
         exit 1
         ;;

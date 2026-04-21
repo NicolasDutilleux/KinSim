@@ -1,0 +1,5 @@
+sample_id,reads,reference
+Bacillus_subtilis_bc1001,/data/projects/p774_MARSD/NDutilleux/data/Sequel/subreads/bc1001.subreads.bam,/data/projects/p774_MARSD/NDutilleux/data/Sequel/refs/bc1001.fna
+Escherichia_coli_bc1002,/data/projects/p774_MARSD/NDutilleux/data/Sequel/subreads/bc1002.subreads.bam,/data/projects/p774_MARSD/NDutilleux/data/Sequel/refs/bc1002.fna
+Pseudomonas_aeruginosa_bc1003,/data/projects/p774_MARSD/NDutilleux/data/Sequel/subreads/bc1003.subreads.bam,/data/projects/p774_MARSD/NDutilleux/data/Sequel/refs/bc1003.fna
+Staphylococcus_aureus_bc1004,/data/projects/p774_MARSD/NDutilleux/data/Sequel/subreads/bc1004.subreads.bam.gz,/data/projects/p774_MARSD/NDutilleux/data/Sequel/refs/bc1004.fna
