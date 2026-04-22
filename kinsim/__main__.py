@@ -11,8 +11,9 @@ import sys
 __version__ = "0.4.0"
 
 COMMANDS = [
-    "extract", "merge", "binarize", "train", "generate", "evaluate", "analyze",
-    "compare", "inspect-model", "sample", "strip-kinetics", "merge-bam",
+    "extract", "merge", "refine", "binarize", "train", "generate", "evaluate",
+    "verify-generate", "analyze", "compare", "inspect-model", "sample",
+    "strip-kinetics", "merge-bam",
 ]
 
 USAGE = """\
@@ -23,10 +24,12 @@ KinSim - PacBio kinetic signal simulator (MLP pipeline).
 Commands:
   extract          Extract raw IPD/PW samples from a BAM file  (-> .pkl shard)
   merge            Merge .pkl shards into a master training set
+  refine           EM fixed-None cleanup of methylated buckets (master -> master_clean)
   binarize         GMM binarization of raw .pkl (separate meth vs unmeth reads)
   train            Train the ConvPredictor / MLPPredictor model
   generate         Generate synthetic kinetic signals for PBSIM3 reads
   evaluate         Evaluate a trained model (calibration report + plots)
+  verify-generate  Compare per-kmer kinetic distributions: reference BAM vs generated BAM
   analyze          Analyse a .pkl shard or dictionary (coverage, signals, sensitivity)
   compare          Compare per-kmer kinetics across datasets (Vega vs Revio etc.)
   inspect-model    Inspect ipdSummary null model (.npz.gz) internals
@@ -81,6 +84,16 @@ def main(argv=None):
     elif cmd == "merge":
         from .extract import main as run
         run(["merge"] + rest)
+
+    # -- refine --
+    elif cmd == "refine":
+        from .refine import main as run
+        run(rest)
+
+    # -- verify-generate --
+    elif cmd == "verify-generate":
+        from .verify_generate import main as run
+        run(rest)
 
     # -- binarize --
     elif cmd == "binarize":

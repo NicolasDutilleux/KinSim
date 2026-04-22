@@ -22,6 +22,16 @@ from pathlib import Path
 
 import numpy as np
 
+# Numpy 2.0 pickle compat: allow loading .pkls saved under numpy._core
+# when current env has numpy 1.x (only exposes numpy.core).
+if not hasattr(np, "_core"):
+    import numpy.core  # noqa: F401
+    sys.modules["numpy._core"] = np.core
+    for sub in ("multiarray", "numeric", "umath", "_multiarray_umath"):
+        mod = getattr(np.core, sub, None)
+        if mod is not None:
+            sys.modules[f"numpy._core.{sub}"] = mod
+
 METH_NAMES = {0: "none", 1: "m6A", 2: "m4C", 3: "m5C"}
 
 
