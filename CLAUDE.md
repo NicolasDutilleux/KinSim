@@ -27,9 +27,11 @@ KinSim/
 │   ├── __main__.py                 CLI router (v0.4.0)
 │   │
 │   ├── extract.py                  BAM extraction + shard merging; manifest + GFF mode
+│   ├── refine.py                   EM fixed-None cleanup of merged .pkl (kinsim refine)
 │   ├── train.py                    supervised training loop (ConvPredictor/MLPPredictor)
 │   ├── generate.py                 BAM generation with trained model
 │   ├── evaluate.py                 calibration report + per-kmer distribution plots
+│   ├── verify_generate.py          per-(kmer, meth) reference vs generated BAM comparison
 │   ├── analyze.py                  training data analysis (coverage, signals, sensitivity)
 │   ├── sample.py                   random subsampling of .pkl files
 │   ├── strip_kinetics.py           remove fi/fp/ri/rp tags from BAM copy
@@ -76,24 +78,53 @@ KinSim/
 │   └── conv_no_film.py             ConvPredictor without FiLM (post-hoc ratio shift)
 │
 └── slurm_kinsim/                   HPC SLURM job scripts
-    ├── run_pipeline.sh             submit full pipeline with dependency chain
     ├── pbsim3_simulate.slurm       PBSIM3 read simulation
+    ├── jasmine_5mc.slurm           jasmine + modkit 5mC motif discovery (array)
     │
-    ├── 00_extract.slurm            extract (array job, manifest mode)
-    ├── 01_train.slurm              train (1 GPU, 24h)
-    ├── 02_generate.slurm           generate (array job)
-    ├── 03a_validate_generate.slurm validation: generate
-    ├── 03b_validate_align.slurm    validation: pbmm2 alignment
-    ├── 03c_validate_ipdsummary.slurm validation: ipdSummary
-    ├── 03d_validate_pbmotifmaker.slurm validation: pbmotifmaker
-    ├── 04_evaluate.slurm           evaluate
-    ├── 05_baselines.slurm          run all 3 baseline models
+    ├── vega/                       PREP pipeline 1 — Vega HiFi → assembly → motifmaker
+    │   ├── 00_assembly.slurm       hifiasm draft assembly
+    │   ├── 01_bystrandify.slurm    ccs-kinetics-bystrandify
+    │   ├── 02_align.slurm          pbmm2 align
+    │   ├── 03_index.slurm          samtools index + pbindex
+    │   ├── 04_ipdsummary.slurm     ipdSummary SP3-C3
+    │   ├── 05_motifmaker.slurm     pbmotifmaker find
+    │   ├── 06_build_manifest.sh    emit manifest_vega_gff.csv
+    │   └── run.sh                  orchestrator (chains all with afterok)
+    │
+    ├── sequel/                     PREP pipeline 2 — Sequel subreads → CCS → motifmaker
+    │   ├── 00_ccs.slurm            subreads → HiFi
+    │   ├── 01_bystrandify.slurm
+    │   ├── 02_align.slurm
+    │   ├── 03_index.slurm
+    │   ├── 04_ipdsummary.slurm
+    │   ├── 05_motifmaker.slurm
+    │   ├── 06_build_manifest.sh
+    │   └── run.sh
+    │
+    ├── strepto/                    PREP pipeline 3 — Strepto HiFi (manifest-driven)
+    │   ├── 00_bystrandify.slurm
+    │   ├── 01_align.slurm
+    │   ├── 02_index.slurm
+    │   ├── 03_ipdsummary.slurm
+    │   ├── 04_motifmaker.slurm
+    │   ├── 05_build_manifest.sh
+    │   └── run.sh
+    │
+    ├── ml/                         ML pipeline — generic across Vega/Sequel/Strepto
+    │   ├── 00_extract.slurm        kinsim extract (array per manifest row)
+    │   ├── 01_merge.slurm          kinsim merge shards → master.pkl
+    │   ├── 02_refine.slurm         kinsim refine (EM fixed-None) → master_clean.pkl
+    │   ├── 03_train.slurm          kinsim train (1 GPU)
+    │   ├── 04_generate.slurm       kinsim generate on PBSIM3 reads (array)
+    │   ├── 05_evaluate.slurm       kinsim evaluate
+    │   ├── 06_verify_generate.slurm   kinsim verify-generate (array)
+    │   └── run.sh                  orchestrator — extract/merge/refine/train/evaluate chain
     │
     ├── config/                     example configuration files
     │   ├── config_example.yaml     training config example
     │   └── manifest_example.csv    manifest CSV example
     │
-    └── msa1003/                    MSA1003 data extraction pipeline
+    └── msa1003/                    MSA1003 data extraction pipeline (legacy reference)
         ├── prep_rebase.sh          fetch REBASE motifs for each species
         ├── prep_merge.sh           merge calling + REBASE motifs, build manifest
         ├── 00_align_split.slurm    align bc2036 BAM + split by species
@@ -356,11 +387,13 @@ strain1_shard.pkl  strain2_shard.pkl  ...
       |
       v  kinsim merge shards/ master_data.pkl
       |
-      v  (optional) kinsim-prep filter master_data.pkl training_data.pkl --min-coverage 50
-      v
-training_data.pkl
+      v  kinsim refine master_data.pkl master_clean.pkl --report refine.tsv
+      v  (EM fixed-None 2-component mixture: separates methylated/unmethylated)
+master_clean.pkl
       |
-      v  kinsim train training_data.pkl checkpoints/
+      v  (optional) kinsim-prep filter master_clean.pkl training_data.pkl --min-coverage 50
+      v
+      v  kinsim train master_clean.pkl checkpoints/
       v
 checkpoint_epoch50.pt + model_config.json
       |
@@ -368,6 +401,10 @@ checkpoint_epoch50.pt + model_config.json
       v
 species_mlp.bam
   flag=4  fi:B:C (IPD uint8)  fp:B:C (PW uint8)
+      |
+      v  kinsim verify-generate <ref.bam> <gen.bam> <motifs> <report.tsv>
+      v  (per-(kmer, meth) mean/sd comparison — Pearson r + MAE summary)
+verify_report.tsv
 ```
 
 ---
@@ -388,11 +425,13 @@ species_mlp.bam
 
 ```
 # kinsim -- ML pipeline --------------------------------------------------
-kinsim extract                -> kinsim/extract.py  (--gff for GFF mode)
+kinsim extract                -> kinsim/extract.py          (--gff for GFF mode)
 kinsim merge                  -> kinsim/extract.py
+kinsim refine                 -> kinsim/refine.py           (EM fixed-None cleanup)
 kinsim train                  -> kinsim/train.py
 kinsim generate               -> kinsim/generate.py
 kinsim evaluate               -> kinsim/evaluate.py
+kinsim verify-generate        -> kinsim/verify_generate.py  (ref vs gen BAM comparison)
 kinsim analyze                -> kinsim/analyze.py
 kinsim sample                 -> kinsim/sample.py
 kinsim strip-kinetics         -> kinsim/strip_kinetics.py

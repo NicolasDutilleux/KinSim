@@ -29,6 +29,9 @@ Subcommands:
   balance        Balance a merged dictionary: even out mod types (m6A/m4C/m5C)
                  and maximise IPD diversity per key
 
+EM refinement of a merged .pkl (remove motif-label contamination) has moved
+to the main pipeline: use 'kinsim refine <in.pkl> <out.pkl>'.
+
 Use 'kinsim-prep <subcommand> -h' for detailed help.
 Use 'kinsim-prep --version' to print the version number.
 """
@@ -78,6 +81,12 @@ def main(argv=None):
     elif cmd == "balance":
         from .balance import main as run
         run(rest)
+
+    elif cmd == "refine":
+        print("ERROR: 'refine' has moved to the main CLI.", file=sys.stderr)
+        print("  Use:  kinsim refine <input.pkl> <output.pkl> [--report report.tsv]",
+              file=sys.stderr)
+        sys.exit(2)
 
     else:
         msg = f"Unknown subcommand: '{cmd}'"
