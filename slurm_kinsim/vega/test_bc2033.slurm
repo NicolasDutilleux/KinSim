@@ -126,13 +126,14 @@ fi
     apptainer exec --bind /data "$SMRT_SIF" pbindex "$BYSTRAND";
 }
 
-# --- A2 pbmm2 align ---
+# --- A2 pbmm2 align (apptainer — matches bystrandify BAM format) ---
 if [ -s "$A_ALIGNED" ]; then
     echo "=== A2 SKIP — aligned BAM exists ==="
 else
     echo "=== A2 pbmm2 align (bystrandify → assembly) ==="
     START=$(date +%s)
-    pbmm2 align "$ASM_FASTA" "$BYSTRAND" "$A_ALIGNED" \
+    apptainer exec --bind /data "$SMRT_SIF" \
+        pbmm2 align "$ASM_FASTA" "$BYSTRAND" "$A_ALIGNED" \
         --preset CCS --sort --num-threads "${SLURM_CPUS_PER_TASK}"
     echo "    $(( $(date +%s) - START ))s"
 fi
@@ -193,13 +194,14 @@ fi
     apptainer exec --bind /data "$SMRT_SIF" pbindex "$JASMINE_BAM";
 }
 
-# --- B2 pbmm2 align ---
+# --- B2 pbmm2 align (apptainer — matches jasmine BAM format) ---
 if [ -s "$B_ALIGNED" ]; then
     echo "=== B2 SKIP — jasmine aligned BAM exists ==="
 else
     echo "=== B2 pbmm2 align (jasmine → assembly) ==="
     START=$(date +%s)
-    pbmm2 align "$ASM_FASTA" "$JASMINE_BAM" "$B_ALIGNED" \
+    apptainer exec --bind /data "$SMRT_SIF" \
+        pbmm2 align "$ASM_FASTA" "$JASMINE_BAM" "$B_ALIGNED" \
         --preset CCS --sort --num-threads "${SLURM_CPUS_PER_TASK}"
     echo "    $(( $(date +%s) - START ))s"
 fi
