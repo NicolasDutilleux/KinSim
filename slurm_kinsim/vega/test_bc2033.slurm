@@ -120,6 +120,12 @@ else
 fi
 [ -s "$BYSTRAND" ] || { echo "FAILED: bystrandify produced no output"; exit 1; }
 
+# pbmm2 needs a .pbi on PacBio BAM inputs
+[ -f "${BYSTRAND}.pbi" ] || {
+    echo "=== A1b pbindex (bystrandify) ===";
+    apptainer exec --bind /data "$SMRT_SIF" pbindex "$BYSTRAND";
+}
+
 # --- A2 pbmm2 align ---
 if [ -s "$A_ALIGNED" ]; then
     echo "=== A2 SKIP — aligned BAM exists ==="
@@ -181,6 +187,11 @@ else
     echo "    $(( $(date +%s) - START ))s"
 fi
 [ -s "$JASMINE_BAM" ] || { echo "FAILED: jasmine produced no output"; exit 1; }
+
+[ -f "${JASMINE_BAM}.pbi" ] || {
+    echo "=== B1b pbindex (jasmine) ===";
+    apptainer exec --bind /data "$SMRT_SIF" pbindex "$JASMINE_BAM";
+}
 
 # --- B2 pbmm2 align ---
 if [ -s "$B_ALIGNED" ]; then
