@@ -55,9 +55,10 @@
 set +u
 source ~/.bashrc
 conda activate kinsim_env
-source /etc/profile.d/modules.sh 2>/dev/null || true
-module load SMRT-Link/12.0.0.177059-cli-tools-only 2>/dev/null || true
 set -euo pipefail
+
+# NOTE: SMRT-Link module is loaded lazily right before step A4 (ipdSummary)
+# because its PATH/LD_LIBRARY_PATH additions poison apptainer exec of pbmm2.
 
 # ---- config ----
 VEGA=/data/projects/p774_MARSD/NDutilleux/training/Vega
@@ -147,6 +148,10 @@ if [ -s "$IPD_GFF" ]; then
     echo "=== A4 SKIP — ipdSummary GFF exists ($(grep -c '^[^#]' "$IPD_GFF" || true) records) ==="
 else
     echo "=== A4 ipdSummary SP3-C3 ==="
+    # Load SMRT-Link here — AFTER all apptainer steps, to avoid host PATH leaking into SIF
+    source /etc/profile.d/modules.sh 2>/dev/null || true
+    module load SMRT-Link/12.0.0.177059-cli-tools-only 2>/dev/null || true
+    command -v ipdSummary >/dev/null || { echo "ERROR: ipdSummary not on PATH after module load"; exit 1; }
     START=$(date +%s)
     ipdSummary "$A_ALIGNED" \
         --reference "$ASM_FASTA" \
