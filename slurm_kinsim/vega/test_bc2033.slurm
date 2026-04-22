@@ -1,64 +1,40 @@
 #!/bin/bash
-#SBATCH --job-name=vega_test_bc2033_dual
+#SBATCH --job-name=vega_test_bc2033
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
 #SBATCH --time=12:00:00
-#SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/vega_test_bc2033_dual_%J.log
+#SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/vega_test_bc2033_%J.log
 #SBATCH --mail-user=nicolas.dutilleux@unifr.ch
 #SBATCH --mail-type=FAIL
 
 # ============================================================
-# Vega bc2033 DUAL-CALLING smoke test — single script, both tracks
+# Vega bc2033 dual-caller smoke test
 #
-# Goal: from ONE raw HiFi BAM, produce TWO motifs.csv files via two
-# independent calling pipelines. This is the gate before rolling the
-# dual pipeline out to all Vega / Sequel / Strepto samples.
+# Runs BOTH calling pipelines on one raw HiFi BAM and emits two
+# motifs.csv files for review. Gate before rolling this out to
+# the full Vega / Sequel / Strepto datasets.
 #
-# Input:
-#   HiFi BAM  = ${VEGA}/m21026_260313_002345.hifi_reads.bc2033.bam
-#               (carries per-strand fi/fp/ri/rp kinetics)
-#   Reference = ${VEGA}/assembly/bc2033/bc2033_assembly.fasta
-#               (hifiasm draft produced by vega/00_assembly.slurm)
+# ipdSummary pipeline (kinetics → m6A + m4C):
+#   bystrandify → pbmm2 align → index → ipdSummary SP3-C3 → pbmotifmaker
+#   → ${SAMPLE}_motifs_ipdsummary.csv
 #
-# ─── Track A — ipdSummary SP3-C3 → pbmotifmaker ───────────────
-#   1. ccs-kinetics-bystrandify         fi/fp → ip/pw per strand
-#   2. pbmm2 align --preset CCS --sort
-#   3. samtools index + pbindex
-#   4. ipdSummary SP3-C3 --identify m6A,m4C --methylFraction  → GFF
-#   5. pbmotifmaker find                                      → motifs_ipdsummary.csv
+# jasmine pipeline (5mC):
+#   jasmine predict (on raw fi/fp/ri/rp BAM) → pbmm2 align → index
+#   → modkit pileup → modkit find-motifs → combined-parser CSV
+#   → ${SAMPLE}_motifs_jasmine.csv
 #
-# ─── Track B — jasmine 5mC → modkit find-motifs ───────────────
-#   1. jasmine predict --keep-kinetics   on ORIGINAL fi/fp/ri/rp BAM
-#   2. pbmm2 align --preset CCS --sort
-#   3. samtools index
-#   4. modkit pileup --filter-threshold 0.5                   → bedMethyl
-#   5. modkit find-motifs                                     → TSV
-#   6. python: modkit TSV → combined-parser CSV              → motifs_jasmine.csv
+# jasmine runs first so the SMRT-Link module load needed by
+# ipdSummary does not pollute PATH/LD_LIBRARY_PATH for conda tools.
 #
-# Output (${VEGA}/test_dual/bc2033/):
-#   bc2033_bystrandify.bam
-#   bc2033_A_aligned.bam{,.bai,.pbi}
-#   bc2033_ipdSummary.{gff,csv}
-#   bc2033_motifs_ipdsummary.csv       ← Track A final motif table
-#   bc2033_jasmine.bam
-#   bc2033_B_aligned.bam{,.bai}
-#   bc2033_pileup.bed
-#   bc2033_find_motifs.tsv
-#   bc2033_motifs_jasmine.csv          ← Track B final motif table
-#
-# Usage:
-#   sbatch slurm_kinsim/vega/test_bc2033.slurm
+# Usage: sbatch slurm_kinsim/vega/test_bc2033.slurm
 # ============================================================
 
 set +u
 source ~/.bashrc
 conda activate kinsim_env
 set -euo pipefail
-
-# NOTE: SMRT-Link module is loaded lazily right before step A4 (ipdSummary)
-# because its PATH/LD_LIBRARY_PATH additions poison apptainer exec of pbmm2.
 
 # ---- config ----
 VEGA=/data/projects/p774_MARSD/NDutilleux/training/Vega
@@ -69,26 +45,36 @@ BC=2033
 SAMPLE="bc${BC}"
 RAW_BAM="${VEGA}/m21026_260313_002345.hifi_reads.${SAMPLE}.bam"
 ASM_FASTA="${VEGA}/assembly/${SAMPLE}/${SAMPLE}_assembly.fasta"
-
 OUTDIR="${VEGA}/test_dual/${SAMPLE}"
 mkdir -p "$OUTDIR"
 
-# Track A outputs
+# ---- ipdSummary pipeline paths ----
 BYSTRAND="${OUTDIR}/${SAMPLE}_bystrandify.bam"
-A_ALIGNED="${OUTDIR}/${SAMPLE}_A_aligned.bam"
+IPD_ALIGNED="${OUTDIR}/${SAMPLE}_ipd_aligned.bam"
 IPD_GFF="${OUTDIR}/${SAMPLE}_ipdSummary.gff"
 IPD_CSV="${OUTDIR}/${SAMPLE}_ipdSummary.csv"
-MOTIFS_A="${OUTDIR}/${SAMPLE}_motifs_ipdsummary.csv"
+MOTIFS_IPD="${OUTDIR}/${SAMPLE}_motifs_ipdsummary.csv"
 
-# Track B outputs
-JASMINE_BAM="${OUTDIR}/${SAMPLE}_jasmine.bam"
-B_ALIGNED="${OUTDIR}/${SAMPLE}_B_aligned.bam"
+# ---- jasmine pipeline paths ----
+JAS_BAM="${OUTDIR}/${SAMPLE}_jasmine.bam"
+JAS_ALIGNED="${OUTDIR}/${SAMPLE}_jas_aligned.bam"
 PILEUP="${OUTDIR}/${SAMPLE}_pileup.bed"
 FIND_TSV="${OUTDIR}/${SAMPLE}_find_motifs.tsv"
-MOTIFS_B="${OUTDIR}/${SAMPLE}_motifs_jasmine.csv"
+MOTIFS_JAS="${OUTDIR}/${SAMPLE}_motifs_jasmine.csv"
+
+# ---- migrate old 'track A/B' filenames from prior runs ----
+for pair in \
+    "${OUTDIR}/${SAMPLE}_A_aligned.bam:${IPD_ALIGNED}" \
+    "${OUTDIR}/${SAMPLE}_A_aligned.bam.bai:${IPD_ALIGNED}.bai" \
+    "${OUTDIR}/${SAMPLE}_A_aligned.bam.pbi:${IPD_ALIGNED}.pbi" \
+    "${OUTDIR}/${SAMPLE}_B_aligned.bam:${JAS_ALIGNED}" \
+    "${OUTDIR}/${SAMPLE}_B_aligned.bam.bai:${JAS_ALIGNED}.bai"; do
+    old=${pair%%:*}; new=${pair##*:}
+    [ -f "$old" ] && [ ! -f "$new" ] && mv -v "$old" "$new"
+done
 
 echo "========================================================"
-echo "  Vega dual-calling test — $SAMPLE"
+echo "  Vega dual-caller test — $SAMPLE"
 echo "========================================================"
 echo "Date:       $(date '+%Y-%m-%d %H:%M:%S')"
 echo "Host:       $(hostname)"
@@ -104,16 +90,16 @@ echo "========================================================"
 T0=$(date +%s)
 
 # ============================================================
-# Track A — ipdSummary SP3-C3 → pbmotifmaker
+# ipdSummary pipeline — part 1 (pre-alignment)
+# The ipdSummary step itself runs later, after the jasmine pipeline.
 # ============================================================
 echo ""
-echo "############  Track A: ipdSummary → pbmotifmaker  ############"
+echo "####################  ipdSummary pipeline  ####################"
 
-# --- A1 bystrandify ---
 if [ -s "$BYSTRAND" ]; then
-    echo "=== A1 SKIP — bystrandify BAM exists ==="
+    echo "=== bystrandify SKIP — BAM exists ==="
 else
-    echo "=== A1 ccs-kinetics-bystrandify ==="
+    echo "=== ccs-kinetics-bystrandify ==="
     START=$(date +%s)
     apptainer exec --bind /data "$SMRT_SIF" \
         ccs-kinetics-bystrandify "$RAW_BAM" "$BYSTRAND"
@@ -121,106 +107,67 @@ else
 fi
 [ -s "$BYSTRAND" ] || { echo "FAILED: bystrandify produced no output"; exit 1; }
 
-# pbmm2 needs a .pbi on PacBio BAM inputs
 [ -f "${BYSTRAND}.pbi" ] || {
-    echo "=== A1b pbindex (bystrandify) ===";
+    echo "=== pbindex bystrandify ===";
     apptainer exec --bind /data "$SMRT_SIF" pbindex "$BYSTRAND";
 }
 
-# --- A2 pbmm2 align (apptainer — matches bystrandify BAM format) ---
-if [ -s "$A_ALIGNED" ]; then
-    echo "=== A2 SKIP — aligned BAM exists ==="
+if [ -s "$IPD_ALIGNED" ]; then
+    echo "=== pbmm2 align (bystrandify) SKIP — aligned BAM exists ==="
 else
-    echo "=== A2 pbmm2 align (bystrandify → assembly) ==="
+    echo "=== pbmm2 align (bystrandify → assembly) ==="
     START=$(date +%s)
     apptainer exec --bind /data "$SMRT_SIF" \
-        pbmm2 align "$ASM_FASTA" "$BYSTRAND" "$A_ALIGNED" \
+        pbmm2 align "$ASM_FASTA" "$BYSTRAND" "$IPD_ALIGNED" \
         --preset CCS --sort --num-threads "${SLURM_CPUS_PER_TASK}"
     echo "    $(( $(date +%s) - START ))s"
 fi
 
-# --- A3 samtools index + pbindex ---
-[ -f "${A_ALIGNED}.bai" ] || samtools index "$A_ALIGNED"
-[ -f "${A_ALIGNED}.pbi" ] || apptainer exec --bind /data "$SMRT_SIF" pbindex "$A_ALIGNED"
-
-# --- A4 ipdSummary SP3-C3 ---
-if [ -s "$IPD_GFF" ]; then
-    echo "=== A4 SKIP — ipdSummary GFF exists ($(grep -c '^[^#]' "$IPD_GFF" || true) records) ==="
-else
-    echo "=== A4 ipdSummary SP3-C3 ==="
-    # Load SMRT-Link here — AFTER all apptainer steps, to avoid host PATH leaking into SIF
-    source /etc/profile.d/modules.sh 2>/dev/null || true
-    module load SMRT-Link/12.0.0.177059-cli-tools-only 2>/dev/null || true
-    command -v ipdSummary >/dev/null || { echo "ERROR: ipdSummary not on PATH after module load"; exit 1; }
-    START=$(date +%s)
-    ipdSummary "$A_ALIGNED" \
-        --reference "$ASM_FASTA" \
-        --identify m6A,m4C \
-        --methylFraction \
-        --csv "$IPD_CSV" \
-        --gff "$IPD_GFF" \
-        --numWorkers "${SLURM_CPUS_PER_TASK}" \
-        --ipdModel "$SP3_MODEL"
-    echo "    $(( $(date +%s) - START ))s"
-    echo "    GFF records: $(grep -c '^[^#]' "$IPD_GFF" || true)"
-fi
-
-# --- A5 pbmotifmaker ---
-if [ -s "$MOTIFS_A" ]; then
-    echo "=== A5 SKIP — Track A motifs.csv exists ==="
-else
-    echo "=== A5 pbmotifmaker find ==="
-    START=$(date +%s)
-    apptainer exec --bind /data "$SMRT_SIF" \
-        pbmotifmaker find "$ASM_FASTA" "$IPD_GFF" "$MOTIFS_A"
-    echo "    $(( $(date +%s) - START ))s"
-fi
+[ -f "${IPD_ALIGNED}.bai" ] || samtools index "$IPD_ALIGNED"
+[ -f "${IPD_ALIGNED}.pbi" ] || apptainer exec --bind /data "$SMRT_SIF" pbindex "$IPD_ALIGNED"
 
 # ============================================================
-# Track B — jasmine 5mC → modkit find-motifs
+# jasmine pipeline (5mC) — runs BEFORE the SMRT-Link module load
+# so conda jasmine + modkit see a clean environment.
 # ============================================================
 echo ""
-echo "############  Track B: jasmine 5mC → modkit  ############"
+echo "####################  jasmine pipeline  ####################"
 
-# --- B1 jasmine predict (on the ORIGINAL raw BAM, not bystrandified) ---
-if [ -s "$JASMINE_BAM" ]; then
-    echo "=== B1 SKIP — jasmine BAM exists ==="
+if [ -s "$JAS_BAM" ]; then
+    echo "=== jasmine SKIP — BAM exists ==="
 else
-    echo "=== B1 jasmine predict (keeps kinetics) ==="
+    echo "=== jasmine predict (conda kinsim_env, --keep-kinetics) ==="
+    command -v jasmine >/dev/null || { echo "ERROR: jasmine not on PATH"; exit 1; }
     START=$(date +%s)
-    apptainer exec --bind /data "$SMRT_SIF" \
-        jasmine "$RAW_BAM" "$JASMINE_BAM" --keep-kinetics
+    jasmine "$RAW_BAM" "$JAS_BAM" --keep-kinetics
     echo "    $(( $(date +%s) - START ))s"
 fi
-[ -s "$JASMINE_BAM" ] || { echo "FAILED: jasmine produced no output"; exit 1; }
+[ -s "$JAS_BAM" ] || { echo "FAILED: jasmine produced no output"; exit 1; }
 
-[ -f "${JASMINE_BAM}.pbi" ] || {
-    echo "=== B1b pbindex (jasmine) ===";
-    apptainer exec --bind /data "$SMRT_SIF" pbindex "$JASMINE_BAM";
+[ -f "${JAS_BAM}.pbi" ] || {
+    echo "=== pbindex jasmine ===";
+    apptainer exec --bind /data "$SMRT_SIF" pbindex "$JAS_BAM";
 }
 
-# --- B2 pbmm2 align (apptainer — matches jasmine BAM format) ---
-if [ -s "$B_ALIGNED" ]; then
-    echo "=== B2 SKIP — jasmine aligned BAM exists ==="
+if [ -s "$JAS_ALIGNED" ]; then
+    echo "=== pbmm2 align (jasmine) SKIP — aligned BAM exists ==="
 else
-    echo "=== B2 pbmm2 align (jasmine → assembly) ==="
+    echo "=== pbmm2 align (jasmine → assembly) ==="
     START=$(date +%s)
     apptainer exec --bind /data "$SMRT_SIF" \
-        pbmm2 align "$ASM_FASTA" "$JASMINE_BAM" "$B_ALIGNED" \
+        pbmm2 align "$ASM_FASTA" "$JAS_BAM" "$JAS_ALIGNED" \
         --preset CCS --sort --num-threads "${SLURM_CPUS_PER_TASK}"
     echo "    $(( $(date +%s) - START ))s"
 fi
 
-# --- B3 samtools index ---
-[ -f "${B_ALIGNED}.bai" ] || samtools index "$B_ALIGNED"
+[ -f "${JAS_ALIGNED}.bai" ] || samtools index "$JAS_ALIGNED"
 
-# --- B4 modkit pileup ---
 if [ -s "$PILEUP" ]; then
-    echo "=== B4 SKIP — pileup BED exists ($(wc -l < "$PILEUP") sites) ==="
+    echo "=== modkit pileup SKIP — BED exists ($(wc -l < "$PILEUP") sites) ==="
 else
-    echo "=== B4 modkit pileup ==="
+    echo "=== modkit pileup ==="
     START=$(date +%s)
-    modkit pileup "$B_ALIGNED" "$PILEUP" \
+    modkit pileup "$JAS_ALIGNED" "$PILEUP" \
         --ref "$ASM_FASTA" \
         --threads "${SLURM_CPUS_PER_TASK}" \
         --filter-threshold 0.5 \
@@ -228,11 +175,10 @@ else
     echo "    $(( $(date +%s) - START ))s  ($(wc -l < "$PILEUP") sites)"
 fi
 
-# --- B5 modkit find-motifs ---
 if [ -s "$FIND_TSV" ]; then
-    echo "=== B5 SKIP — find-motifs TSV exists ==="
+    echo "=== modkit find-motifs SKIP — TSV exists ==="
 else
-    echo "=== B5 modkit find-motifs ==="
+    echo "=== modkit find-motifs ==="
     START=$(date +%s)
     modkit find-motifs \
         --in-bedmethyl "$PILEUP" \
@@ -243,14 +189,13 @@ else
     echo "    $(( $(date +%s) - START ))s"
 fi
 
-# --- B6 TSV → combined-parser CSV ---
-echo "=== B6 emit jasmine motifs.csv (combined-parser format) ==="
+echo "=== emit jasmine motifs.csv (combined-parser format) ==="
 python - <<PY
 import csv
 from pathlib import Path
 
 tsv = Path('${FIND_TSV}')
-out = Path('${MOTIFS_B}')
+out = Path('${MOTIFS_JAS}')
 
 def _cand(d, *names):
     for n in names:
@@ -284,27 +229,65 @@ print(f'Wrote {out}  ({len(rows)} motifs)')
 PY
 
 # ============================================================
+# ipdSummary pipeline — part 2 (kinetic calls + motif discovery)
+# SMRT-Link module is loaded HERE only; jasmine pipeline above
+# already ran with a clean environment.
+# ============================================================
+echo ""
+echo "####################  ipdSummary pipeline (continued)  ####################"
+
+if [ -s "$IPD_GFF" ]; then
+    echo "=== ipdSummary SKIP — GFF exists ($(grep -c '^[^#]' "$IPD_GFF" || true) records) ==="
+else
+    echo "=== ipdSummary SP3-C3 (--identify m6A,m4C --methylFraction) ==="
+    source /etc/profile.d/modules.sh 2>/dev/null || true
+    module load SMRT-Link/12.0.0.177059-cli-tools-only 2>/dev/null || true
+    command -v ipdSummary >/dev/null || { echo "ERROR: ipdSummary not on PATH after module load"; exit 1; }
+    START=$(date +%s)
+    ipdSummary "$IPD_ALIGNED" \
+        --reference "$ASM_FASTA" \
+        --identify m6A,m4C \
+        --methylFraction \
+        --csv "$IPD_CSV" \
+        --gff "$IPD_GFF" \
+        --numWorkers "${SLURM_CPUS_PER_TASK}" \
+        --ipdModel "$SP3_MODEL"
+    echo "    $(( $(date +%s) - START ))s"
+    echo "    GFF records: $(grep -c '^[^#]' "$IPD_GFF" || true)"
+fi
+
+if [ -s "$MOTIFS_IPD" ]; then
+    echo "=== pbmotifmaker SKIP — motifs.csv exists ==="
+else
+    echo "=== pbmotifmaker find ==="
+    START=$(date +%s)
+    apptainer exec --bind /data "$SMRT_SIF" \
+        pbmotifmaker find "$ASM_FASTA" "$IPD_GFF" "$MOTIFS_IPD"
+    echo "    $(( $(date +%s) - START ))s"
+fi
+
+# ============================================================
 # Summary
 # ============================================================
 echo ""
 echo "========================================================"
-echo "  DUAL-CALLING TEST COMPLETE — $SAMPLE"
+echo "  DUAL-CALLER TEST COMPLETE — $SAMPLE"
 echo "========================================================"
 echo "  Elapsed total: $(( $(date +%s) - T0 ))s"
 echo ""
-echo "  Track A (ipdSummary+pbmotifmaker):"
-echo "    $MOTIFS_A"
-if [ -s "$MOTIFS_A" ]; then
-    echo "    rows: $(tail -n +2 "$MOTIFS_A" | wc -l)"
+echo "  ipdSummary → pbmotifmaker:"
+echo "    $MOTIFS_IPD"
+if [ -s "$MOTIFS_IPD" ]; then
+    echo "    rows: $(tail -n +2 "$MOTIFS_IPD" | wc -l)"
     echo "    --- head ---"
-    head -5 "$MOTIFS_A" | sed 's/^/      /'
+    head -5 "$MOTIFS_IPD" | sed 's/^/      /'
 fi
 echo ""
-echo "  Track B (jasmine+modkit):"
-echo "    $MOTIFS_B"
-if [ -s "$MOTIFS_B" ]; then
-    echo "    rows: $(tail -n +2 "$MOTIFS_B" | wc -l)"
+echo "  jasmine → modkit find-motifs:"
+echo "    $MOTIFS_JAS"
+if [ -s "$MOTIFS_JAS" ]; then
+    echo "    rows: $(tail -n +2 "$MOTIFS_JAS" | wc -l)"
     echo "    --- head ---"
-    head -5 "$MOTIFS_B" | sed 's/^/      /'
+    head -5 "$MOTIFS_JAS" | sed 's/^/      /'
 fi
 echo "========================================================"
