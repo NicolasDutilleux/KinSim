@@ -152,7 +152,15 @@ if tsv.exists() and tsv.stat().st_size > 0:
             motif  = _cand(r, 'motif', 'sequence')
             offset = _cand(r, 'mod_offset', 'offset', 'position')
             frac   = _cand(r, 'frac_mod', 'fraction', 'methylated_fraction')
+            # modkit find-motifs emits high_count / mid_count / low_count separately
+            hi     = _cand(r, 'high_count')
+            mid    = _cand(r, 'mid_count')
+            lo     = _cand(r, 'low_count')
             nsite  = _cand(r, 'n_sites', 'num_sites', 'total_sites')
+            if nsite is None:
+                # sum high+mid+low if available
+                parts = [int(x) for x in (hi, mid, lo) if x not in (None, '')]
+                nsite = sum(parts) if parts else 0
             mod    = _cand(r, 'mod_code', 'mod_type') or 'm'
             if not motif or offset is None:
                 continue
