@@ -52,11 +52,15 @@ if [ -s "$OUT_CSV" ]; then
 fi
 
 T=$(date +%s)
-# Falquet invokes pbmotifmaker with default params (no -m flag) in his
-# pb_microbial_analysis cromwell pipeline. The -m 100.0 shown commented
-# in his manual script is the default anyway.
-"$FALQUET_PBMM" find "$REF" "$GFF" "$OUT_CSV"
+# --min-score threshold. Falquet's pb_microbial_analysis cromwell workflow
+# must use an internal threshold ~40 (his bc2071 motifs.csv contains entries
+# with meanScore 46.9-65.0, so pbmotifmaker --min-score 100 default cuts them
+# all). 40 recovers the ~9 motifs visible in his reference outputs.
+MOTIFMAKER_MIN_SCORE=${MOTIFMAKER_MIN_SCORE:-40}
+"$FALQUET_PBMM" find --min-score "$MOTIFMAKER_MIN_SCORE" \
+    "$REF" "$GFF" "$OUT_CSV"
 echo "Elapsed: $(( $(date +%s) - T ))s"
+echo "  min-score threshold (MOTIFMAKER_MIN_SCORE): $MOTIFMAKER_MIN_SCORE"
 
 [ -s "$OUT_CSV" ] || { echo "WARNING: motifs.csv empty"; exit 1; }
 echo "Motifs discovered: $(tail -n +2 "$OUT_CSV" | wc -l)"
