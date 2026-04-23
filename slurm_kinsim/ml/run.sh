@@ -114,6 +114,21 @@ submit_verify() {
         "${HERE}/06_verify_generate.slurm" "$manifest" "$gen" "$VERIFY_DIR"
 }
 
+submit_analyze() {
+    local prefix=$1; local dep=${2:-}
+    local d=""; [ -n "$dep" ] && d="--dependency=afterok:${dep}"
+    paths "$prefix"
+    local pkl="${MASTER_CLEAN}"
+    [ -f "$pkl" ] || pkl="${MASTER}"   # fall back to pre-refine if clean not ready
+    sbatch --parsable $d \
+        --partition=pibu_el8 --account=p774 \
+        --mem=32G --cpus-per-task=2 --time=02:00:00 \
+        --job-name=ml_analyze \
+        --output=/data/projects/p774_MARSD/NDutilleux/logs/ml_analyze_%J.log \
+        --wrap="source ~/.bashrc && conda activate kinsim_env && \
+                kinsim analyze '$pkl' --output-dir '$prefix/analyze'"
+}
+
 STEP=${1:-}
 case "$STEP" in
     extract)
@@ -150,6 +165,10 @@ case "$STEP" in
         GEN=${4:-}
         J=$(submit_verify "$MANIFEST" "$PREFIX" "$GEN"); echo "ml.06 verify:   $J"
         ;;
+    analyze)
+        PREFIX=${2:?"prefix required"}
+        J=$(submit_analyze "$PREFIX"); echo "ml.07 analyze:  $J"
+        ;;
     all)
         MANIFEST=${2:?"manifest required"}; PREFIX=${3:?"prefix required"}
         J0=$(submit_extract "$MANIFEST" "$PREFIX");  echo "ml.00 extract:  $J0"
@@ -170,6 +189,7 @@ Steps:
   extract  <manifest.csv> <prefix>                       array per manifest row
   merge    <prefix>                                       shards → master.pkl
   refine   <prefix>                                       EM fixed-None cleanup
+  analyze  <prefix>                                       kinsim analyze on master_clean.pkl (distribution report)
   train    <prefix> [flags...]                            train ConvPredictor on master_clean.pkl
   generate <prefix> <pbsim3_dir> <motifs> [epoch]         array per PBSIM3 species
   evaluate <prefix>                                       calibration report
