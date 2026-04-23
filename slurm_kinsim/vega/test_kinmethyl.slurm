@@ -113,7 +113,8 @@ if [ "$CHEM" = "SP4C2" ]; then
     for tag in raw_kinetics late_fusion; do
         CKPT="$KM/models/classification_models/SP4C2/5mC/${tag}.ckpt"
         PRED="${PRED_PREFIX}_${tag}.tsv"
-        MT=$([ "$tag" = "raw_kinetics" ] && echo "kinetics" || echo "combined")
+        # KinMethyl test.py only implements --model_type combined (kinetics raises Exception)
+        MT=combined
         if [ -s "$PRED" ]; then
             echo "  ${tag}: SKIP (exists)"
             continue
