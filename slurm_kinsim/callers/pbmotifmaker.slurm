@@ -30,7 +30,12 @@ REF=${1:?"Usage: sbatch $0 <ref_fasta> <ipdsummary_gff> <out_motifs_csv>"}
 GFF=${2:?"ipdsummary_gff missing"}
 OUT_CSV=${3:?"out_motifs_csv missing"}
 
-SMRT_SIF=/containers/apptainer/pacbio-smrt-tools-25.3.sif
+# Use L. Falquet's pbmotifmaker 1.1.0 (SMRT-Link 25.1) for compatibility
+# with his reference outputs. The SIF 25.3 pbmotifmaker 1.2.0 is significantly
+# more stringent at the same --min-score and produces fewer motifs.
+FALQUET_PBMM=/data/users/lfalquet/SOFTS/SMRTlink/smrtlink251R/smrtcmds/bin/pbmotifmaker
+
+[ -x "$FALQUET_PBMM" ] || { echo "ERROR: Falquet pbmotifmaker not executable: $FALQUET_PBMM"; exit 1; }
 [ -f "$REF" ] || { echo "ERROR: reference missing"; exit 1; }
 [ -s "$GFF" ] || { echo "ERROR: GFF missing or empty"; exit 1; }
 mkdir -p "$(dirname "$OUT_CSV")"
@@ -39,6 +44,7 @@ echo "=== callers/pbmotifmaker — $(basename "$OUT_CSV") ==="
 echo "Reference: $REF"
 echo "GFF:       $GFF"
 echo "Out CSV:   $OUT_CSV"
+echo "Binary:    $FALQUET_PBMM (pbmotifmaker 1.1.0 SMRT-Link 25.1)"
 
 if [ -s "$OUT_CSV" ]; then
     echo "SKIP — motifs.csv exists ($(tail -n +2 "$OUT_CSV" | wc -l) motifs)"
@@ -46,16 +52,11 @@ if [ -s "$OUT_CSV" ]; then
 fi
 
 T=$(date +%s)
-# --min-score: minimum Qmod motif score. Default in SIF 25.3 is 100, which is
-# the same explicit value L. Falquet uses in SMRT-Link 25.1 — but 25.3 behaves
-# more stringently at the same threshold. 50 recovers the typical 5-15 motifs
-# per bacterial sample seen in Falquet's legacy outputs. Override via env var.
-MOTIFMAKER_MIN_SCORE=${MOTIFMAKER_MIN_SCORE:-50}
-apptainer exec --bind /data "$SMRT_SIF" \
-    pbmotifmaker find --min-score "$MOTIFMAKER_MIN_SCORE" \
-    "$REF" "$GFF" "$OUT_CSV"
+# Falquet invokes pbmotifmaker with default params (no -m flag) in his
+# pb_microbial_analysis cromwell pipeline. The -m 100.0 shown commented
+# in his manual script is the default anyway.
+"$FALQUET_PBMM" find "$REF" "$GFF" "$OUT_CSV"
 echo "Elapsed: $(( $(date +%s) - T ))s"
-echo "  min-score threshold (MOTIFMAKER_MIN_SCORE): $MOTIFMAKER_MIN_SCORE"
 
 [ -s "$OUT_CSV" ] || { echo "WARNING: motifs.csv empty"; exit 1; }
 echo "Motifs discovered: $(tail -n +2 "$OUT_CSV" | wc -l)"
