@@ -32,18 +32,27 @@ source ~/.bashrc
 conda activate kinsim_env
 set -euo pipefail
 
-SAMPLE=${1:?"Usage: sbatch $0 <barcode> [motif=CCWGG] [mod_loc=1]"}
+SAMPLE=${1:?"Usage: sbatch $0 <barcode> [motif=CCWGG] [mod_loc=1] [chemistry=SP4C2|P6C4]"}
 MOTIF=${2:-CCWGG}
 MOD_LOC=${3:-1}
+CHEM=${4:-SP4C2}   # SP4C2 (Sequel II, closer to P1-C1) or P6C4 (RSII)
 case "$SAMPLE" in bc*) ;; *) SAMPLE="bc${SAMPLE}" ;; esac
 
 VEGA=/data/projects/p774_MARSD/NDutilleux/training/Vega
 KM=/data/users/ndutilleux/tools/KinMethyl
 SIF=/containers/apptainer/pacbio-smrt-tools-25.3.sif
 
-ALIGNED="${VEGA}/test_dual/${SAMPLE}/${SAMPLE}_ipd_aligned.bam"
+# Prefer downsampled BAM if exists (KinMethyl extract_features produces per-read
+# features, so full 600x coverage blows up the TSV to 100+ GB — use 50x subsample).
+if [ -f "${VEGA}/test_dual/${SAMPLE}/${SAMPLE}_ipd_aligned_ds50.bam" ]; then
+    ALIGNED="${VEGA}/test_dual/${SAMPLE}/${SAMPLE}_ipd_aligned_ds50.bam"
+    echo "Using downsampled BAM (50x)"
+else
+    ALIGNED="${VEGA}/test_dual/${SAMPLE}/${SAMPLE}_ipd_aligned.bam"
+    echo "WARN: using full BAM — feature TSV will be huge (100+ GB). Consider downsampling."
+fi
 REF="${VEGA}/assembly/${SAMPLE}/${SAMPLE}_assembly.fasta"
-OUTDIR="${VEGA}/test_dual/${SAMPLE}/kinmethyl_${MOTIF}"
+OUTDIR="${VEGA}/test_dual/${SAMPLE}/kinmethyl_${CHEM}_${MOTIF}"
 mkdir -p "$OUTDIR"
 
 FEAT_TSV="${OUTDIR}/${SAMPLE}_${MOTIF}_features.tsv"
@@ -95,24 +104,50 @@ N_SITES=$(wc -l < "$FEAT_TSV")
 echo "    feature TSV: $FEAT_TSV ($N_SITES rows)"
 echo ""
 
-# ---------- 2. kinmethyl-test with 9-model ensemble (P6-C4 5mC) ----------
-echo "=== kinmethyl-test ensemble (9 P6-C4 5mC classifiers) ==="
-for i in 1 2 3 4 5 6 7 8 9; do
-    PRED="${PRED_PREFIX}_id${i}.tsv"
-    if [ -s "$PRED" ]; then
-        echo "  Fusion_ID${i}: SKIP (exists)"
-        continue
-    fi
-    echo "  Fusion_ID${i}:"
-    START=$(date +%s)
-    kinmethyl-test \
-        --data_file "$FEAT_TSV" \
-        --model_file "$KM/models/classification_models/P6C4/5mC/Fusion_ID${i}.ckpt" \
-        --model_type combined \
-        --batch_size 256 \
-        --output "$PRED" 2>&1 | tail -3
-    echo "    $(( $(date +%s) - START ))s"
-done
+# ---------- 2. kinmethyl-test — choose model based on chemistry ----------
+if [ "$CHEM" = "SP4C2" ]; then
+    # SP4-C2 (Sequel II) — chemistrically closest to P1-C1 (Revio/Vega)
+    # raw_kinetics.ckpt doesnt need regression model (feature kinetics only → cross-chem robust)
+    # late_fusion.ckpt uses regression-derived delta features
+    echo "=== kinmethyl-test SP4-C2 5mC (raw_kinetics + late_fusion) ==="
+    for tag in raw_kinetics late_fusion; do
+        CKPT="$KM/models/classification_models/SP4C2/5mC/${tag}.ckpt"
+        PRED="${PRED_PREFIX}_${tag}.tsv"
+        MT=$([ "$tag" = "raw_kinetics" ] && echo "kinetics" || echo "combined")
+        if [ -s "$PRED" ]; then
+            echo "  ${tag}: SKIP (exists)"
+            continue
+        fi
+        echo "  ${tag} (--model_type $MT):"
+        START=$(date +%s)
+        kinmethyl-test \
+            --data_file "$FEAT_TSV" \
+            --model_file "$CKPT" \
+            --model_type "$MT" \
+            --batch_size 256 \
+            --output "$PRED" 2>&1 | tail -3
+        echo "    $(( $(date +%s) - START ))s"
+    done
+else
+    # P6-C4 (RSII) — legacy chemistry, 9-model ensemble
+    echo "=== kinmethyl-test P6-C4 ensemble (9 × Fusion_ID, combined) ==="
+    for i in 1 2 3 4 5 6 7 8 9; do
+        PRED="${PRED_PREFIX}_id${i}.tsv"
+        if [ -s "$PRED" ]; then
+            echo "  Fusion_ID${i}: SKIP (exists)"
+            continue
+        fi
+        echo "  Fusion_ID${i}:"
+        START=$(date +%s)
+        kinmethyl-test \
+            --data_file "$FEAT_TSV" \
+            --model_file "$KM/models/classification_models/P6C4/5mC/Fusion_ID${i}.ckpt" \
+            --model_type combined \
+            --batch_size 256 \
+            --output "$PRED" 2>&1 | tail -3
+        echo "    $(( $(date +%s) - START ))s"
+    done
+fi
 echo ""
 
 # ---------- 3. aggregate + per-motif stats ----------
@@ -122,9 +157,9 @@ import glob, statistics
 from pathlib import Path
 
 OUTDIR = Path("${OUTDIR}")
-PREDS  = sorted(OUTDIR.glob("${SAMPLE}_${MOTIF}_pred_id*.tsv"))
+PREDS  = sorted(OUTDIR.glob("${SAMPLE}_${MOTIF}_pred_*.tsv"))
 FEAT   = Path("${FEAT_TSV}")
-MOTIFS_CSV = OUTDIR / "${SAMPLE}_motifs_kinmethyl.csv"
+MOTIFS_CSV = OUTDIR / "${SAMPLE}_motifs_kinmethyl_${CHEM}.csv"
 
 print(f"Found {len(PREDS)} prediction files")
 for p in PREDS:
