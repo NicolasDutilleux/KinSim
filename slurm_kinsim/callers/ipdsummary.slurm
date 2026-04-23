@@ -16,8 +16,10 @@
 #   sbatch -J call_ipd_<sample> slurm_kinsim/callers/ipdsummary.slurm \
 #          <aligned_bam> <reference_fasta> <out_gff> <out_csv>
 #
-# Input BAM must be pbmm2-aligned + pbindex'd. SP3-C3 model resolved via
-# SMRT-Link module (ipdSummary is NOT in the apptainer SIF).
+# Uses L. Falquet's SMRT-Link 25.1 install (kineticsTools/ipdSummary 3.0)
+# for compatibility with his reference outputs (bc2071 TCGCGA m4C 94%).
+# Our cluster module SMRT-Link 12.0 was 13 versions older and produced
+# lower detection rates (e.g. TCGCGA 73% instead of 94%).
 # ============================================================
 
 set +u
@@ -30,12 +32,14 @@ REF=${2:?"reference missing"}
 OUT_GFF=${3:?"out_gff missing"}
 OUT_CSV=${4:?"out_csv missing"}
 
-source /etc/profile.d/modules.sh 2>/dev/null || true
-module load SMRT-Link/12.0.0.177059-cli-tools-only 2>/dev/null || true
-command -v ipdSummary >/dev/null || { echo "ERROR: ipdSummary not on PATH"; exit 1; }
+# L. Falquet's SMRT-Link 25.1 install — matches his reference pipeline.
+# Run ipdSummary directly via its path (no module load needed).
+FALQUET_SMRT=/data/users/lfalquet/SOFTS/SMRTlink/smrtlink251R
+IPDSUMMARY_BIN="$FALQUET_SMRT/smrtcmds/bin/ipdSummary"
+SP3_MODEL="$FALQUET_SMRT/install/smrtlink-release_25.1.0.257715/bundles/smrttools/install/smrttools-release_25.1.0.257715/private/pacbio/python3pkgs/kineticstools-py3/lib/python3.9/site-packages/kineticsTools/resources/SP3-C3.npz.gz"
 
-SP3_MODEL="/mnt/ss/sib/ibu/rocky8/2023072800/software/SMRT-Link/12.0.0.177059-cli-tools-only/install/smrtlink-release_12.0.0.177059/bundles/smrttools/install/smrttools-release_12.0.0.177059/private/thirdparty/python3/python3_3.9.6/site-packages/kineticsTools/resources/SP3-C3.npz.gz"
-[ -f "$SP3_MODEL" ] || { echo "ERROR: SP3-C3 model not found: $SP3_MODEL"; exit 1; }
+[ -x "$IPDSUMMARY_BIN" ] || { echo "ERROR: Falquet ipdSummary not executable: $IPDSUMMARY_BIN"; exit 1; }
+[ -f "$SP3_MODEL" ]      || { echo "ERROR: SP3-C3 model not found: $SP3_MODEL"; exit 1; }
 
 [ -f "$IN_BAM" ]        || { echo "ERROR: input BAM missing"; exit 1; }
 [ -f "${IN_BAM}.pbi" ]  || { echo "ERROR: .pbi missing (run prep/index_bam first)"; exit 1; }
@@ -55,7 +59,7 @@ if [ -s "$OUT_GFF" ]; then
 fi
 
 T=$(date +%s)
-ipdSummary "$IN_BAM" \
+"$IPDSUMMARY_BIN" "$IN_BAM" \
     --reference "$REF" \
     --identify m6A,m4C \
     --methylFraction \
