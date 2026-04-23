@@ -46,9 +46,15 @@ if [ -s "$OUT_CSV" ]; then
 fi
 
 T=$(date +%s)
+# -m 100.0 : minimum motif score threshold.  Matches L. Falquet's production
+# pipeline (SMRT-Link 25.1 motifMaker find -m 100.0).  The SIF 25.3 default is
+# more stringent and returned only 1 motif on our test; -m 100.0 recovers the
+# typical 5-10 motifs per bacterial sample.
+MOTIFMAKER_MIN_SCORE=${MOTIFMAKER_MIN_SCORE:-100.0}
 apptainer exec --bind /data "$SMRT_SIF" \
-    pbmotifmaker find "$REF" "$GFF" "$OUT_CSV"
+    pbmotifmaker find -m "$MOTIFMAKER_MIN_SCORE" "$REF" "$GFF" "$OUT_CSV"
 echo "Elapsed: $(( $(date +%s) - T ))s"
+echo "  min-score threshold (MOTIFMAKER_MIN_SCORE): $MOTIFMAKER_MIN_SCORE"
 
 [ -s "$OUT_CSV" ] || { echo "WARNING: motifs.csv empty"; exit 1; }
 echo "Motifs discovered: $(tail -n +2 "$OUT_CSV" | wc -l)"

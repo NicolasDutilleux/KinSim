@@ -16,13 +16,17 @@ After fitting, the methylated bucket is replaced with samples drawn from
 N(μ_m, Σ_m) at count round(π · N_original), giving a clean dictionary.
 
 Fallback (too few samples / EM failure):
-    5% Mahalanobis threshold against None (χ²_{2, 0.95} = 5.99).  Samples
-    beyond threshold are treated as real methylated; μ_m, Σ_m estimated
-    from those.
+    Mahalanobis threshold against None: samples beyond the χ² threshold
+    are kept as real methylated; μ_m, Σ_m estimated from those.
+    - Default :  χ²_{2, 0.95} = 5.99  (5 %% chance of being None)
+    - Strict  :  χ²_{2, 0.99} = 9.21  (1 %% chance of being None) —
+      auto-enabled when the key has < `strict_n` samples (default 50)
+      to avoid letting noise leak into the methylated bucket.
 
 Usage:
     kinsim refine in.pkl out.pkl
     kinsim refine in.pkl out.pkl --report report.tsv --min-pi 0.1
+    kinsim refine in.pkl out.pkl --strict-n 100          # stricter: strict below 100
 """
 
 from __future__ import annotations
@@ -38,7 +42,8 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-CHI2_95_2DOF = 5.991                              # χ² 0.95 quantile, 2 dof
+CHI2_95_2DOF = 5.991        # χ² 0.95 quantile, 2 dof — 5% rejection (default)
+CHI2_99_2DOF = 9.210        # χ² 0.99 quantile, 2 dof — 1% rejection (strict, low-count)
 MOD_NAMES = {0: "none", 1: "m6A", 2: "m4C", 3: "m5C"}
 
 
@@ -127,8 +132,16 @@ def mahalanobis_fallback(
     mu_n:      np.ndarray,
     sigma_n:   np.ndarray,
     ridge:     float = 1e-4,
+    chi2_threshold: float = CHI2_95_2DOF,
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    """Keep samples with d²(·, None) > χ²_{2, 0.95}; estimate μ_m, Σ_m from them."""
+    """Keep samples with d²(·, None) > threshold; estimate μ_m, Σ_m from them.
+
+    Threshold defaults to χ²_{2, 0.95} (5% rejection). When called with the
+    stricter χ²_{2, 0.99} = 9.21, only keeps samples that have ≤1% chance
+    of belonging to the None distribution. Use the strict variant for
+    low-count keys where EM is unreliable and loose thresholds let noise
+    leak into the methylated bucket.
+    """
     sigma_n_reg = sigma_n + ridge * np.eye(2)
     try:
         inv_n = np.linalg.inv(sigma_n_reg)
@@ -137,7 +150,7 @@ def mahalanobis_fallback(
 
     diff = samples_m - mu_n
     d2   = np.einsum("ij,jk,ik->i", diff, inv_n, diff)
-    mask = d2 > CHI2_95_2DOF
+    mask = d2 > chi2_threshold
     kept = samples_m[mask]
     if len(kept) < 3:
         return mu_n.copy(), sigma_n.copy(), 0.0
@@ -161,6 +174,7 @@ def refine_pkl(
     em_max_iter: int   = 30,
     em_tol:      float = 1e-4,
     min_samples: int   = 30,
+    strict_n:    int   = 50,
     min_pi:      float = 0.05,
     min_sep:     float = 0.3,
     seed:        int   = 42,
@@ -218,16 +232,28 @@ def refine_pkl(
             else:
                 sigma_n = np.eye(2) * 0.01
 
+            # Low-count keys use stricter χ²_{0.99} (1% rejection) to avoid
+            # noise leakage; high-count keys use the standard χ²_{0.95} (5%).
+            chi2_t = CHI2_99_2DOF if n_orig < strict_n else CHI2_95_2DOF
+
             if n_orig < min_samples:
-                mu_m, sigma_m, pi = mahalanobis_fallback(xy_meth, mu_n, sigma_n)
-                status = "fallback_few_samples" if pi > 0 else "skip_fallback_empty"
+                mu_m, sigma_m, pi = mahalanobis_fallback(
+                    xy_meth, mu_n, sigma_n, chi2_threshold=chi2_t,
+                )
+                status = "fallback_few_samples_strict" if chi2_t > CHI2_95_2DOF and pi > 0 \
+                         else "fallback_few_samples" if pi > 0 \
+                         else "skip_fallback_empty"
             else:
                 mu_m, sigma_m, pi, converged = em_fixed_none(
                     xy_meth, mu_n, sigma_n, max_iter=em_max_iter, tol=em_tol,
                 )
                 if not converged:
-                    mu_m, sigma_m, pi = mahalanobis_fallback(xy_meth, mu_n, sigma_n)
-                    status = "fallback_em_nonconverged" if pi > 0 else "skip_em_failed"
+                    mu_m, sigma_m, pi = mahalanobis_fallback(
+                        xy_meth, mu_n, sigma_n, chi2_threshold=chi2_t,
+                    )
+                    status = "fallback_em_nonconverged_strict" if chi2_t > CHI2_95_2DOF and pi > 0 \
+                             else "fallback_em_nonconverged" if pi > 0 \
+                             else "skip_em_failed"
                 elif pi < min_pi:
                     status = "skip_low_pi"
                 else:
@@ -269,6 +295,7 @@ def refine_pkl(
         "em_max_iter":      em_max_iter,
         "em_tol":           em_tol,
         "min_samples":      min_samples,
+        "strict_n":         strict_n,
         "min_pi":           min_pi,
         "min_sep":          min_sep,
         "seed":             seed,
@@ -318,6 +345,11 @@ def main(argv=None):
     ap.add_argument("--em-tol",      type=float, default=1e-4)
     ap.add_argument("--min-samples", type=int,   default=30,
                     help="Meth buckets with fewer samples skip EM and go to Mahalanobis fallback")
+    ap.add_argument("--strict-n",    type=int,   default=50,
+                    help="For keys with <N samples use the stricter χ²_{0.99} threshold "
+                         "(1%% chance of being None) in the Mahalanobis fallback, instead "
+                         "of the default χ²_{0.95} (5%%). Reduces noise leakage when EM "
+                         "fit is unreliable or the fallback is triggered by low count.")
     ap.add_argument("--min-pi",      type=float, default=0.05,
                     help="Drop keys where fitted π < this (no real meth signal)")
     ap.add_argument("--min-sep",     type=float, default=0.3,
@@ -341,7 +373,8 @@ def main(argv=None):
     refine_pkl(
         in_p, out_p, report_path=rep_p,
         em_max_iter=args.em_max_iter, em_tol=args.em_tol,
-        min_samples=args.min_samples, min_pi=args.min_pi, min_sep=args.min_sep,
+        min_samples=args.min_samples, strict_n=args.strict_n,
+        min_pi=args.min_pi, min_sep=args.min_sep,
         seed=args.seed,
     )
 
