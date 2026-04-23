@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=vega_kinmethyl
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=128G
+#SBATCH --mem=300G
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
 #SBATCH --time=06:00:00
@@ -42,15 +42,23 @@ VEGA=/data/projects/p774_MARSD/NDutilleux/training/Vega
 KM=/data/users/ndutilleux/tools/KinMethyl
 SIF=/containers/apptainer/pacbio-smrt-tools-25.3.sif
 
-# Prefer downsampled BAM if exists (KinMethyl extract_features produces per-read
-# features, so full 600x coverage blows up the TSV to 100+ GB — use 50x subsample).
-if [ -f "${VEGA}/test_dual/${SAMPLE}/${SAMPLE}_ipd_aligned_ds50.bam" ]; then
-    ALIGNED="${VEGA}/test_dual/${SAMPLE}/${SAMPLE}_ipd_aligned_ds50.bam"
-    echo "Using downsampled BAM (50x)"
-else
-    ALIGNED="${VEGA}/test_dual/${SAMPLE}/${SAMPLE}_ipd_aligned.bam"
-    echo "WARN: using full BAM — feature TSV will be huge (100+ GB). Consider downsampling."
-fi
+# Prefer the smallest downsampled BAM available (ds10 > ds50 > full).
+# KinMethyl extract_features emits per-read features, so the TSV explodes:
+#   - full 600x :  ~200 GB TSV  → OOM on any node
+#   - ds50 (50x):  ~34 GB TSV   → OOM with 128 GB RAM (pandas overhead ~3-5x)
+#   - ds10 (10x):  ~7  GB TSV   → fits in 32-64 GB RAM comfortably
+for cand in _ds10 _ds50 ""; do
+    BAM_CANDIDATE="${VEGA}/test_dual/${SAMPLE}/${SAMPLE}_ipd_aligned${cand}.bam"
+    if [ -f "$BAM_CANDIDATE" ]; then
+        ALIGNED="$BAM_CANDIDATE"
+        if [ "$cand" = "" ]; then
+            echo "WARN: using full BAM — feature TSV will be huge. Consider downsampling."
+        else
+            echo "Using downsampled BAM (${cand#_})"
+        fi
+        break
+    fi
+done
 REF="${VEGA}/assembly/${SAMPLE}/${SAMPLE}_assembly.fasta"
 OUTDIR="${VEGA}/test_dual/${SAMPLE}/kinmethyl_${CHEM}_${MOTIF}"
 mkdir -p "$OUTDIR"
