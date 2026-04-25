@@ -69,7 +69,7 @@ T=$(date +%s)
     --reference "$REF" \
     --identify m6A,m4C \
     --methylFraction \
-    --pvalue 0.1 \
+    --pvalue 0.2 \
     --methylMinCov 5 \
     --identifyMinCov 3 \
     --minCoverage 2 \
