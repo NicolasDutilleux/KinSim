@@ -60,7 +60,7 @@ T=$(date +%s)
 # * --min-score 50 catches 8/9 (misses only VVRCNKNNNND at meanScore 47.4,
 #   fraction 2.7% = noise anyway), runs in ~75 min per sample.
 # 50 is the best time-vs-sensitivity tradeoff. Override via env var.
-MOTIFMAKER_MIN_SCORE=${MOTIFMAKER_MIN_SCORE:-50}
+MOTIFMAKER_MIN_SCORE=${MOTIFMAKER_MIN_SCORE:-40}
 "$FALQUET_PBMM" find --min-score "$MOTIFMAKER_MIN_SCORE" \
     "$REF" "$GFF" "$OUT_CSV"
 echo "Elapsed: $(( $(date +%s) - T ))s"
