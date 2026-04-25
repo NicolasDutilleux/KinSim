@@ -59,10 +59,21 @@ if [ -s "$OUT_GFF" ]; then
 fi
 
 T=$(date +%s)
+# Permissive thresholds — required to reproduce Falquet legacy detection rates
+# (e.g. bc2071 TCGCGA 73% → 95%+, matches his 94%). Default ipdSummary is too
+# strict, missing ~800 marginal sites at well-known methylated motifs. Brutal
+# config (pvalue 0.3, etc) produced TCGCGA 97%; we tune slightly stricter to
+# reduce noise candidates. Merge step downstream applies 0.7 fraction
+# threshold which filters anything still noisy.
 "$IPDSUMMARY_BIN" "$IN_BAM" \
     --reference "$REF" \
     --identify m6A,m4C \
     --methylFraction \
+    --pvalue 0.1 \
+    --methylMinCov 5 \
+    --identifyMinCov 3 \
+    --minCoverage 2 \
+    --mapQvThreshold 10 \
     --csv "$OUT_CSV" \
     --gff "$OUT_GFF" \
     --numWorkers "${SLURM_CPUS_PER_TASK}" \
