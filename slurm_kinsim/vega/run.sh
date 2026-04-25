@@ -82,8 +82,10 @@ chain_one() {
         "${out}/${sample}_motifs_merged.csv" "$MERGE_THRESHOLD" \
         "${out}/${sample}_motifs_ipdsummary.csv" "${out}/${sample}_motifs_jasmine.csv")
 
+    # Display chain summary on stderr so it doesn't pollute the captured stdout.
+    # Only the merge job ID goes to stdout (consumed by `jid=$(chain_one ...)`).
     printf '  %s :  asm=%s  by=%s  aln=%s  idx=%s  ipd=%s  mm=%s  jm=%s  MERGE=%s\n' \
-        "$sample" "$J_ASM" "$J_BY" "$J_AL" "$J_IX" "$J_IPD" "$J_MM" "$J_JM" "$J_MG"
+        "$sample" "$J_ASM" "$J_BY" "$J_AL" "$J_IX" "$J_IPD" "$J_MM" "$J_JM" "$J_MG" >&2
 
     echo "$J_MG"   # final dep
 }
