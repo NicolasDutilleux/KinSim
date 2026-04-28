@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ml_01_merge
 #SBATCH --cpus-per-task=2
-#SBATCH --mem=64G
+#SBATCH --mem=750G
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
 #SBATCH --time=04:00:00

@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ml_00_extract
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=48G
+#SBATCH --mem=128G
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
 #SBATCH --time=24:00:00
