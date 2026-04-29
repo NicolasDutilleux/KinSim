@@ -171,6 +171,21 @@ METH_CTX_LEFT  = 8     # positions before center
 METH_CTX_RIGHT = 2     # positions after center
 METH_CTX_LEN   = METH_CTX_LEFT + 1 + METH_CTX_RIGHT   # = 11
 
+# Kinetic profile window: IPD/PW values at offsets [0, +PROFILE_LEN-1] from
+# the prediction position. Used by refine to validate the signature pattern
+# (e.g. for m5C the signal is at +2 and +6, not at the position itself).
+PROFILE_START = 0
+PROFILE_END   = 8
+PROFILE_LEN   = PROFILE_END - PROFILE_START + 1   # = 9
+
+# Total per-sample column count:
+#   0..1   : IPD center, PW center
+#   2      : fraction
+#   3..13  : mc_0..mc_10  (11 meth context values, [-8, +2])
+#   14..22 : profile_IPD_0..+8  (9 values)
+#   23..31 : profile_PW_0..+8   (9 values)
+SAMPLE_NCOLS = 3 + METH_CTX_LEN + 2 * PROFILE_LEN     # = 32
+
 
 def _slice_meth_context(meth_status, center):
     """Return an 11-element list covering [-8, +2] around `center`.
@@ -185,6 +200,24 @@ def _slice_meth_context(meth_status, center):
         if 0 <= pos < n:
             out[k] = int(meth_status[pos])
     return out
+
+
+def _slice_kinetic_profile(ipds, pws, center):
+    """Return a list of 18 values: [profile_IPD_0..+8, profile_PW_0..+8].
+
+    Out-of-range positions (past the end of the read) are padded with 0.
+    """
+    n_ipd = len(ipds)
+    n_pw  = len(pws)
+    ipd_prof = [0.0] * PROFILE_LEN
+    pw_prof  = [0.0] * PROFILE_LEN
+    for k in range(PROFILE_LEN):
+        pos = center + PROFILE_START + k
+        if 0 <= pos < n_ipd:
+            ipd_prof[k] = float(ipds[pos])
+        if 0 <= pos < n_pw:
+            pw_prof[k]  = float(pws[pos])
+    return ipd_prof + pw_prof
 
 
 # ---------------------------------------------------------------------------
@@ -534,16 +567,21 @@ def extract_samples_from_bam(
                     # downstream of the modified base, so to predict the IPD at
                     # `center` the model needs to see modifications UPSTREAM of it.
                     mc = _slice_meth_context(meth_status, center)
+                    # Kinetic profile aval [0, +8] from center: used by refine
+                    # to validate that the signature pattern (e.g. m5C at +2/+6)
+                    # is actually present in the sample's kinetic neighbourhood.
+                    profile = _slice_kinetic_profile(ipds, pws, center)
+                    row = [ipd_val, pw_val, frac] + mc + profile
 
                     counts[key] += 1
                     n = counts[key]
                     if n <= max_samples_per_key:
-                        samples[key].append([ipd_val, pw_val, frac] + mc)
+                        samples[key].append(row)
                     else:
                         # Reservoir sampling: replace a random existing entry
                         j = np.random.randint(0, n)
                         if j < max_samples_per_key:
-                            samples[key][j] = [ipd_val, pw_val, frac] + mc
+                            samples[key][j] = row
 
             # --- Reverse strand: slide RC 11-mer window, collect ri/rp ---
             #
@@ -585,15 +623,18 @@ def extract_samples_from_bam(
 
                             # 11-position asymmetric meth context [-8, +2] for RC window
                             rev_mc = _slice_meth_context(rev_meth_status, rc_center)
+                            # Kinetic profile aval [0, +8] on the complementary strand
+                            profile = _slice_kinetic_profile(ri_tags, rp_tags, fwd_center)
+                            row = [ri_val, rp_val, frac] + rev_mc + profile
 
                             counts[rc_key] += 1
                             n = counts[rc_key]
                             if n <= max_samples_per_key:
-                                samples[rc_key].append([ri_val, rp_val, frac] + rev_mc)
+                                samples[rc_key].append(row)
                             else:
                                 j2 = np.random.randint(0, n)
                                 if j2 < max_samples_per_key:
-                                    samples[rc_key][j2] = [ri_val, rp_val, frac] + rev_mc
+                                    samples[rc_key][j2] = row
 
             n_reads_processed += 1
 
@@ -789,14 +830,24 @@ def extract_from_aligned_bam(
                     # already decided this position is methylated)
                     frac = 1.0 if meth_id > 0 else 0.0
 
+                    # Build the per-sample meth context from pos_meth (asymmetric).
+                    mc = [0] * METH_CTX_LEN
+                    for k in range(METH_CTX_LEN):
+                        mc_pos = center - METH_CTX_LEFT + k
+                        if 0 <= mc_pos < min_len:
+                            mc[k] = pos_meth.get(mc_pos, 0)
+                    # Kinetic profile aval
+                    profile = _slice_kinetic_profile(ipds, pws, center)
+                    row = [ipd_val, pw_val, frac] + mc + profile
+
                     counts[key] += 1
                     n = counts[key]
                     if n <= max_samples_per_key:
-                        samples[key].append([ipd_val, pw_val, frac])
+                        samples[key].append(row)
                     else:
                         j = np.random.randint(0, n)
                         if j < max_samples_per_key:
-                            samples[key][j] = [ipd_val, pw_val, frac]
+                            samples[key][j] = row
 
             n_reads_processed += 1
             if n_reads_processed % 5000 == 0:

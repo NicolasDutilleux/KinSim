@@ -127,6 +127,139 @@ def em_fixed_none(
     return mu_m, sigma_m, pi, False
 
 
+def gmm_signature_validate(
+    arr:        np.ndarray,         # (N, SAMPLE_NCOLS) — full sample rows
+    mu_n:       np.ndarray,         # (2,)   None mean (log1p space)
+    sigma_n:    np.ndarray,         # (2, 2) None covariance (log1p space)
+    sig_offsets: list[int],          # signature positions in profile (0..PROFILE_LEN-1)
+    profile_start_col: int,          # column index where profile_IPD_0 starts
+    profile_len:       int,          # length of the IPD profile (= PW profile)
+    k_max:      int   = 3,
+    chi2_t:     float = 9.21,
+    min_sig_ratio: float = 1.3,
+    min_pi:     float = 0.05,
+    ridge:      float = 1e-4,
+) -> tuple[np.ndarray, np.ndarray, float, str] | None:
+    """GMM clustering + signature validation using the kinetic profile.
+
+    Steps:
+      1. Fit a GMM on the (IPD, PW) of the meth samples for K = 1..k_max,
+         BIC selects the best K.
+      2. For each component, compute:
+           - d²_centroid = Mahalanobis distance of its centroid from None.
+           - sig_score   = mean profile_IPD at signature offsets / mean
+                           profile_IPD at non-signature offsets.
+         A component is "valid" when d² > chi2_t AND sig_score > min_sig_ratio.
+      3. Decision:
+           - K = 1 valid: keep all samples.
+           - K = 1 invalid: keep all samples ANYWAY (user choice — when there's
+             no clustering to do, we can't separate signal from noise here).
+           - K >= 2 with at least one valid component: pick the highest
+             sig_score among valid components.
+           - K >= 2 with no valid component: reject the bucket.
+
+    Returns:
+        (mu_m, sigma_m, pi, status_string) or None if the bucket should be
+        kept untouched (status returned in the string for reporting).
+    """
+    from sklearn.mixture import GaussianMixture
+
+    n = len(arr)
+    if n < 2:
+        return None
+
+    xy_meth = np.log1p(arr[:, :2].astype(np.float32))
+    profile_ipd = arr[:, profile_start_col : profile_start_col + profile_len].astype(np.float32)
+
+    # --- Compute per-sample signature score on the profile ---
+    sig_idx     = [i for i in sig_offsets if 0 <= i < profile_len]
+    nonsig_idx  = [i for i in range(profile_len) if i not in sig_idx]
+    if not sig_idx or not nonsig_idx:
+        # Degenerate profile config — fall through to centroid-only validation.
+        per_sample_score = np.zeros(n, dtype=np.float32)
+    else:
+        sig_mean    = profile_ipd[:, sig_idx].mean(axis=1)
+        nonsig_mean = profile_ipd[:, nonsig_idx].mean(axis=1)
+        per_sample_score = sig_mean / np.maximum(nonsig_mean, 1.0)
+
+    # --- Mahalanobis prep ---
+    sigma_n_reg = sigma_n + ridge * np.eye(2)
+    try:
+        inv_n = np.linalg.inv(sigma_n_reg)
+    except np.linalg.LinAlgError:
+        return None
+
+    # --- GMM with K = 1..k_max (BIC selection) ---
+    best_bic = np.inf
+    best_gmm = None
+    for k in range(1, k_max + 1):
+        if k > n // 3 and k > 1:
+            break
+        try:
+            gmm = GaussianMixture(
+                n_components=k, covariance_type="full",
+                reg_covar=ridge, max_iter=100, n_init=2, random_state=42,
+            )
+            gmm.fit(xy_meth)
+            bic = float(gmm.bic(xy_meth))
+            if bic < best_bic:
+                best_bic = bic
+                best_gmm = gmm
+        except (ValueError, np.linalg.LinAlgError):
+            continue
+
+    if best_gmm is None:
+        return None
+
+    # --- Per-component validation ---
+    K_chosen = best_gmm.n_components
+    labels   = best_gmm.predict(xy_meth)
+    component_info = []
+    for kk in range(K_chosen):
+        mu_k = best_gmm.means_[kk]
+        diff = mu_k - mu_n
+        d2   = float(diff @ inv_n @ diff)
+        in_k = (labels == kk)
+        n_in_k = int(in_k.sum())
+        if n_in_k == 0:
+            sig_score_mean = 0.0
+        else:
+            sig_score_mean = float(per_sample_score[in_k].mean())
+        valid = (d2 > chi2_t) and (sig_score_mean >= min_sig_ratio)
+        component_info.append({
+            "k": kk, "d2": d2, "sig_score": sig_score_mean,
+            "n": n_in_k, "valid": valid,
+        })
+
+    # --- Decision logic ---
+    if K_chosen == 1:
+        # Single component — keep everything regardless. The user's policy:
+        # "if there's only one Gaussian we keep it." We trust the input.
+        info = component_info[0]
+        mu_m    = best_gmm.means_[0].astype(np.float32).copy()
+        sigma_m = best_gmm.covariances_[0].astype(np.float32)
+        if mu_m[0] < mu_n[0]:
+            mu_m[0] = mu_n[0] + 0.05
+        pi = 1.0
+        status = "gmm1_valid" if info["valid"] else "gmm1_kept_unvalidated"
+        return mu_m, sigma_m, pi, status
+
+    valid = [c for c in component_info if c["valid"]]
+    if not valid:
+        return None  # K>1, no component matches signature → reject bucket
+
+    best = max(valid, key=lambda c: c["sig_score"])
+    kk   = best["k"]
+    mu_m = best_gmm.means_[kk].astype(np.float32).copy()
+    sigma_m = best_gmm.covariances_[kk].astype(np.float32)
+    if mu_m[0] < mu_n[0]:
+        mu_m[0] = mu_n[0] + 0.05
+    pi = float(best_gmm.weights_[kk])
+    if pi < min_pi:
+        return None
+    return mu_m, sigma_m, pi, "gmm_signature_ok"
+
+
 def cluster_pick_farthest(
     samples_m: np.ndarray,        # (N, 2) meth samples, log1p space
     mu_n:      np.ndarray,        # (2,)   None mean
@@ -255,7 +388,7 @@ def refine_pkl(
     min_pi:      float = 0.05,
     min_sep:     float = 0.3,
     seed:        int   = 42,
-    method:      str   = "clustered",
+    method:      str   = "gmm_signature",
     chi2_99:     bool  = True,
 ) -> dict:
     log.info("Loading: %s  (%.2f GB)", in_path, in_path.stat().st_size / 1e9)
@@ -317,7 +450,57 @@ def refine_pkl(
             base_chi2 = CHI2_99_2DOF if chi2_99 else CHI2_95_2DOF
             chi2_t = CHI2_99_2DOF if n_orig < strict_n else base_chi2
 
-            if method == "clustered":
+            if method == "gmm_signature":
+                # Load config (cached) and resolve signature offsets.
+                from .utils.config import load_kinsim_config
+                cfg = load_kinsim_config()
+                sig_cfg  = cfg.get("kinetic_signatures", {}).get(mod_name, {})
+                signal_offsets = list(sig_cfg.get("signal_offsets", [0]))
+                gmm_cfg  = cfg.get("refine", {}).get("gmm_signature", {})
+                k_max          = int(gmm_cfg.get("k_max", 3))
+                cfg_chi2       = float(gmm_cfg.get("chi2_threshold", CHI2_99_2DOF))
+                min_sig_ratio  = float(gmm_cfg.get("min_signature_ratio", 1.3))
+                cfg_min_pi     = float(gmm_cfg.get("min_pi", 0.05))
+                min_for_gmm    = int(gmm_cfg.get("min_samples_for_gmm", 5))
+
+                # Resolve where the kinetic profile starts in `arr`.
+                # See extract.py SAMPLE_NCOLS layout: 3 + 11 + 9 + 9 = 32.
+                # The IPD profile starts at column 3 + METH_CTX_LEN.
+                from .extract import METH_CTX_LEN, PROFILE_LEN
+                profile_start_col = 3 + METH_CTX_LEN
+
+                if arr.shape[1] < profile_start_col + PROFILE_LEN:
+                    # Old-format pkl: no profile stored. Fall back to centroid-only.
+                    log.warning("kmer=%d %s: pkl lacks kinetic profile (cols=%d) — "
+                                "using centroid-only Mahalanobis filter",
+                                kmer_id, mod_name, arr.shape[1])
+                    mu_m, sigma_m, pi = mahalanobis_fallback(
+                        xy_meth, mu_n, sigma_n, chi2_threshold=chi2_t,
+                    )
+                    status = "fallback_no_profile" if pi > 0 else "skip_fallback_empty"
+                elif n_orig < min_for_gmm:
+                    # Too few samples for GMM: Mahalanobis hard filter from None.
+                    mu_m, sigma_m, pi = mahalanobis_fallback(
+                        xy_meth, mu_n, sigma_n, chi2_threshold=chi2_t,
+                    )
+                    status = "lowN_mahal_kept" if pi > 0 else "lowN_mahal_empty"
+                else:
+                    result = gmm_signature_validate(
+                        arr, mu_n, sigma_n,
+                        sig_offsets=signal_offsets,
+                        profile_start_col=profile_start_col,
+                        profile_len=PROFILE_LEN,
+                        k_max=k_max,
+                        chi2_t=cfg_chi2,
+                        min_sig_ratio=min_sig_ratio,
+                        min_pi=cfg_min_pi,
+                    )
+                    if result is None:
+                        mu_m, sigma_m, pi = mu_n.copy(), sigma_n.copy(), 0.0
+                        status = "skip_gmm_no_valid"
+                    else:
+                        mu_m, sigma_m, pi, status = result
+            elif method == "clustered":
                 # Cluster the meth bucket, pick the component farthest from None.
                 # Handles bimodal contamination correctly: BIC selects K=2 when
                 # the bucket is a mix of real meth + near-None contamination,
@@ -392,7 +575,17 @@ def refine_pkl(
             xy_new_l = mu_m + z @ L.T
             xy_new   = np.expm1(xy_new_l).clip(0, 255).astype(np.float32)
             frac_col = np.full((n_new, 1), float(pi), dtype=np.float32)
-            new_arr  = np.concatenate([xy_new, frac_col], axis=1)
+            # Preserve meth context (and profile if present) by sampling from
+            # the original array's rows. Each refined sample inherits the
+            # context of a random original sample.
+            n_input_cols = arr.shape[1]
+            if n_input_cols > 3:
+                # Sample row indices from the original bucket, preserving cols 3..end.
+                src_idx = rng.integers(0, n_orig, size=n_new)
+                tail    = arr[src_idx, 3:].astype(np.float32)
+                new_arr = np.concatenate([xy_new, frac_col, tail], axis=1)
+            else:
+                new_arr = np.concatenate([xy_new, frac_col], axis=1)
 
             out[(kmer_id, meth_id)] = new_arr
             n_samples_out += n_new
@@ -467,17 +660,18 @@ def main(argv=None):
     ap.add_argument("--min-sep",     type=float, default=0.3,
                     help="Drop keys where ||μ_m - μ_n||/√tr(Σ_n) < this (signal too weak)")
     ap.add_argument("--seed",        type=int,   default=42)
-    ap.add_argument("--method", choices=["clustered", "mahalanobis", "em"],
-                    default="clustered",
-                    help="Refinement method (default: clustered). "
-                         "'clustered' = fit GMM with K=1..3 on meth samples (BIC), "
-                         "pick component farthest from None (largest Mahalanobis "
-                         "distance from None centroid). Best when meth signal is "
-                         "bimodal (partial + full methylation). "
+    ap.add_argument("--method",
+                    choices=["gmm_signature", "clustered", "mahalanobis", "em"],
+                    default="gmm_signature",
+                    help="Refinement method (default: gmm_signature). "
+                         "'gmm_signature' = GMM (BIC selects K) + per-component "
+                         "validation using kinetic profile signature offsets from "
+                         "kinsim_config.yaml. Handles m6A/m4C/m5C uniformly. "
+                         "'clustered' = legacy GMM picking the centroid farthest "
+                         "from None (no profile validation). "
                          "'mahalanobis' = hard χ² filter on each sample's distance "
-                         "from None; estimates (μ_m, Σ_m) from kept samples. "
-                         "'em' = legacy EM fixed-None mixture; can over-fit when "
-                         "meth signal is bimodal.")
+                         "from None. "
+                         "'em' = legacy EM fixed-None mixture (can over-fit).")
     ap.add_argument("--no-chi2-99",  dest="chi2_99", action="store_false",
                     help="Use χ²_{0.95} (5%% rejection) instead of the default "
                          "χ²_{0.99} (1%% rejection). Keeps more samples but lets more "
