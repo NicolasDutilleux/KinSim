@@ -518,10 +518,11 @@ def render_txt_report(stats: DictStats, sensitivity: dict, output_path: str,
     p('-' * W)
     p('1-base neighbor sensitivity analysis')
     p('-' * W)
-    center = K // 2
+    from .utils.encoding import KMER_PRED_IDX
+    center = KMER_PRED_IDX
     p(f'  How much does a single base change in the {K}-mer context affect')
     p(f'  the expected (mean) IPD / PW?  '
-      f'(pos {center}[C] = center / modified base)')
+      f'(pos {center}[C] = prediction position / modified base)')
     p()
     for category in ['unmethylated', 'methylated']:
         ns = sensitivity.get(category)
@@ -775,7 +776,8 @@ def render_html_report(
         for c in ('unmethylated', 'methylated')
     )
     if has_any_pos:
-        center     = K // 2
+        from .utils.encoding import KMER_PRED_IDX
+        center     = KMER_PRED_IDX
         positions  = list(range(K))
         pos_labels = [f'{p}[C]' if p == center else str(p) for p in positions]
         fig = make_subplots(rows=1, cols=2,

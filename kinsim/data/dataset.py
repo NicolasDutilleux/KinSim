@@ -94,16 +94,16 @@ class MLPSignalDataset(Dataset):
     --------------------------
     ``__getitem__`` returns ``meth_full``: a Float[L, num_meth_types] tensor
     encoding the methylation state at each of the L=11 positions in the
-    asymmetric meth context window [-8, +2] around the prediction position.
+    asymmetric meth context window [-7, +3] around the prediction position.
 
     The PREDICTION position (where IPD/PW is measured) sits at index
-    ``METH_CTX_LEFT = 8`` in this tensor — NOT at K//2.
+    ``KMER_PRED_IDX = 7`` in this tensor — NOT at K//2.
 
     For a sample whose prediction position carries meth_id = 1 (m6A):
-        meth_full[8, :] = [0, frac, 0, 0]   ← soft label at prediction pos
+        meth_full[7, :] = [0, frac, 0, 0]   ← soft label at prediction pos
 
     For an upstream modification (m4C at offset -3 from prediction):
-        meth_full[5, :] = [0, 0, 1.0, 0]    ← hard label at offset -3
+        meth_full[4, :] = [0, 0, 1.0, 0]    ← hard label at offset -3
 
     For positions with no modification:
         meth_full[pos, :] = [0, 0, 0, 0]    ← all-zero (no contribution)
@@ -173,7 +173,6 @@ class MLPSignalDataset(Dataset):
 
         self._num_meth_types = num_meth_types
         self._kmer_size      = kmer_size
-        _center              = kmer_size // 2
 
         # ── Build flat arrays (all samples, capped per key) ───────────────────
         kmer_ids_list:   list = []
@@ -270,13 +269,12 @@ class MLPSignalDataset(Dataset):
         meth_id    = int(self._meth_ids[idx])
         signal     = self._signals[idx]               # already log-transformed
         frac       = float(self._fractions[idx])
-        ctx_ids    = self._meth_ctx[idx]              # (L,) uint8 meth IDs ([-8, +2])
+        ctx_ids    = self._meth_ctx[idx]              # (L,) uint8 meth IDs ([-7, +3])
 
-        # Prediction position lives at index METH_CTX_LEFT in the asymmetric
-        # context window — NOT at kmer_size // 2 (which would be the centre
-        # of a symmetric kmer-aligned window).
-        from ..extract import METH_CTX_LEFT
-        pred_idx = METH_CTX_LEFT
+        # Prediction position lives at index KMER_PRED_IDX in the asymmetric
+        # context window — NOT at kmer_size // 2.
+        from ..utils.encoding import KMER_PRED_IDX
+        pred_idx = KMER_PRED_IDX
         meth_full = torch.zeros(self._kmer_size, self._num_meth_types, dtype=torch.float32)
         for pos in range(self._kmer_size):
             m = int(ctx_ids[pos])

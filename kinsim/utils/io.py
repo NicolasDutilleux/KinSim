@@ -18,12 +18,20 @@ import sys
 
 import numpy as np
 
-from .encoding import K, METH_IDS
+from .encoding import K, KMER_LEFT_PAD, KMER_RIGHT_PAD, METH_IDS
 from .motifs import load_motif_string
 
 log = logging.getLogger(__name__)
 
-MID = K // 2  # 5 — flanking bases on each side of the center position
+# Asymmetric padding around each prediction position. With kmer covering
+# [-KMER_LEFT_PAD, +KMER_RIGHT_PAD] from the prediction position, the
+# extended context needs KMER_LEFT_PAD bases on the left side and
+# KMER_RIGHT_PAD on the right of the read.
+#
+# `MID` is no longer a single value — kept temporarily as KMER_LEFT_PAD for
+# any external import; new code should explicitly use KMER_LEFT_PAD or
+# KMER_RIGHT_PAD depending on intent.
+MID = KMER_LEFT_PAD
 
 
 # ---------------------------------------------------------------------------
@@ -269,10 +277,15 @@ def parse_maf(maf_path):
 # ---------------------------------------------------------------------------
 
 def get_extended_context(ref_seq, ref_start, read_len, circular=True):
-    """Get reference context extended by MID on each side for edge-base encoding."""
+    """Get reference context extended ASYMMETRICALLY for edge-base encoding.
+
+    For the asymmetric kmer [-KMER_LEFT_PAD, +KMER_RIGHT_PAD] window we need
+    KMER_LEFT_PAD bases on the upstream side and KMER_RIGHT_PAD bases on the
+    downstream side of the read so every read position has a complete kmer.
+    """
     ref_len = len(ref_seq)
-    start = ref_start - MID
-    end   = ref_start + read_len + MID
+    start = ref_start - KMER_LEFT_PAD
+    end   = ref_start + read_len + KMER_RIGHT_PAD
 
     if circular and ref_len > 0:
         return ''.join(ref_seq[i % ref_len] for i in range(start, end))

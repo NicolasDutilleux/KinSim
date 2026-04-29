@@ -162,14 +162,15 @@ def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
 # Methylation-context window (asymmetric, upstream-biased)
 # ---------------------------------------------------------------------------
 
-# Asymmetric window around the prediction position from which we extract the
-# methylation context fed to the model. All kinetic signatures (m6A at +5,
-# m5C at +2/+6) are DOWNSTREAM of the modified base, so the influences felt
-# at position Y come from upstream modifications. Window total length stays
-# at 11 to match existing storage layout (mc_0..mc_10).
-METH_CTX_LEFT  = 8     # positions before center
-METH_CTX_RIGHT = 2     # positions after center
-METH_CTX_LEN   = METH_CTX_LEFT + 1 + METH_CTX_RIGHT   # = 11
+# Asymmetric window around the prediction position. Both the kmer (sequence
+# context) and the methylation context use the same window: [-7, +3] = 11
+# positions, prediction position at index 7. The polymerase has more upstream
+# context already incorporated than downstream prevued bases. See
+# `kinsim/utils/encoding.py` for the central definitions.
+from .utils.encoding import KMER_LEFT_PAD, KMER_RIGHT_PAD, KMER_PRED_IDX, K
+METH_CTX_LEFT  = KMER_LEFT_PAD     # = 7
+METH_CTX_RIGHT = KMER_RIGHT_PAD    # = 3
+METH_CTX_LEN   = K                 # = 11
 
 # Kinetic profile window: IPD/PW values at offsets [0, +PROFILE_LEN-1] from
 # the prediction position. Used by refine to validate the signature pattern
@@ -363,7 +364,7 @@ def _binarize_by_ipd(result: dict) -> dict:
             low_arr = arr.copy()
             low_arr[:, 2] = 0.0
             if low_arr.shape[1] >= 14:
-                low_arr[:, 3 + K // 2] = 0
+                low_arr[:, 3 + KMER_PRED_IDX] = 0
             none_extras.setdefault((kmer_id, 0), []).append(low_arr)
             n_rejected_keys += 1
             continue
@@ -422,7 +423,7 @@ def _binarize_by_ipd(result: dict) -> dict:
             low_arr = arr[~high_mask].copy()
             low_arr[:, 2] = 0.0
             if low_arr.shape[1] >= 14:
-                low_arr[:, 3 + K // 2] = 0
+                low_arr[:, 3 + KMER_PRED_IDX] = 0
             none_extras.setdefault((kmer_id, 0), []).append(low_arr)
         else:
             kept = arr.copy()
@@ -517,7 +518,12 @@ def extract_samples_from_bam(
         motif_string = filter_motif_string_by_types(motif_string, meth_types)
 
     _mask  = kmer_mask(kmer_size)
-    mid    = kmer_size // 2
+    # Asymmetric kmer: prediction position is at index KMER_PRED_IDX (= 7)
+    # within the 11-mer. The right edge of the kmer is at offset KMER_RIGHT_PAD
+    # (= 3) from the prediction position. So when sliding through the read
+    # with `i` as the right edge of the current kmer:
+    #   center = i - KMER_RIGHT_PAD   (= i - 3)
+    pred_off = KMER_RIGHT_PAD
     motifs = parse_motifs(motif_string, revcomp=revcomp)
     frac_lookup = _build_fraction_lookup(motif_string)
 
@@ -552,7 +558,7 @@ def extract_samples_from_bam(
                 current_kmer = ((current_kmer << 2) | base_val) & _mask
 
                 if i >= kmer_size - 1:
-                    center  = i - mid
+                    center  = i - pred_off
                     meth_id = int(meth_status[center])
                     # Subsample unmethylated positions to control dict size
                     if meth_id == 0 and np.random.random() >= unmeth_subsample_rate:
@@ -587,11 +593,13 @@ def extract_samples_from_bam(
             #
             # ri[i] is the IPD of the polymerase reading the complementary
             # strand at the position paired with seq[i], moving 5'→3' on the
-            # complement.  The local 11-mer it sees is RC(seq[i-5:i+6]).
+            # complement.  Each strand is read independently so we apply the
+            # same asymmetric kmer convention (-7, +3 from prediction pos)
+            # to rc_seq — the polymerase's own reading direction.
             #
             # Implementation: slide an 11-mer window through rc_seq (the reverse
             # complement of the read).  At window position j in rc_seq, the
-            # window centre in rc_seq is rc_center = j - mid, which corresponds
+            # rc_center is at j - pred_off in rc_seq coords, which corresponds
             # to forward position fwd_center = min_rev_len - 1 - rc_center.
             # ri_tags[fwd_center] gives the complementary-strand IPD at that site.
             if use_reverse_strand and read.has_tag("ri") and read.has_tag("rp"):
@@ -610,7 +618,7 @@ def extract_samples_from_bam(
                         rc_kmer = ((rc_kmer << 2) | rc_base) & _mask
 
                         if j >= kmer_size - 1:
-                            rc_center  = j - mid
+                            rc_center  = j - pred_off
                             fwd_center = min_rev_len - 1 - rc_center
 
                             rc_meth_id = int(rev_meth_status[rc_center])
@@ -745,7 +753,7 @@ def extract_from_aligned_bam(
     log.info("Using kinetic tags: %s/%s", ipd_tag, pw_tag)
 
     _mask = kmer_mask(kmer_size)
-    mid   = kmer_size // 2
+    pred_off = KMER_RIGHT_PAD     # asymmetric kmer: prediction at i - 3
 
     # Load GFF annotations (with optional mod-type filter).  Excluded types
     # are SKIPPED during load, so those genomic positions look like "no
@@ -816,7 +824,7 @@ def extract_from_aligned_bam(
                 current_kmer = ((current_kmer << 2) | base_val) & _mask
 
                 if i >= kmer_size - 1:
-                    center = i - mid
+                    center = i - pred_off
                     meth_id = pos_meth.get(center, 0)
 
                     # Subsample unmethylated
