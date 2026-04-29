@@ -233,15 +233,20 @@ def gmm_signature_validate(
 
     # --- Decision logic ---
     if K_chosen == 1:
-        # Single component — keep everything regardless. The user's policy:
-        # "if there's only one Gaussian we keep it." We trust the input.
+        # Single component — there's nothing to filter via clustering, so we
+        # validate by the same criteria used for K>=2 components. If the lone
+        # component has neither centroid separation from None nor a valid
+        # signature pattern, the bucket is noise and we reject it.
         info = component_info[0]
+        if not info["valid"]:
+            return None  # noise: K=1 with no signature → drop the bucket
+
         mu_m    = best_gmm.means_[0].astype(np.float32).copy()
         sigma_m = best_gmm.covariances_[0].astype(np.float32)
         if mu_m[0] < mu_n[0]:
             mu_m[0] = mu_n[0] + 0.05
         pi = 1.0
-        status = "gmm1_valid" if info["valid"] else "gmm1_kept_unvalidated"
+        status = "gmm1_valid"
         return mu_m, sigma_m, pi, status
 
     valid = [c for c in component_info if c["valid"]]
