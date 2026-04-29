@@ -261,14 +261,17 @@ class ConvPredictor(nn.Module):
         # stiffness, steric effects, unzipping energy.
         self.pos_embed = nn.Parameter(torch.zeros(1, kmer_size, base_embed_dim))
 
-        # --- Methylation projection (shared across positions) ---
-        # Linear(M, proj_dim, bias=False): zero meth -> zero output.
-        # Scales to M=50+ with only M * proj_dim parameters.
-        self.meth_proj = nn.Linear(num_meth_types, meth_proj_dim, bias=False)
+        # --- Methylation projection: GLOBAL embedding from per-position context.
+        # Methylation context is an asymmetric window [-8, +2] around the
+        # prediction position (length 11), independent of the kmer's [-5, +5]
+        # window. Flatten to (B, 11*M) and project to a single embedding so
+        # FiLM conditioning is decoupled from per-position alignment.
+        self.meth_proj = nn.Linear(kmer_size * num_meth_types, meth_proj_dim,
+                                   bias=False)
 
         # --- FiLM conditioning: meth -> (gamma, beta) -> modulate base emb ---
-        # x_modulated = (1 + gamma) * x_base + beta
-        # Zero-init ensures identity when methylation is absent.
+        # x_modulated = (1 + gamma) * x_base + beta, broadcast over positions.
+        # Zero-init ensures identity when methylation context is empty.
         self.film_gamma = nn.Linear(meth_proj_dim, base_embed_dim)
         self.film_beta  = nn.Linear(meth_proj_dim, base_embed_dim)
 
@@ -398,12 +401,14 @@ class ConvPredictor(nn.Module):
         # Per-base embedding + positional encoding
         x = self.base_embed(bases) + self.pos_embed     # (B, 11, base_embed_dim)
 
-        # FiLM conditioning: methylation modulates base representation
-        # x_mod = (1 + gamma) * x + beta
-        # When meth_full is zero at a position -> meth_feat=0 -> gamma=0, beta=0 -> identity
-        meth_feat = self.meth_proj(meth_full)            # (B, 11, meth_proj_dim)
-        gamma = self.film_gamma(meth_feat)               # (B, 11, base_embed_dim)
-        beta  = self.film_beta(meth_feat)                # (B, 11, base_embed_dim)
+        # FiLM conditioning: GLOBAL meth context modulates the kmer uniformly.
+        # Flatten the per-position meth context (B, 11, M) into (B, 11*M),
+        # project to a single embedding, derive (gamma, beta), broadcast.
+        # When meth_full is all zeros -> meth_feat=0 -> gamma=0, beta=0 -> identity.
+        meth_flat = meth_full.reshape(meth_full.shape[0], -1)  # (B, 11*M)
+        meth_feat = self.meth_proj(meth_flat)                  # (B, meth_proj_dim)
+        gamma = self.film_gamma(meth_feat).unsqueeze(1)        # (B, 1, base_embed_dim)
+        beta  = self.film_beta(meth_feat).unsqueeze(1)         # (B, 1, base_embed_dim)
         x = (1.0 + gamma) * x + beta
 
         # Conv1D expects (B, C, L)
