@@ -176,6 +176,21 @@ def parse_motifs(motif_string, revcomp=True):
     return motifs
 
 
+# Kinetic signature offsets per methylation type. Where the IPD/PW
+# signal is actually OBSERVABLE relative to the modified base position
+# (PacBio HiFi). These are biochemistry constants, not per-dataset:
+#   m6A: signal at the modified A AND ~5 bases downstream
+#   m4C: signal at the modified C only
+#   m5C: signal at +2 and +6 downstream — almost nothing AT the C itself
+#
+# Reference: PacBio "Detecting DNA Base Modifications" application note.
+KINETIC_SIGNATURE = {
+    1: (0, 5),       # m6A
+    2: (0,),         # m4C
+    3: (2, 6),       # m5C
+}
+
+
 def scan_sequence(seq, motifs):
     """Scan a DNA sequence for methylation motifs (in-memory regex backend).
 
@@ -186,15 +201,22 @@ def scan_sequence(seq, motifs):
     build_reference_meth_map() which delegates to EMBOSS fuzznuc as the
     primary backend.
 
+    Each motif hit propagates its meth_id to ALL positions in its
+    KINETIC_SIGNATURE (e.g. m6A → modification position + 5 bases
+    downstream; m5C → +2 and +6, NOT at the C itself).
+
     Returns an int8 numpy array of length len(seq), where each position
     holds the methylation type ID (0 = unmethylated).
     """
     status = np.zeros(len(seq), dtype=np.int8)
     for motif in motifs:
+        offsets = KINETIC_SIGNATURE.get(motif['id'], (0,))
         for match in motif['pattern'].finditer(seq):
-            target_pos = match.start() + motif['pos']
-            if target_pos < len(seq):
-                status[target_pos] = motif['id']
+            base = match.start() + motif['pos']
+            for off in offsets:
+                pos = base + off
+                if 0 <= pos < len(seq):
+                    status[pos] = motif['id']
     return status
 
 
@@ -423,8 +445,10 @@ def _build_meth_map_regex(ref_seqs, motif_string, revcomp=True):
 def build_reference_frac_map(ref_seqs, motif_string, revcomp=True):
     """Build per-position stoichiometric fraction map for the reference genome.
 
-    Reuses parse_motifs() (which now carries a 'frac' field) and follows the
-    same scan pattern as scan_sequence / _build_meth_map_regex.
+    Reuses parse_motifs() (which now carries a 'frac' field) and applies the
+    same KINETIC_SIGNATURE offsets as scan_sequence — so the fraction lands
+    at the position(s) where the signal is observable, matching the meth_id
+    map.
 
     Returns:
         dict[ref_name] -> np.float32 array of shape (ref_len,)
@@ -435,10 +459,13 @@ def build_reference_frac_map(ref_seqs, motif_string, revcomp=True):
     for name, seq in ref_seqs.items():
         fmap = np.zeros(len(seq), dtype=np.float32)
         for motif in motifs:
+            offsets = KINETIC_SIGNATURE.get(motif['id'], (0,))
             for match in motif['pattern'].finditer(seq):
-                target_pos = match.start() + motif['pos']
-                if target_pos < len(seq):
-                    fmap[target_pos] = motif['frac']
+                base = match.start() + motif['pos']
+                for off in offsets:
+                    pos = base + off
+                    if 0 <= pos < len(seq):
+                        fmap[pos] = motif['frac']
         frac_map[name] = fmap
     return frac_map
 
@@ -533,13 +560,21 @@ def _build_meth_map_fuzznuc(ref_seqs, motif_string, revcomp=True):
                         meth_id, mod_pos = decode_fuzznuc_pattern_name(pname)
 
                 if strand == '+':
-                    meth_pos = (start_1b - 1) + mod_pos
+                    base_pos = (start_1b - 1) + mod_pos
+                    sign = +1
                 else:
-                    meth_pos = (end_1b - 1) - mod_pos
+                    base_pos = (end_1b - 1) - mod_pos
+                    sign = -1
 
+                # Apply kinetic signature offsets relative to the
+                # polymerase reading direction. On '-' strand, downstream
+                # is in the opposite direction on forward coordinates.
                 ref_len = len(ref_seqs[ref_name])
-                if 0 <= meth_pos < ref_len:
-                    meth_map[ref_name][meth_pos] = meth_id
+                offsets = KINETIC_SIGNATURE.get(meth_id, (0,))
+                for off in offsets:
+                    pos = base_pos + sign * off
+                    if 0 <= pos < ref_len:
+                        meth_map[ref_name][pos] = meth_id
 
     return meth_map
 
