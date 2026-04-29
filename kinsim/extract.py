@@ -159,6 +159,35 @@ def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
 
 
 # ---------------------------------------------------------------------------
+# Methylation-context window (asymmetric, upstream-biased)
+# ---------------------------------------------------------------------------
+
+# Asymmetric window around the prediction position from which we extract the
+# methylation context fed to the model. All kinetic signatures (m6A at +5,
+# m5C at +2/+6) are DOWNSTREAM of the modified base, so the influences felt
+# at position Y come from upstream modifications. Window total length stays
+# at 11 to match existing storage layout (mc_0..mc_10).
+METH_CTX_LEFT  = 8     # positions before center
+METH_CTX_RIGHT = 2     # positions after center
+METH_CTX_LEN   = METH_CTX_LEFT + 1 + METH_CTX_RIGHT   # = 11
+
+
+def _slice_meth_context(meth_status, center):
+    """Return an 11-element list covering [-8, +2] around `center`.
+
+    Out-of-range positions (start of read or end of read) are padded with 0
+    (unmethylated) so every sample has the same fixed-length context.
+    """
+    n = len(meth_status)
+    out = [0] * METH_CTX_LEN
+    for k in range(METH_CTX_LEN):
+        pos = center - METH_CTX_LEFT + k
+        if 0 <= pos < n:
+            out[k] = int(meth_status[pos])
+    return out
+
+
+# ---------------------------------------------------------------------------
 # IPD-based binarization helpers
 # ---------------------------------------------------------------------------
 
@@ -500,8 +529,11 @@ def extract_samples_from_bam(
                     pw_val  = float(pws[center])
                     frac    = frac_lookup.get(meth_id, 0.0)
 
-                    # 11-position methylation context for the current window
-                    mc = meth_status[i - (kmer_size - 1) : i + 1].tolist()
+                    # 11-position asymmetric methylation context [-8, +2] around
+                    # `center`. All kinetic signatures (m6A +5, m5C +2 +6) are
+                    # downstream of the modified base, so to predict the IPD at
+                    # `center` the model needs to see modifications UPSTREAM of it.
+                    mc = _slice_meth_context(meth_status, center)
 
                     counts[key] += 1
                     n = counts[key]
@@ -551,8 +583,8 @@ def extract_samples_from_bam(
                             rp_val = float(rp_tags[fwd_center])
                             frac   = frac_lookup.get(rc_meth_id, 0.0)
 
-                            # 11-position meth context for the RC window
-                            rev_mc = rev_meth_status[j - (kmer_size - 1) : j + 1].tolist()
+                            # 11-position asymmetric meth context [-8, +2] for RC window
+                            rev_mc = _slice_meth_context(rev_meth_status, rc_center)
 
                             counts[rc_key] += 1
                             n = counts[rc_key]
