@@ -159,6 +159,52 @@ def _key_stats_samples(arr: np.ndarray):
     return n, mu_ipd, sig_ipd, mu_pw, sig_pw, frac
 
 
+def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
+    """Aggregate the kinetic profile per meth type across all keys.
+
+    Returns dict[meth_name] -> {'profile_ipd': np.ndarray(PROFILE_LEN,),
+                                'profile_pw':  np.ndarray(PROFILE_LEN,),
+                                'n_samples':   int,
+                                'sig_offsets': list[int]}
+    """
+    from .extract import METH_CTX_LEN, PROFILE_LEN
+    from .utils.config import load_kinsim_config
+
+    cfg = load_kinsim_config()
+    profile_start_col = 3 + METH_CTX_LEN
+    pw_start_col      = profile_start_col + PROFILE_LEN
+    needed_cols       = pw_start_col + PROFILE_LEN  # = 32
+
+    out: dict = {}
+    for meth_id_int in [0, 1, 2, 3]:
+        name = _meth_name(meth_id_int)
+        sums_ipd = np.zeros(PROFILE_LEN, dtype=np.float64)
+        sums_pw  = np.zeros(PROFILE_LEN, dtype=np.float64)
+        n_total  = 0
+        for k, v in data.items():
+            if not (isinstance(k, tuple) and len(k) == 2 and isinstance(v, np.ndarray)):
+                continue
+            kmer_id, meth_id = k
+            if int(meth_id) != meth_id_int:
+                continue
+            if v.shape[1] < needed_cols:
+                continue  # old-format pkl, no profile stored
+            sums_ipd += v[:, profile_start_col:pw_start_col].sum(axis=0)
+            sums_pw  += v[:, pw_start_col:needed_cols].sum(axis=0)
+            n_total  += len(v)
+        if n_total == 0:
+            continue
+        sig_offsets = list(cfg.get("kinetic_signatures", {})
+                              .get(name, {}).get("signal_offsets", []))
+        out[name] = {
+            "profile_ipd": (sums_ipd / n_total).astype(np.float32),
+            "profile_pw":  (sums_pw  / n_total).astype(np.float32),
+            "n_samples":   n_total,
+            "sig_offsets": sig_offsets,
+        }
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Stats collection (single pass)
 # ---------------------------------------------------------------------------
@@ -329,7 +375,8 @@ def compute_neighbor_sensitivity(
 # TXT report
 # ---------------------------------------------------------------------------
 
-def render_txt_report(stats: DictStats, sensitivity: dict, output_path: str) -> None:
+def render_txt_report(stats: DictStats, sensitivity: dict, output_path: str,
+                       signature_profiles: dict | None = None) -> None:
     """Print TXT report to stdout and write to *output_path*."""
     buf = io.StringIO()
     K = stats.kmer_size
@@ -418,6 +465,37 @@ def render_txt_report(stats: DictStats, sensitivity: dict, output_path: str) -> 
               f'  p5={np.percentile(sigmas, 5):.3f}'
               f'  p95={np.percentile(sigmas, 95):.3f}')
     p()
+
+    # ── 3.5 Kinetic signature profile per meth type ──────────────────────
+    if signature_profiles:
+        p('-' * W)
+        p('Kinetic signature profiles  (mean IPD/PW at offsets 0..+8 from prediction pos)')
+        p('-' * W)
+        for name, sp in signature_profiles.items():
+            if name == 'none':
+                continue
+            offsets_str = '  '.join(f'+{i}' for i in range(len(sp['profile_ipd'])))
+            ipd_str = '  '.join(f'{v:5.1f}' for v in sp['profile_ipd'])
+            pw_str  = '  '.join(f'{v:5.1f}' for v in sp['profile_pw'])
+            sig = sp.get('sig_offsets', [])
+            sig_marker = '  '.join('***' if i in sig else '   '
+                                    for i in range(len(sp['profile_ipd'])))
+            p(f"\n  {name}  (n={sp['n_samples']:,} samples, signature at {sig})")
+            p(f"    Offset      :  {offsets_str}")
+            p(f"    Signature   :  {sig_marker}")
+            p(f"    IPD profile :  {ipd_str}")
+            p(f"    PW  profile :  {pw_str}")
+            # Compute the signature score: mean at sig offsets / mean at non-sig
+            if sig:
+                ipd_arr = sp['profile_ipd']
+                sig_idx     = [i for i in sig if 0 <= i < len(ipd_arr)]
+                nonsig_idx  = [i for i in range(len(ipd_arr)) if i not in sig_idx]
+                if sig_idx and nonsig_idx:
+                    score = float(ipd_arr[sig_idx].mean()
+                                   / max(float(ipd_arr[nonsig_idx].mean()), 1.0))
+                    p(f"    Sig/non-sig IPD ratio : {score:.3f}  "
+                      f"(>1.3 expected for real {name})")
+        p()
 
     # ── 4. Low-coverage warnings ──────────────────────────────────────────
     p('-' * W)
@@ -1054,8 +1132,11 @@ def analyze_pkl(
     else:
         log.info("Skipping neighbor sensitivity (--max-neighbor-entries 0)")
 
+    log.info("Computing kinetic signature profiles per meth type...")
+    sig_profiles = compute_signature_profiles(data, kmer_size=stats.kmer_size)
+
     print()
-    render_txt_report(stats, sensitivity, txt_path)
+    render_txt_report(stats, sensitivity, txt_path, signature_profiles=sig_profiles)
 
     if not no_html:
         log.info("Generating HTML report...")

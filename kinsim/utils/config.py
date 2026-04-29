@@ -50,6 +50,7 @@ for SLURM log files.
 
 import csv
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -261,6 +262,83 @@ def load_yaml_config(path: str) -> dict:
 
     log.info("Loaded %d config keys from %s", len(cfg), path)
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# Project-wide config (kinsim_config.yaml at repo root)
+# ---------------------------------------------------------------------------
+
+# Default config — used if kinsim_config.yaml is missing or unreadable.
+# Numbers match the YAML at the repo root; keep in sync.
+_DEFAULT_KINSIM_CONFIG = {
+    "kinetic_signatures": {
+        "m6A": {"signal_offsets": [0, 5]},
+        "m4C": {"signal_offsets": [0]},
+        "m5C": {"signal_offsets": [2, 6]},
+    },
+    "meth_context":     {"left": 8, "right": 2},
+    "kinetic_profile":  {"start": 0, "end": 8},
+    "refine": {
+        "default_strategy": "gmm_signature",
+        "gmm_signature": {
+            "k_max": 3,
+            "chi2_threshold": 9.21,
+            "min_signature_ratio": 1.3,
+            "min_pi": 0.05,
+            "min_samples_for_gmm": 5,
+            "min_samples_low": 1,
+        },
+    },
+}
+
+_CACHED_KINSIM_CONFIG: dict | None = None
+
+
+def load_kinsim_config(explicit_path: str | None = None) -> dict:
+    """Load the project-wide kinsim_config.yaml.
+
+    Search order:
+      1. ``explicit_path`` if given.
+      2. ``$KINSIM_CONFIG`` environment variable.
+      3. ``kinsim_config.yaml`` at the repo root (parent of the kinsim package).
+      4. Built-in defaults (returned with a warning).
+
+    Returns the parsed dict; caches the result so repeated calls are cheap.
+    """
+    global _CACHED_KINSIM_CONFIG
+    if explicit_path is None and _CACHED_KINSIM_CONFIG is not None:
+        return _CACHED_KINSIM_CONFIG
+
+    candidates: list[Path] = []
+    if explicit_path:
+        candidates.append(Path(explicit_path))
+    env_path = os.environ.get("KINSIM_CONFIG")
+    if env_path:
+        candidates.append(Path(env_path))
+    pkg_root = Path(__file__).resolve().parents[2]
+    candidates.append(pkg_root / "kinsim_config.yaml")
+
+    for cand in candidates:
+        if cand.exists():
+            try:
+                cfg = load_yaml_config(str(cand))
+                _CACHED_KINSIM_CONFIG = cfg
+                return cfg
+            except Exception as exc:
+                log.warning("Failed to load kinsim config %s: %s", cand, exc)
+
+    log.warning("kinsim_config.yaml not found — using built-in defaults")
+    _CACHED_KINSIM_CONFIG = _DEFAULT_KINSIM_CONFIG
+    return _DEFAULT_KINSIM_CONFIG
+
+
+def get_signature_offsets(meth_name: str) -> list[int]:
+    """Return the list of signature offsets for a methylation type name."""
+    cfg = load_kinsim_config()
+    sigs = cfg.get("kinetic_signatures", {}).get(meth_name)
+    if sigs is None:
+        return [0]
+    return list(sigs.get("signal_offsets", [0]))
 
 
 # ---------------------------------------------------------------------------
