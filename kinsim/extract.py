@@ -466,7 +466,24 @@ def extract_samples_from_bam(
 ) -> dict:
     """Extract raw (IPD, PW) pairs from a BAM file for each k-mer context.
 
-    For each read: extract sequence + fi/fp kinetic tags, scan methylation
+    Supported BAM formats
+    ---------------------
+    * **Raw HiFi (recommended, fastest)** — single read per molecule with
+      ``fi``/``fp`` tags (forward strand) and ``ri``/``rp`` (reverse strand).
+      Both forward and reverse paths are used → full kinetic data captured
+      in a single pass.
+    * **Bystrandified (recommended, modern)** — two reads per molecule, each
+      with ``ip``/``pw`` tags (one per strand, in polymerase 5'→3' order).
+      Only the forward path is used per read; the complementary strand is
+      already a separate read of its own.  Equivalent data volume to raw HiFi.
+    * **Aligned post-pbmm2 (NOT recommended)** — single read with ``ip``/``pw``
+      after alignment.  Only forward-strand kinetics are accessible
+      (``ri``/``rp`` are dropped during alignment).  You lose half the
+      training data.  Pass an unaligned BAM instead, or use the ipdSummary
+      GFF-mode extraction (`extract_from_aligned_bam`) which handles aligned
+      BAMs differently.
+
+    For each read: extract sequence + kinetic tags, scan methylation
     motifs, then slide a kmer_size-mer window collecting raw signal values.
 
     When ``use_reverse_strand=True`` (default) and the BAM contains ``ri``/``rp``

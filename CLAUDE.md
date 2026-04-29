@@ -226,8 +226,8 @@ class MLPSignalDataset(Dataset):   # flat-sample dataset with dynamic capping
 ### `kinsim/extract.py`
 The data preparation pipeline. Supports two extraction modes:
 
-1. **Motif-based** (original): scans sequence for motif patterns, labels by regex match
-2. **GFF-based** (recommended): uses ipdSummary GFF3 annotations for methylation labels
+1. **Motif-based** (default for v3): scans sequence for motif patterns, labels by regex match
+2. **GFF-based** (legacy): uses ipdSummary GFF3 annotations for methylation labels
 
 ```python
 validate_bam_kinetics(bam_path, n_check=10)
@@ -237,6 +237,20 @@ merge_shards(input_dir, output_file, max_samples_per_key=50000)
 extract_from_manifest_task(manifest_path, task_index, output_dir, ...)
     # Auto-selects GFF or motif mode based on manifest gff column
 ```
+
+**Supported BAM formats for motif-based extraction:**
+
+| Format | Tags | Reverse-strand support | Recommended |
+|---|---|---|---|
+| Raw HiFi (unaligned) | `fi/fp` + `ri/rp` | ✅ Both strands per read | ✅ Yes |
+| Bystrandified | `ip/pw` (×2 reads) | ✅ Each strand = own read | ✅ Yes (modern) |
+| Aligned post-pbmm2 | `ip/pw` only | ❌ `ri/rp` dropped on alignment | ❌ Not for motif mode (use GFF mode instead) |
+
+`validate_bam_kinetics()` returns `"fi"` or `"ip"` to auto-route the forward
+extraction; the reverse-strand pass is gated by `read.has_tag("ri")`. Users
+should pass either a **raw HiFi BAM** or a **bystrandified BAM** to get full
+two-strand training data. Aligned BAMs lose `ri/rp` and only the forward path
+is captured (half the data).
 
 ### `kinsim/models/predictor.py`
 Dual architecture with factory pattern:
