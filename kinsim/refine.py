@@ -131,36 +131,33 @@ def gmm_signature_validate(
     arr:        np.ndarray,         # (N, SAMPLE_NCOLS) — full sample rows
     mu_n:       np.ndarray,         # (2,)   None mean (log1p space)
     sigma_n:    np.ndarray,         # (2, 2) None covariance (log1p space)
-    sig_offsets: list[int],          # signature positions in profile (0..PROFILE_LEN-1)
-    profile_start_col: int,          # column index where profile_IPD_0 starts
-    profile_len:       int,          # length of the IPD profile (= PW profile)
+    sig_offsets: list[int],          # signature positions in profile (kept for compat)
+    profile_start_col: int,          # column index where profile_IPD_0 starts (compat)
+    profile_len:       int,          # length of the IPD profile (compat)
     k_max:      int   = 3,
-    chi2_t:     float = 9.21,
-    min_sig_ratio: float = 1.3,
+    chi2_t:     float = 9.21,        # kept for compat — not used by drop-lowest rule
+    min_sig_ratio: float = 1.3,      # kept for compat
     min_pi:     float = 0.05,
     ridge:      float = 1e-4,
 ) -> tuple[np.ndarray, np.ndarray, float, str] | None:
-    """GMM clustering + signature validation using the kinetic profile.
+    """GMM clustering + drop-lowest-IPD-cluster rule.
 
-    Steps:
-      1. Fit a GMM on the (IPD, PW) of the meth samples for K = 1..k_max,
+    Assumes inputs have already been filtered upstream (jasmine/motifmaker
+    >= 70% confidence). Under that assumption, every (kmer, meth) bucket
+    contains real methylated samples plus possibly some near-None
+    contamination. The contamination always sits at LOWER IPD than the
+    real methylated cluster (a methylated polymerase is slower, IPD goes
+    UP — never down).
+
+    Algorithm:
+      1. Fit a GMM with K = 1..k_max components on (log1p IPD, log1p PW),
          BIC selects the best K.
-      2. For each component, compute:
-           - d²_centroid = Mahalanobis distance of its centroid from None.
-           - sig_score   = mean profile_IPD at signature offsets / mean
-                           profile_IPD at non-signature offsets.
-         A component is "valid" when d² > chi2_t AND sig_score > min_sig_ratio.
-      3. Decision:
-           - K = 1 valid: keep all samples.
-           - K = 1 invalid: keep all samples ANYWAY (user choice — when there's
-             no clustering to do, we can't separate signal from noise here).
-           - K >= 2 with at least one valid component: pick the highest
-             sig_score among valid components.
-           - K >= 2 with no valid component: reject the bucket.
+      2. K = 1: keep everything (no contamination cluster to drop).
+      3. K >= 2: drop the component with the lowest mean IPD (the
+         contamination cluster). Re-estimate (μ_m, Σ_m) from the kept
+         samples (samples assigned to any non-dropped component).
 
-    Returns:
-        (mu_m, sigma_m, pi, status_string) or None if the bucket should be
-        kept untouched (status returned in the string for reporting).
+    Returns (μ_m, Σ_m, π, status) or None if too few samples remain.
     """
     from sklearn.mixture import GaussianMixture
 
@@ -169,25 +166,6 @@ def gmm_signature_validate(
         return None
 
     xy_meth = np.log1p(arr[:, :2].astype(np.float32))
-    profile_ipd = arr[:, profile_start_col : profile_start_col + profile_len].astype(np.float32)
-
-    # --- Compute per-sample signature score on the profile ---
-    sig_idx     = [i for i in sig_offsets if 0 <= i < profile_len]
-    nonsig_idx  = [i for i in range(profile_len) if i not in sig_idx]
-    if not sig_idx or not nonsig_idx:
-        # Degenerate profile config — fall through to centroid-only validation.
-        per_sample_score = np.zeros(n, dtype=np.float32)
-    else:
-        sig_mean    = profile_ipd[:, sig_idx].mean(axis=1)
-        nonsig_mean = profile_ipd[:, nonsig_idx].mean(axis=1)
-        per_sample_score = sig_mean / np.maximum(nonsig_mean, 1.0)
-
-    # --- Mahalanobis prep ---
-    sigma_n_reg = sigma_n + ridge * np.eye(2)
-    try:
-        inv_n = np.linalg.inv(sigma_n_reg)
-    except np.linalg.LinAlgError:
-        return None
 
     # --- GMM with K = 1..k_max (BIC selection) ---
     best_bic = np.inf
@@ -211,58 +189,43 @@ def gmm_signature_validate(
     if best_gmm is None:
         return None
 
-    # --- Per-component validation ---
     K_chosen = best_gmm.n_components
     labels   = best_gmm.predict(xy_meth)
-    component_info = []
-    for kk in range(K_chosen):
-        mu_k = best_gmm.means_[kk]
-        diff = mu_k - mu_n
-        d2   = float(diff @ inv_n @ diff)
-        in_k = (labels == kk)
-        n_in_k = int(in_k.sum())
-        if n_in_k == 0:
-            sig_score_mean = 0.0
-        else:
-            sig_score_mean = float(per_sample_score[in_k].mean())
-        valid = (d2 > chi2_t) and (sig_score_mean >= min_sig_ratio)
-        component_info.append({
-            "k": kk, "d2": d2, "sig_score": sig_score_mean,
-            "n": n_in_k, "valid": valid,
-        })
 
-    # --- Decision logic ---
+    # --- K = 1: keep everything ---
     if K_chosen == 1:
-        # Single component — there's nothing to filter via clustering, so we
-        # validate by the same criteria used for K>=2 components. If the lone
-        # component has neither centroid separation from None nor a valid
-        # signature pattern, the bucket is noise and we reject it.
-        info = component_info[0]
-        if not info["valid"]:
-            return None  # noise: K=1 with no signature → drop the bucket
-
         mu_m    = best_gmm.means_[0].astype(np.float32).copy()
         sigma_m = best_gmm.covariances_[0].astype(np.float32)
         if mu_m[0] < mu_n[0]:
             mu_m[0] = mu_n[0] + 0.05
-        pi = 1.0
-        status = "gmm1_valid"
-        return mu_m, sigma_m, pi, status
+        return mu_m, sigma_m, 1.0, "gmm1_kept"
 
-    valid = [c for c in component_info if c["valid"]]
-    if not valid:
-        return None  # K>1, no component matches signature → reject bucket
+    # --- K >= 2: drop the lowest-IPD cluster (contamination) ---
+    # Real methylated samples have HIGHER IPD than baseline (a methylated
+    # polymerase is slower → longer pulse). The component with the smallest
+    # mean log1p(IPD) is the contamination from near-None positions that
+    # snuck through upstream filtering.
+    ipd_means = best_gmm.means_[:, 0]            # (K,)
+    drop_k    = int(np.argmin(ipd_means))         # contamination cluster
+    keep_mask = (labels != drop_k)
+    n_kept    = int(keep_mask.sum())
+    if n_kept < 3:
+        # The "real" cluster is too small — bucket is dominated by
+        # contamination, can't trust either side.
+        return None
 
-    best = max(valid, key=lambda c: c["sig_score"])
-    kk   = best["k"]
-    mu_m = best_gmm.means_[kk].astype(np.float32).copy()
-    sigma_m = best_gmm.covariances_[kk].astype(np.float32)
+    xy_kept = xy_meth[keep_mask]
+    mu_m    = xy_kept.mean(axis=0).astype(np.float32)
+    sigma_m = (np.cov(xy_kept, rowvar=False) + ridge * np.eye(2)).astype(np.float32)
+    if sigma_m.ndim < 2:
+        sigma_m = np.eye(2, dtype=np.float32) * float(sigma_m)
     if mu_m[0] < mu_n[0]:
         mu_m[0] = mu_n[0] + 0.05
-    pi = float(best_gmm.weights_[kk])
+    pi = float(n_kept / n)
     if pi < min_pi:
         return None
-    return mu_m, sigma_m, pi, "gmm_signature_ok"
+    status = f"gmm{K_chosen}_dropped_lowest"
+    return mu_m, sigma_m, pi, status
 
 
 def cluster_pick_farthest(
