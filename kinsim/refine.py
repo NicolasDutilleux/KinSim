@@ -178,6 +178,8 @@ def refine_pkl(
     min_pi:      float = 0.05,
     min_sep:     float = 0.3,
     seed:        int   = 42,
+    method:      str   = "mahalanobis",
+    chi2_99:     bool  = True,
 ) -> dict:
     log.info("Loading: %s  (%.2f GB)", in_path, in_path.stat().st_size / 1e9)
     with open(in_path, "rb") as f:
@@ -232,11 +234,26 @@ def refine_pkl(
             else:
                 sigma_n = np.eye(2) * 0.01
 
-            # Low-count keys use stricter χ²_{0.99} (1% rejection) to avoid
-            # noise leakage; high-count keys use the standard χ²_{0.95} (5%).
-            chi2_t = CHI2_99_2DOF if n_orig < strict_n else CHI2_95_2DOF
+            # Threshold: stricter χ²_{0.99} (1% rejection) by default, or χ²_{0.95}
+            # (5%) when chi2_99=False.  Low-count keys ALWAYS use the strict version
+            # regardless, to avoid noise leakage.
+            base_chi2 = CHI2_99_2DOF if chi2_99 else CHI2_95_2DOF
+            chi2_t = CHI2_99_2DOF if n_orig < strict_n else base_chi2
 
-            if n_orig < min_samples:
+            if method == "mahalanobis":
+                # Hard cutoff: keep only samples beyond the χ² boundary from None.
+                # This sidesteps EM's tendency to fit a wide Gaussian that swallows
+                # both the real meth peak and near-None contamination.
+                mu_m, sigma_m, pi = mahalanobis_fallback(
+                    xy_meth, mu_n, sigma_n, chi2_threshold=chi2_t,
+                )
+                if pi <= 0:
+                    status = "skip_mahal_empty"
+                elif pi < min_pi:
+                    status = "skip_low_pi"
+                else:
+                    status = "mahal_strict" if chi2_t > CHI2_95_2DOF else "mahal_ok"
+            elif n_orig < min_samples:
                 mu_m, sigma_m, pi = mahalanobis_fallback(
                     xy_meth, mu_n, sigma_n, chi2_threshold=chi2_t,
                 )
@@ -355,6 +372,19 @@ def main(argv=None):
     ap.add_argument("--min-sep",     type=float, default=0.3,
                     help="Drop keys where ||μ_m - μ_n||/√tr(Σ_n) < this (signal too weak)")
     ap.add_argument("--seed",        type=int,   default=42)
+    ap.add_argument("--method",      choices=["mahalanobis", "em"], default="mahalanobis",
+                    help="Refinement method (default: mahalanobis). "
+                         "'mahalanobis' = hard χ² filter on distance from None; "
+                         "samples beyond the threshold are kept and used to estimate "
+                         "(μ_m, Σ_m). Robust to bimodal contamination. "
+                         "'em' = legacy EM fixed-None mixture; can over-fit when meth "
+                         "signal is bimodal (partial methylation), causing the meth "
+                         "Gaussian to absorb near-None samples and drawing them back.")
+    ap.add_argument("--no-chi2-99",  dest="chi2_99", action="store_false",
+                    help="Use χ²_{0.95} (5%% rejection) instead of the default "
+                         "χ²_{0.99} (1%% rejection). Keeps more samples but lets more "
+                         "near-None contamination leak into the meth bucket.")
+    ap.set_defaults(chi2_99=True)
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -376,6 +406,8 @@ def main(argv=None):
         min_samples=args.min_samples, strict_n=args.strict_n,
         min_pi=args.min_pi, min_sep=args.min_sep,
         seed=args.seed,
+        method=args.method,
+        chi2_99=args.chi2_99,
     )
 
 
