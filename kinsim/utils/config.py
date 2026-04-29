@@ -279,7 +279,7 @@ _DEFAULT_KINSIM_CONFIG = {
         "m4C": {"signal_offsets": [0]},
         "m5C": {"signal_offsets": [2, 6]},
     },
-    "meth_context":     {"left": 8, "right": 2},
+    "meth_context":     {"left": 7, "right": 3},
     "kinetic_profile":  {"start": 0, "end": 8},
     "refine": {
         "default_strategy": "gmm_signature",

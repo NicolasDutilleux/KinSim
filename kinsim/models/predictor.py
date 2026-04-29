@@ -46,7 +46,7 @@ import torch.nn as nn
 
 # Log-space transforms for training/inference signal conversion.
 from ..data.dataset import log_transform, inv_log_transform  # noqa: F401
-from ..utils.encoding import K as _DEFAULT_K, kmer_mask
+from ..utils.encoding import K as _DEFAULT_K, KMER_PRED_IDX, kmer_mask
 
 
 # =========================================================================
@@ -140,7 +140,7 @@ class MLPPredictor(nn.Module):
             B, M = meth_probs.shape
             full = torch.zeros(B, self.kmer_size, M,
                                device=meth_probs.device, dtype=meth_probs.dtype)
-            full[:, self.kmer_size // 2, :] = meth_probs
+            full[:, KMER_PRED_IDX, :] = meth_probs
             meth_flat = full.view(B, -1)
         else:
             # (B, K, M) → flatten to (B, K*M)
@@ -377,7 +377,7 @@ class ConvPredictor(nn.Module):
         B, M = meth_probs.shape
         full = torch.zeros(B, self.kmer_size, M,
                            device=meth_probs.device, dtype=meth_probs.dtype)
-        full[:, self.kmer_size // 2, :] = meth_probs
+        full[:, KMER_PRED_IDX, :] = meth_probs
         return full
 
     # ------------------------------------------------------------------
@@ -416,7 +416,7 @@ class ConvPredictor(nn.Module):
         x = self.conv(x)                                # (B, conv_dim, 11)
 
         # Dual readout: center (active site) + global context
-        center      = x[:, :, self.kmer_size // 2]      # (B, conv_dim)
+        center      = x[:, :, KMER_PRED_IDX]            # (B, conv_dim)
         global_pool = x.mean(dim=2)                      # (B, conv_dim)
         readout     = torch.cat([center, global_pool], dim=1)  # (B, 2*conv_dim)
 

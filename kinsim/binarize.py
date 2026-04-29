@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from .utils.config import setup_logging
-from .utils.encoding import K, METH_IDS
+from .utils.encoding import K, KMER_PRED_IDX, METH_IDS
 
 log = logging.getLogger(__name__)
 
@@ -163,7 +163,7 @@ def binarize_pkl(
             low_arr = arr.copy()
             low_arr[:, 2] = 0.0
             if low_arr.shape[1] >= 14:
-                low_arr[:, 3 + K // 2] = 0
+                low_arr[:, 3 + KMER_PRED_IDX] = 0
             none_extras.setdefault((kmer_id, 0), []).append(low_arr)
             n_rejected_keys += 1
             continue
@@ -222,7 +222,7 @@ def binarize_pkl(
             low_arr = arr[~high_mask].copy()
             low_arr[:, 2] = 0.0
             if low_arr.shape[1] >= 14:
-                low_arr[:, 3 + K // 2] = 0
+                low_arr[:, 3 + KMER_PRED_IDX] = 0
             none_extras.setdefault((kmer_id, 0), []).append(low_arr)
         else:
             kept = arr.copy()

@@ -12,6 +12,18 @@ K = 11
 KMER_BITS = 2 * K       # 22 for K=11
 KMER_MASK = (1 << KMER_BITS) - 1  # mask for default K
 
+# Asymmetric kmer/meth-context window around the prediction position.
+# Window covers [-KMER_LEFT_PAD, +KMER_RIGHT_PAD] from the prediction position.
+# Polymerase has read more bases UPSTREAM than DOWNSTREAM at any moment, and
+# all kinetic signatures are downstream of the modification — so to predict
+# IPD/PW at position Y we want more upstream context than downstream.
+# Inspired by Feng et al. 2013 (kineticsTools/ipdSummary, [-7, +2] for
+# unmodified DNA), extended to 11 bases for our k-mer.
+KMER_LEFT_PAD  = 7      # bases before prediction position
+KMER_RIGHT_PAD = 3      # bases after prediction position
+KMER_PRED_IDX  = KMER_LEFT_PAD                         # = 7
+assert KMER_LEFT_PAD + 1 + KMER_RIGHT_PAD == K, "KMER_PAD must sum to K"
+
 BASE_MAP     = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
 INT_TO_BASE  = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
 VALID_BASES  = set('ACGT')

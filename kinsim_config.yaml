@@ -24,9 +24,14 @@ kinetic_signatures:
 # are downstream of the modification — to predict IPD at a position Y we need
 # to see modifications upstream of Y (whose downstream effect reaches Y).
 meth_context:
-  left:  8     # bases before prediction position
-  right: 2     # bases after prediction position
+  left:  7     # bases before prediction position
+  right: 3     # bases after prediction position
   # total length = left + 1 + right = 11
+  # Inspired by Feng et al. 2013 (kineticsTools) [-7, +2] for unmodified DNA,
+  # extended to 11 bases. The window is asymmetric upstream because all
+  # kinetic signatures (m6A +5, m5C +2/+6) are downstream of the modification
+  # — so to predict IPD at position Y the model needs to see modifications
+  # that are upstream of Y (whose downstream effect reaches here).
 
 # Kinetic profile extracted alongside each sample. Used by refine to validate
 # the signature pattern. Range covers all known signature offsets with a

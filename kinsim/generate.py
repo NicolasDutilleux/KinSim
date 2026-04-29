@@ -52,11 +52,13 @@ import torch
 import torch.nn as nn
 
 from .models.predictor import MLPPredictor, create_from_config
-from .utils.encoding import BASE_MAP, K, KMER_MASK
+from .utils.encoding import (
+    BASE_MAP, K, KMER_LEFT_PAD, KMER_MASK, KMER_PRED_IDX, KMER_RIGHT_PAD,
+)
 from .utils.motifs import (build_reference_frac_map, build_reference_meth_map,
                      filter_motif_string_by_types, load_motif_string,
                      parse_meth_types_arg, parse_motifs, scan_sequence)
-from .utils.io import (MID, find_pbsim3_files, resolve_motifs_for_species,
+from .utils.io import (find_pbsim3_files, resolve_motifs_for_species,
                         get_extended_context, load_reference, parse_maf)
 
 log = logging.getLogger(__name__)
@@ -583,7 +585,9 @@ def _process_batch(
                     all_meth_ctxs.append(_ZERO_CTX)
                 else:
                     is_n_context.append(False)
-                    center  = i - MID
+                    # Asymmetric kmer: prediction position is at offset
+                    # KMER_RIGHT_PAD before the kmer's right edge i.
+                    center  = i - KMER_RIGHT_PAD
                     meth_id = int(meth_status[center])
                     frac = frac_lookup.get(meth_id, 0.0)
                     if meth_id > 0:
