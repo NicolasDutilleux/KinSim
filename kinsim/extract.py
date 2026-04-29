@@ -443,7 +443,10 @@ def extract_samples_from_bam(
             columns: [IPD, PW, fraction, mc_0..mc_10]
           - ``"__meta__"``                     → dict with provenance metadata
     """
-    validate_bam_kinetics(bam_path)
+    kinetic_tag = validate_bam_kinetics(bam_path)
+    ipd_tag = kinetic_tag                              # "fi" or "ip"
+    pw_tag  = "fp" if kinetic_tag == "fi" else "pw"
+    log.info("Using kinetic tags: %s/%s", ipd_tag, pw_tag)
 
     # Apply mod-type filter upstream: excluded motifs will never match,
     # so positions carrying those mod types stay unlabelled (= meth_id 0).
@@ -470,11 +473,11 @@ def extract_samples_from_bam(
                 log.info("--max-reads %d reached — stopping early (smoke test only)", max_reads)
                 break
             seq = read.query_sequence
-            if not (seq and len(seq) >= kmer_size and read.has_tag("fi")):
+            if not (seq and len(seq) >= kmer_size and read.has_tag(ipd_tag)):
                 continue
 
-            ipds    = read.get_tag("fi")
-            pws     = read.get_tag("fp")
+            ipds    = read.get_tag(ipd_tag)
+            pws     = read.get_tag(pw_tag)
             min_len = min(len(seq), len(ipds), len(pws))
 
             # Per-read regex scan for methylation positions (forward strand).
