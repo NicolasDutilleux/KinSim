@@ -476,12 +476,10 @@ def extract_samples_from_bam(
       with ``ip``/``pw`` tags (one per strand, in polymerase 5'→3' order).
       Only the forward path is used per read; the complementary strand is
       already a separate read of its own.  Equivalent data volume to raw HiFi.
-    * **Aligned post-pbmm2 (NOT recommended)** — single read with ``ip``/``pw``
-      after alignment.  Only forward-strand kinetics are accessible
-      (``ri``/``rp`` are dropped during alignment).  You lose half the
-      training data.  Pass an unaligned BAM instead, or use the ipdSummary
-      GFF-mode extraction (`extract_from_aligned_bam`) which handles aligned
-      BAMs differently.
+    * **Aligned post-pbmm2 (NOT supported)** — single read with ``ip``/``pw``
+      after alignment.  ``ri``/``rp`` are dropped, and only forward-strand
+      kinetics survive — half the training data.  Pass an unaligned (raw HiFi)
+      or bystrandified BAM instead.
 
     For each read: extract sequence + kinetic tags, scan methylation
     motifs, then slide a kmer_size-mer window collecting raw signal values.
@@ -721,218 +719,6 @@ def extract_samples_from_bam(
     return result
 
 
-# ---------------------------------------------------------------------------
-# GFF-based extraction: aligned BAM + ipdSummary GFF annotations
-# ---------------------------------------------------------------------------
-
-def extract_from_aligned_bam(
-    bam_path: str,
-    gff_path: str,
-    max_samples_per_key: int = 10_000,
-    max_reads: int = 0,
-    kmer_size: int = K,
-    unmeth_subsample_rate: float = 0.05,
-    min_score: float = 20.0,
-    min_ipd_ratio: float = 0.0,
-    meth_types: set[str] | None = None,
-) -> dict:
-    """Extract raw (IPD, PW) pairs using GFF annotations for methylation labels.
-
-    Instead of scanning motif patterns in the sequence (which is deterministic
-    and produces the same label for the same kmer), this uses ipdSummary GFF
-    output to label each genomic position based on kinetic signal analysis.
-
-    This approach is:
-    - **More accurate**: labels come from the SP3-C3 chemistry model, not
-      sequence pattern matching
-    - **Generalizable**: any modification type in the GFF is supported,
-      including future types beyond m6A/m4C/m5C
-    - **Read-level**: each read position is labelled independently based
-      on its alignment to the reference
-
-    Requires an aligned BAM (reads mapped to a reference). Each read's
-    CIGAR is used to map read positions to reference coordinates, which
-    are then looked up in the GFF annotation map.
-
-    No binarization step is needed — the GFF already provides the ground
-    truth labels from ipdSummary's statistical analysis.
-
-    Args:
-        bam_path:              Path to aligned BAM with fi/fp kinetic tags.
-        gff_path:              Path to ipdSummary GFF3 output.
-        max_samples_per_key:   Reservoir sampling cap per (kmer, meth_id).
-        max_reads:             Stop after N reads (0 = no limit).
-        kmer_size:             K-mer window size (default 11).
-        unmeth_subsample_rate: Fraction of unmethylated positions to keep.
-        min_score:             Minimum GFF score for a position to be
-                               considered methylated (default 20).
-        min_ipd_ratio:         Minimum IPD ratio in GFF (0 = no filter).
-
-    Returns:
-        dict with (kmer_id, meth_id) → np.ndarray(N, 3) [IPD, PW, fraction]
-        and "__meta__" provenance key.
-    """
-    from .utils.io import load_gff_annotations
-
-    kinetic_tag = validate_bam_kinetics(bam_path)
-    ipd_tag = kinetic_tag                              # "fi" or "ip"
-    pw_tag  = "fp" if kinetic_tag == "fi" else "pw"
-    log.info("Using kinetic tags: %s/%s", ipd_tag, pw_tag)
-
-    _mask = kmer_mask(kmer_size)
-    pred_off = KMER_RIGHT_PAD     # asymmetric kmer: prediction at i - 3
-
-    # Load GFF annotations (with optional mod-type filter).  Excluded types
-    # are SKIPPED during load, so those genomic positions look like "no
-    # annotation" downstream and end up labelled meth_id=0 (unmeth) in the
-    # per-read map.  This keeps the unmeth class consistent with the filter.
-    annotations = load_gff_annotations(
-        gff_path, min_score=min_score, min_ipd_ratio=min_ipd_ratio,
-        allowed_mods=meth_types,
-    )
-    if not annotations:
-        log.error("No methylation annotations found in GFF: %s", gff_path)
-        sys.exit(1)
-
-    samples: dict = defaultdict(list)
-    counts:  dict = defaultdict(int)
-    n_reads_processed = 0
-    n_mapped = 0
-    n_meth_hits = 0
-
-    log.info("Extracting (GFF mode) from: %s", bam_path)
-    log.info("GFF annotations: %d positions", len(annotations))
-
-    with pysam.AlignmentFile(bam_path, "rb") as bam:
-        for read in bam:
-            if max_reads > 0 and n_reads_processed >= max_reads:
-                break
-
-            # Skip unmapped, secondary, supplementary
-            if read.is_unmapped or read.is_secondary or read.is_supplementary:
-                continue
-
-            seq = read.query_sequence
-            if not (seq and len(seq) >= kmer_size and read.has_tag(ipd_tag)):
-                continue
-
-            ipds = read.get_tag(ipd_tag)
-            pws  = read.get_tag(pw_tag)
-            min_len = min(len(seq), len(ipds), len(pws))
-
-            # Build per-base meth_id array from alignment + GFF
-            contig = read.reference_name
-            strand = '-' if read.is_reverse else '+'
-
-            # get_aligned_pairs gives (query_pos, ref_pos) for each alignment column
-            aligned_pairs = read.get_aligned_pairs(matches_only=True)
-
-            # Build a query_pos → meth_id map from the alignment
-            pos_meth: dict[int, int] = {}
-            for query_pos, ref_pos in aligned_pairs:
-                if query_pos is None or ref_pos is None:
-                    continue
-                if query_pos >= min_len:
-                    continue
-                key = (contig, ref_pos, strand)
-                if key in annotations:
-                    pos_meth[query_pos] = annotations[key]
-                    n_meth_hits += 1
-
-            n_mapped += 1
-
-            # Slide kmer window
-            current_kmer = 0
-            for i in range(min_len):
-                base_val = BASE_MAP.get(seq[i], -1)
-                if base_val < 0:
-                    current_kmer = 0
-                    continue
-                current_kmer = ((current_kmer << 2) | base_val) & _mask
-
-                if i >= kmer_size - 1:
-                    center = i - pred_off
-                    meth_id = pos_meth.get(center, 0)
-
-                    # Subsample unmethylated
-                    if meth_id == 0 and np.random.random() >= unmeth_subsample_rate:
-                        continue
-
-                    key = (current_kmer, meth_id)
-                    ipd_val = float(ipds[center])
-                    pw_val  = float(pws[center])
-                    # fraction = 1.0 for GFF-labelled positions (ipdSummary
-                    # already decided this position is methylated)
-                    frac = 1.0 if meth_id > 0 else 0.0
-
-                    # Build the per-sample meth context from pos_meth (asymmetric).
-                    mc = [0] * METH_CTX_LEN
-                    for k in range(METH_CTX_LEN):
-                        mc_pos = center - METH_CTX_LEFT + k
-                        if 0 <= mc_pos < min_len:
-                            mc[k] = pos_meth.get(mc_pos, 0)
-                    # Kinetic profile aval
-                    profile = _slice_kinetic_profile(ipds, pws, center)
-                    row = [ipd_val, pw_val, frac] + mc + profile
-
-                    counts[key] += 1
-                    n = counts[key]
-                    if n <= max_samples_per_key:
-                        samples[key].append(row)
-                    else:
-                        j = np.random.randint(0, n)
-                        if j < max_samples_per_key:
-                            samples[key][j] = row
-
-            n_reads_processed += 1
-            if n_reads_processed % 5000 == 0:
-                log.info("  %d reads processed (%d meth hits so far)...",
-                         n_reads_processed, n_meth_hits)
-
-    n_keys    = len(samples)
-    n_samples = sum(len(v) for v in samples.values())
-    log.info(
-        "Done: %d reads mapped → %d unique (kmer, meth) keys, %d total samples, "
-        "%d methylation hits",
-        n_mapped, n_keys, n_samples, n_meth_hits,
-    )
-
-    # Count per meth type
-    meth_names = {v: k for k, v in METH_IDS.items()}
-    type_counts: dict[int, int] = defaultdict(int)
-    for (_, m_id), vals in samples.items():
-        type_counts[m_id] += len(vals)
-    for m_id in sorted(type_counts):
-        name = meth_names.get(m_id, f"type{m_id}")
-        log.info("  %s: %d samples across %d keys",
-                 name, type_counts[m_id],
-                 sum(1 for k in samples if k[1] == m_id))
-
-    result = {key: np.array(vals, dtype=np.float32) for key, vals in samples.items()}
-
-    # No binarization needed — GFF labels are the ground truth from ipdSummary.
-
-    result["__meta__"] = {
-        "kinsim_version":         _KINSIM_VERSION,
-        "extraction_mode":        "gff",
-        "source_bam":             str(bam_path),
-        "gff_path":               str(gff_path),
-        "meth_types":             sorted(meth_types) if meth_types else None,
-        "min_score":              min_score,
-        "min_ipd_ratio":          min_ipd_ratio,
-        "kmer_size":              kmer_size,
-        "unmeth_subsample_rate":  unmeth_subsample_rate,
-        "max_samples_per_key":    max_samples_per_key,
-        "n_reads_processed":      n_reads_processed,
-        "n_reads_mapped":         n_mapped,
-        "n_meth_hits":            n_meth_hits,
-        "n_unique_keys":          n_keys,
-        "n_total_samples":        n_samples,
-        "created":                datetime.datetime.now().isoformat(timespec="seconds"),
-    }
-
-    return result
-
 
 # ---------------------------------------------------------------------------
 # Merge: combine shards from multiple BAMs
@@ -1063,20 +849,14 @@ def extract_from_manifest_task(
     max_reads: int = 0,
     kmer_size: int = K,
     unmeth_subsample_rate: float = 0.05,
-    min_score: float = 20.0,
-    min_ipd_ratio: float = 0.0,
     binarize: bool = True,
     meth_types: set[str] | None = None,
 ) -> None:
     """Extract one BAM from a manifest CSV (for SLURM array jobs).
 
     Reads the manifest at ``manifest_path``, picks the row at ``task_index``
-    (1-based, matching SLURM_ARRAY_TASK_ID), runs extraction, and writes the
-    shard to ``output_dir/<sample_id>_shard.pkl``.
-
-    When the manifest row has a non-empty ``gff`` column, GFF-based extraction
-    is used (``extract_from_aligned_bam``).  Otherwise, motif-based extraction
-    is used (``extract_samples_from_bam``).
+    (1-based, matching SLURM_ARRAY_TASK_ID), runs motif-based extraction, and
+    writes the shard to ``output_dir/<sample_id>_shard.pkl``.
 
     Args:
         manifest_path:        Path to the manifest CSV.
@@ -1086,8 +866,6 @@ def extract_from_manifest_task(
         revcomp:              Scan reverse complement strand for motifs.
         use_reverse_strand:   Extract ri/rp complementary-strand kinetics.
         max_reads:            Stop after N reads (0 = no limit, smoke test only).
-        min_score:            Minimum GFF score (only used in GFF mode).
-        min_ipd_ratio:        Minimum IPD ratio filter (only used in GFF mode).
     """
     from .utils.config import load_manifest
     from .utils.motifs import load_motif_string as _load_motif_string
@@ -1112,38 +890,24 @@ def extract_from_manifest_task(
     if meth_types is not None:
         log.info("  Meth types filter: %s", sorted(meth_types))
 
-    if entry.gff:
-        # ---- GFF-based extraction ----
-        log.info("  GFF:    %s (GFF mode)", entry.gff)
-        result = extract_from_aligned_bam(
-            entry.bam_path, entry.gff,
-            max_samples_per_key=max_samples_per_key,
-            max_reads=max_reads,
-            kmer_size=kmer_size,
-            unmeth_subsample_rate=unmeth_subsample_rate,
-            min_score=min_score,
-            min_ipd_ratio=min_ipd_ratio,
-            meth_types=meth_types,
-        )
-    else:
-        # ---- Motif-based extraction ----
-        log.info("  Motifs: %s", entry.motifs)
-        motif_string = _load_motif_string(entry.motifs)
-        if not motif_string:
-            log.warning("No motifs resolved for sample '%s' -- SKIPPING.", entry.sample_id)
-            return
+    # Motif-based extraction (single supported path; GFF mode removed in v3)
+    log.info("  Motifs: %s", entry.motifs)
+    motif_string = _load_motif_string(entry.motifs)
+    if not motif_string:
+        log.warning("No motifs resolved for sample '%s' -- SKIPPING.", entry.sample_id)
+        return
 
-        result = extract_samples_from_bam(
-            entry.bam_path, motif_string,
-            max_samples_per_key=max_samples_per_key,
-            revcomp=revcomp,
-            use_reverse_strand=use_reverse_strand,
-            max_reads=max_reads,
-            kmer_size=kmer_size,
-            unmeth_subsample_rate=unmeth_subsample_rate,
-            binarize=binarize,
-            meth_types=meth_types,
-        )
+    result = extract_samples_from_bam(
+        entry.bam_path, motif_string,
+        max_samples_per_key=max_samples_per_key,
+        revcomp=revcomp,
+        use_reverse_strand=use_reverse_strand,
+        max_reads=max_reads,
+        kmer_size=kmer_size,
+        unmeth_subsample_rate=unmeth_subsample_rate,
+        binarize=binarize,
+        meth_types=meth_types,
+    )
 
     with open(output_pkl, "wb") as f:
         pickle.dump(result, f)
@@ -1211,23 +975,6 @@ def main(argv=None) -> None:
                            help="1-based row index from the manifest (= SLURM_ARRAY_TASK_ID)")
     p_extract.add_argument("--output-dir", default=None,
                            help="Output directory for shard .pkl files (manifest mode)")
-
-    # GFF-based extraction (aligned BAM + ipdSummary GFF)
-    # Usage: kinsim extract <bam> --gff <gff> -o <output.pkl>
-    p_extract.add_argument("--gff", default=None,
-                           help="Path to ipdSummary GFF3 file. Enables GFF-based "
-                                "extraction: methylation labels come from GFF annotations "
-                                "instead of motif sequence scanning. Requires an aligned "
-                                "BAM. Use -o/--output for the output path.")
-    p_extract.add_argument("-o", "--output", dest="output_file", default=None,
-                           help="Output .pkl shard file (used with --gff mode). "
-                                "In motif mode, use the positional 'output' arg instead.")
-    p_extract.add_argument("--min-score", type=float, default=20.0,
-                           help="Minimum GFF score for methylation calls "
-                                "(default: 20, i.e. p < 0.01). Only used with --gff.")
-    p_extract.add_argument("--min-ipd-ratio", type=float, default=0.0,
-                           help="Minimum IPD ratio filter for GFF records "
-                                "(default: 0 = no filter). Only used with --gff.")
 
     # Common options
     p_extract.add_argument("--max-samples", type=int, default=20_000,
@@ -1324,52 +1071,8 @@ def main(argv=None) -> None:
                 max_reads            = args.max_reads,
                 kmer_size            = args.kmer_size or K,
                 unmeth_subsample_rate= args.unmeth_subsample_rate,
-                min_score            = args.min_score,
-                min_ipd_ratio        = args.min_ipd_ratio,
                 binarize             = not args.no_binarize,
                 meth_types           = meth_types,
-            )
-
-        elif args.gff:
-            # ---- GFF-based extraction (aligned BAM + ipdSummary GFF) ----
-            if not args.bam:
-                log.error(
-                    "GFF mode requires: kinsim extract <bam> --gff <gff> -o <output.pkl>\n"
-                    "The BAM must be aligned (mapped to the reference used by ipdSummary)."
-                )
-                sys.exit(1)
-            gff_output = args.output_file or args.output
-            if not gff_output:
-                log.error(
-                    "GFF mode requires an output path:\n"
-                    "  kinsim extract <bam> --gff <gff> -o <output.pkl>"
-                )
-                sys.exit(1)
-
-            log.info("GFF-based extraction from: %s", os.path.basename(args.bam))
-            if meth_types is not None:
-                log.info("Meth types filter: %s", sorted(meth_types))
-            result = extract_from_aligned_bam(
-                args.bam, args.gff,
-                max_samples_per_key=args.max_samples,
-                max_reads=args.max_reads,
-                kmer_size=args.kmer_size or K,
-                unmeth_subsample_rate=args.unmeth_subsample_rate,
-                min_score=args.min_score,
-                min_ipd_ratio=args.min_ipd_ratio,
-                meth_types=meth_types,
-            )
-
-            Path(gff_output).parent.mkdir(parents=True, exist_ok=True)
-            with open(gff_output, "wb") as f:
-                pickle.dump(result, f)
-
-            meta = result.get("__meta__", {})
-            log.info(
-                "Shard saved: %s (%d contexts, %d samples)",
-                gff_output,
-                meta.get("n_unique_keys", "?"),
-                meta.get("n_total_samples", "?"),
             )
 
         else:
@@ -1377,7 +1080,6 @@ def main(argv=None) -> None:
             if not args.bam or not args.motifs or not args.output:
                 log.error(
                     "Single-BAM mode requires: kinsim extract <bam> <motifs> <output>\n"
-                    "Or use --gff mode: kinsim extract <bam> --gff <gff> <output>\n"
                     "Or use manifest mode: kinsim extract --manifest CSV --task N "
                     "--output-dir DIR"
                 )

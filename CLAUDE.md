@@ -26,7 +26,7 @@ KinSim/
 │   ├── __init__.py
 │   ├── __main__.py                 CLI router (v0.4.0)
 │   │
-│   ├── extract.py                  BAM extraction + shard merging; manifest + GFF mode
+│   ├── extract.py                  BAM extraction + shard merging (motif-based, manifest-driven)
 │   ├── refine.py                   EM fixed-None cleanup of merged .pkl (kinsim refine)
 │   ├── train.py                    supervised training loop (ConvPredictor/MLPPredictor)
 │   ├── generate.py                 BAM generation with trained model
@@ -186,7 +186,6 @@ class SampleEntry:
     sample_id: str
     bam_path:  str
     motifs:    str    # KinSim string or path (resolved by load_motif_string)
-    gff:       str = ""  # optional ipdSummary GFF3 path (enables GFF extraction mode)
 
 load_manifest(manifest_path) -> list[SampleEntry]
 validate_manifest(entries, check_files=True) -> list[str]
@@ -228,19 +227,13 @@ Strain-specific signatures (e.g. m6A at +8 instead of +5 for some
 methyltransferases) are handled by editing the YAML — no code change.
 
 ### `kinsim/utils/io.py`
-File I/O for FASTA references, MAF alignments, GFF annotations, and PBSIM3 directory discovery.
+File I/O for FASTA references, MAF alignments, and PBSIM3 directory discovery.
 
 ```python
 load_reference(fasta_path) -> dict[str, str]       # contig_name -> sequence
 parse_maf(maf_path) -> iterator                     # MAF alignment records
 get_extended_context(ref, pos, k) -> str            # extract 11-mer from reference
 discover_pbsim3_layout(directory) -> list[dict]     # auto-detect flat vs subdirectory
-
-# GFF-based methylation annotations (ipdSummary output)
-load_gff_annotations(gff_path, min_score=20.0, min_ipd_ratio=0.0)
-    -> dict[(contig, pos_0based, strand), meth_id]  # GFF3 → position lookup
-build_read_meth_array(annotations, contig, ref_start, read_len, strand)
-    -> np.ndarray(int8)                             # per-base meth_id for one read
 ```
 
 ### `kinsim/data/dataset.py`
@@ -257,27 +250,24 @@ class MLPSignalDataset(Dataset):   # flat-sample dataset with dynamic capping
 ```
 
 ### `kinsim/extract.py`
-The data preparation pipeline. Supports two extraction modes:
-
-1. **Motif-based** (default for v3): scans sequence for motif patterns, labels by regex match
-2. **GFF-based** (legacy): uses ipdSummary GFF3 annotations for methylation labels
+The data preparation pipeline. **Motif-based extraction only** (GFF mode was
+removed in v3; the model now learns kinetic signatures from the per-position
+methylation context fed to FiLM, so a separate aligned-BAM path is unnecessary).
 
 ```python
 validate_bam_kinetics(bam_path, n_check=10)
-extract_samples_from_bam(bam_path, motif_string, ...)    # motif-based (unaligned BAM)
-extract_from_aligned_bam(bam_path, gff_path, ...)        # GFF-based (aligned BAM)
+extract_samples_from_bam(bam_path, motif_string, ...)    # motif-based (raw HiFi or bystrandified)
 merge_shards(input_dir, output_file, max_samples_per_key=50000)
 extract_from_manifest_task(manifest_path, task_index, output_dir, ...)
-    # Auto-selects GFF or motif mode based on manifest gff column
 ```
 
-**Supported BAM formats for motif-based extraction:**
+**Supported BAM formats:**
 
 | Format | Tags | Reverse-strand support | Recommended |
 |---|---|---|---|
 | Raw HiFi (unaligned) | `fi/fp` + `ri/rp` | ✅ Both strands per read | ✅ Yes |
 | Bystrandified | `ip/pw` (×2 reads) | ✅ Each strand = own read | ✅ Yes (modern) |
-| Aligned post-pbmm2 | `ip/pw` only | ❌ `ri/rp` dropped on alignment | ❌ Not for motif mode (use GFF mode instead) |
+| Aligned post-pbmm2 | `ip/pw` only | ❌ `ri/rp` dropped on alignment | ❌ Not supported — pass an unaligned BAM |
 
 `validate_bam_kinetics()` returns `"fi"` or `"ip"` to auto-route the forward
 extraction; the reverse-strand pass is gated by `read.has_tag("ri")`. Users
@@ -415,27 +405,21 @@ kinsim-prep manifest list <csv>        # tabular display
 ## Data Flow
 
 ```
-Real PacBio BAMs
+Real PacBio BAMs (raw HiFi or bystrandified — never aligned post-pbmm2)
       |
-      +---- Motif-based path ----+---- GFF-based path (recommended) ----+
-      |                          |                                       |
-      v                          v  (align BAM + run ipdSummary SP3-C3)  |
-rebase_motifs.csv          aligned.bam + annotations.gff                 |
-      |                          |                                       |
-      v  (merge-motifs)          v                                       |
-final_motifs.csv                 |                                       |
-      |                          |                                       |
-      +---- manifest.csv -------+                                       |
-             [sample_id, bam_path, motifs, gff]                         |
-      |                                                                  |
+      +-- Motif discovery (jasmine + ipdSummary + pbmotifmaker, threshold 0.7)
+      |   produces a merged motifs.csv per sample
+      |
+      v  manifest.csv  [sample_id, bam_path, motifs]
+      |
       v  kinsim extract --manifest manifest.csv --task $TASK --output-dir shards/
-      v  (auto-selects GFF or motif mode per row)
+      v  (motif-based: scans read sequence, tags positions of modification)
 strain1_shard.pkl  strain2_shard.pkl  ...
       |
       v  kinsim merge shards/ master_data.pkl
       |
       v  kinsim refine master_data.pkl master_clean.pkl --report refine.tsv
-      v  (EM fixed-None 2-component mixture: separates methylated/unmethylated)
+      v  (per-offset joint-GMM: drops contamination cluster per kmer)
 master_clean.pkl
       |
       v  (optional) kinsim-prep filter master_clean.pkl training_data.pkl --min-coverage 50
@@ -472,7 +456,7 @@ verify_report.tsv
 
 ```
 # kinsim -- ML pipeline --------------------------------------------------
-kinsim extract                -> kinsim/extract.py          (--gff for GFF mode)
+kinsim extract                -> kinsim/extract.py
 kinsim merge                  -> kinsim/extract.py
 kinsim refine                 -> kinsim/refine.py           (EM fixed-None cleanup)
 kinsim train                  -> kinsim/train.py
@@ -621,8 +605,7 @@ torch.save({
 - All SLURM scripts include diagnostics: date, hostname, GPU info, timing, exit codes.
 
 ### Manifest CSV
-- Manifest columns: `sample_id`, `bam_path`, `motifs`, `gff` (CSV with header, commas OK in quoted fields).
-- The `gff` column is optional. When present and non-empty, GFF-based extraction is used.
+- Manifest columns: `sample_id`, `bam_path`, `motifs` (CSV with header).
 - Count rows for `--array`: `N=$(kinsim-prep manifest count manifest.csv)`.
 - Output shard naming: `shards/<sample_id>_shard.pkl` (derived from manifest `sample_id`).
 

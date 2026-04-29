@@ -68,17 +68,11 @@ _REQUIRED_COLUMNS = {"sample_id", "bam_path", "motifs"}
 
 @dataclass
 class SampleEntry:
-    """One BAM + motif pair from a manifest CSV.
-
-    When ``gff`` is set (non-empty), the extraction uses GFF-based labelling
-    from ipdSummary instead of motif sequence scanning.  The ``motifs`` field
-    is then ignored during extraction but kept for provenance.
-    """
+    """One BAM + motif pair from a manifest CSV."""
 
     sample_id: str
     bam_path:  str
     motifs:    str   # KinSim motif string or path (resolved later by load_motif_string)
-    gff:       str = ""  # optional path to ipdSummary GFF3 file
 
 
 def load_manifest(manifest_path: str) -> list[SampleEntry]:
@@ -132,21 +126,18 @@ def load_manifest(manifest_path: str) -> list[SampleEntry]:
             sample_id = row["sample_id"].strip()
             bam_path  = row["bam_path"].strip()
             motifs    = row["motifs"].strip()
-            gff       = row.get("gff", "").strip()  # optional column
 
             if not sample_id:
                 raise ValueError(f"Empty 'sample_id' at row {row_num} in {manifest_path}")
             if not bam_path:
                 raise ValueError(f"Empty 'bam_path'  at row {row_num} in {manifest_path}")
-            if not motifs and not gff:
+            if not motifs:
                 raise ValueError(
-                    f"Empty 'motifs' at row {row_num} in {manifest_path}. "
-                    "Provide either a motifs source or a gff column."
+                    f"Empty 'motifs' at row {row_num} in {manifest_path}."
                 )
 
             entries.append(SampleEntry(
-                sample_id=sample_id, bam_path=bam_path,
-                motifs=motifs, gff=gff,
+                sample_id=sample_id, bam_path=bam_path, motifs=motifs,
             ))
 
     if not entries:
@@ -208,12 +199,6 @@ def validate_manifest(
                 errors.append(
                     f"Row {idx} ({entry.sample_id}): "
                     f"motifs file does not exist: {entry.motifs}"
-                )
-            # 4. GFF file existence (when provided)
-            if entry.gff and not Path(entry.gff).expanduser().exists():
-                errors.append(
-                    f"Row {idx} ({entry.sample_id}): "
-                    f"gff file does not exist: {entry.gff}"
                 )
 
     return errors
