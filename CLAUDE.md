@@ -191,8 +191,41 @@ class SampleEntry:
 load_manifest(manifest_path) -> list[SampleEntry]
 validate_manifest(entries, check_files=True) -> list[str]
 load_yaml_config(path) -> dict
+load_kinsim_config(explicit_path=None) -> dict   # parses kinsim_config.yaml
+get_signature_offsets(meth_name) -> list[int]    # signature offsets per meth type
 setup_logging(verbose=False)
 ```
+
+#### Project-wide config — `kinsim_config.yaml`
+
+A single YAML at the repo root holds the biology- and refine-related parameters
+that the user must keep up-to-date. Loaded once and cached by
+`load_kinsim_config()`.
+
+```yaml
+kinetic_signatures:
+  m6A: { signal_offsets: [0, 5] }   # at modified A AND +5 downstream
+  m4C: { signal_offsets: [0] }      # at modified C only
+  m5C: { signal_offsets: [2, 6] }   # +2 and +6, NOT at the C itself
+  # User MUST add an entry per methylation type their data carries.
+  # If a type is missing, KinSim falls back to [0] and logs a warning —
+  # this is correct for m4C, but WRONG for m5C and incomplete for m6A.
+
+meth_context:    { left: 7, right: 3 }    # asymmetric kmer / FiLM window
+kinetic_profile: { start: 0, end: 8 }     # downstream profile stored per sample
+
+refine:
+  default_strategy: "gmm_signature"
+  gmm_signature:
+    k_max: 3
+    chi2_threshold: 9.21
+    min_signature_ratio: 1.3
+    min_pi: 0.05
+    min_samples_for_gmm: 5
+```
+
+Strain-specific signatures (e.g. m6A at +8 instead of +5 for some
+methyltransferases) are handled by editing the YAML — no code change.
 
 ### `kinsim/utils/io.py`
 File I/O for FASTA references, MAF alignments, GFF annotations, and PBSIM3 directory discovery.

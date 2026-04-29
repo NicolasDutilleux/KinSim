@@ -457,11 +457,28 @@ def refine_pkl(
             chi2_t = CHI2_99_2DOF if n_orig < strict_n else base_chi2
 
             if method == "gmm_signature":
-                # Load config (cached) and resolve signature offsets.
+                # Load config (cached) and resolve signature offsets per type.
+                # If the methylation type is missing from kinsim_config.yaml,
+                # we fall back to [0] (signal at the modification position
+                # only) and warn the user — they should fill in the YAML.
                 from .utils.config import load_kinsim_config
                 cfg = load_kinsim_config()
-                sig_cfg  = cfg.get("kinetic_signatures", {}).get(mod_name, {})
-                signal_offsets = list(sig_cfg.get("signal_offsets", [0]))
+                sig_cfg  = cfg.get("kinetic_signatures", {}).get(mod_name)
+                if sig_cfg is None or "signal_offsets" not in sig_cfg:
+                    if not getattr(refine_pkl, "_warned_missing_sig", set()).__contains__(mod_name):
+                        log.warning(
+                            "kinsim_config.yaml has no kinetic_signatures entry "
+                            "for '%s' — defaulting to signal_offsets=[0]. "
+                            "Edit kinsim_config.yaml to declare the correct "
+                            "signature offsets for this methylation type.",
+                            mod_name,
+                        )
+                        if not hasattr(refine_pkl, "_warned_missing_sig"):
+                            refine_pkl._warned_missing_sig = set()  # type: ignore[attr-defined]
+                        refine_pkl._warned_missing_sig.add(mod_name)  # type: ignore[attr-defined]
+                    signal_offsets = [0]
+                else:
+                    signal_offsets = list(sig_cfg.get("signal_offsets", [0]))
                 gmm_cfg  = cfg.get("refine", {}).get("gmm_signature", {})
                 k_max          = int(gmm_cfg.get("k_max", 3))
                 cfg_chi2       = float(gmm_cfg.get("chi2_threshold", CHI2_99_2DOF))
