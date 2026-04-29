@@ -128,58 +128,87 @@ def em_fixed_none(
 
 
 def gmm_signature_validate(
-    arr:        np.ndarray,         # (N, SAMPLE_NCOLS) — full sample rows
+    arr:        np.ndarray,         # (N, SAMPLE_NCOLS) — meth bucket samples
     mu_n:       np.ndarray,         # (2,)   None mean (log1p space)
     sigma_n:    np.ndarray,         # (2, 2) None covariance (log1p space)
-    sig_offsets: list[int],          # signature positions in profile (kept for compat)
-    profile_start_col: int,          # column index where profile_IPD_0 starts (compat)
-    profile_len:       int,          # length of the IPD profile (compat)
+    sig_offsets: list[int],          # kept for compat
+    profile_start_col: int,          # kept for compat
+    profile_len:       int,          # kept for compat
     k_max:      int   = 3,
-    chi2_t:     float = 9.21,        # kept for compat — not used by drop-lowest rule
+    chi2_t:     float = 9.21,        # kept for compat
     min_sig_ratio: float = 1.3,      # kept for compat
     min_pi:     float = 0.05,
     ridge:      float = 1e-4,
+    none_arr:   np.ndarray | None = None,   # (M, SAMPLE_NCOLS) — None bucket samples
 ) -> tuple[np.ndarray, np.ndarray, float, str] | None:
-    """GMM clustering + drop-lowest-IPD-cluster rule.
-
-    Assumes inputs have already been filtered upstream (jasmine/motifmaker
-    >= 70% confidence). Under that assumption, every (kmer, meth) bucket
-    contains real methylated samples plus possibly some near-None
-    contamination. The contamination always sits at LOWER IPD than the
-    real methylated cluster (a methylated polymerase is slower, IPD goes
-    UP — never down).
+    """Joint-GMM clustering on combined (None + Meth) samples per kmer.
 
     Algorithm:
-      1. Fit a GMM with K = 1..k_max components on (log1p IPD, log1p PW),
-         BIC selects the best K.
-      2. K = 1: keep everything (no contamination cluster to drop).
-      3. K >= 2: drop the component with the lowest mean IPD (the
-         contamination cluster). Re-estimate (μ_m, Σ_m) from the kept
-         samples (samples assigned to any non-dropped component).
+      1. Stack the (kmer, none) and (kmer, meth) samples into one combined
+         dataset (log1p IPD, log1p PW).
+      2. Fit a GMM with K=2 (or K=3 if BIC prefers, e.g. partial methylation
+         as a third middle cluster).
+      3. Identify the "real meth" cluster as the one with the highest mean
+         IPD. The other cluster(s) are None / contamination.
+      4. For the meth samples only, keep those assigned to the highest-IPD
+         cluster. These are the truly methylated samples; the rest are
+         contamination that snuck through upstream filtering.
+      5. Re-estimate (μ_m, Σ_m) from the kept meth samples.
 
-    Returns (μ_m, Σ_m, π, status) or None if too few samples remain.
+    Why combined GMM (vs Mahalanobis-only): the GMM learns the cluster
+    boundary from the data (using both None and Meth populations) rather
+    than assuming a fixed distance threshold. This is more robust when the
+    None distribution is non-Gaussian or when the meth signal is partial.
     """
     from sklearn.mixture import GaussianMixture
 
     n = len(arr)
     if n < 2:
         return None
+    if none_arr is None or len(none_arr) < 2:
+        return None  # Need a None reference to do joint clustering
 
-    xy_meth = np.log1p(arr[:, :2].astype(np.float32))
+    # --- Build clustering features from the kinetic profile at signature offsets ---
+    # Features = log1p(IPD) at each signature position. For m6A this is
+    # (profile[0], profile[5]); for m4C just (profile[0],); for m5C
+    # (profile[2], profile[6]). At a real methylation event ALL signature
+    # positions are elevated; at contamination none of them are.
+    sig_idx = [i for i in sig_offsets if 0 <= i < profile_len]
+    if not sig_idx:
+        sig_idx = [0]   # fallback to center
+
+    # Profile IPD columns in arr: profile_start_col + 0..profile_len-1
+    def _sig_features(samples: np.ndarray) -> np.ndarray:
+        # samples: (M, ncols) — extract the IPD at each sig offset, log1p them
+        cols = [profile_start_col + i for i in sig_idx]
+        feats = samples[:, cols].astype(np.float32)
+        return np.log1p(feats)
+
+    # Original (IPD, PW) center values — used to compute the final (mu, Sigma)
+    # to store for training. Clustering happens on signature features.
+    xy_meth     = np.log1p(arr[:, :2].astype(np.float32))           # for output
+    feats_meth  = _sig_features(arr)                                 # for clustering
+    feats_none  = _sig_features(none_arr)                            # for clustering
+    feats_combined = np.concatenate([feats_none, feats_meth], axis=0)
+    n_none = len(feats_none)
 
     # --- GMM with K = 1..k_max (BIC selection) ---
+    # --- Joint-GMM on combined (None + Meth) signature features ---
+    # BIC selects K in 1..k_max. K can naturally be > 2 if the data shows
+    # additional structure (partial methylation, outlier subpopulations).
     best_bic = np.inf
     best_gmm = None
+    n_combined = len(feats_combined)
     for k in range(1, k_max + 1):
-        if k > n // 3 and k > 1:
+        if k > n_combined // 3 and k > 1:
             break
         try:
             gmm = GaussianMixture(
                 n_components=k, covariance_type="full",
                 reg_covar=ridge, max_iter=100, n_init=2, random_state=42,
             )
-            gmm.fit(xy_meth)
-            bic = float(gmm.bic(xy_meth))
+            gmm.fit(feats_combined)
+            bic = float(gmm.bic(feats_combined))
             if bic < best_bic:
                 best_bic = bic
                 best_gmm = gmm
@@ -190,38 +219,34 @@ def gmm_signature_validate(
         return None
 
     K_chosen = best_gmm.n_components
-    labels   = best_gmm.predict(xy_meth)
 
-    # --- Per-sample Mahalanobis filter from None ---
-    # Real methylated samples sit far from the None distribution. Samples
-    # within chi2_t of None are contamination that snuck through upstream
-    # filtering — drop them at the sample level.
-    sigma_n_reg = sigma_n + ridge * np.eye(2)
-    try:
-        inv_n = np.linalg.inv(sigma_n_reg)
-    except np.linalg.LinAlgError:
-        return None
-    diff = xy_meth - mu_n                                       # (N, 2)
-    d2   = np.einsum("ij,jk,ik->i", diff, inv_n, diff)          # (N,)
-    far_mask = d2 > chi2_t                                       # far from None
+    # --- Identify the "real methylation" cluster ---
+    # Methylation always RAISES IPD (slower polymerase). The cluster with the
+    # highest mean across the signature feature dimensions is the real meth.
+    # Any other cluster (None, contamination, partial meth, outliers) sits
+    # at lower mean — discarded.
+    mean_per_cluster = best_gmm.means_.mean(axis=1)           # (K,)
+    real_meth_id = int(np.argmax(mean_per_cluster))
 
+    # K=1: there is only one cluster. We can't distinguish meth from None
+    # within this kmer's data — fall back to keeping all meth samples (the
+    # caller still has the upstream jasmine/motifmaker confidence filter).
     if K_chosen == 1:
-        # K=1: pure Mahalanobis filter (no cluster info available).
-        keep_mask = far_mask
-        status_base = "gmm1"
-    else:
-        # K>=2: also drop samples assigned to the lowest-IPD cluster
-        # (the contamination cluster). Combine with per-sample Mahalanobis
-        # filter for extra safety.
-        ipd_means = best_gmm.means_[:, 0]            # (K,)
-        drop_k    = int(np.argmin(ipd_means))         # contamination cluster
-        in_kept_cluster = (labels != drop_k)
-        keep_mask = in_kept_cluster & far_mask
-        status_base = f"gmm{K_chosen}_droplowest"
+        mu_m    = xy_meth.mean(axis=0).astype(np.float32)
+        sigma_m = (np.cov(xy_meth, rowvar=False) + ridge * np.eye(2)).astype(np.float32)
+        if sigma_m.ndim < 2:
+            sigma_m = np.eye(2, dtype=np.float32) * float(sigma_m)
+        if mu_m[0] < mu_n[0]:
+            mu_m[0] = mu_n[0] + 0.05
+        return mu_m, sigma_m, 1.0, "gmm1_kept"
 
+    # --- K >= 2: classify each meth sample, keep only those in the real-meth cluster ---
+    meth_labels = best_gmm.predict(feats_meth)
+    keep_mask = (meth_labels == real_meth_id)
     n_kept = int(keep_mask.sum())
     if n_kept < 3:
-        # Bucket is dominated by contamination → drop it.
+        # Almost no meth sample falls in the highest-IPD cluster — bucket is
+        # dominated by contamination (or partially methylated) → reject.
         return None
 
     xy_kept = xy_meth[keep_mask]
@@ -234,7 +259,7 @@ def gmm_signature_validate(
     pi = float(n_kept / n)
     if pi < min_pi:
         return None
-    return mu_m, sigma_m, pi, f"{status_base}_mahal_kept"
+    return mu_m, sigma_m, pi, f"gmm{K_chosen}_realmeth_kept"
 
 
 def cluster_pick_farthest(
@@ -471,6 +496,7 @@ def refine_pkl(
                         chi2_t=cfg_chi2,
                         min_sig_ratio=min_sig_ratio,
                         min_pi=cfg_min_pi,
+                        none_arr=none_arr,            # joint clustering needs None reference
                     )
                     if result is None:
                         mu_m, sigma_m, pi = mu_n.copy(), sigma_n.copy(), 0.0
