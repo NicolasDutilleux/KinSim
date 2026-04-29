@@ -168,88 +168,89 @@ def gmm_signature_validate(
     if none_arr is None or len(none_arr) < 2:
         return None  # Need a None reference to do joint clustering
 
-    # --- Build clustering features from the kinetic profile at signature offsets ---
-    # Features = log1p(IPD) at each signature position. For m6A this is
-    # (profile[0], profile[5]); for m4C just (profile[0],); for m5C
-    # (profile[2], profile[6]). At a real methylation event ALL signature
-    # positions are elevated; at contamination none of them are.
+    # --- Per-offset clustering: one GMM per signature offset ---
+    # For multi-offset signatures (m6A: [0, 5]; m5C: [2, 6]), each offset
+    # gets its own joint-GMM (None + Meth on that single offset's IPD).
+    # The final keep_mask is the INTERSECTION across all offsets — a sample
+    # must look "real meth" at EVERY signature position to survive.
+    # This is stricter than a single multi-dim GMM and treats each
+    # signature event as an independent confirmation.
     sig_idx = [i for i in sig_offsets if 0 <= i < profile_len]
     if not sig_idx:
         sig_idx = [0]   # fallback to center
 
-    # Profile IPD columns in arr: profile_start_col + 0..profile_len-1
-    def _sig_features(samples: np.ndarray) -> np.ndarray:
-        # samples: (M, ncols) — extract the IPD at each sig offset, log1p them
-        cols = [profile_start_col + i for i in sig_idx]
-        feats = samples[:, cols].astype(np.float32)
-        return np.log1p(feats)
-
     # Original (IPD, PW) center values — used to compute the final (mu, Sigma)
     # to store for training. Clustering happens on signature features.
-    xy_meth     = np.log1p(arr[:, :2].astype(np.float32))           # for output
-    feats_meth  = _sig_features(arr)                                 # for clustering
-    feats_none  = _sig_features(none_arr)                            # for clustering
-    feats_combined = np.concatenate([feats_none, feats_meth], axis=0)
-    n_none = len(feats_none)
+    xy_meth = np.log1p(arr[:, :2].astype(np.float32))
 
     # --- GMM with K = 1..k_max (BIC selection) ---
-    # --- Joint-GMM on combined (None + Meth) signature features ---
-    # BIC selects K in 1..k_max. K can naturally be > 2 if the data shows
-    # additional structure (partial methylation, outlier subpopulations).
-    best_bic = np.inf
-    best_gmm = None
-    n_combined = len(feats_combined)
-    for k in range(1, k_max + 1):
-        if k > n_combined // 3 and k > 1:
-            break
-        try:
-            gmm = GaussianMixture(
-                n_components=k, covariance_type="full",
-                reg_covar=ridge, max_iter=100, n_init=2, random_state=42,
-            )
-            gmm.fit(feats_combined)
-            bic = float(gmm.bic(feats_combined))
-            if bic < best_bic:
-                best_bic = bic
-                best_gmm = gmm
-        except (ValueError, np.linalg.LinAlgError):
+    # --- Per-offset joint-GMM, intersect the keep masks ---
+    # For each signature offset (e.g. +0 and +5 for m6A), fit a 1D
+    # joint-GMM on the combined (None + Meth) IPDs at that offset, identify
+    # the "real meth" cluster (highest mean), classify the meth samples.
+    # A sample must pass at EVERY offset to be kept.
+    keep_masks_per_offset: list[np.ndarray] = []
+    K_per_offset: list[int] = []
+    K_chosen_any_above_1 = False
+
+    for off in sig_idx:
+        col = profile_start_col + off
+        feats_meth_1d = np.log1p(arr[:, col].astype(np.float32)).reshape(-1, 1)
+        feats_none_1d = np.log1p(none_arr[:, col].astype(np.float32)).reshape(-1, 1)
+        feats_combined = np.concatenate([feats_none_1d, feats_meth_1d], axis=0)
+
+        best_bic = np.inf
+        best_gmm = None
+        n_combined = len(feats_combined)
+        for k in range(1, k_max + 1):
+            if k > n_combined // 3 and k > 1:
+                break
+            try:
+                gmm = GaussianMixture(
+                    n_components=k, covariance_type="full",
+                    reg_covar=ridge, max_iter=100, n_init=2, random_state=42,
+                )
+                gmm.fit(feats_combined)
+                bic = float(gmm.bic(feats_combined))
+                if bic < best_bic:
+                    best_bic = bic
+                    best_gmm = gmm
+            except (ValueError, np.linalg.LinAlgError):
+                continue
+
+        if best_gmm is None:
+            return None
+
+        K_off = best_gmm.n_components
+        K_per_offset.append(K_off)
+
+        if K_off == 1:
+            # No separation found at this offset — accept all meth samples
+            # (we can't filter, fall back on upstream confidence).
+            keep_masks_per_offset.append(np.ones(n, dtype=bool))
             continue
 
-    if best_gmm is None:
-        return None
+        K_chosen_any_above_1 = True
+        # Real-meth cluster: highest mean (methylation only raises IPD)
+        mean_per_cluster = best_gmm.means_[:, 0]                # (K,)
+        real_meth_id = int(np.argmax(mean_per_cluster))
+        meth_labels = best_gmm.predict(feats_meth_1d)
+        keep_masks_per_offset.append(meth_labels == real_meth_id)
 
-    K_chosen = best_gmm.n_components
-
-    # --- Identify the "real methylation" cluster ---
-    # Methylation always RAISES IPD (slower polymerase). The cluster with the
-    # highest mean across the signature feature dimensions is the real meth.
-    # Any other cluster (None, contamination, partial meth, outliers) sits
-    # at lower mean — discarded.
-    mean_per_cluster = best_gmm.means_.mean(axis=1)           # (K,)
-    real_meth_id = int(np.argmax(mean_per_cluster))
-
-    # K=1: there is only one cluster. We can't distinguish meth from None
-    # within this kmer's data — fall back to keeping all meth samples (the
-    # caller still has the upstream jasmine/motifmaker confidence filter).
-    if K_chosen == 1:
-        mu_m    = xy_meth.mean(axis=0).astype(np.float32)
-        sigma_m = (np.cov(xy_meth, rowvar=False) + ridge * np.eye(2)).astype(np.float32)
-        if sigma_m.ndim < 2:
-            sigma_m = np.eye(2, dtype=np.float32) * float(sigma_m)
-        if mu_m[0] < mu_n[0]:
-            mu_m[0] = mu_n[0] + 0.05
-        return mu_m, sigma_m, 1.0, "gmm1_kept"
-
-    # --- K >= 2: classify each meth sample, keep only those in the real-meth cluster ---
-    meth_labels = best_gmm.predict(feats_meth)
-    keep_mask = (meth_labels == real_meth_id)
+    # Intersection: a sample passes only if "real meth" at every signature offset
+    keep_mask = np.logical_and.reduce(keep_masks_per_offset)
     n_kept = int(keep_mask.sum())
     if n_kept < 3:
-        # Almost no meth sample falls in the highest-IPD cluster — bucket is
-        # dominated by contamination (or partially methylated) → reject.
         return None
 
-    xy_kept = xy_meth[keep_mask]
+    if not K_chosen_any_above_1:
+        # All offsets ended up K=1 (no separation possible) — keep all
+        # meth samples. The caller's upstream jasmine/motifmaker
+        # confidence is the safety net here.
+        xy_kept = xy_meth
+    else:
+        xy_kept = xy_meth[keep_mask]
+
     mu_m    = xy_kept.mean(axis=0).astype(np.float32)
     sigma_m = (np.cov(xy_kept, rowvar=False) + ridge * np.eye(2)).astype(np.float32)
     if sigma_m.ndim < 2:
@@ -259,7 +260,10 @@ def gmm_signature_validate(
     pi = float(n_kept / n)
     if pi < min_pi:
         return None
-    return mu_m, sigma_m, pi, f"gmm{K_chosen}_realmeth_kept"
+
+    K_str = "_".join(str(k) for k in K_per_offset)              # e.g. "2_3" for m6A
+    status = f"gmm_{K_str}_real_kept" if K_chosen_any_above_1 else "gmm_all1_kept"
+    return mu_m, sigma_m, pi, status
 
 
 def cluster_pick_farthest(
