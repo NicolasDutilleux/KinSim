@@ -48,11 +48,14 @@ KinSim uses Python's standard ``logging`` module throughout.  Call
 for SLURM log files.
 """
 
+from __future__ import annotations
+
 import csv
 import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -291,7 +294,7 @@ _DEFAULT_KINSIM_CONFIG = {
     },
 }
 
-_CACHED_KINSIM_CONFIG: dict | None = None
+_CACHED_KINSIM_CONFIG: Optional[dict] = None
 
 
 def load_kinsim_config(explicit_path: str | None = None) -> dict:
