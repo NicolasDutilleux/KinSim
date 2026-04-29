@@ -192,26 +192,36 @@ def gmm_signature_validate(
     K_chosen = best_gmm.n_components
     labels   = best_gmm.predict(xy_meth)
 
-    # --- K = 1: keep everything ---
-    if K_chosen == 1:
-        mu_m    = best_gmm.means_[0].astype(np.float32).copy()
-        sigma_m = best_gmm.covariances_[0].astype(np.float32)
-        if mu_m[0] < mu_n[0]:
-            mu_m[0] = mu_n[0] + 0.05
-        return mu_m, sigma_m, 1.0, "gmm1_kept"
+    # --- Per-sample Mahalanobis filter from None ---
+    # Real methylated samples sit far from the None distribution. Samples
+    # within chi2_t of None are contamination that snuck through upstream
+    # filtering — drop them at the sample level.
+    sigma_n_reg = sigma_n + ridge * np.eye(2)
+    try:
+        inv_n = np.linalg.inv(sigma_n_reg)
+    except np.linalg.LinAlgError:
+        return None
+    diff = xy_meth - mu_n                                       # (N, 2)
+    d2   = np.einsum("ij,jk,ik->i", diff, inv_n, diff)          # (N,)
+    far_mask = d2 > chi2_t                                       # far from None
 
-    # --- K >= 2: drop the lowest-IPD cluster (contamination) ---
-    # Real methylated samples have HIGHER IPD than baseline (a methylated
-    # polymerase is slower → longer pulse). The component with the smallest
-    # mean log1p(IPD) is the contamination from near-None positions that
-    # snuck through upstream filtering.
-    ipd_means = best_gmm.means_[:, 0]            # (K,)
-    drop_k    = int(np.argmin(ipd_means))         # contamination cluster
-    keep_mask = (labels != drop_k)
-    n_kept    = int(keep_mask.sum())
+    if K_chosen == 1:
+        # K=1: pure Mahalanobis filter (no cluster info available).
+        keep_mask = far_mask
+        status_base = "gmm1"
+    else:
+        # K>=2: also drop samples assigned to the lowest-IPD cluster
+        # (the contamination cluster). Combine with per-sample Mahalanobis
+        # filter for extra safety.
+        ipd_means = best_gmm.means_[:, 0]            # (K,)
+        drop_k    = int(np.argmin(ipd_means))         # contamination cluster
+        in_kept_cluster = (labels != drop_k)
+        keep_mask = in_kept_cluster & far_mask
+        status_base = f"gmm{K_chosen}_droplowest"
+
+    n_kept = int(keep_mask.sum())
     if n_kept < 3:
-        # The "real" cluster is too small — bucket is dominated by
-        # contamination, can't trust either side.
+        # Bucket is dominated by contamination → drop it.
         return None
 
     xy_kept = xy_meth[keep_mask]
@@ -224,8 +234,7 @@ def gmm_signature_validate(
     pi = float(n_kept / n)
     if pi < min_pi:
         return None
-    status = f"gmm{K_chosen}_dropped_lowest"
-    return mu_m, sigma_m, pi, status
+    return mu_m, sigma_m, pi, f"{status_base}_mahal_kept"
 
 
 def cluster_pick_farthest(
