@@ -127,6 +127,83 @@ def em_fixed_none(
     return mu_m, sigma_m, pi, False
 
 
+def cluster_pick_farthest(
+    samples_m: np.ndarray,        # (N, 2) meth samples, log1p space
+    mu_n:      np.ndarray,        # (2,)   None mean
+    sigma_n:   np.ndarray,        # (2, 2) None covariance
+    k_max:     int   = 3,
+    ridge:     float = 1e-4,
+    min_d2:    float = CHI2_99_2DOF,
+) -> tuple[np.ndarray, np.ndarray, float] | None:
+    """Cluster the meth bucket; keep the component farthest from None.
+
+    Steps:
+      1. Fit GMM with K=1..k_max components on the meth samples (BIC selects K).
+      2. Compute Mahalanobis distance from each component centroid to None.
+      3. Return (μ_m, Σ_m) of the component with the largest distance, with π
+         set to that component's mixing weight (fraction of samples assigned).
+      4. If the farthest centroid is still within χ²_{0.99} of None, return
+         None — there is no real meth signal in this bucket.
+
+    Robust to bimodal contamination: when meth samples are a mix of real
+    methylated reads and near-None partial-methylation/false-positive reads,
+    BIC favours K=2 and we keep only the far component.
+
+    Returns:
+        (μ_m, Σ_m, π) on success, or None if no separable cluster found.
+    """
+    from sklearn.mixture import GaussianMixture
+
+    n = len(samples_m)
+    if n < 5:
+        return None
+
+    sigma_n_reg = sigma_n + ridge * np.eye(2)
+    try:
+        inv_n = np.linalg.inv(sigma_n_reg)
+    except np.linalg.LinAlgError:
+        return None
+
+    best_bic = np.inf
+    best_gmm = None
+    for k in range(1, k_max + 1):
+        if k > n // 3:
+            break
+        try:
+            gmm = GaussianMixture(
+                n_components=k, covariance_type="full",
+                reg_covar=ridge, max_iter=100, n_init=2, random_state=42,
+            )
+            gmm.fit(samples_m)
+            bic = float(gmm.bic(samples_m))
+            if bic < best_bic:
+                best_bic = bic
+                best_gmm = gmm
+        except (ValueError, np.linalg.LinAlgError):
+            continue
+
+    if best_gmm is None:
+        return None
+
+    distances = []
+    for kk in range(best_gmm.n_components):
+        diff = best_gmm.means_[kk] - mu_n
+        d2 = float(diff @ inv_n @ diff)
+        distances.append(d2)
+
+    best_k = int(np.argmax(distances))
+    if distances[best_k] < min_d2:
+        return None  # closest component still too close to None
+
+    mu_m    = best_gmm.means_[best_k].astype(np.float32).copy()
+    sigma_m = best_gmm.covariances_[best_k].astype(np.float32)
+    if mu_m[0] < mu_n[0]:
+        mu_m[0] = mu_n[0] + 0.05
+
+    pi = float(best_gmm.weights_[best_k])
+    return mu_m, sigma_m, pi
+
+
 def mahalanobis_fallback(
     samples_m: np.ndarray,
     mu_n:      np.ndarray,
@@ -178,7 +255,7 @@ def refine_pkl(
     min_pi:      float = 0.05,
     min_sep:     float = 0.3,
     seed:        int   = 42,
-    method:      str   = "mahalanobis",
+    method:      str   = "clustered",
     chi2_99:     bool  = True,
 ) -> dict:
     log.info("Loading: %s  (%.2f GB)", in_path, in_path.stat().st_size / 1e9)
@@ -240,7 +317,25 @@ def refine_pkl(
             base_chi2 = CHI2_99_2DOF if chi2_99 else CHI2_95_2DOF
             chi2_t = CHI2_99_2DOF if n_orig < strict_n else base_chi2
 
-            if method == "mahalanobis":
+            if method == "clustered":
+                # Cluster the meth bucket, pick the component farthest from None.
+                # Handles bimodal contamination correctly: BIC selects K=2 when
+                # the bucket is a mix of real meth + near-None contamination,
+                # and we keep only the far cluster.
+                result = cluster_pick_farthest(
+                    xy_meth, mu_n, sigma_n,
+                    k_max=3, min_d2=chi2_t,
+                )
+                if result is None:
+                    mu_m, sigma_m, pi = mu_n.copy(), sigma_n.copy(), 0.0
+                    status = "skip_no_far_cluster"
+                else:
+                    mu_m, sigma_m, pi = result
+                    if pi < min_pi:
+                        status = "skip_low_pi"
+                    else:
+                        status = "clustered_ok"
+            elif method == "mahalanobis":
                 # Hard cutoff: keep only samples beyond the χ² boundary from None.
                 # This sidesteps EM's tendency to fit a wide Gaussian that swallows
                 # both the real meth peak and near-None contamination.
@@ -372,14 +467,17 @@ def main(argv=None):
     ap.add_argument("--min-sep",     type=float, default=0.3,
                     help="Drop keys where ||μ_m - μ_n||/√tr(Σ_n) < this (signal too weak)")
     ap.add_argument("--seed",        type=int,   default=42)
-    ap.add_argument("--method",      choices=["mahalanobis", "em"], default="mahalanobis",
-                    help="Refinement method (default: mahalanobis). "
-                         "'mahalanobis' = hard χ² filter on distance from None; "
-                         "samples beyond the threshold are kept and used to estimate "
-                         "(μ_m, Σ_m). Robust to bimodal contamination. "
-                         "'em' = legacy EM fixed-None mixture; can over-fit when meth "
-                         "signal is bimodal (partial methylation), causing the meth "
-                         "Gaussian to absorb near-None samples and drawing them back.")
+    ap.add_argument("--method", choices=["clustered", "mahalanobis", "em"],
+                    default="clustered",
+                    help="Refinement method (default: clustered). "
+                         "'clustered' = fit GMM with K=1..3 on meth samples (BIC), "
+                         "pick component farthest from None (largest Mahalanobis "
+                         "distance from None centroid). Best when meth signal is "
+                         "bimodal (partial + full methylation). "
+                         "'mahalanobis' = hard χ² filter on each sample's distance "
+                         "from None; estimates (μ_m, Σ_m) from kept samples. "
+                         "'em' = legacy EM fixed-None mixture; can over-fit when "
+                         "meth signal is bimodal.")
     ap.add_argument("--no-chi2-99",  dest="chi2_99", action="store_false",
                     help="Use χ²_{0.95} (5%% rejection) instead of the default "
                          "χ²_{0.99} (1%% rejection). Keeps more samples but lets more "
