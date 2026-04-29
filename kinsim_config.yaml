@@ -7,7 +7,19 @@
 
 # Per-modification kinetic signature: where the IPD/PW signal is observable
 # relative to the modified base position (PacBio HiFi).
+#
+# IMPORTANT — USERS MUST FILL THIS IN for every methylation type their data
+# contains. The signature offsets drive the refine step: GMM clustering
+# happens at these specific positions of the kinetic profile, and a sample
+# must look "real meth" at every signature offset to be kept.
+#
+# If a methylation type is missing here, KinSim falls back to `[0]` (signal
+# expected only at the modification position itself). This is correct for
+# m4C but WRONG for m5C (whose signal is at +2 and +6, not at the C).
+#
 # Reference: PacBio "Detecting DNA Base Modifications" application note.
+# If you discover a strain-specific signature (e.g. m6A at +8 instead of +5),
+# add or override the entry here — no code change needed.
 kinetic_signatures:
   m6A:
     signal_offsets: [0, 5]      # at the modified A AND ~5 bases downstream
@@ -18,6 +30,10 @@ kinetic_signatures:
   m5C:
     signal_offsets: [2, 6]      # +2 and +6 downstream — NOT at the C itself
     description: "Signal at +2 and +6 downstream of modified C"
+  # Add new methylation types here, e.g.:
+  # m4mC:
+  #   signal_offsets: [0, 3]
+  #   description: "..."
 
 # Methylation context window fed to the model (FiLM input).
 # The window is asymmetric and biased UPSTREAM because all kinetic signatures
