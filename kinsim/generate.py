@@ -162,18 +162,19 @@ def generate_signals_batch(
         fractions_bin[idx[~is_meth]] = 0.0
         meth_ids_bin[idx[~is_meth]]  = 0
 
-    # Build (N, K, M) meth context tensor.
-    # Flanking positions: hard one-hot from meth_contexts.
-    # Center position: binarised meth_id + fraction.
-    K_SIZE = K
-    CENTER = K_SIZE // 2
+    # Build (N, L, M) meth context tensor matching the asymmetric window
+    # [-8, +2] used at extraction time. Prediction position lives at index
+    # METH_CTX_LEFT (= 8), NOT at K_SIZE // 2.
+    from .extract import METH_CTX_LEFT, METH_CTX_LEN
+    K_SIZE = METH_CTX_LEN
+    PRED_IDX = METH_CTX_LEFT
     NUM_M  = 4
-    ctx_np = np.array(meth_contexts, dtype=np.int64)  # (N, K)
+    ctx_np = np.array(meth_contexts, dtype=np.int64)  # (N, L)
     meth_full_np = np.zeros((N, K_SIZE, NUM_M), dtype=np.float32)
 
-    # Flanking positions — hard one-hot (reference state)
+    # Non-prediction positions — hard one-hot (upstream/downstream state)
     for pos in range(K_SIZE):
-        if pos == CENTER:
+        if pos == PRED_IDX:
             continue
         flanking_m = ctx_np[:, pos]       # (N,)
         mask = flanking_m > 0
@@ -181,8 +182,8 @@ def generate_signals_batch(
             rows = np.where(mask)[0]
             meth_full_np[rows, pos, flanking_m[rows]] = 1.0
 
-    # Center position — binarised soft label
-    meth_full_np[np.arange(N), CENTER, meth_ids_bin] = fractions_bin
+    # Prediction position — binarised soft label
+    meth_full_np[np.arange(N), PRED_IDX, meth_ids_bin] = fractions_bin
 
     def _run_chunk(k_slice, mf_slice):
         k_t  = torch.tensor(k_slice,  dtype=torch.long,  device=device)
@@ -472,12 +473,16 @@ def _process_batch(
     all_meth_ids    = []
     all_fractions   = []      # stoichiometric fraction per position
     all_rc_kmer_ids = []      # RC kmer IDs for ri/rp inference
-    all_meth_ctxs   = []      # (K,) int array per position — full 11-mer meth context
+    all_meth_ctxs   = []      # (L,) int array per position — meth context [-8, +2]
     is_n_context    = []      # Per-position flag: True = N-context, use default signal
     read_offsets    = [0]
     _K      = K
-    _CENTER = K // 2
-    _ZERO_CTX = np.zeros(_K, dtype=np.int64)  # placeholder for N/unmapped positions
+    from .extract import METH_CTX_LEFT, METH_CTX_RIGHT, METH_CTX_LEN
+    _LEFT     = METH_CTX_LEFT     # 8
+    _RIGHT    = METH_CTX_RIGHT    # 2
+    _CTX_LEN  = METH_CTX_LEN      # 11
+    _PRED_IDX = METH_CTX_LEFT     # prediction position inside the context array
+    _ZERO_CTX = np.zeros(_CTX_LEN, dtype=np.int64)  # placeholder for N/unmapped
 
     n_mapped = n_unmapped = 0
 
@@ -539,15 +544,15 @@ def _process_batch(
                                 # (prob=frac) or not — produces bimodal signal
                                 meth_id = meth_id if np.random.random() < frac else 0
                                 frac    = 1.0 if meth_id > 0 else 0.0
-                            # 11-position meth context from reference map
-                            ctx = np.zeros(_K, dtype=np.int64)
-                            for k_pos in range(_K):
-                                rp_k = ref_pos + k_pos - _CENTER
+                            # Asymmetric meth context [-8, +2] from reference map
+                            ctx = np.zeros(_CTX_LEN, dtype=np.int64)
+                            for k_pos in range(_CTX_LEN):
+                                rp_k = ref_pos + k_pos - _LEFT
                                 if circular:
                                     ctx[k_pos] = int(ref_meth[rp_k % ref_len])
                                 elif 0 <= rp_k < ref_len:
                                     ctx[k_pos] = int(ref_meth[rp_k])
-                            ctx[_CENTER] = meth_id  # override center with binarised state
+                            ctx[_PRED_IDX] = meth_id  # binarised state at prediction pos
                             all_kmer_ids.append(current_kmer)
                             all_rc_kmer_ids.append(_rc_kmer(current_kmer))
                             all_meth_ids.append(meth_id)
@@ -586,9 +591,14 @@ def _process_batch(
                         # (prob=frac) or not — produces bimodal signal
                         meth_id = meth_id if np.random.random() < frac else 0
                         frac    = 1.0 if meth_id > 0 else 0.0
-                    # 11-position meth context from per-read scan
-                    ctx = np.array(meth_status[i - (_K - 1) : i + 1], dtype=np.int64)
-                    ctx[_CENTER] = meth_id  # override center with binarised state
+                    # Asymmetric meth context [-8, +2] from per-read scan
+                    ctx = np.zeros(_CTX_LEN, dtype=np.int64)
+                    n_status = len(meth_status)
+                    for k_pos in range(_CTX_LEN):
+                        rp_k = center + k_pos - _LEFT
+                        if 0 <= rp_k < n_status:
+                            ctx[k_pos] = int(meth_status[rp_k])
+                    ctx[_PRED_IDX] = meth_id  # binarised state at prediction pos
                     all_kmer_ids.append(current_kmer)
                     all_rc_kmer_ids.append(_rc_kmer(current_kmer))
                     all_meth_ids.append(meth_id)

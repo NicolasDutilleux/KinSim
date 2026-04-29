@@ -92,17 +92,21 @@ class MLPSignalDataset(Dataset):
 
     Methylation context output
     --------------------------
-    ``__getitem__`` returns ``meth_full``: a Float[K, num_meth_types] tensor
-    encoding the methylation state at each of the K=11 k-mer positions.
+    ``__getitem__`` returns ``meth_full``: a Float[L, num_meth_types] tensor
+    encoding the methylation state at each of the L=11 positions in the
+    asymmetric meth context window [-8, +2] around the prediction position.
 
-    For a position with meth_id = 1 (m6A) at the center (pos 5):
-        meth_full[5, :] = [0, frac, 0, 0]   ← soft label at center
+    The PREDICTION position (where IPD/PW is measured) sits at index
+    ``METH_CTX_LEFT = 8`` in this tensor — NOT at K//2.
 
-    For a flanking position with meth_id = 2 (m4C, pos 3):
-        meth_full[3, :] = [0, 0, 1.0, 0]    ← hard label at flanking
+    For a sample whose prediction position carries meth_id = 1 (m6A):
+        meth_full[8, :] = [0, frac, 0, 0]   ← soft label at prediction pos
 
-    For an unmethylated position (meth_id = 0, any position):
-        meth_full[pos, :] = [0, 0, 0, 0]    ← all-zero (same as "no info")
+    For an upstream modification (m4C at offset -3 from prediction):
+        meth_full[5, :] = [0, 0, 1.0, 0]    ← hard label at offset -3
+
+    For positions with no modification:
+        meth_full[pos, :] = [0, 0, 0, 0]    ← all-zero (no contribution)
 
     Args:
         pkl_path:       Path to a merged .pkl produced by `kinsim merge`.
@@ -266,16 +270,20 @@ class MLPSignalDataset(Dataset):
         meth_id    = int(self._meth_ids[idx])
         signal     = self._signals[idx]               # already log-transformed
         frac       = float(self._fractions[idx])
-        ctx_ids    = self._meth_ctx[idx]              # (K,) uint8 meth IDs
+        ctx_ids    = self._meth_ctx[idx]              # (L,) uint8 meth IDs ([-8, +2])
 
-        center = self._kmer_size // 2
+        # Prediction position lives at index METH_CTX_LEFT in the asymmetric
+        # context window — NOT at kmer_size // 2 (which would be the centre
+        # of a symmetric kmer-aligned window).
+        from ..extract import METH_CTX_LEFT
+        pred_idx = METH_CTX_LEFT
         meth_full = torch.zeros(self._kmer_size, self._num_meth_types, dtype=torch.float32)
         for pos in range(self._kmer_size):
             m = int(ctx_ids[pos])
             if m > 0:
-                # Center position: soft label via stoichiometric fraction
-                # Flanking positions: hard 1.0 (reference methylation state)
-                meth_full[pos, m] = frac if pos == center else 1.0
+                # Prediction position: soft label via stoichiometric fraction
+                # Other positions: hard 1.0 (upstream/downstream modification)
+                meth_full[pos, m] = frac if pos == pred_idx else 1.0
 
         return (
             torch.tensor(kmer_id, dtype=torch.long),
