@@ -647,11 +647,21 @@ def extract_samples_from_bam(
             n_reads_processed += 1
 
     if use_reverse_strand and n_reads_with_reverse == 0:
-        log.warning(
-            "No ri/rp tags found in %s — reverse strand extraction skipped. "
-            "BAM may not contain complementary-strand kinetics.",
-            bam_path,
-        )
+        # If the BAM uses ip/pw tags (post-bystrandify or post-pbmm2 alignment),
+        # ri/rp do not exist as separate tags — the complementary strand is in
+        # a separate read of its own.  Don't alarm the user; just note the path.
+        if kinetic_tag == "ip":
+            log.info(
+                "No ri/rp in %s (expected — ip/pw BAM, complementary "
+                "strand is in its own read).", bam_path,
+            )
+        else:
+            log.warning(
+                "No ri/rp tags found in %s — reverse strand extraction skipped. "
+                "BAM uses fi/fp but lacks ri/rp; complementary-strand kinetics "
+                "may be missing.",
+                bam_path,
+            )
 
     n_keys    = len(samples)
     n_samples = sum(len(v) for v in samples.values())
