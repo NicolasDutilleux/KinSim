@@ -179,17 +179,24 @@ PROFILE_START = 0
 PROFILE_END   = 8
 PROFILE_LEN   = PROFILE_END - PROFILE_START + 1   # = 9
 
+# Complementary-strand methylation captured at the prediction position
+# and immediate neighbours (active-site footprint). Captures bilateral
+# methylation patterns (palindromic R-M sites) — see CLAUDE.md v4 roadmap.
+REV_METH_OFFSETS = (-1, 0, 1)
+REV_METH_LEN = len(REV_METH_OFFSETS)            # = 3
+
 # Total per-sample column count:
 #   0..1   : IPD center, PW center
 #   2      : fraction
-#   3..13  : mc_0..mc_10  (11 meth context values, [-8, +2])
+#   3..13  : mc_0..mc_10  (11 forward-strand meth context, [-7, +3])
 #   14..22 : profile_IPD_0..+8  (9 values)
 #   23..31 : profile_PW_0..+8   (9 values)
-SAMPLE_NCOLS = 3 + METH_CTX_LEN + 2 * PROFILE_LEN     # = 32
+#   32..34 : rev_meth_-1, rev_meth_0, rev_meth_+1   (complementary strand)
+SAMPLE_NCOLS = 3 + METH_CTX_LEN + 2 * PROFILE_LEN + REV_METH_LEN     # = 35
 
 
 def _slice_meth_context(meth_status, center):
-    """Return an 11-element list covering [-8, +2] around `center`.
+    """Return an 11-element list covering [-7, +3] around `center`.
 
     Out-of-range positions (start of read or end of read) are padded with 0
     (unmethylated) so every sample has the same fixed-length context.
@@ -200,6 +207,23 @@ def _slice_meth_context(meth_status, center):
         pos = center - METH_CTX_LEFT + k
         if 0 <= pos < n:
             out[k] = int(meth_status[pos])
+    return out
+
+
+def _slice_rev_meth(meth_status_complement, center):
+    """Return a list of 3 values: complementary-strand meth_id at offsets
+    [-1, 0, +1] from `center`.
+
+    `meth_status_complement` is the per-position meth_id array of the
+    complementary strand, expressed in this read's coordinates (already
+    reverse-mapped). Out-of-range positions are padded with 0.
+    """
+    n = len(meth_status_complement)
+    out = [0] * REV_METH_LEN
+    for k, off in enumerate(REV_METH_OFFSETS):
+        pos = center + off
+        if 0 <= pos < n:
+            out[k] = int(meth_status_complement[pos])
     return out
 
 
@@ -563,8 +587,15 @@ def extract_samples_from_bam(
             pws     = read.get_tag(pw_tag)
             min_len = min(len(seq), len(ipds), len(pws))
 
-            # Per-read regex scan for methylation positions (forward strand).
+            # Per-read regex scan for methylation positions (this read's strand).
             meth_status = scan_sequence(seq[:min_len], motifs)
+
+            # Complementary-strand methylation in this read's coords:
+            # scan rc_seq, then reverse the array so position k matches
+            # forward read position k (the partner base of read[k]).
+            rc_seq_full = reverse_complement(seq[:min_len])
+            meth_status_rc = scan_sequence(rc_seq_full, motifs)
+            meth_complement = meth_status_rc[::-1]   # in this read's coords
 
             # --- Forward strand: slide kmer_size window, collect fi/fp ---
             current_kmer = 0
@@ -592,7 +623,11 @@ def extract_samples_from_bam(
                     # to validate that the signature pattern (e.g. m5C at +2/+6)
                     # is actually present in the sample's kinetic neighbourhood.
                     profile = _slice_kinetic_profile(ipds, pws, center)
-                    row = [ipd_val, pw_val, frac] + mc + profile
+                    # Complementary-strand methylation at -1, 0, +1 from center
+                    # (active-site footprint). Captures bilateral methylation
+                    # patterns (palindromic R-M Type II sites).
+                    rev_meth = _slice_rev_meth(meth_complement, center)
+                    row = [ipd_val, pw_val, frac] + mc + profile + rev_meth
 
                     counts[key] += 1
                     n = counts[key]
@@ -644,11 +679,18 @@ def extract_samples_from_bam(
                             rp_val = float(rp_tags[fwd_center])
                             frac   = frac_lookup.get(rc_meth_id, 0.0)
 
-                            # 11-position asymmetric meth context [-8, +2] for RC window
+                            # 11-position asymmetric meth context [-7, +3] for RC window
                             rev_mc = _slice_meth_context(rev_meth_status, rc_center)
                             # Kinetic profile aval [0, +8] on the complementary strand
                             profile = _slice_kinetic_profile(ri_tags, rp_tags, fwd_center)
-                            row = [ri_val, rp_val, frac] + rev_mc + profile
+                            # Complementary-strand methylation in rc_seq coords:
+                            # the complementary of rc_seq is the original seq, so
+                            # at rc_center we look at meth_status[fwd_center]; the
+                            # offsets -1, 0, +1 in rc_seq map to fwd_center +1, 0, -1
+                            # in original coords (because rc reverses direction).
+                            rev_complement_in_rc = meth_status[::-1]
+                            rc_rev_meth = _slice_rev_meth(rev_complement_in_rc, rc_center)
+                            row = [ri_val, rp_val, frac] + rev_mc + profile + rc_rev_meth
 
                             counts[rc_key] += 1
                             n = counts[rc_key]
