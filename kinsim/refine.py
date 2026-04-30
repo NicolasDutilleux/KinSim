@@ -261,8 +261,126 @@ def slowed_split(
 
 
 # ---------------------------------------------------------------------------
+# v4 pass-2: secondary p95 filter on category-typed v4 master.pkl
+# ---------------------------------------------------------------------------
+
+
+def slowed_split_v4(
+    data:                 dict,
+    secondary_pct:        float,
+    rng:                  np.random.Generator,
+) -> tuple[dict, dict]:
+    """Pass-2 secondary refine for the v4 36-col format.
+
+    The v4 master.pkl is dict[int kmer_id -> ndarray(N, 36)] with col 35
+    encoding the category (0=baseline, 1=meth, 2=slowed). This pass:
+
+      1. Pools the IPD (col 0) of all baseline samples.
+      2. Computes the secondary_pct percentile of that distribution as the
+         lower threshold for slowed samples.
+      3. Drops any slowed sample whose IPD is below the threshold (the
+         expected slowing did not occur — likely an upstream FP that the
+         pass-1 GMM bucket-level confirmation could not catch at the per-
+         sample level).
+
+    Meth and baseline samples are passed through unchanged.
+
+    Returns (new_data dict, stats dict).
+    """
+    from .utils.sample_layout import (
+        COL_CATEGORY, COL_IPD,
+        CATEGORY_BASELINE, CATEGORY_METH, CATEGORY_SLOWED,
+    )
+
+    # 1. Pool baseline IPDs to compute threshold
+    baseline_ipds: list = []
+    for kid, arr in data.items():
+        if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
+            continue
+        if arr.shape[1] <= COL_CATEGORY:
+            continue
+        cats = arr[:, COL_CATEGORY].astype(np.int8)
+        m = (cats == CATEGORY_BASELINE)
+        if m.any():
+            baseline_ipds.append(arr[m, COL_IPD])
+    if baseline_ipds:
+        pooled = np.concatenate(baseline_ipds)
+        threshold = float(np.percentile(pooled, secondary_pct))
+        log.info("[slowed-split-v4] baseline IPD pool: n=%d, mean=%.2f, "
+                 "median=%.2f, p%g=%.2f (threshold for slowed)",
+                 len(pooled), float(pooled.mean()), float(np.median(pooled)),
+                 secondary_pct, threshold)
+    else:
+        threshold = 0.0
+        log.warning("[slowed-split-v4] no baseline samples — threshold=0")
+
+    # 2. Filter slowed samples by IPD >= threshold
+    new_data: dict = {}
+    n_meth_in = n_meth_out = 0
+    n_baseline_in = n_baseline_out = 0
+    n_slowed_in = n_slowed_kept = n_slowed_dropped = 0
+    for kid, arr in data.items():
+        if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
+            continue
+        if arr.shape[1] <= COL_CATEGORY:
+            continue
+        cats = arr[:, COL_CATEGORY].astype(np.int8)
+        meth_m = (cats == CATEGORY_METH)
+        base_m = (cats == CATEGORY_BASELINE)
+        slow_m = (cats == CATEGORY_SLOWED)
+        n_meth_in     += int(meth_m.sum())
+        n_baseline_in += int(base_m.sum())
+        n_slowed_in   += int(slow_m.sum())
+        # Slowed survivors: IPD >= threshold
+        slow_keep_mask = slow_m & (arr[:, COL_IPD] >= threshold)
+        slow_drop_mask = slow_m & ~slow_keep_mask
+        n_slowed_kept    += int(slow_keep_mask.sum())
+        n_slowed_dropped += int(slow_drop_mask.sum())
+        # Reassemble surviving rows (meth + baseline + filtered slowed).
+        keep_rows = meth_m | base_m | slow_keep_mask
+        if keep_rows.any():
+            new_data[int(kid)] = arr[keep_rows].copy()
+            n_meth_out     += int(meth_m.sum())  # all meth pass through
+            n_baseline_out += int(base_m.sum())  # all baseline pass through
+
+    log.info("[slowed-split-v4] meth:     %d in -> %d kept",
+             n_meth_in, n_meth_out)
+    log.info("[slowed-split-v4] baseline: %d in -> %d kept",
+             n_baseline_in, n_baseline_out)
+    log.info("[slowed-split-v4] slowed:   %d in -> %d kept, %d dropped (IPD < p%g = %.2f)",
+             n_slowed_in, n_slowed_kept, n_slowed_dropped, secondary_pct, threshold)
+
+    stats = {
+        "format":               "v4",
+        "secondary_percentile": secondary_pct,
+        "threshold":            threshold,
+        "n_meth_in":            n_meth_in,
+        "n_baseline_in":        n_baseline_in,
+        "n_slowed_in":          n_slowed_in,
+        "n_meth_out":           n_meth_out,
+        "n_baseline_out":       n_baseline_out,
+        "n_slowed_kept":        n_slowed_kept,
+        "n_slowed_dropped":     n_slowed_dropped,
+    }
+    return new_data, stats
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
+
+
+def _detect_format(data: dict) -> str:
+    """Return 'v3' or 'v4' based on the first non-meta key type."""
+    for k in data:
+        if k == "__meta__":
+            continue
+        if isinstance(k, tuple):
+            return "v3"
+        if isinstance(k, (int, np.integer)):
+            return "v4"
+    return "unknown"
+
 
 def refine_pkl(
     in_path:               Path,
@@ -273,26 +391,53 @@ def refine_pkl(
     n_baseline_per_kmer:   Optional[int]   = None,
     secondary_percentile:  Optional[float] = None,
 ) -> dict:
-    """Refine a KinSim master.pkl with a GLOBAL per-meth-type GMM filter.
+    """Refine a KinSim master.pkl. Auto-detects v3 vs v4 format.
 
-    For each methylation type (m6A, m4C, m5C):
-      1. Pool ALL samples across all (kmer, meth_id) buckets.
-      2. Build a global None reference by sub-sampling all (kmer, none).
-      3. Fit a 2-D GMM (BIC selects K in {2, 3}) on the pooled meth samples.
-      4. Identify the real-meth cluster: highest mean IPD (methylation
-         only RAISES IPD, never lowers it).
-      5. Reject samples assigned to non-real clusters - they are false-
-         positive motif matches. Buckets that shrink below 3 samples are
-         dropped entirely.
+    v3 input (tuple keys, 35-col arrays):
+      Pass-1 GMM filter on (kmer, T) buckets — keeps real-meth-cluster
+      samples, drops false-positive motif matches. Followed by an optional
+      pass-2 slowed-split (heuristic, motif-match-based).
 
-    The output keeps all (kmer, none) buckets unchanged plus the surviving
-    (kmer, meth) buckets that contain only the real-meth-cluster samples.
+    v4 input (int kmer keys, 36-col arrays with CATEGORY column):
+      Pass-2 only — secondary p95 filter on slowed samples. Pass-1 GMM
+      has already happened upstream when the v4 extract used a refined
+      master_clean.pkl as confirmed-meth source.
     """
     log.info("Loading: %s  (%.2f GB)", in_path, in_path.stat().st_size / 1e9)
     with open(in_path, "rb") as f:
         data = pickle.load(f)
     orig_meta = data.pop("__meta__", None)
     rng = np.random.default_rng(seed)
+
+    fmt = _detect_format(data)
+    log.info("Refine: detected format = %s", fmt)
+
+    # ---- v4 path: secondary p95 filter only ----
+    if fmt == "v4":
+        if not enable_slowed_split:
+            log.warning("v4 input but --no-slowed-split given — output is "
+                        "the input verbatim minus __meta__.")
+            new_data = {k: v.copy() for k, v in data.items()
+                        if isinstance(k, (int, np.integer))}
+            stats = {"format": "v4", "skipped": True}
+        else:
+            sec_pct = (secondary_percentile if secondary_percentile is not None
+                       else 95.0)
+            new_data, stats = slowed_split_v4(data, sec_pct, rng)
+        new_data["__meta__"] = {
+            "refined_from":  str(in_path),
+            "method":        "slowed_split_v4",
+            "format":        "v4",
+            "seed":          seed,
+            "stats":         stats,
+            "original_meta": orig_meta,
+        }
+        log.info("Writing: %s", out_path)
+        with open(out_path, "wb") as f:
+            pickle.dump(new_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        return stats
+
+    # ---- v3 path: full pass-1 GMM + optional pass-2 (existing behaviour) ----
 
     # 1. Group buckets by meth_id
     none_buckets = {}

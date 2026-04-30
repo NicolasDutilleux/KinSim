@@ -1099,29 +1099,35 @@ def merge_shards(
 ) -> None:
     """Merge multiple shard pickle files into one master training set.
 
+    Auto-detects shard format by inspecting the first non-meta key:
+      - tuple key  -> v3 format (kmer_id, meth_id) -> ndarray(N, 35)
+      - int key    -> v4 format kmer_id            -> ndarray(N, 36)
+
+    Mixing v3 and v4 shards in the same merge is rejected (the model loaders
+    expect a single layout).
+
     Looks for shard files in input_dir using the following precedence:
-      1. ``*_shard.pkl`` (produced by ``kinsim extract --manifest``)
-      2. ``*_cgan.pkl``  (legacy naming, kept for backward compat)
+      1. ``*_shard_v4.pkl``  (produced by v4 ``kinsim extract --refined-pkl``)
+      2. ``*_shard.pkl``     (produced by ``kinsim extract`` bootstrap)
+      3. ``*_cgan.pkl``      (legacy naming, kept for backward compat)
 
     Override with ``glob_pattern`` to use a custom pattern.
 
     After concatenation, keys exceeding max_samples_per_key are randomly
-    subsampled to keep the master file manageable.
+    subsampled to keep the master file manageable. For v4 (integer kmer
+    keys), this caps total samples PER KMER across all categories
+    (meth + slowed + baseline). To preserve the per-category balance, set
+    a generous cap (e.g. 500-1000 per kmer for v4).
 
-    The ``"__meta__"`` key (provenance) is merged across all shards and stored
-    in the output.
-
-    Args:
-        input_dir:           Directory containing shard .pkl files.
-        output_file:         Path for the merged output .pkl file.
-        max_samples_per_key: Maximum samples to keep per (kmer, meth_id).
-        glob_pattern:        Glob pattern for shard files; "auto" tries
-                             ``*_shard.pkl`` then ``*_cgan.pkl``.
+    The ``"__meta__"`` key (provenance) is merged across all shards and
+    stored in the output, with a ``"format"`` field set to "v3" or "v4".
     """
     import glob as _glob
 
     if glob_pattern == "auto":
-        files = _glob.glob(os.path.join(input_dir, "*_shard.pkl"))
+        files = _glob.glob(os.path.join(input_dir, "*_shard_v4.pkl"))
+        if not files:
+            files = _glob.glob(os.path.join(input_dir, "*_shard.pkl"))
         if not files:
             files = _glob.glob(os.path.join(input_dir, "*_cgan.pkl"))
         if not files:
@@ -1140,6 +1146,17 @@ def merge_shards(
 
     master: dict = defaultdict(list)
     shard_metas: list = []
+    detected_format: str | None = None    # "v3" or "v4"
+
+    def _detect_format(shard: dict) -> str | None:
+        for k in shard:
+            if k == "__meta__":
+                continue
+            if isinstance(k, tuple):
+                return "v3"
+            if isinstance(k, (int, np.integer)):
+                return "v4"
+        return None
 
     for f_path in files:
         log.info("  Loading shard: %s", os.path.basename(f_path))
@@ -1150,9 +1167,24 @@ def merge_shards(
         if "__meta__" in shard:
             shard_metas.append(shard.pop("__meta__"))
 
+        f_format = _detect_format(shard)
+        if f_format is None:
+            log.warning("    skipping (no data keys): %s", f_path)
+            continue
+        if detected_format is None:
+            detected_format = f_format
+            log.info("  Format detected: %s", detected_format)
+        elif f_format != detected_format:
+            log.error("Cannot mix v3 (tuple keys) and v4 (int keys) shards in "
+                      "one merge. Found %s in %s but earlier shards were %s.",
+                      f_format, f_path, detected_format)
+            sys.exit(1)
+
         for key, arr in shard.items():
-            if not isinstance(key, tuple):
-                continue   # skip any other non-data keys
+            if detected_format == "v3" and not isinstance(key, tuple):
+                continue
+            if detected_format == "v4" and not isinstance(key, (int, np.integer)):
+                continue
             master[key].append(arr)
 
     result = {}
@@ -1182,6 +1214,7 @@ def merge_shards(
     # Merged metadata
     result["__meta__"] = {
         "kinsim_version":     _KINSIM_VERSION,
+        "format":             detected_format or "unknown",
         "merged_from":        [m.get("source_bam", "?") for m in shard_metas],
         "meth_types":         merged_meth_types,
         "n_shards":           len(files),
@@ -1194,8 +1227,8 @@ def merge_shards(
         pickle.dump(result, f)
 
     total_keys    = len(result) - 1   # exclude __meta__
-    total_samples = sum(len(v) for k, v in result.items() if isinstance(k, tuple))
-    log.info("Master dataset saved: %s", output_file)
+    total_samples = sum(len(v) for k, v in result.items() if k != "__meta__")
+    log.info("Master dataset saved: %s  (format=%s)", output_file, detected_format)
     log.info(
         "  %d unique contexts, %d total samples (%d keys subsampled to cap=%d)",
         total_keys, total_samples, n_subsampled, max_samples_per_key,
