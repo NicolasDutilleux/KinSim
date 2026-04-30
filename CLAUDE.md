@@ -13,6 +13,45 @@ Two CLI tools are installed from the same repository:
 - **`kinsim`**      — ML pipeline: extract, merge, train, generate, evaluate, analyze
 - **`kinsim-prep`** — Data preparation: rebase, merge-motifs, manifest, filter, balance, parse
 
+## v4 Training Set (current)
+
+The v4 architecture (April-May 2026) extends extraction to capture
+**positions of expected kinetic signature** in addition to methylation
+positions themselves. Rationale: m6A/m4C/m5C signatures are observed at
+configured downstream offsets (m6A at 0 and +5, m5C at +2 and +6, etc.,
+declared in `kinsim_config.yaml`). Training only on methylation centers
+deprives the model of the slowing signal at those offsets.
+
+**Pipeline (run once per strain or species):**
+
+```
+  Pass 1 (bootstrap, 35-col v3 layout):
+    BAM + motifs --> kinsim extract                    --> shard.pkl
+                  --> kinsim merge                     --> master.pkl
+                  --> kinsim refine          (GMM)      --> master_clean.pkl
+
+  Pass 2 (v4, 36-col CATEGORY-column layout, kmer-only keys):
+    BAM + motifs + master_clean.pkl
+                  --> kinsim extract --refined-pkl PATH --> shard_v4.pkl
+                  --> kinsim merge   (auto-detects v4)  --> master_v4.pkl
+                  --> kinsim refine  (auto-detects v4)  --> master_v4_clean.pkl
+                                       (p95 IPD filter on slowed only)
+                  --> kinsim train                       --> checkpoint.pt
+```
+
+**Per-position emission rules in v4 extract:**
+- METH samples at confirmed methylation centers (kmer survived pass-1 GMM).
+- SLOWED samples at positions p+k for each k>0 in `signature_offsets[T]`
+  (with k=0 already covered by the meth bucket).
+- BASELINE samples elsewhere, gated by `baseline_min_dist_to_meth ≥ K`
+  so meth_context never contains a methylation. Capped per kmer at
+  `n_baseline_per_kmer` via end-of-stream uniform subsample.
+
+The v3 path is retained as the bootstrap step that produces the
+master_clean.pkl needed by the v4 extract. There is no `kinsim extract
+--legacy-v3` flag — the same `kinsim extract` command emits v3 format
+when `--refined-pkl` is absent.
+
 ---
 
 ## Repository Layout
@@ -27,7 +66,7 @@ KinSim/
 │   ├── __main__.py                 CLI router (v0.4.0)
 │   │
 │   ├── extract.py                  BAM extraction + shard merging (motif-based, manifest-driven)
-│   ├── refine.py                   EM fixed-None cleanup of merged .pkl (kinsim refine)
+│   ├── refine.py                   GMM pass-1 (v3) + p95 slowed-split (v4)
 │   ├── train.py                    supervised training loop (ConvPredictor/MLPPredictor)
 │   ├── generate.py                 BAM generation with trained model
 │   ├── evaluate.py                 calibration report + per-kmer distribution plots
@@ -113,7 +152,7 @@ KinSim/
     ├── ml/                         ML pipeline — generic across Vega/Sequel/Strepto
     │   ├── 00_extract.slurm        kinsim extract (array per manifest row)
     │   ├── 01_merge.slurm          kinsim merge shards → master.pkl
-    │   ├── 02_refine.slurm         kinsim refine (EM fixed-None) → master_clean.pkl
+    │   ├── 02_refine.slurm         kinsim refine — pass-1 GMM (v3) or pass-2 p95 (v4)
     │   ├── 03_train.slurm          kinsim train (1 GPU)
     │   ├── 04_generate.slurm       kinsim generate on PBSIM3 reads (array)
     │   ├── 05_evaluate.slurm       kinsim evaluate
@@ -221,6 +260,13 @@ refine:
     min_signature_ratio: 1.3
     min_pi: 0.05
     min_samples_for_gmm: 5
+  slowed_split:                    # v4 pass-2 (operates on v4 36-col input)
+    n_baseline_per_kmer: 50
+    secondary_percentile: 95
+
+extract:                           # v4 extract knobs
+  n_baseline_per_kmer:        50   # per-kmer baseline cap
+  baseline_min_dist_to_meth:  11   # bases (>= K so meth_context stays clean)
 ```
 
 Strain-specific signatures (e.g. m6A at +8 instead of +5 for some
@@ -236,6 +282,29 @@ get_extended_context(ref, pos, k) -> str            # extract 11-mer from refere
 discover_pbsim3_layout(directory) -> list[dict]     # auto-detect flat vs subdirectory
 ```
 
+### `kinsim/utils/sample_layout.py`
+Per-sample column layout, format detection, category inference. Pure
+Python (no pysam) so refine/dataset/tests can import it without the
+extract/BAM dependency.
+
+```python
+SAMPLE_NCOLS_V3 = 35    # legacy bootstrap layout
+SAMPLE_NCOLS    = 36    # v4 layout (= V3 + 1 CATEGORY column)
+COL_CATEGORY    = 35    # last col on v4
+CATEGORY_BASELINE = 0
+CATEGORY_METH     = 1
+CATEGORY_SLOWED   = 2
+
+is_v4_format(arr)    -> bool   # True iff arr.shape[1] >= 36
+get_categories(arr, signature_offsets_by_meth=None) -> int8 ndarray
+    # v4: arr[:, COL_CATEGORY]
+    # v3: inferred from meth_context (mc[7] -> meth; upstream sig offset hit -> slowed; else baseline)
+
+slice_meth_context(meth_status, center) -> list[11]
+slice_rev_meth(meth_status_complement, center) -> list[3]
+slice_kinetic_profile(ipds, pws, center) -> list[18]
+```
+
 ### `kinsim/data/dataset.py`
 Dataset class and signal transforms. Never import transforms from model files.
 
@@ -243,10 +312,11 @@ Dataset class and signal transforms. Never import transforms from model files.
 log_transform(x: Tensor) -> Tensor      # log1p -- raw [0,255] -> training space
 inv_log_transform(x: Tensor) -> Tensor  # expm1 clamped to [0,255] -- inference
 
-class MLPSignalDataset(Dataset):   # flat-sample dataset with dynamic capping
-    # Returns (kmer_id, meth_probs, log_signal, meth_id) tuples
-    # Dynamic capping: unmeth <= 20, meth <= 100 samples per key
-    # Stoichiometric soft labels from per-sample fraction column
+class MLPSignalDataset(Dataset):
+    # Auto-detects v3 (tuple keys, per-bucket cap) vs v4 (int kmer keys,
+    # no resampling — extract has already capped baseline).
+    # Returns (kmer_id, meth_probs, log_signal, meth_id) tuples.
+    # For v4, meth_id at center is read from mc[KMER_PRED_IDX] (col 10).
 ```
 
 ### `kinsim/extract.py`
@@ -256,9 +326,19 @@ methylation context fed to FiLM, so a separate aligned-BAM path is unnecessary).
 
 ```python
 validate_bam_kinetics(bam_path, n_check=10)
-extract_samples_from_bam(bam_path, motif_string, ...)    # motif-based (raw HiFi or bystrandified)
-merge_shards(input_dir, output_file, max_samples_per_key=50000)
+
+# v3 bootstrap path (no --refined-pkl): emits dict[(kmer, meth_id)] -> 35-col
+extract_samples_from_bam(bam_path, motif_string, ...)
 extract_from_manifest_task(manifest_path, task_index, output_dir, ...)
+
+# v4 path (with --refined-pkl PATH): emits dict[kmer_id] -> 36-col with CATEGORY
+extract_samples_v4_from_bam(bam, motif_string, refined_pkl_path,
+                             n_baseline_per_kmer=50,
+                             baseline_min_dist_to_meth=K, ...)
+extract_v4_from_manifest_task(...)
+
+# Auto-detects v3 vs v4 shards, rejects mixing both
+merge_shards(input_dir, output_file, max_samples_per_key=50000)
 ```
 
 **Supported BAM formats:**
@@ -412,19 +492,27 @@ Real PacBio BAMs (raw HiFi or bystrandified — never aligned post-pbmm2)
       |
       v  manifest.csv  [sample_id, bam_path, motifs]
       |
+      |  ---- v3 BOOTSTRAP (run once to confirm methylations) ----
       v  kinsim extract --manifest manifest.csv --task $TASK --output-dir shards/
-      v  (motif-based: scans read sequence, tags positions of modification)
-strain1_shard.pkl  strain2_shard.pkl  ...
+strain1_shard.pkl  strain2_shard.pkl  ...   (v3: 35 cols, (kmer, meth_id) keys)
       |
-      v  kinsim merge shards/ master_data.pkl
+      v  kinsim merge shards/ master.pkl
       |
-      v  kinsim refine master_data.pkl master_clean.pkl --report refine.tsv
-      v  (per-offset joint-GMM: drops contamination cluster per kmer)
-master_clean.pkl
+      v  kinsim refine master.pkl master_clean.pkl --report refine.tsv
+master_clean.pkl                       (v3 format, used as confirmed-meth source)
       |
-      v  (optional) kinsim-prep filter master_clean.pkl training_data.pkl --min-coverage 50
-      v
-      v  kinsim train master_clean.pkl checkpoints/
+      |  ---- v4 EXTRACT (uses master_clean.pkl for confirmation) ----
+      v  kinsim extract --manifest manifest.csv --task $TASK \
+                         --refined-pkl master_clean.pkl --output-dir shards_v4/
+strain1_shard_v4.pkl ...               (v4: 36 cols + CATEGORY, key=kmer_id)
+      |
+      v  kinsim merge shards_v4/ master_v4.pkl
+      |
+      v  kinsim refine master_v4.pkl master_v4_clean.pkl
+      v  (auto-detects v4: applies p95 IPD filter on slowed only)
+master_v4_clean.pkl
+      |
+      v  kinsim train master_v4_clean.pkl checkpoints/
       v
 checkpoint_epoch50.pt + model_config.json
       |
@@ -458,7 +546,7 @@ verify_report.tsv
 # kinsim -- ML pipeline --------------------------------------------------
 kinsim extract                -> kinsim/extract.py
 kinsim merge                  -> kinsim/extract.py
-kinsim refine                 -> kinsim/refine.py           (EM fixed-None cleanup)
+kinsim refine                 -> kinsim/refine.py           (v3 GMM pass-1, v4 p95 pass-2)
 kinsim train                  -> kinsim/train.py
 kinsim generate               -> kinsim/generate.py
 kinsim evaluate               -> kinsim/evaluate.py

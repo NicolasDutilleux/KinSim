@@ -33,8 +33,11 @@ EXTRACT_CONCURRENT=4
 paths() {
     local prefix=$1
     SHARDS="${prefix}/shards"
+    SHARDS_V4="${prefix}/shards_v4"
     MASTER="${prefix}/master.pkl"
-    MASTER_CLEAN="${prefix}/master_clean.pkl"
+    MASTER_CLEAN="${prefix}/master_clean.pkl"          # v3 GMM-refined (used as confirmation source)
+    MASTER_V4="${prefix}/master_v4.pkl"                # v4 merged
+    MASTER_V4_CLEAN="${prefix}/master_v4_clean.pkl"    # v4 after p95 secondary refine
     REFINE_REPORT="${prefix}/refine_report.tsv"
     CKPT_DIR="${prefix}/checkpoints"
     GEN_DIR="${prefix}/generated"
@@ -64,6 +67,36 @@ submit_refine() {
     paths "$prefix"
     sbatch --parsable $d \
         "${HERE}/02_refine.slurm" "$MASTER" "$MASTER_CLEAN" "$REFINE_REPORT"
+}
+
+submit_extract_v4() {
+    # v4 extract: uses master_clean.pkl from the v3 bootstrap as the source
+    # of confirmed methylations. Emits 36-col shards keyed by kmer_id only,
+    # with CATEGORY (col 35) marking baseline/meth/slowed.
+    local manifest=$1; local prefix=$2; local dep=${3:-}
+    local d=""; [ -n "$dep" ] && d="--dependency=afterok:${dep}"
+    paths "$prefix"
+    local n; n=$(kinsim-prep manifest count "$manifest")
+    mkdir -p "$SHARDS_V4"
+    sbatch --parsable $d --array=1-${n}%${EXTRACT_CONCURRENT} \
+        "${HERE}/00b_extract_v4.slurm" "$manifest" "$SHARDS_V4" "$MASTER_CLEAN"
+}
+
+submit_merge_v4() {
+    local prefix=$1; local dep=${2:-}
+    local d=""; [ -n "$dep" ] && d="--dependency=afterany:${dep}"
+    paths "$prefix"
+    sbatch --parsable $d "${HERE}/01_merge.slurm" "$SHARDS_V4" "$MASTER_V4"
+}
+
+submit_refine_v4() {
+    # v4 refine: kinsim refine auto-detects v4 input and runs the p95
+    # secondary filter on slowed samples only.
+    local prefix=$1; local dep=${2:-}
+    local d=""; [ -n "$dep" ] && d="--dependency=afterok:${dep}"
+    paths "$prefix"
+    sbatch --parsable $d \
+        "${HERE}/02_refine.slurm" "$MASTER_V4" "$MASTER_V4_CLEAN"
 }
 
 submit_train() {
@@ -169,7 +202,21 @@ case "$STEP" in
         PREFIX=${2:?"prefix required"}
         J=$(submit_analyze "$PREFIX"); echo "ml.07 analyze:  $J"
         ;;
+    extract-v4)
+        MANIFEST=${2:?"manifest required"}; PREFIX=${3:?"prefix required"}
+        J=$(submit_extract_v4 "$MANIFEST" "$PREFIX")
+        echo "ml.00b extract-v4: $J"
+        ;;
+    merge-v4)
+        PREFIX=${2:?"prefix required"}
+        J=$(submit_merge_v4 "$PREFIX"); echo "ml.01b merge-v4:  $J"
+        ;;
+    refine-v4)
+        PREFIX=${2:?"prefix required"}
+        J=$(submit_refine_v4 "$PREFIX"); echo "ml.02b refine-v4: $J"
+        ;;
     all)
+        # Bootstrap chain (v3): produces master_clean.pkl needed by v4.
         MANIFEST=${2:?"manifest required"}; PREFIX=${3:?"prefix required"}
         J0=$(submit_extract "$MANIFEST" "$PREFIX");  echo "ml.00 extract:  $J0"
         J1=$(submit_merge   "$PREFIX" "$J0");        echo "ml.01 merge:    $J1 (after $J0)"
@@ -181,26 +228,56 @@ case "$STEP" in
         echo "  bash $0 generate $PREFIX <pbsim3_dir> <motifs>"
         echo "  bash $0 verify   $MANIFEST $PREFIX"
         ;;
+    all-v4)
+        # Full v4 chain: v3 bootstrap (extract + merge + refine) -> v4 extract
+        # using the bootstrap's master_clean -> v4 merge -> v4 refine -> train.
+        MANIFEST=${2:?"manifest required"}; PREFIX=${3:?"prefix required"}
+        J0=$(submit_extract "$MANIFEST" "$PREFIX");          echo "ml.00  extract:    $J0"
+        J1=$(submit_merge   "$PREFIX" "$J0");                echo "ml.01  merge:      $J1 (after $J0)"
+        J2=$(submit_refine  "$PREFIX" "$J1");                echo "ml.02  refine:     $J2 (after $J1)"
+        J3=$(submit_extract_v4 "$MANIFEST" "$PREFIX" "$J2"); echo "ml.00b extract-v4: $J3 (after $J2)"
+        J4=$(submit_merge_v4 "$PREFIX" "$J3");               echo "ml.01b merge-v4:   $J4 (after $J3)"
+        J5=$(submit_refine_v4 "$PREFIX" "$J4");              echo "ml.02b refine-v4:  $J5 (after $J4)"
+        # Train on v4 final (override MASTER_CLEAN to v4 path)
+        paths "$PREFIX"
+        mkdir -p "$CKPT_DIR"
+        J6=$(sbatch --parsable --dependency=afterok:${J5} \
+                "${HERE}/03_train.slurm" "$MASTER_V4_CLEAN" "$CKPT_DIR")
+        echo "ml.03  train-v4:   $J6 (after $J5)"
+        J7=$(submit_evaluate "$PREFIX" "$J6"); echo "ml.05  evaluate:   $J7 (after $J6)"
+        ;;
     *)
         cat <<EOF
 Usage: bash slurm_kinsim/ml/run.sh <step> [args...]
 
-Steps:
-  extract  <manifest.csv> <prefix>                       array per manifest row
+Steps (v3 bootstrap):
+  extract  <manifest.csv> <prefix>                       array per manifest row, 35-col tuple-keyed shards
   merge    <prefix>                                       shards → master.pkl
-  refine   <prefix>                                       EM fixed-None cleanup
-  analyze  <prefix>                                       kinsim analyze on master_clean.pkl (distribution report)
-  train    <prefix> [flags...]                            train ConvPredictor on master_clean.pkl
+  refine   <prefix>                                       GMM pass-1 → master_clean.pkl
+
+Steps (v4):
+  extract-v4 <manifest.csv> <prefix>                     array, requires master_clean.pkl, 36-col CATEGORY shards
+  merge-v4   <prefix>                                     shards_v4/ → master_v4.pkl
+  refine-v4  <prefix>                                     p95 secondary filter → master_v4_clean.pkl
+
+Common:
+  analyze  <prefix>                                       kinsim analyze on master_clean.pkl
+  train    <prefix> [flags...]                            train ConvPredictor on master_clean.pkl (v3) — for v4 use all-v4
   generate <prefix> <pbsim3_dir> <motifs> [epoch]         array per PBSIM3 species
   evaluate <prefix>                                       calibration report
   verify   <manifest.csv> <prefix> [gen_dir]              kinsim verify-generate per sample
-  all      <manifest.csv> <prefix>                        chain extract→merge→refine→train→evaluate
+
+Chains:
+  all      <manifest.csv> <prefix>                        v3-only: extract→merge→refine→train→evaluate
+  all-v4   <manifest.csv> <prefix>                        full v4: bootstrap → v4 extract → merge-v4 → refine-v4 → train → evaluate
 
 Prefix layout:
-  <prefix>/shards/              per-sample *_shard.pkl
-  <prefix>/master.pkl           merged
-  <prefix>/master_clean.pkl     refined
-  <prefix>/refine_report.tsv
+  <prefix>/shards/              v3 per-sample *_shard.pkl
+  <prefix>/shards_v4/           v4 per-sample *_shard_v4.pkl
+  <prefix>/master.pkl           v3 merged
+  <prefix>/master_clean.pkl     v3 GMM-refined (also confirmation source for v4 extract)
+  <prefix>/master_v4.pkl        v4 merged
+  <prefix>/master_v4_clean.pkl  v4 after p95 secondary refine — input to train-v4
   <prefix>/checkpoints/         model_config.json + checkpoint_epoch*.pt
   <prefix>/generated/           generated BAMs (from step 04)
   <prefix>/verify/              per-sample verify tsvs (from step 06)
