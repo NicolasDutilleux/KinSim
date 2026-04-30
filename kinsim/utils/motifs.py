@@ -33,7 +33,7 @@ import re
 import subprocess
 import tempfile
 import numpy as np
-from .encoding import METH_IDS
+from .encoding import METH_IDS, get_meth_ids
 
 log = logging.getLogger(__name__)
 
@@ -175,7 +175,7 @@ def parse_motifs(motif_string, revcomp=True):
 
     for parts in user_entries:
         m_type, seq, pos = parts[0], parts[1], parts[2]
-        m_id = METH_IDS.get(m_type, 0)
+        m_id = get_meth_ids().get(m_type, 0)
         mod_pos = int(pos) - 1  # 1-based input → 0-based internal
 
         pairs = [(seq, mod_pos)]

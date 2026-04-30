@@ -28,7 +28,56 @@ BASE_MAP     = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
 INT_TO_BASE  = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
 VALID_BASES  = set('ACGT')
 
+# Default methylation type → integer mapping. Extended at runtime by
+# `get_meth_ids()` based on the entries declared in kinsim_config.yaml's
+# `kinetic_signatures` section. The default fallback below covers the three
+# standard PacBio modifications; users adding new types only need to declare
+# them in kinsim_config.yaml — no code change required.
 METH_IDS = {'none': 0, 'm6A': 1, 'm4C': 2, 'm5C': 3}
+
+
+def get_meth_ids() -> dict:
+    """Return a complete mod_type → int mapping, expanded from kinsim_config.yaml.
+
+    Always includes 'none' = 0. Then assigns sequential integers (1, 2, ...)
+    to the methylation types declared under `kinetic_signatures` in
+    kinsim_config.yaml. Standard types (m6A, m4C, m5C) keep their default IDs
+    when present; new types declared in the YAML get auto-assigned.
+
+    Adding a new methylation type to KinSim:
+      1. Edit kinsim_config.yaml:
+           kinetic_signatures:
+             m4mC:
+               signal_offsets: [0, 3]
+               description: "..."
+      2. That's it. extract / refine / generate / analyze all pick it up
+         from get_meth_ids() at runtime.
+    """
+    try:
+        # Lazy import to avoid circular dependency: utils.config imports motifs
+        # which imports encoding.
+        from .config import load_kinsim_config
+        cfg = load_kinsim_config()
+    except Exception:
+        return dict(METH_IDS)
+
+    user_types = list(cfg.get("kinetic_signatures", {}).keys())
+    out = {'none': 0}
+    next_id = 1
+    # Preserve standard IDs when present
+    for std in ('m6A', 'm4C', 'm5C'):
+        if std in user_types:
+            out[std] = METH_IDS.get(std, next_id)
+            next_id = max(next_id, out[std] + 1)
+    # Assign IDs to any additional user-declared types
+    for name in user_types:
+        if name in out:
+            continue
+        out[name] = next_id
+        next_id += 1
+    return out
+
+
 TOTAL_POSSIBLE_KMERS = 4 ** K  # 4,194,304 for K=11
 
 

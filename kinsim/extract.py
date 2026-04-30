@@ -57,7 +57,7 @@ from pathlib import Path
 import numpy as np
 import pysam
 
-from .utils.encoding import BASE_MAP, K, KMER_MASK, METH_IDS, kmer_mask
+from .utils.encoding import BASE_MAP, K, KMER_MASK, METH_IDS, get_meth_ids, kmer_mask
 from .utils.motifs import (filter_motif_string_by_types, load_motif_string,
                            parse_meth_types_arg, parse_motifs,
                            reverse_complement, scan_sequence)
@@ -152,7 +152,7 @@ def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
         parts = entry.split(',')
         if len(parts) < 3:
             continue
-        m_id = METH_IDS.get(parts[0], 0)
+        m_id = get_meth_ids().get(parts[0], 0)
         frac = float(parts[4]) if len(parts) >= 5 else 1.0
         fracs[m_id] = frac
     return fracs
