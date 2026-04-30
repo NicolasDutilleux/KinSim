@@ -653,3 +653,21 @@ torch.save({
 | meth_proj_dim | 8 | `kinsim/models/predictor.py` |
 | ConvPredictor params | ~140K | `kinsim/models/predictor.py` |
 | MLPPredictor params | ~268M | `kinsim/models/predictor.py` |
+
+---
+
+## Future Work / v4 Roadmap
+
+### Complementary-strand methylation channel
+**Problem:** for palindromic methylation sites (Type II R-M systems), both strands carry an m6A. The polymerase generating one strand's read physically contacts both strands of the duplex (~12 bp footprint), so the methylation on the OPPOSITE strand also affects IPD/PW. Currently only forward-strand methylation is encoded in the FiLM input — the model has no signal about the complementary-strand methylation at the same genomic position.
+
+**Observation:** on bc2033 (HMB-10), the m6A profile shows a strong IPD spike at +8 in addition to the expected peak at +0. This is the kinetic footprint of the bilateral methylation: the reverse strand's m6A sits 8 bp downstream of the forward m6A on the same site, and its steric effect on the polymerase is what produces the +8 spike.
+
+**Proposed addition:**
+- Extract: store rev_meth[-1], rev_meth[0], rev_meth[+1] per sample (3 extra columns) — meth_id of the complementary strand at the prediction position and its immediate neighbours.
+- Dataset / model: feed those into FiLM alongside the forward meth context.
+- Generate: build two reference meth maps (forward, reverse) and look up both at each prediction position.
+
+**Cost:** ~+3 columns in the .pkl, ~100 lines of code modified, retraining required.
+
+**Benefit:** the model learns bilateral methylation patterns explicitly. Predictions on palindromic sites reproduce the double IPD peak seen in real data (e.g. bc2033's +0/+8 signature). Also captures hemimethylation asymmetries (relevant for cell-cycle studies).
