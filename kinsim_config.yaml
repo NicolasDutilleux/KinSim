@@ -57,6 +57,25 @@ kinetic_profile:
   end:   8     # offset (inclusive)
   # length = end - start + 1 = 9
 
+# Extraction parameters (v4)
+#
+# v4 changes how kinsim extract emits samples:
+#   - For each *confirmed* methylation at p of type T (i.e. (kmer, T) is a
+#     bucket present in the master_clean.pkl produced by refine pass-1),
+#     positions p+k for k in signature_offsets[T] are flagged "slowed".
+#   - Slowed positions are ALWAYS emitted (no subsampling) — they carry the
+#     downstream kinetic footprint of the upstream methylation.
+#   - Confirmed methylated positions (the meth itself, k=0) are emitted as
+#     CATEGORY_METH samples.
+#   - All other positions in the read are baseline candidates, capped per
+#     kmer at `n_baseline_per_kmer` via reservoir sampling. The baseline must
+#     also be at least `baseline_min_dist_to_meth` bases away from any
+#     confirmed methylation in either direction so its meth_context window
+#     never accidentally contains a methylation.
+extract:
+  n_baseline_per_kmer:        50    # cap on baseline samples per kmer
+  baseline_min_dist_to_meth:  11    # in bases; must be >= K (kmer size)
+
 # Refinement parameters
 refine:
   # Strategy applied per-type. All currently use the same algorithm
