@@ -694,6 +694,398 @@ def extract_samples_from_bam(
     return result
 
 
+# ---------------------------------------------------------------------------
+# v4 extract: emits meth + slowed + baseline using a refined master_clean.pkl
+# as the source of confirmed methylations.
+# ---------------------------------------------------------------------------
+
+
+def _load_confirmed_set(refined_pkl_path: str) -> tuple[set, dict]:
+    """Load a refined master_clean.pkl (output of refine pass-1) and return:
+
+      confirmed_kmer_meth: set of (kmer_id, meth_id) tuples — the methylated
+        buckets that survived the global GMM filter. We treat any motif-match
+        in a read whose (kmer_at_position, meth_id) belongs to this set as a
+        confirmed methylation.
+
+      sig_offsets_by_name: dict[mod_name -> list[int]] of signature offsets
+        from kinsim_config.yaml, used to flag p+k as slowed for each
+        confirmed methylation at p of type mod_name.
+    """
+    with open(refined_pkl_path, "rb") as f:
+        data = pickle.load(f)
+    confirmed: set = set()
+    for k in data:
+        if isinstance(k, tuple) and len(k) == 2:
+            kid, mid = k
+            if int(mid) > 0:
+                confirmed.add((int(kid), int(mid)))
+
+    from .utils.config import load_kinsim_config
+    cfg = load_kinsim_config()
+    sig_offsets_by_name: dict = {}
+    for mname, scfg in (cfg.get("kinetic_signatures") or {}).items():
+        offs = []
+        for k in scfg.get("signal_offsets", []):
+            try:
+                offs.append(int(k))
+            except (TypeError, ValueError):
+                continue
+        sig_offsets_by_name[mname] = offs
+    return confirmed, sig_offsets_by_name
+
+
+def _slide_kmers(seq: str, kmer_size: int) -> list:
+    """Return a per-position list of (kmer_id, valid) tuples.
+
+    Index `c` corresponds to read position `c` as the prediction-position
+    center. A kmer is valid only if the [-LEFT_PAD, +RIGHT_PAD] window fits
+    inside the read; otherwise (kmer_id, valid) is (0, False).
+
+    The kmer is computed by encoding seq[c-LEFT_PAD : c+RIGHT_PAD+1].
+    """
+    n = len(seq)
+    out = [(0, False)] * n
+    mask = kmer_mask(kmer_size)
+    cur = 0
+    init_count = 0
+    for i in range(n):
+        cur = ((cur << 2) | BASE_MAP.get(seq[i], 0)) & mask
+        init_count += 1
+        if init_count >= kmer_size:
+            center = i - KMER_RIGHT_PAD
+            if 0 <= center < n:
+                out[center] = (cur, True)
+    return out
+
+
+def extract_samples_v4_from_bam(
+    bam_path:                  str,
+    motif_string:              str,
+    refined_pkl_path:          str,
+    n_baseline_per_kmer:       int  = 50,
+    baseline_min_dist_to_meth: int  = K,
+    revcomp:                   bool = True,
+    use_reverse_strand:        bool = True,
+    max_reads:                 int  = 0,
+    kmer_size:                 int  = K,
+    meth_types:                set | None = None,
+    seed:                      int  = 42,
+) -> dict:
+    """v4 extract: emit meth + slowed + baseline samples per read.
+
+    Args:
+        bam_path:                Path to a raw HiFi or bystrandified BAM.
+        motif_string:            Motif spec used to scan candidate
+                                 methylation positions on each read.
+        refined_pkl_path:        Path to master_clean.pkl produced by
+                                 ``kinsim refine`` pass-1 (GMM). Used as the
+                                 source of confirmed (kmer, meth_id) tuples.
+        n_baseline_per_kmer:     Reservoir cap on baseline samples per kmer.
+        baseline_min_dist_to_meth: Minimum distance (bases) a baseline
+                                 candidate must keep from any confirmed-meth
+                                 or slowed position. Defaults to K so the
+                                 meth_context window of a baseline never
+                                 contains a methylation.
+        revcomp:                 Scan the reverse-complement motifs too.
+        use_reverse_strand:      Also extract ri/rp complementary-strand
+                                 kinetics (with RC kmers as keys).
+        max_reads:                Smoke-test cap (0 = no limit).
+        kmer_size:               Window size (default K=11).
+        meth_types:              Optional restriction to a subset of types.
+        seed:                    RNG seed for reservoir sampling.
+
+    Returns:
+        dict with v4 layout:
+          - int kmer_id                      → np.ndarray(N, 36)
+          - "__meta__"                       → provenance dict
+        Column 35 (last) carries the category:
+          0 = baseline
+          1 = meth      (center is a confirmed methylation)
+          2 = slowed    (center is at a signature offset of an upstream
+                         confirmed methylation)
+    """
+    from .utils.sample_layout import (
+        SAMPLE_NCOLS, COL_CATEGORY,
+        CATEGORY_BASELINE, CATEGORY_METH, CATEGORY_SLOWED,
+    )
+    rng = np.random.default_rng(seed)
+    kinetic_tag = validate_bam_kinetics(bam_path)
+    ipd_tag = kinetic_tag
+    pw_tag  = "fp" if kinetic_tag == "fi" else "pw"
+    log.info("v4 extract — kinetic tags: %s/%s", ipd_tag, pw_tag)
+
+    if meth_types is not None:
+        motif_string = filter_motif_string_by_types(motif_string, meth_types)
+
+    confirmed, sig_offsets_by_name = _load_confirmed_set(refined_pkl_path)
+    log.info("v4 extract — confirmed buckets: %d  (from %s)",
+             len(confirmed), refined_pkl_path)
+    log.info("v4 extract — signature offsets: %s", sig_offsets_by_name)
+
+    motifs       = parse_motifs(motif_string, revcomp=revcomp)
+    frac_lookup  = _build_fraction_lookup(motif_string)
+    meth_ids     = get_meth_ids()
+    name_by_mid  = {v: k for k, v in meth_ids.items()}
+
+    # meth + slowed go directly into `samples`; baseline candidates accumulate
+    # into a separate buffer so we can subsample uniformly to n_baseline_per_kmer
+    # at the end (proper "reservoir at end" instead of biased first-N).
+    samples:         dict = defaultdict(list)   # kmer_id -> list of 36-col rows (meth+slowed)
+    baseline_buffer: dict = defaultdict(list)   # kmer_id -> list of 36-col baseline rows
+    n_meth = n_slowed = n_baseline_seen = 0
+    slowed_offset_dist: dict = defaultdict(int)
+    n_reads_processed    = 0
+    n_reads_with_reverse = 0
+
+    log.info("v4 extract from: %s", bam_path)
+    log.info("Motifs: %s  |  reverse_strand=%s", motif_string, use_reverse_strand)
+
+    def _build_row(ipd_v, pw_v, frac_v, mc, profile, rev_meth, category):
+        row = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
+        row[0] = ipd_v
+        row[1] = pw_v
+        row[2] = frac_v
+        row[3:14]  = mc
+        row[14:32] = profile
+        row[32:35] = rev_meth
+        row[COL_CATEGORY] = category
+        return row
+
+    def _process_strand(seq_str, ipd_arr, pw_arr,
+                        meth_status_arr, meth_status_complement_arr):
+        """One-strand extract pass. Caller pre-orients the arrays so position
+        i in seq_str corresponds to ipd_arr[i] and meth_status_arr[i]."""
+        nonlocal n_meth, n_slowed, n_baseline_seen
+        n = min(len(seq_str), len(ipd_arr), len(pw_arr))
+        if n < kmer_size:
+            return
+        kmers = _slide_kmers(seq_str[:n], kmer_size)
+
+        # Phase 1: identify confirmed-meth positions and slowed positions.
+        confirmed_pos: dict = {}     # center -> meth_id (the meth itself)
+        slowed_pos:    dict = {}     # center -> parent meth_id
+        for c in range(n):
+            T = int(meth_status_arr[c])
+            if T == 0:
+                continue
+            kmer_id, valid = kmers[c]
+            if not valid:
+                continue
+            if (kmer_id, T) in confirmed:
+                confirmed_pos[c] = T
+                mname = name_by_mid.get(T)
+                if not mname:
+                    continue
+                for k in sig_offsets_by_name.get(mname, []):
+                    if k <= 0:
+                        continue
+                    sc = c + k
+                    if 0 <= sc < n and sc not in confirmed_pos:
+                        # only flag positions whose center is unmethylated;
+                        # if sc itself is a meth, it'll be emitted as meth
+                        if int(meth_status_arr[sc]) == 0:
+                            # Last writer wins is fine — multiple parents may
+                            # land on the same offset; track for stats.
+                            slowed_pos[sc] = T
+                            slowed_offset_dist[(mname, k)] += 1
+
+        # Pre-compute distance-to-nearest-flag for baseline gating.
+        flagged = sorted(set(confirmed_pos) | set(slowed_pos))
+        # For each position, find nearest flagged distance (binary search).
+        import bisect
+        def _dist_to_flag(c: int) -> int:
+            if not flagged:
+                return 10**9
+            i = bisect.bisect_left(flagged, c)
+            best = 10**9
+            if i < len(flagged):
+                best = min(best, flagged[i] - c)
+            if i > 0:
+                best = min(best, c - flagged[i - 1])
+            return best
+
+        # Phase 2: emit samples per position.
+        for c in range(n):
+            kmer_id, valid = kmers[c]
+            if not valid:
+                continue
+
+            # Sample row helpers
+            meth_id_center = int(meth_status_arr[c])
+            ipd_v = float(ipd_arr[c])
+            pw_v  = float(pw_arr[c])
+            mc        = _slice_meth_context(meth_status_arr, c)
+            profile   = _slice_kinetic_profile(ipd_arr, pw_arr, c)
+            rev_meth  = _slice_rev_meth(meth_status_complement_arr, c)
+            frac_v    = frac_lookup.get(meth_id_center, 0.0)
+
+            if c in confirmed_pos:
+                samples[kmer_id].append(_build_row(
+                    ipd_v, pw_v, frac_v, mc, profile, rev_meth, CATEGORY_METH))
+                n_meth += 1
+            elif c in slowed_pos:
+                samples[kmer_id].append(_build_row(
+                    ipd_v, pw_v, 0.0, mc, profile, rev_meth, CATEGORY_SLOWED))
+                n_slowed += 1
+            else:
+                # Baseline candidate — must be far enough from any flag so
+                # its meth_context window does not contain any methylation.
+                if _dist_to_flag(c) < baseline_min_dist_to_meth:
+                    continue
+                # Proper reservoir sampling per kmer (cap = n_baseline_per_kmer).
+                baseline_buffer[kmer_id].append(_build_row(
+                    ipd_v, pw_v, 0.0, mc, profile, rev_meth, CATEGORY_BASELINE))
+                n_baseline_seen += 1
+
+    with pysam.AlignmentFile(bam_path, "rb", check_sq=False) as bam:
+        for read in bam:
+            if max_reads > 0 and n_reads_processed >= max_reads:
+                log.info("--max-reads %d reached — stopping early", max_reads)
+                break
+            seq = read.query_sequence
+            if not (seq and len(seq) >= kmer_size and read.has_tag(ipd_tag)):
+                continue
+
+            ipds = read.get_tag(ipd_tag)
+            pws  = read.get_tag(pw_tag)
+            min_len = min(len(seq), len(ipds), len(pws))
+
+            meth_status = scan_sequence(seq[:min_len], motifs)
+            rc_seq_full = reverse_complement(seq[:min_len])
+            meth_status_rc = scan_sequence(rc_seq_full, motifs)
+            meth_complement = meth_status_rc[::-1]   # this read's coords
+
+            _process_strand(seq[:min_len], ipds[:min_len], pws[:min_len],
+                            meth_status, meth_complement)
+
+            if use_reverse_strand and read.has_tag("ri") and read.has_tag("rp"):
+                ri = read.get_tag("ri")
+                rp = read.get_tag("rp")
+                min_rev_len = min(min_len, len(ri), len(rp))
+                if min_rev_len >= kmer_size:
+                    n_reads_with_reverse += 1
+                    rc_seq = reverse_complement(seq[:min_rev_len])
+                    rc_meth_status = scan_sequence(rc_seq, motifs)
+                    # ri/rp arrays are stored in forward-read coords; we need
+                    # them in rc_seq coords for symmetric processing.
+                    ri_rc = list(reversed(list(ri[:min_rev_len])))
+                    rp_rc = list(reversed(list(rp[:min_rev_len])))
+                    # Complement-of-complement = forward strand meth, in rc coords
+                    fwd_in_rc = list(reversed(list(meth_status[:min_rev_len])))
+                    _process_strand(rc_seq, ri_rc, rp_rc,
+                                    rc_meth_status, fwd_in_rc)
+
+            n_reads_processed += 1
+
+    # End-of-stream subsample of baselines: cap each kmer's baseline buffer
+    # at n_baseline_per_kmer with uniform random selection (no first-N bias).
+    n_baseline_kept = 0
+    for kmer_id, rows in baseline_buffer.items():
+        if len(rows) > n_baseline_per_kmer:
+            idx = rng.choice(len(rows), n_baseline_per_kmer, replace=False)
+            rows = [rows[i] for i in idx]
+        if rows:
+            samples[kmer_id].extend(rows)
+            n_baseline_kept += len(rows)
+
+    # Pack samples to ndarrays
+    result: dict = {}
+    for kmer_id, rows in samples.items():
+        result[int(kmer_id)] = np.array(rows, dtype=np.float32)
+
+    n_total = n_meth + n_slowed + n_baseline_kept
+    log.info("v4 extract done: reads=%d (rev=%d)  meth=%d  slowed=%d  "
+             "baseline_seen=%d  baseline_kept=%d  total=%d",
+             n_reads_processed, n_reads_with_reverse,
+             n_meth, n_slowed, n_baseline_seen, n_baseline_kept, n_total)
+    log.info("v4 extract: %d unique kmers in output", len(result))
+    if slowed_offset_dist:
+        log.info("Slowed-offset distribution:")
+        for (mname, k), n in sorted(slowed_offset_dist.items(),
+                                    key=lambda x: (-x[1], x[0])):
+            log.info("  %s @ +%d: %d", mname, k, n)
+
+    result["__meta__"] = {
+        "kinsim_version":            _KINSIM_VERSION,
+        "extraction_mode":           "v4",
+        "source_bam":                str(bam_path),
+        "refined_pkl":               str(refined_pkl_path),
+        "motifs":                    motif_string,
+        "meth_types":                sorted(meth_types) if meth_types else None,
+        "kmer_size":                 kmer_size,
+        "n_baseline_per_kmer":       n_baseline_per_kmer,
+        "baseline_min_dist_to_meth": baseline_min_dist_to_meth,
+        "use_reverse_strand":        use_reverse_strand,
+        "n_reads_processed":         n_reads_processed,
+        "n_reads_with_reverse":      n_reads_with_reverse,
+        "n_meth":                    n_meth,
+        "n_slowed":                  n_slowed,
+        "n_baseline_seen":           n_baseline_seen,
+        "n_baseline_kept":           n_baseline_kept,
+        "slowed_offset_distribution":
+            {f"{m}+{k}": n for (m, k), n in slowed_offset_dist.items()},
+        "n_unique_kmers":            len(result),
+        "n_total_samples":           n_total,
+        "created":                   datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    return result
+
+
+def extract_v4_from_manifest_task(
+    manifest_path:             str,
+    task_index:                int,
+    output_dir:                str,
+    refined_pkl_path:          str,
+    n_baseline_per_kmer:       int  = 50,
+    baseline_min_dist_to_meth: int  = K,
+    revcomp:                   bool = True,
+    use_reverse_strand:        bool = True,
+    max_reads:                 int  = 0,
+    kmer_size:                 int  = K,
+    meth_types:                set | None = None,
+) -> None:
+    """Manifest-mode wrapper for the v4 extract path."""
+    from .utils.config import load_manifest
+    from .utils.motifs import load_motif_string as _load_motif_string
+
+    entries = load_manifest(manifest_path)
+    if task_index < 1 or task_index > len(entries):
+        log.error("Task index %d out of range (manifest has %d entries).",
+                  task_index, len(entries))
+        sys.exit(1)
+    entry = entries[task_index - 1]
+    log.info("v4 task %d/%d: %s", task_index, len(entries), entry.sample_id)
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    output_pkl = os.path.join(output_dir, f"{entry.sample_id}_shard_v4.pkl")
+    log.info("  Output: %s", output_pkl)
+
+    motif_string = _load_motif_string(entry.motifs)
+    if not motif_string:
+        log.warning("No motifs resolved for '%s' — SKIPPING.", entry.sample_id)
+        return
+
+    result = extract_samples_v4_from_bam(
+        entry.bam_path, motif_string, refined_pkl_path,
+        n_baseline_per_kmer=n_baseline_per_kmer,
+        baseline_min_dist_to_meth=baseline_min_dist_to_meth,
+        revcomp=revcomp,
+        use_reverse_strand=use_reverse_strand,
+        max_reads=max_reads,
+        kmer_size=kmer_size,
+        meth_types=meth_types,
+    )
+
+    with open(output_pkl, "wb") as f:
+        pickle.dump(result, f)
+    meta = result.get("__meta__", {})
+    log.info("v4 shard saved: %s  meth=%d slowed=%d baseline=%d",
+             output_pkl,
+             meta.get("n_meth", 0),
+             meta.get("n_slowed", 0),
+             meta.get("n_baseline", 0))
+
 
 # ---------------------------------------------------------------------------
 # Merge: combine shards from multiple BAMs
@@ -992,6 +1384,29 @@ def main(argv=None) -> None:
     p_extract.add_argument("--verbose", "-v", action="store_true",
                            help="Enable DEBUG-level logging")
 
+    # ---- v4 mode flags ----
+    p_extract.add_argument("--refined-pkl", default=None,
+                           help="Path to a master_clean.pkl produced by "
+                                "`kinsim refine` pass-1 (GMM). When provided, "
+                                "the extract switches to v4 mode: emits METH "
+                                "samples at confirmed methylation positions, "
+                                "SLOWED samples at signature offsets of those, "
+                                "and BASELINE samples elsewhere (capped per "
+                                "kmer). Output is the v4 36-col format keyed "
+                                "by kmer_id only. Without this flag, extract "
+                                "runs in legacy bootstrap mode (35-col "
+                                "(kmer, meth_id) keys) — needed once to feed "
+                                "refine pass-1 and produce master_clean.pkl.")
+    p_extract.add_argument("--n-baseline-per-kmer", type=int, default=None,
+                           help="(v4 only) Cap on baseline samples kept per "
+                                "kmer. Overrides kinsim_config.yaml "
+                                "extract.n_baseline_per_kmer.")
+    p_extract.add_argument("--baseline-min-dist", type=int, default=None,
+                           help="(v4 only) Minimum distance (bases) a baseline "
+                                "candidate must keep from any confirmed-meth "
+                                "or slowed position. Overrides "
+                                "extract.baseline_min_dist_to_meth in YAML.")
+
     # -- merge subcommand --
     p_merge = sub.add_parser(
         "merge",
@@ -1028,6 +1443,19 @@ def main(argv=None) -> None:
     else:   # extract
         meth_types = parse_meth_types_arg(args.meth_types)
 
+        # Resolve v4 params (CLI overrides YAML).
+        v4_mode = args.refined_pkl is not None
+        v4_baseline_n = args.n_baseline_per_kmer
+        v4_baseline_d = args.baseline_min_dist
+        if v4_mode and (v4_baseline_n is None or v4_baseline_d is None):
+            from .utils.config import load_kinsim_config
+            cfg = load_kinsim_config()
+            ext = (cfg.get("extract") or {})
+            if v4_baseline_n is None:
+                v4_baseline_n = int(ext.get("n_baseline_per_kmer", 50))
+            if v4_baseline_d is None:
+                v4_baseline_d = int(ext.get("baseline_min_dist_to_meth", K))
+
         if args.manifest:
             # ---- Manifest mode ----
             if args.task is None:
@@ -1036,19 +1464,34 @@ def main(argv=None) -> None:
             if args.output_dir is None:
                 log.error("--output-dir is required when using --manifest")
                 sys.exit(1)
-            extract_from_manifest_task(
-                args.manifest,
-                task_index           = args.task,
-                output_dir           = args.output_dir,
-                max_samples_per_key  = args.max_samples,
-                revcomp              = not args.no_revcomp,
-                use_reverse_strand   = not args.no_reverse_strand,
-                max_reads            = args.max_reads,
-                kmer_size            = args.kmer_size or K,
-                unmeth_subsample_rate= args.unmeth_subsample_rate,
-                binarize             = not args.no_binarize,
-                meth_types           = meth_types,
-            )
+            if v4_mode:
+                extract_v4_from_manifest_task(
+                    args.manifest,
+                    task_index               = args.task,
+                    output_dir               = args.output_dir,
+                    refined_pkl_path         = args.refined_pkl,
+                    n_baseline_per_kmer      = v4_baseline_n,
+                    baseline_min_dist_to_meth= v4_baseline_d,
+                    revcomp                  = not args.no_revcomp,
+                    use_reverse_strand       = not args.no_reverse_strand,
+                    max_reads                = args.max_reads,
+                    kmer_size                = args.kmer_size or K,
+                    meth_types               = meth_types,
+                )
+            else:
+                extract_from_manifest_task(
+                    args.manifest,
+                    task_index           = args.task,
+                    output_dir           = args.output_dir,
+                    max_samples_per_key  = args.max_samples,
+                    revcomp              = not args.no_revcomp,
+                    use_reverse_strand   = not args.no_reverse_strand,
+                    max_reads            = args.max_reads,
+                    kmer_size            = args.kmer_size or K,
+                    unmeth_subsample_rate= args.unmeth_subsample_rate,
+                    binarize             = not args.no_binarize,
+                    meth_types           = meth_types,
+                )
 
         else:
             # ---- Single-BAM mode (motif-based) ----
@@ -1072,29 +1515,54 @@ def main(argv=None) -> None:
             log.info("Extracting samples from: %s", os.path.basename(args.bam))
             if meth_types is not None:
                 log.info("Meth types filter: %s", sorted(meth_types))
-            result = extract_samples_from_bam(
-                args.bam, motif_string,
-                max_samples_per_key=args.max_samples,
-                revcomp=not args.no_revcomp,
-                use_reverse_strand=not args.no_reverse_strand,
-                max_reads=args.max_reads,
-                kmer_size=args.kmer_size or K,
-                unmeth_subsample_rate=args.unmeth_subsample_rate,
-                binarize=not args.no_binarize,
-                meth_types=meth_types,
-            )
+            if v4_mode:
+                log.info("v4 mode (--refined-pkl=%s)", args.refined_pkl)
+                result = extract_samples_v4_from_bam(
+                    args.bam, motif_string, args.refined_pkl,
+                    n_baseline_per_kmer       = v4_baseline_n,
+                    baseline_min_dist_to_meth = v4_baseline_d,
+                    revcomp                   = not args.no_revcomp,
+                    use_reverse_strand        = not args.no_reverse_strand,
+                    max_reads                 = args.max_reads,
+                    kmer_size                 = args.kmer_size or K,
+                    meth_types                = meth_types,
+                )
+            else:
+                result = extract_samples_from_bam(
+                    args.bam, motif_string,
+                    max_samples_per_key=args.max_samples,
+                    revcomp=not args.no_revcomp,
+                    use_reverse_strand=not args.no_reverse_strand,
+                    max_reads=args.max_reads,
+                    kmer_size=args.kmer_size or K,
+                    unmeth_subsample_rate=args.unmeth_subsample_rate,
+                    binarize=not args.no_binarize,
+                    meth_types=meth_types,
+                )
 
             Path(args.output).parent.mkdir(parents=True, exist_ok=True)
             with open(args.output, "wb") as f:
                 pickle.dump(result, f)
 
             meta = result.get("__meta__", {})
-            log.info(
-                "Shard saved: %s (%d contexts, %d samples)",
-                args.output,
-                meta.get("n_unique_keys", "?"),
-                meta.get("n_total_samples", "?"),
-            )
+            if v4_mode:
+                log.info(
+                    "v4 shard saved: %s (kmers=%d, samples=%d, "
+                    "meth=%d slowed=%d baseline=%d)",
+                    args.output,
+                    meta.get("n_unique_kmers", "?"),
+                    meta.get("n_total_samples", "?"),
+                    meta.get("n_meth", "?"),
+                    meta.get("n_slowed", "?"),
+                    meta.get("n_baseline_kept", "?"),
+                )
+            else:
+                log.info(
+                    "Shard saved: %s (%d contexts, %d samples)",
+                    args.output,
+                    meta.get("n_unique_keys", "?"),
+                    meta.get("n_total_samples", "?"),
+                )
 
 
 if __name__ == "__main__":
