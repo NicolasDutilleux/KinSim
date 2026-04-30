@@ -1,32 +1,41 @@
-"""Refine a KinSim .pkl by removing contamination from methylated buckets.
+"""Refine a KinSim .pkl in two passes:
 
-For each (kmer, mod_type>0) bucket, the samples are a mixture of:
-  - Real methylated signal
-  - Unmethylated contamination (positions labelled by motif scan but not
-    actually modified at that genomic site — partial methylation, hemi-sites,
-    false-positive motifs, etc.)
+Pass 1 — confirm methylated buckets (global per-meth-type GMM)
+   For each meth type T (m6A, m4C, m5C, ...) all (kmer, T) buckets are
+   pooled, a balanced None reference is sub-sampled, and a 2-D GMM is fit on
+   the kinetic profile at the configured signature offsets. The cluster with
+   the highest mean signal is treated as "real meth"; samples assigned to
+   any other cluster are dropped as motif false-positives. Buckets that
+   shrink below 3 surviving samples are dropped entirely.
 
-Given the abundant (kmer, 0) bucket as a known reference for unmethylated
-signal, fit a 2-component Gaussian mixture where the None component is
-FIXED to (μ_N, Σ_N) and the methylated component (μ_m, Σ_m) + mixing
-weight π are free.  EM recovers the true methylation fraction π from data,
-without relying on motifs.csv's sometimes-noisy global fraction.
+Pass 2 — split the (kmer, 0) bucket into baseline vs slowed (v4 addition)
+   The polymerase IPD/PW at position c can be elevated even when c itself
+   is unmodified, IF an upstream confirmed methylation sits at a position
+   c-k where k is one of the signature offsets for that mod type
+   (e.g. m6A at c-5 elevates IPD at c). These "slowed" positions look like
+   noise to a model trained only on (kmer, 0) → unmodified label, but the
+   meth_context columns 3..13 actually encode the upstream context FiLM
+   needs to disambiguate them.
 
-After fitting, the methylated bucket is replaced with samples drawn from
-N(μ_m, Σ_m) at count round(π · N_original), giving a clean dictionary.
+   Pass 2 walks every (kmer, 0) sample, inspects its meth_context for an
+   upstream methylation at a signature offset, and:
+     - flags the sample as 'slowed_T' if a signature offset matches,
+     - else keeps it as a true baseline.
+   Baseline samples are capped at `n_baseline_per_kmer` per kmer (YAML
+   parameter) to prevent class imbalance. The 95-th percentile of the
+   baseline IPD distribution is used as a quality threshold: slowed samples
+   whose center IPD falls below it are dropped (the expected slowing did
+   not actually occur — likely an upstream motif false-call, edge effect,
+   or low-coverage artefact).
 
-Fallback (too few samples / EM failure):
-    Mahalanobis threshold against None: samples beyond the χ² threshold
-    are kept as real methylated; μ_m, Σ_m estimated from those.
-    - Default :  χ²_{2, 0.95} = 5.99  (5 %% chance of being None)
-    - Strict  :  χ²_{2, 0.99} = 9.21  (1 %% chance of being None) —
-      auto-enabled when the key has < `strict_n` samples (default 50)
-      to avoid letting noise leak into the methylated bucket.
+   Both surviving baseline and slowed samples remain stored as (kmer, 0)
+   in the output: the meth_context already in cols 3..13 is what FiLM
+   uses to distinguish them at training time. No new dict key is needed.
 
 Usage:
     kinsim refine in.pkl out.pkl
-    kinsim refine in.pkl out.pkl --report report.tsv --min-pi 0.1
-    kinsim refine in.pkl out.pkl --strict-n 100          # stricter: strict below 100
+    kinsim refine in.pkl out.pkl --report report.tsv
+    kinsim refine in.pkl out.pkl --no-slowed-split    # skip pass 2
 """
 
 from __future__ import annotations
@@ -37,6 +46,7 @@ import pickle
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -48,14 +58,220 @@ MOD_NAMES = {0: "none", 1: "m6A", 2: "m4C", 3: "m5C"}
 
 
 # ---------------------------------------------------------------------------
+# Pass 2: slowed-position vs baseline split (v4)
+# ---------------------------------------------------------------------------
+
+
+def _build_upstream_signature_targets(cfg: dict) -> list[tuple[int, int, str, int]]:
+    """Resolve which (mc_index, expected_meth_id, type_name, offset) tuples
+    flag a (kmer, 0) sample as a slowed position.
+
+    The meth_context column ``mc[idx]`` corresponds to the meth_id at read
+    position ``center - KMER_LEFT_PAD + idx`` (see kinsim.extract). For a
+    sample whose center is at p+k (where p has a confirmed methylation of
+    type T with signature offset k > 0), the upstream methylation at p
+    appears at mc-index ``KMER_PRED_IDX - k``.
+
+    We skip k = 0 because for a (kmer, 0) sample the center has meth_id = 0
+    by construction — k = 0 can never produce a slowed signature here.
+
+    Returns list of (mc_index, expected_meth_id, mod_name, signature_offset).
+    """
+    from .utils.encoding import KMER_PRED_IDX, get_meth_ids
+    meth_ids = get_meth_ids()
+    sigs = cfg.get("kinetic_signatures", {}) or {}
+
+    targets: list[tuple[int, int, str, int]] = []
+    for mod_name, sig_cfg in sigs.items():
+        mid = meth_ids.get(mod_name)
+        if not mid:                          # 0 (none) or missing
+            continue
+        for k in sig_cfg.get("signal_offsets", []):
+            try:
+                k = int(k)
+            except (TypeError, ValueError):
+                continue
+            if k <= 0:                       # k = 0 invisible in (kmer, 0)
+                continue
+            mc_idx = KMER_PRED_IDX - k
+            if mc_idx < 0:                   # offset too large for window
+                log.warning("[%s] signature offset +%d exceeds meth_context "
+                            "left pad (KMER_PRED_IDX=%d) — slowed split will "
+                            "miss this offset.", mod_name, k, KMER_PRED_IDX)
+                continue
+            targets.append((mc_idx, mid, mod_name, k))
+    return targets
+
+
+def slowed_split(
+    none_buckets:        dict,
+    cfg:                 dict,
+    n_baseline_per_kmer: int,
+    secondary_pct:       float,
+    rng:                 np.random.Generator,
+) -> tuple[dict, dict]:
+    """Pass 2 — split (kmer, 0) buckets into baseline + slowed, apply QC.
+
+    Args:
+        none_buckets:        dict[int kmer_id -> ndarray(N, 35)] of unmethylated
+                             samples passed through from Pass 1.
+        cfg:                 parsed kinsim_config.yaml.
+        n_baseline_per_kmer: cap on baseline samples retained per kmer.
+        secondary_pct:       percentile of baseline IPD used as a lower
+                             threshold for slowed samples (e.g. 95).
+        rng:                 numpy Generator for reproducible subsampling.
+
+    Returns:
+        new_none_buckets: dict[int kmer_id -> ndarray] with capped baseline
+                          + QC-filtered slowed samples concatenated. Same
+                          column layout as input.
+        stats:            summary counters.
+    """
+    from .utils.encoding import KMER_PRED_IDX
+
+    # Reverse map int meth_id -> name for offset distribution logging
+    from .utils.encoding import get_meth_ids
+    name_by_mid = {v: k for k, v in get_meth_ids().items()}
+
+    targets = _build_upstream_signature_targets(cfg)
+    if not targets:
+        log.info("[slowed-split] no upstream signature offsets configured "
+                 "(all signal_offsets are 0 or missing) — skipping pass 2.")
+        return {kid: arr.copy() for kid, arr in none_buckets.items()}, {
+            "n_baseline_in":    sum(len(a) for a in none_buckets.values()),
+            "n_slowed_in":      0,
+            "n_baseline_kept":  sum(len(a) for a in none_buckets.values()),
+            "n_slowed_kept":    0,
+            "n_slowed_dropped": 0,
+            "threshold":        None,
+        }
+
+    log.info("[slowed-split] checking %d upstream signature targets:", len(targets))
+    for mc_idx, mid, mname, k in targets:
+        log.info("  %s offset +%d → meth_context[%d] == meth_id %d",
+                 mname, k, mc_idx, mid)
+
+    # Step 1: classify each sample of each (kmer, 0) bucket
+    classified: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    n_baseline_in = 0
+    n_slowed_in   = 0
+    offset_distribution: Counter = Counter()
+
+    METH_CTX_COL_START = 3                        # cols 3..13 hold meth_context
+    METH_CTX_COL_END   = METH_CTX_COL_START + 11  # exclusive
+
+    for kmer_id, arr in none_buckets.items():
+        if arr.size == 0:
+            classified[kmer_id] = (arr, arr)
+            continue
+        if arr.shape[1] < METH_CTX_COL_END:
+            log.warning("[slowed-split] (kmer=%d, none) has only %d cols — "
+                        "no meth_context, treating all as baseline.",
+                        kmer_id, arr.shape[1])
+            classified[kmer_id] = (arr, np.empty((0, arr.shape[1]), dtype=arr.dtype))
+            n_baseline_in += len(arr)
+            continue
+
+        mc = arr[:, METH_CTX_COL_START:METH_CTX_COL_END].astype(np.int32)
+        is_slowed = np.zeros(len(arr), dtype=bool)
+        for mc_idx, mid, mname, k in targets:
+            mask = (mc[:, mc_idx] == mid)
+            if mask.any():
+                offset_distribution[(mname, k)] += int(mask.sum())
+            is_slowed |= mask
+
+        baseline_arr = arr[~is_slowed]
+        slowed_arr   = arr[is_slowed]
+        n_baseline_in += int((~is_slowed).sum())
+        n_slowed_in   += int(is_slowed.sum())
+
+        # Cap baseline samples per kmer
+        if len(baseline_arr) > n_baseline_per_kmer:
+            idx = rng.choice(len(baseline_arr), n_baseline_per_kmer, replace=False)
+            baseline_arr = baseline_arr[idx]
+
+        classified[kmer_id] = (baseline_arr, slowed_arr)
+
+    # Step 2: global baseline IPD percentile threshold
+    baseline_ipds = []
+    for baseline_arr, _ in classified.values():
+        if len(baseline_arr):
+            baseline_ipds.append(baseline_arr[:, 0])
+    if baseline_ipds:
+        pooled = np.concatenate(baseline_ipds)
+        threshold = float(np.percentile(pooled, secondary_pct))
+        log.info("[slowed-split] baseline IPD pool: n=%d, mean=%.2f, "
+                 "median=%.2f, p%g=%.2f (threshold for slowed samples)",
+                 len(pooled), float(pooled.mean()), float(np.median(pooled)),
+                 secondary_pct, threshold)
+    else:
+        threshold = 0.0
+        log.warning("[slowed-split] no baseline samples — threshold defaults "
+                    "to 0 (no slowed samples will be filtered).")
+
+    # Step 3: apply threshold to slowed, merge baseline + filtered slowed
+    new_none_buckets: dict = {}
+    n_baseline_kept   = 0
+    n_slowed_kept     = 0
+    n_slowed_dropped  = 0
+    for kmer_id, (baseline_arr, slowed_arr) in classified.items():
+        if len(slowed_arr):
+            keep_mask = slowed_arr[:, 0] >= threshold
+            slowed_kept = slowed_arr[keep_mask]
+            n_slowed_dropped += int((~keep_mask).sum())
+        else:
+            slowed_kept = slowed_arr
+
+        n_baseline_kept += len(baseline_arr)
+        n_slowed_kept   += len(slowed_kept)
+
+        if len(baseline_arr) == 0 and len(slowed_kept) == 0:
+            continue
+        if len(baseline_arr) == 0:
+            new_none_buckets[kmer_id] = slowed_kept
+        elif len(slowed_kept) == 0:
+            new_none_buckets[kmer_id] = baseline_arr
+        else:
+            new_none_buckets[kmer_id] = np.concatenate([baseline_arr, slowed_kept], axis=0)
+
+    log.info("[slowed-split] baseline: %d in → %d kept (cap=%d/kmer)",
+             n_baseline_in, n_baseline_kept, n_baseline_per_kmer)
+    log.info("[slowed-split] slowed:   %d in → %d kept, %d dropped "
+             "(IPD < p%g = %.2f)",
+             n_slowed_in, n_slowed_kept, n_slowed_dropped,
+             secondary_pct, threshold)
+    if offset_distribution:
+        log.info("[slowed-split] slowed-offset distribution (before secondary filter):")
+        for (mname, k), n in sorted(offset_distribution.items(),
+                                    key=lambda x: (-x[1], x[0])):
+            log.info("  %s @ +%d: %d samples", mname, k, n)
+
+    stats = {
+        "n_baseline_in":         n_baseline_in,
+        "n_slowed_in":           n_slowed_in,
+        "n_baseline_kept":       n_baseline_kept,
+        "n_slowed_kept":         n_slowed_kept,
+        "n_slowed_dropped":      n_slowed_dropped,
+        "threshold":             threshold,
+        "secondary_percentile":  secondary_pct,
+        "n_baseline_per_kmer":   n_baseline_per_kmer,
+        "offset_distribution":   {f"{m}+{k}": n for (m, k), n in offset_distribution.items()},
+    }
+    return new_none_buckets, stats
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
 def refine_pkl(
-    in_path:     Path,
-    out_path:    Path,
-    report_path: Path | None = None,
-    seed:        int           = 42,
+    in_path:               Path,
+    out_path:              Path,
+    report_path:           Optional[Path] = None,
+    seed:                  int           = 42,
+    enable_slowed_split:   bool          = True,
+    n_baseline_per_kmer:   Optional[int]   = None,
+    secondary_percentile:  Optional[float] = None,
 ) -> dict:
     """Refine a KinSim master.pkl with a GLOBAL per-meth-type GMM filter.
 
@@ -134,7 +350,7 @@ def refine_pkl(
 
     # Resolve signature offsets per meth type from config
     from .utils.config import load_kinsim_config
-    from .extract import METH_CTX_LEN, PROFILE_LEN
+    from .utils.sample_layout import METH_CTX_LEN, PROFILE_LEN
     cfg = load_kinsim_config()
     profile_start_col = 3 + METH_CTX_LEN   # = 14: cols 14..14+PROFILE_LEN-1 are IPD profile
 
@@ -283,10 +499,43 @@ def refine_pkl(
     log.info("Dropped (false-positive): %d", n_meth_dropped)
     log.info("Buckets fully dropped:    %d", n_buckets_dropped)
 
-    # --- 5. Write output ---
+    # --- 5. Pass 2: slowed-vs-baseline split on (kmer, 0) buckets ---
+    slowed_stats: Optional[dict] = None
+    if enable_slowed_split:
+        refine_cfg = (cfg.get("refine") or {}).get("slowed_split") or {}
+        n_baseline = (n_baseline_per_kmer
+                      if n_baseline_per_kmer is not None
+                      else int(refine_cfg.get("n_baseline_per_kmer", 50)))
+        sec_pct    = (secondary_percentile
+                      if secondary_percentile is not None
+                      else float(refine_cfg.get("secondary_percentile", 95)))
+        log.info("Pass 2 (slowed-split): n_baseline_per_kmer=%d, "
+                 "secondary_percentile=%.1f", n_baseline, sec_pct)
+
+        # Strip current (kmer, 0) buckets from `out` before re-adding the
+        # split versions. Pass 1 wrote them through unchanged (line ~339).
+        none_in_out = {k[0]: v for k, v in out.items()
+                       if isinstance(k, tuple) and k[1] == 0}
+        for kid in list(none_in_out):
+            out.pop((kid, 0), None)
+
+        new_none, slowed_stats = slowed_split(
+            none_in_out, cfg, n_baseline, sec_pct, rng,
+        )
+        for kmer_id, arr in new_none.items():
+            out[(kmer_id, 0)] = arr
+
+        # Adjust running sample-out counter: pass 1 had counted all none
+        # samples; we now replace that contribution with the post-split count.
+        n_samples_out -= sum(len(a) for a in none_in_out.values())
+        n_samples_out += sum(len(a) for a in new_none.values())
+    else:
+        log.info("Pass 2 (slowed-split): SKIPPED (--no-slowed-split)")
+
+    # --- 6. Write output ---
     out["__meta__"] = {
         "refined_from":     str(in_path),
-        "method":           "global_gmm",
+        "method":           "global_gmm" + ("+slowed_split" if enable_slowed_split else ""),
         "space_for_fit":    "log1p",
         "space_for_store":  "raw",
         "seed":             seed,
@@ -298,6 +547,7 @@ def refine_pkl(
         "n_meth_dropped":   n_meth_dropped,
         "n_buckets_dropped": n_buckets_dropped,
         "status_counts":    dict(status_counter),
+        "slowed_split":     slowed_stats,
         "original_meta":    orig_meta,
     }
 
@@ -334,6 +584,18 @@ def main(argv=None):
     ap.add_argument("--report", help="Optional per-key TSV report")
     ap.add_argument("--seed",    type=int,   default=42,
                     help="Random seed for None-pool subsampling and GMM init")
+    ap.add_argument("--no-slowed-split", action="store_true",
+                    help="Skip pass 2 (slowed-vs-baseline split on (kmer, 0) "
+                         "buckets). Output keeps the v3 behaviour: all "
+                         "(kmer, none) samples passed through unchanged.")
+    ap.add_argument("--n-baseline-per-kmer", type=int, default=None,
+                    help="Cap on baseline (kmer, none) samples kept per kmer "
+                         "in pass 2. Overrides kinsim_config.yaml "
+                         "refine.slowed_split.n_baseline_per_kmer.")
+    ap.add_argument("--secondary-percentile", type=float, default=None,
+                    help="Percentile of baseline IPD used as the lower "
+                         "threshold for slowed samples in pass 2. Overrides "
+                         "kinsim_config.yaml refine.slowed_split.secondary_percentile.")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -349,7 +611,12 @@ def main(argv=None):
     if rep_p is not None:
         rep_p.parent.mkdir(parents=True, exist_ok=True)
 
-    refine_pkl(in_p, out_p, report_path=rep_p, seed=args.seed)
+    refine_pkl(
+        in_p, out_p, report_path=rep_p, seed=args.seed,
+        enable_slowed_split   = not args.no_slowed_split,
+        n_baseline_per_kmer   = args.n_baseline_per_kmer,
+        secondary_percentile  = args.secondary_percentile,
+    )
 
 
 if __name__ == "__main__":

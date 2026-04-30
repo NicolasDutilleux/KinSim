@@ -162,87 +162,20 @@ def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
 # Methylation-context window (asymmetric, upstream-biased)
 # ---------------------------------------------------------------------------
 
-# Asymmetric window around the prediction position. Both the kmer (sequence
-# context) and the methylation context use the same window: [-7, +3] = 11
-# positions, prediction position at index 7. The polymerase has more upstream
-# context already incorporated than downstream prevued bases. See
-# `kinsim/utils/encoding.py` for the central definitions.
+# Per-sample column layout (constants + pure-Python slicing helpers) lives in
+# kinsim/utils/sample_layout.py so it is importable without pysam (refine and
+# tests rely on it). Re-export the symbols here so the existing names used
+# elsewhere in extract.py still resolve.
 from .utils.encoding import KMER_LEFT_PAD, KMER_RIGHT_PAD, KMER_PRED_IDX, K
-METH_CTX_LEFT  = KMER_LEFT_PAD     # = 7
-METH_CTX_RIGHT = KMER_RIGHT_PAD    # = 3
-METH_CTX_LEN   = K                 # = 11
-
-# Kinetic profile window: IPD/PW values at offsets [0, +PROFILE_LEN-1] from
-# the prediction position. Used by refine to validate the signature pattern
-# (e.g. for m5C the signal is at +2 and +6, not at the position itself).
-PROFILE_START = 0
-PROFILE_END   = 8
-PROFILE_LEN   = PROFILE_END - PROFILE_START + 1   # = 9
-
-# Complementary-strand methylation captured at the prediction position
-# and immediate neighbours (active-site footprint). Captures bilateral
-# methylation patterns (palindromic R-M sites) — see CLAUDE.md v4 roadmap.
-REV_METH_OFFSETS = (-1, 0, 1)
-REV_METH_LEN = len(REV_METH_OFFSETS)            # = 3
-
-# Total per-sample column count:
-#   0..1   : IPD center, PW center
-#   2      : fraction
-#   3..13  : mc_0..mc_10  (11 forward-strand meth context, [-7, +3])
-#   14..22 : profile_IPD_0..+8  (9 values)
-#   23..31 : profile_PW_0..+8   (9 values)
-#   32..34 : rev_meth_-1, rev_meth_0, rev_meth_+1   (complementary strand)
-SAMPLE_NCOLS = 3 + METH_CTX_LEN + 2 * PROFILE_LEN + REV_METH_LEN     # = 35
-
-
-def _slice_meth_context(meth_status, center):
-    """Return an 11-element list covering [-7, +3] around `center`.
-
-    Out-of-range positions (start of read or end of read) are padded with 0
-    (unmethylated) so every sample has the same fixed-length context.
-    """
-    n = len(meth_status)
-    out = [0] * METH_CTX_LEN
-    for k in range(METH_CTX_LEN):
-        pos = center - METH_CTX_LEFT + k
-        if 0 <= pos < n:
-            out[k] = int(meth_status[pos])
-    return out
-
-
-def _slice_rev_meth(meth_status_complement, center):
-    """Return a list of 3 values: complementary-strand meth_id at offsets
-    [-1, 0, +1] from `center`.
-
-    `meth_status_complement` is the per-position meth_id array of the
-    complementary strand, expressed in this read's coordinates (already
-    reverse-mapped). Out-of-range positions are padded with 0.
-    """
-    n = len(meth_status_complement)
-    out = [0] * REV_METH_LEN
-    for k, off in enumerate(REV_METH_OFFSETS):
-        pos = center + off
-        if 0 <= pos < n:
-            out[k] = int(meth_status_complement[pos])
-    return out
-
-
-def _slice_kinetic_profile(ipds, pws, center):
-    """Return a list of 18 values: [profile_IPD_0..+8, profile_PW_0..+8].
-
-    Out-of-range positions (past the end of the read) are padded with 0.
-    """
-    n_ipd = len(ipds)
-    n_pw  = len(pws)
-    ipd_prof = [0.0] * PROFILE_LEN
-    pw_prof  = [0.0] * PROFILE_LEN
-    for k in range(PROFILE_LEN):
-        pos = center + PROFILE_START + k
-        if 0 <= pos < n_ipd:
-            ipd_prof[k] = float(ipds[pos])
-        if 0 <= pos < n_pw:
-            pw_prof[k]  = float(pws[pos])
-    return ipd_prof + pw_prof
+from .utils.sample_layout import (
+    METH_CTX_LEFT, METH_CTX_RIGHT, METH_CTX_LEN,
+    PROFILE_START, PROFILE_END, PROFILE_LEN,
+    REV_METH_OFFSETS, REV_METH_LEN,
+    SAMPLE_NCOLS,
+    slice_meth_context as _slice_meth_context,
+    slice_rev_meth     as _slice_rev_meth,
+    slice_kinetic_profile as _slice_kinetic_profile,
+)
 
 
 # ---------------------------------------------------------------------------

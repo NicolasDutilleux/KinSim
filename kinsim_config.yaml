@@ -85,3 +85,27 @@ refine:
     # Below this sample count, the bucket is too small even for Mahalanobis;
     # keep all samples without refinement (single-Gaussian fit on the data).
     min_samples_low: 1
+
+  # ---------- v4: slowed-position vs baseline split ----------
+  # After the global per-meth-type GMM has confirmed the methylated buckets,
+  # the (kmer, none) bucket still contains a mix of:
+  #   - true baseline positions (no methylation upstream within window)
+  #   - "slowed" positions: samples whose center is unmethylated but whose
+  #     meth_context contains a methylation at a signature offset upstream
+  #     (e.g. a sample at p+5 whose mc[2]=m6A, where p is a confirmed m6A).
+  # The polymerase kinetics at slowed positions ARE elevated even though the
+  # base at center is unmethylated — that's the very signal kinetic-aware
+  # methylation calling exploits. We split the none bucket in two and apply
+  # quality control to each:
+  slowed_split:
+    # Cap on truly-baseline samples (no meth at any signature offset
+    # upstream) kept per kmer in the final training set. Prevents the
+    # baseline class from drowning the slowed class.
+    n_baseline_per_kmer: 50
+
+    # Percentile of baseline-IPD distribution used as a lower threshold
+    # for slowed samples: a slowed sample whose center IPD is below the
+    # baseline N-th percentile is treated as a false-positive "expected
+    # slowing did not actually occur" (motif false call upstream, edge
+    # effect, low-coverage artefact) and dropped.
+    secondary_percentile: 95
