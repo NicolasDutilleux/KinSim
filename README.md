@@ -36,17 +36,47 @@ Real PacBio BAMs              Synthetic reads (PBSIM3)
 
 ## Tools used
 
-| Component | Role |
-|---|---|
-| **PacBio SMRT-Tools 25.x** | `ccs-kinetics-bystrandify` (per-strand reads), `pbindex`, `pbmm2` |
-| **jasmine** + **modkit** | 5mC calling from MM/ML tags (Revio) |
-| **ipdSummary** (kineticsTools, SMRT-Link 25.1) | m6A / m4C statistical caller (SP3-C3 model) |
-| **pbmotifmaker** | Consensus motif discovery from ipdSummary GFF |
-| **EMBOSS fuzznuc** *(optional)* | Fast genome-wide motif scanning |
-| **PBSIM3** | HiFi read simulator (sequence-only, no kinetics) |
-| **PyTorch ≥ 2.0** | Neural network framework |
-| **scikit-learn** | GaussianMixture for refine clustering |
-| **pysam, numpy, pandas, plotly, pyyaml** | Standard scientific stack |
+### Upstream callers (methylation motif discovery)
+
+| Tool | Tested version | Role |
+|---|---|---|
+| **PacBio SMRT-Link** | 25.1 (containerised: `pacbio-smrt-tools-25.3.sif` on IBU) | Bundle providing all PacBio CLIs below |
+| `ccs-kinetics-bystrandify` | SMRT-Link 25.1 | Split each HiFi read into two per-strand reads carrying ip/pw |
+| `pbindex` | SMRT-Link 25.1 | Build `.pbi` index required by ipdSummary |
+| `pbmm2` | SMRT-Link 25.1 | Reference alignment (when GFF mode was used; now optional) |
+| `ipdSummary` (kineticsTools) | SMRT-Link 25.1, SP3-C3 chemistry model | m6A / m4C statistical caller |
+| `pbmotifmaker` | SMRT-Link 25.1 | Consensus motif discovery from ipdSummary GFF |
+| `jasmine` | SMRT-Link 25.1 (Revio P2-C2 model) | 5mC ML caller producing MM/ML tags |
+| `modkit` | 0.4.x | Convert MM/ML tags into per-position bedMethyl / motif fractions |
+| `hifiasm` | 0.19.x | Draft assembly (Vega prep pipeline only) |
+| `samtools` | 1.18+ | BAM indexing |
+
+### Read simulation
+
+| Tool | Tested version | Role |
+|---|---|---|
+| `PBSIM3` | 3.0.4 | HiFi read simulator (sequence-only, no kinetics) — input to `kinsim generate` |
+
+### KinSim model + pipeline
+
+| Component | Tested version | Role |
+|---|---|---|
+| **Python** | 3.9 (cluster) / 3.10+ (local) | runtime |
+| **PyTorch** | ≥ 2.0 | neural network framework |
+| **pysam** | 0.22+ | BAM I/O |
+| **numpy** | 1.26+ | numerical core |
+| **scikit-learn** | 1.4+ | `GaussianMixture` for refine clustering |
+| **pandas** | 2.2+ | report tables |
+| **plotly** | 5.20+ | interactive HTML reports |
+| **pyyaml** | 6.0+ | `kinsim_config.yaml` loader |
+| **EMBOSS fuzznuc** *(optional)* | 6.6.0 | fast genome-wide motif scanning (Python regex used as fallback) |
+| **Apptainer / Singularity** *(HPC)* | 1.x | container runtime for SMRT-Link image |
+
+The IBU cluster ships `/containers/apptainer/pacbio-smrt-tools-25.3.sif` —
+note the image label says 25.3 but the embedded SMRT-Link release is 25.1
+for `ipdSummary`/`pbmotifmaker`. Pinning to 25.1 was a deliberate choice:
+SMRT-Link 12.x (the system module) detected only ~73% of TCGCGA m4C sites,
+versus ~95% with 25.1 (matching L. Falquet's reference output).
 
 ---
 
@@ -60,11 +90,11 @@ cd KinSim
 pip install -e .
 ```
 
-This installs two CLI tools:
-- **`kinsim`** — ML pipeline (extract / merge / refine / train / generate / evaluate / analyze)
-- **`kinsim-prep`** — data prep (motif parsing / manifest tools / balance / filter)
-
-For HPC reproducibility, the tested SMRT-Link version is 25.1 (jasmine + ipdSummary + pbmotifmaker bundled). Available as Apptainer image at `/containers/apptainer/pacbio-smrt-tools-25.3.sif` on the IBU cluster.
+The main CLI entry point is **`kinsim`** — the full ML pipeline (extract /
+merge / refine / train / generate / evaluate / analyze). A complementary
+`kinsim-prep` CLI is also installed for ancillary data-preparation tools
+(motif parsing, manifest CSV checks, sample filtering / balancing); see
+[`prep/README.md`](prep/README.md) for details.
 
 ### 2. Discover methylation motifs (upstream callers)
 

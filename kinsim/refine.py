@@ -48,338 +48,6 @@ MOD_NAMES = {0: "none", 1: "m6A", 2: "m4C", 3: "m5C"}
 
 
 # ---------------------------------------------------------------------------
-# Core: 2-component GMM with fixed None component
-# ---------------------------------------------------------------------------
-
-def em_fixed_none(
-    samples_m: np.ndarray,      # (N, 2) mixture, log1p space
-    mu_n:      np.ndarray,      # (2,)   None mean
-    sigma_n:   np.ndarray,      # (2, 2) None covariance
-    max_iter:  int = 30,
-    tol:       float = 1e-4,
-    ridge:     float = 1e-4,
-) -> tuple[np.ndarray, np.ndarray, float, bool]:
-    """Fit N(μ_m, Σ_m) + π against fixed N(μ_n, Σ_n).
-
-    Returns:  (μ_m, Σ_m, π, converged).
-    """
-    n = len(samples_m)
-    if n < 2:
-        return mu_n.copy(), sigma_n.copy(), 0.0, False
-
-    sigma_n_reg = sigma_n + ridge * np.eye(2)
-    try:
-        inv_n = np.linalg.inv(sigma_n_reg)
-    except np.linalg.LinAlgError:
-        return mu_n.copy(), sigma_n.copy(), 0.0, False
-    det_n = np.linalg.det(sigma_n_reg)
-    if det_n <= 0:
-        return mu_n.copy(), sigma_n.copy(), 0.0, False
-
-    std_n = np.sqrt(np.clip(np.diag(sigma_n_reg), 0, None))
-    mu_m = mu_n + 1.0 * std_n
-    sigma_m = sigma_n_reg.copy()
-    pi = 0.5
-    prev_ll = -np.inf
-
-    for _ in range(max_iter):
-        sigma_m_reg = sigma_m + ridge * np.eye(2)
-        try:
-            inv_m = np.linalg.inv(sigma_m_reg)
-        except np.linalg.LinAlgError:
-            return mu_n.copy(), sigma_n.copy(), 0.0, False
-        det_m = np.linalg.det(sigma_m_reg)
-        if det_m <= 0:
-            return mu_n.copy(), sigma_n.copy(), 0.0, False
-
-        diff_m = samples_m - mu_m
-        diff_n = samples_m - mu_n
-        log_p_m = -0.5 * np.einsum("ij,jk,ik->i", diff_m, inv_m, diff_m) - 0.5 * np.log(det_m)
-        log_p_n = -0.5 * np.einsum("ij,jk,ik->i", diff_n, inv_n, diff_n) - 0.5 * np.log(det_n)
-
-        log_pi_m = np.log(max(pi, 1e-12))       + log_p_m
-        log_pi_n = np.log(max(1.0 - pi, 1e-12)) + log_p_n
-        log_max  = np.maximum(log_pi_m, log_pi_n)
-        log_sum  = log_max + np.log(np.exp(log_pi_m - log_max) + np.exp(log_pi_n - log_max))
-        gamma    = np.exp(log_pi_m - log_sum)
-
-        w = gamma.sum()
-        if w < 1e-6:
-            return mu_n.copy(), sigma_n.copy(), 0.0, False
-        pi_new   = float(w / n)
-        mu_m_new = (gamma[:, None] * samples_m).sum(axis=0) / w
-
-        # Methylation can only SLOW the polymerase → μ_m[IPD] ≥ μ_n[IPD].
-        if mu_m_new[0] < mu_n[0]:
-            mu_m_new[0] = mu_n[0] + 0.05
-
-        diff = samples_m - mu_m_new
-        sigma_m_new = (gamma[:, None, None] * diff[:, :, None] * diff[:, None, :]).sum(axis=0) / w
-
-        ll = float(log_sum.sum())
-        converged = abs(ll - prev_ll) < tol
-
-        mu_m, sigma_m, pi = mu_m_new, sigma_m_new, pi_new
-        prev_ll = ll
-        if converged:
-            return mu_m, sigma_m, pi, True
-
-    return mu_m, sigma_m, pi, False
-
-
-def gmm_signature_validate(
-    arr:        np.ndarray,         # (N, SAMPLE_NCOLS) — meth bucket samples
-    mu_n:       np.ndarray,         # (2,)   None mean (log1p space)
-    sigma_n:    np.ndarray,         # (2, 2) None covariance (log1p space)
-    sig_offsets: list[int],          # kept for compat
-    profile_start_col: int,          # kept for compat
-    profile_len:       int,          # kept for compat
-    k_max:      int   = 3,
-    chi2_t:     float = 9.21,        # kept for compat
-    min_sig_ratio: float = 1.3,      # kept for compat
-    min_pi:     float = 0.05,
-    ridge:      float = 1e-4,
-    none_arr:   np.ndarray | None = None,   # (M, SAMPLE_NCOLS) — None bucket samples
-) -> tuple[np.ndarray, np.ndarray, float, str] | None:
-    """Joint-GMM clustering on combined (None + Meth) samples per kmer.
-
-    Algorithm:
-      1. Stack the (kmer, none) and (kmer, meth) samples into one combined
-         dataset (log1p IPD, log1p PW).
-      2. Fit a GMM with K=2 (or K=3 if BIC prefers, e.g. partial methylation
-         as a third middle cluster).
-      3. Identify the "real meth" cluster as the one with the highest mean
-         IPD. The other cluster(s) are None / contamination.
-      4. For the meth samples only, keep those assigned to the highest-IPD
-         cluster. These are the truly methylated samples; the rest are
-         contamination that snuck through upstream filtering.
-      5. Re-estimate (μ_m, Σ_m) from the kept meth samples.
-
-    Why combined GMM (vs Mahalanobis-only): the GMM learns the cluster
-    boundary from the data (using both None and Meth populations) rather
-    than assuming a fixed distance threshold. This is more robust when the
-    None distribution is non-Gaussian or when the meth signal is partial.
-    """
-    from sklearn.mixture import GaussianMixture
-
-    n = len(arr)
-    if n < 2:
-        return None
-    if none_arr is None or len(none_arr) < 2:
-        return None  # Need a None reference to do joint clustering
-
-    # --- Per-offset clustering: one GMM per signature offset ---
-    # For multi-offset signatures (m6A: [0, 5]; m5C: [2, 6]), each offset
-    # gets its own joint-GMM (None + Meth on that single offset's IPD).
-    # The final keep_mask is the INTERSECTION across all offsets — a sample
-    # must look "real meth" at EVERY signature position to survive.
-    # This is stricter than a single multi-dim GMM and treats each
-    # signature event as an independent confirmation.
-    sig_idx = [i for i in sig_offsets if 0 <= i < profile_len]
-    if not sig_idx:
-        sig_idx = [0]   # fallback to center
-
-    # Original (IPD, PW) center values — used to compute the final (mu, Sigma)
-    # to store for training. Clustering happens on signature features.
-    xy_meth = np.log1p(arr[:, :2].astype(np.float32))
-
-    # --- GMM with K = 1..k_max (BIC selection) ---
-    # --- Per-offset joint-GMM, intersect the keep masks ---
-    # For each signature offset (e.g. +0 and +5 for m6A), fit a 1D
-    # joint-GMM on the combined (None + Meth) IPDs at that offset, identify
-    # the "real meth" cluster (highest mean), classify the meth samples.
-    # A sample must pass at EVERY offset to be kept.
-    keep_masks_per_offset: list[np.ndarray] = []
-    K_per_offset: list[int] = []
-    K_chosen_any_above_1 = False
-
-    for off in sig_idx:
-        col = profile_start_col + off
-        feats_meth_1d = np.log1p(arr[:, col].astype(np.float32)).reshape(-1, 1)
-        feats_none_1d = np.log1p(none_arr[:, col].astype(np.float32)).reshape(-1, 1)
-        feats_combined = np.concatenate([feats_none_1d, feats_meth_1d], axis=0)
-
-        best_bic = np.inf
-        best_gmm = None
-        n_combined = len(feats_combined)
-        for k in range(1, k_max + 1):
-            if k > n_combined // 3 and k > 1:
-                break
-            try:
-                gmm = GaussianMixture(
-                    n_components=k, covariance_type="full",
-                    reg_covar=ridge, max_iter=100, n_init=2, random_state=42,
-                )
-                gmm.fit(feats_combined)
-                bic = float(gmm.bic(feats_combined))
-                if bic < best_bic:
-                    best_bic = bic
-                    best_gmm = gmm
-            except (ValueError, np.linalg.LinAlgError):
-                continue
-
-        if best_gmm is None:
-            return None
-
-        K_off = best_gmm.n_components
-        K_per_offset.append(K_off)
-
-        if K_off == 1:
-            # No separation found at this offset — accept all meth samples
-            # (we can't filter, fall back on upstream confidence).
-            keep_masks_per_offset.append(np.ones(n, dtype=bool))
-            continue
-
-        K_chosen_any_above_1 = True
-        # Real-meth cluster: highest mean (methylation only raises IPD)
-        mean_per_cluster = best_gmm.means_[:, 0]                # (K,)
-        real_meth_id = int(np.argmax(mean_per_cluster))
-        meth_labels = best_gmm.predict(feats_meth_1d)
-        keep_masks_per_offset.append(meth_labels == real_meth_id)
-
-    # Intersection: a sample passes only if "real meth" at every signature offset
-    keep_mask = np.logical_and.reduce(keep_masks_per_offset)
-    n_kept = int(keep_mask.sum())
-    if n_kept < 3:
-        return None
-
-    if not K_chosen_any_above_1:
-        # All offsets ended up K=1 (no separation possible) — keep all
-        # meth samples. The caller's upstream jasmine/motifmaker
-        # confidence is the safety net here.
-        xy_kept = xy_meth
-    else:
-        xy_kept = xy_meth[keep_mask]
-
-    mu_m    = xy_kept.mean(axis=0).astype(np.float32)
-    sigma_m = (np.cov(xy_kept, rowvar=False) + ridge * np.eye(2)).astype(np.float32)
-    if sigma_m.ndim < 2:
-        sigma_m = np.eye(2, dtype=np.float32) * float(sigma_m)
-    if mu_m[0] < mu_n[0]:
-        mu_m[0] = mu_n[0] + 0.05
-    pi = float(n_kept / n)
-    if pi < min_pi:
-        return None
-
-    K_str = "_".join(str(k) for k in K_per_offset)              # e.g. "2_3" for m6A
-    status = f"gmm_{K_str}_real_kept" if K_chosen_any_above_1 else "gmm_all1_kept"
-    return mu_m, sigma_m, pi, status
-
-
-def cluster_pick_farthest(
-    samples_m: np.ndarray,        # (N, 2) meth samples, log1p space
-    mu_n:      np.ndarray,        # (2,)   None mean
-    sigma_n:   np.ndarray,        # (2, 2) None covariance
-    k_max:     int   = 3,
-    ridge:     float = 1e-4,
-    min_d2:    float = CHI2_99_2DOF,
-) -> tuple[np.ndarray, np.ndarray, float] | None:
-    """Cluster the meth bucket; keep the component farthest from None.
-
-    Steps:
-      1. Fit GMM with K=1..k_max components on the meth samples (BIC selects K).
-      2. Compute Mahalanobis distance from each component centroid to None.
-      3. Return (μ_m, Σ_m) of the component with the largest distance, with π
-         set to that component's mixing weight (fraction of samples assigned).
-      4. If the farthest centroid is still within χ²_{0.99} of None, return
-         None — there is no real meth signal in this bucket.
-
-    Robust to bimodal contamination: when meth samples are a mix of real
-    methylated reads and near-None partial-methylation/false-positive reads,
-    BIC favours K=2 and we keep only the far component.
-
-    Returns:
-        (μ_m, Σ_m, π) on success, or None if no separable cluster found.
-    """
-    from sklearn.mixture import GaussianMixture
-
-    n = len(samples_m)
-    if n < 5:
-        return None
-
-    sigma_n_reg = sigma_n + ridge * np.eye(2)
-    try:
-        inv_n = np.linalg.inv(sigma_n_reg)
-    except np.linalg.LinAlgError:
-        return None
-
-    best_bic = np.inf
-    best_gmm = None
-    for k in range(1, k_max + 1):
-        if k > n // 3:
-            break
-        try:
-            gmm = GaussianMixture(
-                n_components=k, covariance_type="full",
-                reg_covar=ridge, max_iter=100, n_init=2, random_state=42,
-            )
-            gmm.fit(samples_m)
-            bic = float(gmm.bic(samples_m))
-            if bic < best_bic:
-                best_bic = bic
-                best_gmm = gmm
-        except (ValueError, np.linalg.LinAlgError):
-            continue
-
-    if best_gmm is None:
-        return None
-
-    distances = []
-    for kk in range(best_gmm.n_components):
-        diff = best_gmm.means_[kk] - mu_n
-        d2 = float(diff @ inv_n @ diff)
-        distances.append(d2)
-
-    best_k = int(np.argmax(distances))
-    if distances[best_k] < min_d2:
-        return None  # closest component still too close to None
-
-    mu_m    = best_gmm.means_[best_k].astype(np.float32).copy()
-    sigma_m = best_gmm.covariances_[best_k].astype(np.float32)
-    if mu_m[0] < mu_n[0]:
-        mu_m[0] = mu_n[0] + 0.05
-
-    pi = float(best_gmm.weights_[best_k])
-    return mu_m, sigma_m, pi
-
-
-def mahalanobis_fallback(
-    samples_m: np.ndarray,
-    mu_n:      np.ndarray,
-    sigma_n:   np.ndarray,
-    ridge:     float = 1e-4,
-    chi2_threshold: float = CHI2_95_2DOF,
-) -> tuple[np.ndarray, np.ndarray, float]:
-    """Keep samples with d²(·, None) > threshold; estimate μ_m, Σ_m from them.
-
-    Threshold defaults to χ²_{2, 0.95} (5% rejection). When called with the
-    stricter χ²_{2, 0.99} = 9.21, only keeps samples that have ≤1% chance
-    of belonging to the None distribution. Use the strict variant for
-    low-count keys where EM is unreliable and loose thresholds let noise
-    leak into the methylated bucket.
-    """
-    sigma_n_reg = sigma_n + ridge * np.eye(2)
-    try:
-        inv_n = np.linalg.inv(sigma_n_reg)
-    except np.linalg.LinAlgError:
-        return mu_n.copy(), sigma_n.copy(), 0.0
-
-    diff = samples_m - mu_n
-    d2   = np.einsum("ij,jk,ik->i", diff, inv_n, diff)
-    mask = d2 > chi2_threshold
-    kept = samples_m[mask]
-    if len(kept) < 3:
-        return mu_n.copy(), sigma_n.copy(), 0.0
-
-    mu_m    = kept.mean(axis=0)
-    sigma_m = np.cov(kept, rowvar=False) + ridge * np.eye(2)
-    if mu_m[0] < mu_n[0]:
-        mu_m[0] = mu_n[0] + 0.05
-    pi = float(mask.mean())
-    return mu_m, sigma_m, pi
-
-
-# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -387,15 +55,7 @@ def refine_pkl(
     in_path:     Path,
     out_path:    Path,
     report_path: Path | None = None,
-    em_max_iter: int   = 30,
-    em_tol:      float = 1e-4,
-    min_samples: int   = 30,
-    strict_n:    int   = 50,
-    min_pi:      float = 0.05,
-    min_sep:     float = 0.3,
-    seed:        int   = 42,
-    method:      str   = "global_gmm",
-    chi2_99:     bool  = True,
+    seed:        int           = 42,
 ) -> dict:
     """Refine a KinSim master.pkl with a GLOBAL per-meth-type GMM filter.
 
@@ -412,9 +72,6 @@ def refine_pkl(
     The output keeps all (kmer, none) buckets unchanged plus the surviving
     (kmer, meth) buckets that contain only the real-meth-cluster samples.
     """
-    if method != "global_gmm":
-        log.warning("Legacy method %r requested - using global_gmm.", method)
-
     log.info("Loading: %s  (%.2f GB)", in_path, in_path.stat().st_size / 1e9)
     with open(in_path, "rb") as f:
         data = pickle.load(f)
@@ -626,6 +283,43 @@ def refine_pkl(
     log.info("Dropped (false-positive): %d", n_meth_dropped)
     log.info("Buckets fully dropped:    %d", n_buckets_dropped)
 
+    # --- 5. Write output ---
+    out["__meta__"] = {
+        "refined_from":     str(in_path),
+        "method":           "global_gmm",
+        "space_for_fit":    "log1p",
+        "space_for_store":  "raw",
+        "seed":             seed,
+        "n_unique_kmers":   n_unique_kmers,
+        "n_samples_in":     n_samples_in,
+        "n_samples_out":    n_samples_out,
+        "n_meth_in":        n_meth_in,
+        "n_meth_kept":      n_meth_kept,
+        "n_meth_dropped":   n_meth_dropped,
+        "n_buckets_dropped": n_buckets_dropped,
+        "status_counts":    dict(status_counter),
+        "original_meta":    orig_meta,
+    }
+
+    log.info("Writing: %s", out_path)
+    with open(out_path, "wb") as f:
+        pickle.dump(out, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    log.info("Status summary:")
+    for s, c in status_counter.most_common():
+        log.info("  %-32s %d", s, c)
+    log.info("Samples in:  %d", n_samples_in)
+    log.info("Samples out: %d  (Δ = %+d)", n_samples_out, n_samples_out - n_samples_in)
+
+    if report_path is not None:
+        log.info("Report: %s", report_path)
+        with open(report_path, "w") as f:
+            f.write("kmer_id\tmeth\tn_original\tn_kept\tpi\tseparation\tstatus\n")
+            for r in rows:
+                f.write(f"{r[0]}\t{r[1]}\t{r[2]}\t{r[3]}\t{r[4]:.4f}\t{r[5]:.4f}\t{r[6]}\n")
+
+    return dict(status_counter)
+
 
 def main(argv=None):
     from .utils.config import setup_logging
@@ -638,40 +332,8 @@ def main(argv=None):
     ap.add_argument("input_pkl", help="Input .pkl (typically a merged master)")
     ap.add_argument("output_pkl", help="Output refined .pkl")
     ap.add_argument("--report", help="Optional per-key TSV report")
-    ap.add_argument("--em-max-iter", type=int,   default=30)
-    ap.add_argument("--em-tol",      type=float, default=1e-4)
-    ap.add_argument("--min-samples", type=int,   default=30,
-                    help="Meth buckets with fewer samples skip EM and go to Mahalanobis fallback")
-    ap.add_argument("--strict-n",    type=int,   default=50,
-                    help="For keys with <N samples use the stricter χ²_{0.99} threshold "
-                         "(1%% chance of being None) in the Mahalanobis fallback, instead "
-                         "of the default χ²_{0.95} (5%%). Reduces noise leakage when EM "
-                         "fit is unreliable or the fallback is triggered by low count.")
-    ap.add_argument("--min-pi",      type=float, default=0.05,
-                    help="Drop keys where fitted π < this (no real meth signal)")
-    ap.add_argument("--min-sep",     type=float, default=0.3,
-                    help="Drop keys where ||μ_m - μ_n||/√tr(Σ_n) < this (signal too weak)")
-    ap.add_argument("--seed",        type=int,   default=42)
-    ap.add_argument("--method",
-                    choices=["global_gmm", "gmm_signature", "clustered",
-                             "mahalanobis", "em"],
-                    default="global_gmm",
-                    help="Refinement method (default: global_gmm). "
-                         "'global_gmm' = pool ALL samples per meth_id, fit one "
-                         "GMM globally, reject samples not in the highest-IPD "
-                         "cluster (false-positive motif matches). Buckets that "
-                         "shrink below 3 samples are dropped entirely. "
-                         "'gmm_signature' = legacy per-bucket GMM. "
-                         "'clustered' = legacy GMM picking the centroid farthest "
-                         "from None (no profile validation). "
-                         "'mahalanobis' = hard χ² filter on each sample's distance "
-                         "from None. "
-                         "'em' = legacy EM fixed-None mixture (can over-fit).")
-    ap.add_argument("--no-chi2-99",  dest="chi2_99", action="store_false",
-                    help="Use χ²_{0.95} (5%% rejection) instead of the default "
-                         "χ²_{0.99} (1%% rejection). Keeps more samples but lets more "
-                         "near-None contamination leak into the meth bucket.")
-    ap.set_defaults(chi2_99=True)
+    ap.add_argument("--seed",    type=int,   default=42,
+                    help="Random seed for None-pool subsampling and GMM init")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -687,15 +349,7 @@ def main(argv=None):
     if rep_p is not None:
         rep_p.parent.mkdir(parents=True, exist_ok=True)
 
-    refine_pkl(
-        in_p, out_p, report_path=rep_p,
-        em_max_iter=args.em_max_iter, em_tol=args.em_tol,
-        min_samples=args.min_samples, strict_n=args.strict_n,
-        min_pi=args.min_pi, min_sep=args.min_sep,
-        seed=args.seed,
-        method=args.method,
-        chi2_99=args.chi2_99,
-    )
+    refine_pkl(in_p, out_p, report_path=rep_p, seed=args.seed)
 
 
 if __name__ == "__main__":

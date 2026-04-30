@@ -11,9 +11,9 @@ import sys
 __version__ = "0.4.0"
 
 COMMANDS = [
-    "extract", "merge", "refine", "binarize", "train", "generate", "evaluate",
+    "extract", "merge", "refine", "train", "generate", "evaluate",
     "verify-generate", "analyze", "compare", "inspect-model", "sample",
-    "strip-kinetics", "merge-bam",
+    "strip-kinetics",
 ]
 
 USAGE = """\
@@ -24,8 +24,7 @@ KinSim - PacBio kinetic signal simulator (MLP pipeline).
 Commands:
   extract          Extract raw IPD/PW samples from a BAM file  (-> .pkl shard)
   merge            Merge .pkl shards into a master training set
-  refine           EM fixed-None cleanup of methylated buckets (master -> master_clean)
-  binarize         GMM binarization of raw .pkl (separate meth vs unmeth reads)
+  refine           Joint-GMM cleanup of methylated buckets (master -> master_clean)
   train            Train the ConvPredictor / MLPPredictor model
   generate         Generate synthetic kinetic signals for PBSIM3 reads
   evaluate         Evaluate a trained model (calibration report + plots)
@@ -35,7 +34,8 @@ Commands:
   inspect-model    Inspect ipdSummary null model (.npz.gz) internals
   sample           Subsample a .pkl for train/test splits
   strip-kinetics   Copy a BAM and remove fi/fp/ri/rp tags from the copy
-  merge-bam        Merge multiple BAMs into one metagenomic BAM
+                   (use `samtools cat` to merge multiple BAMs into one;
+                    no built-in command needed)
 
 Data preparation:
   Use 'kinsim-prep' for motif parsing, REBASE fetching, manifest tools,
@@ -95,11 +95,6 @@ def main(argv=None):
         from .verify_generate import main as run
         run(rest)
 
-    # -- binarize --
-    elif cmd == "binarize":
-        from .binarize import main as run
-        run(rest)
-
     # -- train --
     elif cmd == "train":
         from .train import main as run
@@ -138,11 +133,6 @@ def main(argv=None):
     # -- strip-kinetics --
     elif cmd == "strip-kinetics":
         from .strip_kinetics import main as run
-        run(rest)
-
-    # -- merge-bam --
-    elif cmd == "merge-bam":
-        from .merge_bam import main as run
         run(rest)
 
     # -- unknown --
