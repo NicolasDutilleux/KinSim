@@ -475,6 +475,12 @@ def refine_pkl(
     from sklearn.mixture import GaussianMixture
     from collections import defaultdict as _dd
 
+    # Resolve signature offsets per meth type from config
+    from .utils.config import load_kinsim_config
+    from .extract import METH_CTX_LEN, PROFILE_LEN
+    cfg = load_kinsim_config()
+    profile_start_col = 3 + METH_CTX_LEN   # = 14: cols 14..14+PROFILE_LEN-1 are IPD profile
+
     # 4. Process each meth type GLOBALLY
     for meth_id in sorted(meth_buckets):
         buckets = meth_buckets[meth_id]
@@ -482,18 +488,39 @@ def refine_pkl(
             continue
         mod_name = MOD_NAMES.get(meth_id, "mod%d" % meth_id)
 
+        # Pick the IPD columns to use as GMM features, based on the signature
+        # offsets configured for this meth type. For m6A this is the IPD at
+        # offsets [0, 5]; for m4C [0]; for m5C [2, 6] (the C itself has no
+        # signal, so we MUST use profile aval to find the real-meth cluster).
+        sig_cfg = cfg.get("kinetic_signatures", {}).get(mod_name, {})
+        sig_offsets = list(sig_cfg.get("signal_offsets", [0]))
+        sig_offsets = [o for o in sig_offsets if 0 <= o < PROFILE_LEN]
+        if not sig_offsets:
+            sig_offsets = [0]
+        feature_cols = [profile_start_col + o for o in sig_offsets]
+        log.info("[%s] signature offsets %s -> GMM features at cols %s",
+                 mod_name, sig_offsets, feature_cols)
+
         all_arrays = []
         sample_kmer = []
         for kmer_id, arr in buckets.items():
             all_arrays.append(arr)
             sample_kmer.extend([kmer_id] * len(arr))
         meth_pool = np.concatenate(all_arrays).astype(np.float32)
-        meth_pool_log = np.log1p(meth_pool[:, :2])
+        # Check storage layout supports the profile columns
+        if meth_pool.shape[1] < max(feature_cols) + 1:
+            log.warning("[%s] pkl lacks profile cols (cols=%d) - falling back to "
+                        "(IPD center, PW center) for GMM features",
+                        mod_name, meth_pool.shape[1])
+            meth_pool_log = np.log1p(meth_pool[:, :2])
+        else:
+            meth_pool_log = np.log1p(meth_pool[:, feature_cols])
         n_pool = len(meth_pool)
         n_samples_in += n_pool
         n_meth_in    += n_pool
-        log.info("[%s] global pool: %d samples across %d buckets",
-                 mod_name, n_pool, len(buckets))
+        log.info("[%s] global pool: %d samples across %d buckets, "
+                 "feature dim=%d", mod_name, n_pool, len(buckets),
+                 meth_pool_log.shape[1])
 
         best_bic = np.inf
         best_gmm = None
@@ -523,16 +550,19 @@ def refine_pkl(
             continue
 
         K = best_gmm.n_components
-        ipd_means = best_gmm.means_[:, 0]
-        real_cluster = int(np.argmax(ipd_means))
+        # Real-meth cluster: highest MEAN across all signature features
+        # (methylation only RAISES IPD at signature positions). For m6A this
+        # averages IPD@+0 and IPD@+5; for m5C IPD@+2 and IPD@+6.
+        cluster_score = best_gmm.means_.mean(axis=1)            # (K,)
+        real_cluster = int(np.argmax(cluster_score))
         labels = best_gmm.predict(meth_pool_log)
         keep_mask = (labels == real_cluster)
         n_kept_pool = int(keep_mask.sum())
 
-        log.info("[%s] BIC K=%d. cluster_means_log_IPD=%s. real_cluster=%d. "
-                 "Kept %d/%d (%.1f%%); dropped %d as false positives.",
+        log.info("[%s] BIC K=%d. cluster_means_log_IPD_per_feature=%s. "
+                 "real_cluster=%d. Kept %d/%d (%.1f%%); dropped %d as false positives.",
                  mod_name, K,
-                 [round(float(m), 3) for m in ipd_means.tolist()],
+                 best_gmm.means_.round(3).tolist(),
                  real_cluster, n_kept_pool, n_pool,
                  100.0 * n_kept_pool / max(n_pool, 1),
                  n_pool - n_kept_pool)
