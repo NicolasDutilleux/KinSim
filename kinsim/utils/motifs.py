@@ -155,17 +155,36 @@ def parse_motifs(motif_string, revcomp=True):
     motifs = []
     if not motif_string:
         return motifs
+
+    # Pre-collect user-provided sequences. If the user has provided BOTH a
+    # motif M and its reverse complement (often the case for palindromic
+    # methylation systems like Type II R-M, where each strand carries its own
+    # methylation event at different positions), we must NOT auto-expand the
+    # revcomp again — doing so would tag positions on the read that are NOT
+    # the actual methylated base on either strand (the user's two motifs
+    # already cover both strand views explicitly).
+    user_entries = []
     for entry in motif_string.split(';'):
         if not entry or ',' not in entry:
             continue
         parts = entry.split(',')
+        if len(parts) < 3:
+            continue
+        user_entries.append(parts)
+    user_seqs = {parts[1] for parts in user_entries}
+
+    for parts in user_entries:
         m_type, seq, pos = parts[0], parts[1], parts[2]
         m_id = METH_IDS.get(m_type, 0)
         mod_pos = int(pos) - 1  # 1-based input → 0-based internal
 
         pairs = [(seq, mod_pos)]
         if revcomp:
-            pairs.append((reverse_complement(seq), len(seq) - 1 - mod_pos))
+            rc = reverse_complement(seq)
+            # Skip auto-revcomp expansion if the user already provided the
+            # revcomp sequence as a separate motif entry (palindromic system).
+            if rc not in user_seqs:
+                pairs.append((rc, len(seq) - 1 - mod_pos))
 
         frac = float(parts[4]) if len(parts) >= 5 else 1.0
 
