@@ -508,7 +508,8 @@ def refine_pkl(
             sample_kmer.extend([kmer_id] * len(arr))
         meth_pool = np.concatenate(all_arrays).astype(np.float32)
         # Check storage layout supports the profile columns
-        if meth_pool.shape[1] < max(feature_cols) + 1:
+        has_profile = meth_pool.shape[1] >= max(feature_cols) + 1
+        if not has_profile:
             log.warning("[%s] pkl lacks profile cols (cols=%d) - falling back to "
                         "(IPD center, PW center) for GMM features",
                         mod_name, meth_pool.shape[1])
@@ -522,10 +523,36 @@ def refine_pkl(
                  "feature dim=%d", mod_name, n_pool, len(buckets),
                  meth_pool_log.shape[1])
 
+        # Build a BALANCED None pool of equal size for the GMM fit. Including
+        # the None reference in the fit gives the GMM a clear anchor for the
+        # contamination cluster (otherwise BIC may pick a sub-structure of
+        # the meth pool itself rather than separate meth from None).
+        none_arrays = list(none_buckets.values())
+        if none_arrays:
+            none_full = np.concatenate(none_arrays).astype(np.float32)
+            if has_profile and none_full.shape[1] >= max(feature_cols) + 1:
+                none_full_log = np.log1p(none_full[:, feature_cols])
+            else:
+                none_full_log = np.log1p(none_full[:, :2])
+            n_none_avail = len(none_full_log)
+            n_balance    = min(n_pool, n_none_avail)
+            if n_balance < n_none_avail:
+                idx = rng.choice(n_none_avail, n_balance, replace=False)
+                none_pool_log = none_full_log[idx]
+            else:
+                none_pool_log = none_full_log
+            log.info("[%s] balanced None pool: %d samples", mod_name, len(none_pool_log))
+        else:
+            none_pool_log = np.empty((0, meth_pool_log.shape[1]), dtype=np.float32)
+
+        # Combined pool: meth + balanced None
+        combined_log = np.concatenate([meth_pool_log, none_pool_log], axis=0)
+        n_combined   = len(combined_log)
+
         best_bic = np.inf
         best_gmm = None
         for k in (2, 3):
-            if k * 5 > n_pool:
+            if k * 5 > n_combined:
                 continue
             try:
                 gmm = GaussianMixture(
@@ -533,8 +560,8 @@ def refine_pkl(
                     reg_covar=1e-4, max_iter=100, n_init=2,
                     random_state=seed,
                 )
-                gmm.fit(meth_pool_log)
-                bic = float(gmm.bic(meth_pool_log))
+                gmm.fit(combined_log)
+                bic = float(gmm.bic(combined_log))
                 if bic < best_bic:
                     best_bic = bic
                     best_gmm = gmm
