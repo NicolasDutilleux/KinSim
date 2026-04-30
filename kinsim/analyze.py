@@ -116,8 +116,8 @@ class DictStats:
 @dataclasses.dataclass
 class NeighborSensitivity:
     """1-base substitution sensitivity results for one category."""
-    delta_ipd: np.ndarray         # |Δ mean_ipd| per neighbor pair found
-    delta_pw: np.ndarray          # |Δ mean_pw|  per neighbor pair found
+    delta_ipd: np.ndarray         # |delta mean_ipd| per neighbor pair found
+    delta_pw: np.ndarray          # |delta mean_pw|  per neighbor pair found
     positions: np.ndarray         # int8 — which position (0…K-1) was mutated
     n_source_entries: int
     n_pairs_found: int
@@ -128,19 +128,26 @@ class NeighborSensitivity:
 # ---------------------------------------------------------------------------
 
 def _detect_kmer_size(data: dict, meta: dict) -> int:
-    """Infer kmer size from __meta__ or from the range of kmer_ids in the data."""
+    """Infer kmer size from __meta__ or from the range of kmer_ids in the data.
+
+    Supports v3 (tuple keys) and v4 (int kmer keys).
+    """
     if meta and 'kmer_size' in meta:
         return int(meta['kmer_size'])
-    # Infer from the largest kmer_id present:
-    # a kmer_id < 4^k → needs 2k bits → k = ceil(bits / 2)
     max_kmer = 0
     for k in data:
+        if k == "__meta__":
+            continue
+        kid = None
         if isinstance(k, tuple) and len(k) >= 1:
-            if k[0] > max_kmer:
-                max_kmer = k[0]
+            kid = k[0]
+        elif isinstance(k, (int, np.integer)):
+            kid = int(k)
+        if kid is not None and kid > max_kmer:
+            max_kmer = kid
     if max_kmer == 0:
-        return 11  # safe default
-    bits = max_kmer.bit_length()
+        return 11
+    bits = int(max_kmer).bit_length()
     return max(1, (bits + 1) // 2)
 
 
@@ -159,6 +166,18 @@ def _key_stats_samples(arr: np.ndarray):
     return n, mu_ipd, sig_ipd, mu_pw, sig_pw, frac
 
 
+def _detect_format_a(data: dict) -> str:
+    """Return 'v3' or 'v4' based on the first non-meta key type."""
+    for k in data:
+        if k == "__meta__":
+            continue
+        if isinstance(k, tuple):
+            return "v3"
+        if isinstance(k, (int, np.integer)):
+            return "v4"
+    return "unknown"
+
+
 def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
     """Aggregate the kinetic profile per meth type across all keys.
 
@@ -166,17 +185,157 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
                                 'profile_pw':  np.ndarray(PROFILE_LEN,),
                                 'n_samples':   int,
                                 'sig_offsets': list[int]}
+
+    Auto-detects v3 (tuple keys) vs v4 (int kmer keys + col 35 CATEGORY).
+    For v4, the bucket assignment is read directly from the CATEGORY column;
+    for v3, it is inferred from meth_context as before.
     """
-    from .extract import METH_CTX_LEN, PROFILE_LEN
+    from .utils.sample_layout import (
+        METH_CTX_LEN, PROFILE_LEN, COL_CATEGORY,
+        CATEGORY_BASELINE, CATEGORY_METH, CATEGORY_SLOWED,
+    )
     from .utils.config import load_kinsim_config
+    from .utils.encoding import KMER_PRED_IDX, get_meth_ids
 
     cfg = load_kinsim_config()
     profile_start_col = 3 + METH_CTX_LEN
     pw_start_col      = profile_start_col + PROFILE_LEN
     needed_cols       = pw_start_col + PROFILE_LEN  # = 32
+    meth_ids          = get_meth_ids()
 
+    # Build the upstream-signature target list (same logic as refine.slowed_split).
+    # For each meth type T with signature offset k>0, a (kmer, 0) sample whose
+    # mc[KMER_PRED_IDX-k] == meth_id[T] is a "slowed-by-T" sample.
+    upstream_targets: list[tuple[int, int, str, int]] = []
+    for mod_name, sig_cfg in (cfg.get("kinetic_signatures") or {}).items():
+        mid = meth_ids.get(mod_name)
+        if not mid:
+            continue
+        for k in sig_cfg.get("signal_offsets", []):
+            try:
+                k = int(k)
+            except (TypeError, ValueError):
+                continue
+            if k <= 0:
+                continue
+            mc_idx = KMER_PRED_IDX - k
+            if 0 <= mc_idx < METH_CTX_LEN:
+                upstream_targets.append((mc_idx, mid, mod_name, k))
+
+    fmt = _detect_format_a(data)
     out: dict = {}
-    for meth_id_int in [0, 1, 2, 3]:
+
+    if fmt == "v4":
+        # v4 path: iterate int-keyed arrays, dispatch by CATEGORY column.
+        # Build a fast meth_id -> name table and the targets-by-name dict
+        # for slowed-by-T attribution (a CATEGORY_SLOWED sample may be slowed
+        # by any T whose upstream signature offset matches mc[KMER_PRED_IDX-k]).
+        name_by_mid = {v: k for k, v in meth_ids.items()}
+        targets_by_name: dict[str, list[tuple[int, int]]] = {}
+        for mc_idx, mid, mname, k in upstream_targets:
+            targets_by_name.setdefault(mname, []).append((mc_idx, mid))
+
+        # Per-bucket accumulators
+        meth_acc: dict[str, list] = {}     # name -> [sum_ipd, sum_pw, n]
+        baseline_acc = [np.zeros(PROFILE_LEN, dtype=np.float64),
+                        np.zeros(PROFILE_LEN, dtype=np.float64), 0]
+        slowed_acc:  dict[str, list] = {}  # name -> [sum_ipd, sum_pw, n]
+
+        for kid, v in data.items():
+            if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
+                continue
+            if v.shape[1] < needed_cols:
+                continue
+            cats = v[:, COL_CATEGORY].astype(np.int8) if v.shape[1] > COL_CATEGORY else None
+            if cats is None:
+                continue
+            ipd_prof = v[:, profile_start_col:pw_start_col]
+            pw_prof  = v[:, pw_start_col:needed_cols]
+            mc       = v[:, 3:3 + METH_CTX_LEN].astype(np.int32)
+
+            # Meth bucket (CATEGORY_METH): meth_id at center is mc[7]
+            meth_m = (cats == CATEGORY_METH)
+            if meth_m.any():
+                center_ids = mc[meth_m, KMER_PRED_IDX]
+                for mid_val in np.unique(center_ids):
+                    if mid_val == 0:
+                        continue
+                    sub = (center_ids == mid_val)
+                    sub_idx = np.where(meth_m)[0][sub]
+                    name = name_by_mid.get(int(mid_val), f"meth{int(mid_val)}")
+                    if name not in meth_acc:
+                        meth_acc[name] = [np.zeros(PROFILE_LEN, dtype=np.float64),
+                                          np.zeros(PROFILE_LEN, dtype=np.float64), 0]
+                    meth_acc[name][0] += ipd_prof[sub_idx].sum(axis=0)
+                    meth_acc[name][1] += pw_prof [sub_idx].sum(axis=0)
+                    meth_acc[name][2] += len(sub_idx)
+
+            # Baseline bucket
+            base_m = (cats == CATEGORY_BASELINE)
+            if base_m.any():
+                baseline_acc[0] += ipd_prof[base_m].sum(axis=0)
+                baseline_acc[1] += pw_prof [base_m].sum(axis=0)
+                baseline_acc[2] += int(base_m.sum())
+
+            # Slowed bucket — attribute to one of the configured types via
+            # first-match-wins on upstream signature offsets.
+            slow_m = (cats == CATEGORY_SLOWED)
+            if slow_m.any() and targets_by_name:
+                slow_idx_all = np.where(slow_m)[0]
+                assigned = np.full(len(slow_idx_all), -1, dtype=np.int32)
+                mod_names_order = list(targets_by_name.keys())
+                for mname_idx, mname in enumerate(mod_names_order):
+                    still_open = (assigned == -1)
+                    hit = np.zeros(len(slow_idx_all), dtype=bool)
+                    for mc_idx, mid in targets_by_name[mname]:
+                        hit |= (mc[slow_idx_all, mc_idx] == mid)
+                    assigned[still_open & hit] = mname_idx
+                for mname_idx, mname in enumerate(mod_names_order):
+                    sub = (assigned == mname_idx)
+                    if not sub.any():
+                        continue
+                    rows = slow_idx_all[sub]
+                    if mname not in slowed_acc:
+                        slowed_acc[mname] = [np.zeros(PROFILE_LEN, dtype=np.float64),
+                                             np.zeros(PROFILE_LEN, dtype=np.float64), 0]
+                    slowed_acc[mname][0] += ipd_prof[rows].sum(axis=0)
+                    slowed_acc[mname][1] += pw_prof [rows].sum(axis=0)
+                    slowed_acc[mname][2] += len(rows)
+
+        # Pack accumulators into the output dict.
+        for name, (s_i, s_p, n) in meth_acc.items():
+            sig_offsets = list(cfg.get("kinetic_signatures", {})
+                                  .get(name, {}).get("signal_offsets", []))
+            out[name] = {
+                "profile_ipd": (s_i / max(n, 1)).astype(np.float32),
+                "profile_pw":  (s_p / max(n, 1)).astype(np.float32),
+                "n_samples":   n,
+                "sig_offsets": sig_offsets,
+            }
+        if baseline_acc[2] > 0:
+            out["none/baseline"] = {
+                "profile_ipd": (baseline_acc[0] / baseline_acc[2]).astype(np.float32),
+                "profile_pw":  (baseline_acc[1] / baseline_acc[2]).astype(np.float32),
+                "n_samples":   baseline_acc[2],
+                "sig_offsets": [],
+            }
+        for mname, (s_i, s_p, n) in slowed_acc.items():
+            sig_offsets = list(cfg.get("kinetic_signatures", {})
+                                  .get(mname, {}).get("signal_offsets", []))
+            out[f"none/slowed_by_{mname}"] = {
+                "profile_ipd": (s_i / max(n, 1)).astype(np.float32),
+                "profile_pw":  (s_p / max(n, 1)).astype(np.float32),
+                "n_samples":   n,
+                "sig_offsets": sig_offsets,
+            }
+        return out
+
+    # v3 path (tuple keys) — original logic preserved below.
+    present_ids = sorted({int(k[1]) for k in data.keys()
+                          if isinstance(k, tuple) and len(k) == 2})
+
+    # ---- Standard per-type aggregate (existing behaviour) ----
+    for meth_id_int in present_ids:
         name = _meth_name(meth_id_int)
         sums_ipd = np.zeros(PROFILE_LEN, dtype=np.float64)
         sums_pw  = np.zeros(PROFILE_LEN, dtype=np.float64)
@@ -202,7 +361,290 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
             "n_samples":   n_total,
             "sig_offsets": sig_offsets,
         }
+
+    # ---- v4: split the (kmer, 0) bucket into baseline + slowed-by-T ----
+    # Verifies pass-2: the slowed-by-T sub-profile should peak at the same
+    # offsets as type T's signature; the baseline sub-profile should be flat.
+    if upstream_targets:
+        baseline_sum_ipd = np.zeros(PROFILE_LEN, dtype=np.float64)
+        baseline_sum_pw  = np.zeros(PROFILE_LEN, dtype=np.float64)
+        baseline_n       = 0
+        slowed_sums_ipd: dict[str, np.ndarray] = {}
+        slowed_sums_pw:  dict[str, np.ndarray] = {}
+        slowed_ns:       dict[str, int]        = {}
+        # Pre-group targets by mod_name for assignment
+        targets_by_name: dict[str, list[tuple[int, int]]] = {}
+        for mc_idx, mid, mname, k in upstream_targets:
+            targets_by_name.setdefault(mname, []).append((mc_idx, mid))
+
+        for k, v in data.items():
+            if not (isinstance(k, tuple) and len(k) == 2 and isinstance(v, np.ndarray)):
+                continue
+            if int(k[1]) != 0:
+                continue
+            if v.shape[1] < needed_cols:
+                continue
+            mc = v[:, 3:3 + METH_CTX_LEN].astype(np.int32)
+
+            # First-match-wins assignment: a sample tagged by multiple types
+            # (rare) is attributed to the first listed type in the YAML.
+            assigned = np.zeros(len(v), dtype=np.int8)   # 0 = baseline, idx+1 = slowed_by mname[idx]
+            mod_names_order = list(targets_by_name.keys())
+            for idx, mname in enumerate(mod_names_order, start=1):
+                still_baseline = (assigned == 0)
+                hit = np.zeros(len(v), dtype=bool)
+                for mc_idx, mid in targets_by_name[mname]:
+                    hit |= (mc[:, mc_idx] == mid)
+                assigned[still_baseline & hit] = idx
+
+            ipd_prof = v[:, profile_start_col:pw_start_col]
+            pw_prof  = v[:, pw_start_col:needed_cols]
+
+            base_mask = (assigned == 0)
+            if base_mask.any():
+                baseline_sum_ipd += ipd_prof[base_mask].sum(axis=0)
+                baseline_sum_pw  += pw_prof[base_mask].sum(axis=0)
+                baseline_n       += int(base_mask.sum())
+            for idx, mname in enumerate(mod_names_order, start=1):
+                m = (assigned == idx)
+                if not m.any():
+                    continue
+                slowed_sums_ipd.setdefault(mname, np.zeros(PROFILE_LEN, dtype=np.float64))
+                slowed_sums_pw .setdefault(mname, np.zeros(PROFILE_LEN, dtype=np.float64))
+                slowed_sums_ipd[mname] += ipd_prof[m].sum(axis=0)
+                slowed_sums_pw [mname] += pw_prof [m].sum(axis=0)
+                slowed_ns[mname] = slowed_ns.get(mname, 0) + int(m.sum())
+
+        if baseline_n > 0:
+            out["none/baseline"] = {
+                "profile_ipd": (baseline_sum_ipd / baseline_n).astype(np.float32),
+                "profile_pw":  (baseline_sum_pw  / baseline_n).astype(np.float32),
+                "n_samples":   baseline_n,
+                "sig_offsets": [],
+            }
+        for mname, n in slowed_ns.items():
+            if n == 0:
+                continue
+            sig_offsets = list(cfg.get("kinetic_signatures", {})
+                                  .get(mname, {}).get("signal_offsets", []))
+            out[f"none/slowed_by_{mname}"] = {
+                "profile_ipd": (slowed_sums_ipd[mname] / n).astype(np.float32),
+                "profile_pw":  (slowed_sums_pw [mname] / n).astype(np.float32),
+                "n_samples":   n,
+                "sig_offsets": sig_offsets,
+            }
+
     return out
+
+
+# ---------------------------------------------------------------------------
+# Methylation-context distribution per bucket (v4 verification)
+# ---------------------------------------------------------------------------
+
+
+def compute_meth_context_distribution(data: dict) -> dict:
+    """For each labelled bucket, count the meth_id at each meth_context offset.
+
+    Returns dict[bucket_name] -> {
+        'counts':   np.ndarray(METH_CTX_LEN, num_meth_ids)  raw counts,
+        'fractions': same shape, normalised per row,
+        'n_samples': int,
+        'meth_ids': list[int],          # column order in counts/fractions
+        'meth_names': list[str],        # display names
+    }
+
+    Buckets reported:
+      * One per (kmer, meth_id>0) family — the standard meth buckets.
+      * 'none' if (kmer, 0) buckets exist.
+      * 'none/baseline' and 'none/slowed_by_<T>' splits if upstream signature
+        targets are configured (same logic as compute_signature_profiles).
+
+    The counts answer "for samples in bucket X, how often does meth_id Y
+    appear at meth_context position P [-7..+3]". Useful for verifying that
+    e.g. m6A samples have m6A at center (position +0 ≡ mc_idx 7), and that
+    palindromic R-M sites show a co-occurring m6A at some specific offset.
+    """
+    from .utils.sample_layout import METH_CTX_LEN
+    from .utils.config import load_kinsim_config
+    from .utils.encoding import KMER_PRED_IDX, get_meth_ids
+
+    cfg = load_kinsim_config()
+    meth_ids = get_meth_ids()
+    meth_id_list  = sorted(set(meth_ids.values()))               # [0, 1, 2, 3, ...]
+    meth_id_index = {mid: i for i, mid in enumerate(meth_id_list)}
+    name_by_mid   = {v: k for k, v in meth_ids.items()}
+    NMID = len(meth_id_list)
+
+    upstream_targets: list[tuple[int, int, str, int]] = []
+    for mod_name, sig_cfg in (cfg.get("kinetic_signatures") or {}).items():
+        mid = meth_ids.get(mod_name)
+        if not mid:
+            continue
+        for k in sig_cfg.get("signal_offsets", []):
+            try:
+                k = int(k)
+            except (TypeError, ValueError):
+                continue
+            if k <= 0:
+                continue
+            mc_idx = KMER_PRED_IDX - k
+            if 0 <= mc_idx < METH_CTX_LEN:
+                upstream_targets.append((mc_idx, mid, mod_name, k))
+
+    targets_by_name: dict[str, list[tuple[int, int]]] = {}
+    for mc_idx, mid, mname, k in upstream_targets:
+        targets_by_name.setdefault(mname, []).append((mc_idx, mid))
+
+    out: dict = {}
+
+    def _empty():
+        return {
+            "counts":     np.zeros((METH_CTX_LEN, NMID), dtype=np.int64),
+            "n_samples":  0,
+        }
+
+    def _accumulate(bucket: dict, mc_arr: np.ndarray) -> None:
+        # mc_arr shape (n, METH_CTX_LEN), values in meth_id_list.
+        for col_pos in range(METH_CTX_LEN):
+            col = mc_arr[:, col_pos]
+            for mid in meth_id_list:
+                bucket["counts"][col_pos, meth_id_index[mid]] += int((col == mid).sum())
+        bucket["n_samples"] += len(mc_arr)
+
+    fmt = _detect_format_a(data)
+
+    # ── Standard buckets ────────────────────────────────────────────────
+    standard_buckets: dict[str, dict] = {}
+    if fmt == "v3":
+        for k, v in data.items():
+            if not (isinstance(k, tuple) and len(k) == 2 and isinstance(v, np.ndarray)):
+                continue
+            if v.shape[1] < 14:
+                continue
+            meth_id = int(k[1])
+            name = name_by_mid.get(meth_id, f"meth{meth_id}")
+            bkt  = standard_buckets.setdefault(name, _empty())
+            mc   = v[:, 3:14].astype(np.int32)
+            _accumulate(bkt, mc)
+    elif fmt == "v4":
+        # v4: dispatch by CATEGORY column. The "standard" buckets are the
+        # confirmed-meth ones (CATEGORY_METH), keyed by mc[KMER_PRED_IDX].
+        from .utils.sample_layout import (
+            COL_CATEGORY, CATEGORY_METH,
+        )
+        for kid, v in data.items():
+            if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
+                continue
+            if v.shape[1] <= COL_CATEGORY:
+                continue
+            cats = v[:, COL_CATEGORY].astype(np.int8)
+            meth_m = (cats == CATEGORY_METH)
+            if not meth_m.any():
+                continue
+            mc = v[:, 3:14].astype(np.int32)
+            center_ids = mc[meth_m, KMER_PRED_IDX]
+            for mid_val in np.unique(center_ids):
+                if mid_val == 0:
+                    continue
+                rows = np.where(meth_m)[0][center_ids == mid_val]
+                name = name_by_mid.get(int(mid_val), f"meth{int(mid_val)}")
+                bkt = standard_buckets.setdefault(name, _empty())
+                _accumulate(bkt, mc[rows])
+
+    # ── Slowed / baseline split ─────────────────────────────────────────
+    # v3: infer from meth_context using upstream signature targets (legacy).
+    # v4: read CATEGORY column directly; attribute slowed-by-T via mc lookup.
+    split_buckets: dict[str, dict] = {}
+    if upstream_targets:
+        baseline_b = _empty()
+        slowed_buckets: dict[str, dict] = {}
+        mod_names_order = list(targets_by_name.keys())
+
+        if fmt == "v3":
+            for k, v in data.items():
+                if not (isinstance(k, tuple) and len(k) == 2 and isinstance(v, np.ndarray)):
+                    continue
+                if v.shape[1] < 14 or int(k[1]) != 0:
+                    continue
+                mc = v[:, 3:14].astype(np.int32)
+                assigned = np.zeros(len(v), dtype=np.int8)
+                for idx, mname in enumerate(mod_names_order, start=1):
+                    still_baseline = (assigned == 0)
+                    hit = np.zeros(len(v), dtype=bool)
+                    for mc_idx, mid in targets_by_name[mname]:
+                        hit |= (mc[:, mc_idx] == mid)
+                    assigned[still_baseline & hit] = idx
+                base_mask = (assigned == 0)
+                if base_mask.any():
+                    _accumulate(baseline_b, mc[base_mask])
+                for idx, mname in enumerate(mod_names_order, start=1):
+                    m = (assigned == idx)
+                    if not m.any():
+                        continue
+                    bkt = slowed_buckets.setdefault(mname, _empty())
+                    _accumulate(bkt, mc[m])
+
+        elif fmt == "v4":
+            from .utils.sample_layout import (
+                COL_CATEGORY, CATEGORY_BASELINE, CATEGORY_SLOWED,
+            )
+            for kid, v in data.items():
+                if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
+                    continue
+                if v.shape[1] <= COL_CATEGORY:
+                    continue
+                cats = v[:, COL_CATEGORY].astype(np.int8)
+                mc   = v[:, 3:14].astype(np.int32)
+
+                base_mask = (cats == CATEGORY_BASELINE)
+                if base_mask.any():
+                    _accumulate(baseline_b, mc[base_mask])
+
+                slow_mask = (cats == CATEGORY_SLOWED)
+                if slow_mask.any():
+                    slow_idx_all = np.where(slow_mask)[0]
+                    assigned = np.full(len(slow_idx_all), -1, dtype=np.int32)
+                    for idx2, mname in enumerate(mod_names_order):
+                        still_open = (assigned == -1)
+                        hit = np.zeros(len(slow_idx_all), dtype=bool)
+                        for mc_idx, mid in targets_by_name[mname]:
+                            hit |= (mc[slow_idx_all, mc_idx] == mid)
+                        assigned[still_open & hit] = idx2
+                    for idx2, mname in enumerate(mod_names_order):
+                        sub = (assigned == idx2)
+                        if not sub.any():
+                            continue
+                        rows = slow_idx_all[sub]
+                        bkt = slowed_buckets.setdefault(mname, _empty())
+                        _accumulate(bkt, mc[rows])
+
+        if baseline_b["n_samples"] > 0:
+            split_buckets["none/baseline"] = baseline_b
+        for mname, bkt in slowed_buckets.items():
+            if bkt["n_samples"] > 0:
+                split_buckets[f"none/slowed_by_{mname}"] = bkt
+
+    # ── Finalise: add fractions, names ──────────────────────────────────
+    def _finalise(bkt: dict) -> dict:
+        n = bkt["n_samples"]
+        counts = bkt["counts"]
+        # Normalise per row (each row = METH_CTX position) — sum along axis=1
+        # is n_samples (every sample contributes one meth_id per position).
+        denom = max(n, 1)
+        bkt["fractions"]  = counts / denom
+        bkt["meth_ids"]   = meth_id_list
+        bkt["meth_names"] = [name_by_mid.get(m, f"meth{m}") for m in meth_id_list]
+        return bkt
+
+    final: dict = {}
+    for name, bkt in standard_buckets.items():
+        if bkt["n_samples"] > 0:
+            final[name] = _finalise(bkt)
+    for name, bkt in split_buckets.items():
+        if bkt["n_samples"] > 0:
+            final[name] = _finalise(bkt)
+
+    return final
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +652,13 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
 # ---------------------------------------------------------------------------
 
 def collect_stats(data: dict, pkl_path: str) -> DictStats:
-    """One-pass collection of all per-key statistics from a .pkl file."""
+    """One-pass collection of all per-key statistics from a .pkl file.
+
+    Auto-detects v3 (tuple keys, 35-col arrays) vs v4 (int kmer keys, 36-col
+    arrays with CATEGORY at col 35). For v4, samples are partitioned by the
+    meth_id at center (mc[KMER_PRED_IDX]), reproducing the v3 grouping for
+    downstream stats.
+    """
     meta = data.get('__meta__', {})
     if not isinstance(meta, dict):
         meta = {}
@@ -218,15 +666,30 @@ def collect_stats(data: dict, pkl_path: str) -> DictStats:
     kmer_size = _detect_kmer_size(data, meta)
     total_possible = 4 ** kmer_size
 
-    # Group items by meth_id
+    fmt = _detect_format_a(data)
+
+    # Group items by meth_id (v3: from key; v4: from mc[KMER_PRED_IDX]).
     partitions: dict[int, list] = {}
-    for k, v in data.items():
-        if not (isinstance(k, tuple) and len(k) == 2 and isinstance(v, np.ndarray)):
-            continue
-        kmer_id, meth_id = k
-        if meth_id not in partitions:
-            partitions[meth_id] = []
-        partitions[meth_id].append((kmer_id, v))
+    if fmt == "v3":
+        for k, v in data.items():
+            if not (isinstance(k, tuple) and len(k) == 2 and isinstance(v, np.ndarray)):
+                continue
+            kmer_id, meth_id = k
+            partitions.setdefault(meth_id, []).append((kmer_id, v))
+    elif fmt == "v4":
+        from .utils.encoding import KMER_PRED_IDX
+        for kid, v in data.items():
+            if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
+                continue
+            if v.shape[1] < 14:
+                continue
+            mc = v[:, 3:14].astype(np.int32)
+            center = mc[:, KMER_PRED_IDX]
+            for mid in np.unique(center):
+                rows = (center == mid)
+                if not rows.any():
+                    continue
+                partitions.setdefault(int(mid), []).append((int(kid), v[rows]))
 
     groups: dict[int, MethGroupStats] = {}
     total_samples = 0
@@ -292,7 +755,7 @@ def compute_neighbor_sensitivity(
     """Compute 1-base substitution sensitivity for methylated and unmethylated kmers.
 
     For each source kmer, generates all K×3 single-base substitutions and
-    records |Δ mean_ipd|, |Δ mean_pw|, and the mutated position for every
+    records |delta mean_ipd|, |delta mean_pw|, and the mutated position for every
     neighbor found in the dictionary.
 
     Returns dict with keys 'unmethylated' and 'methylated'.
@@ -376,7 +839,8 @@ def compute_neighbor_sensitivity(
 # ---------------------------------------------------------------------------
 
 def render_txt_report(stats: DictStats, sensitivity: dict, output_path: str,
-                       signature_profiles: dict | None = None) -> None:
+                       signature_profiles: dict | None = None,
+                       context_distribution: dict | None = None) -> None:
     """Print TXT report to stdout and write to *output_path*."""
     buf = io.StringIO()
     K = stats.kmer_size
@@ -471,31 +935,208 @@ def render_txt_report(stats: DictStats, sensitivity: dict, output_path: str,
         p('-' * W)
         p('Kinetic signature profiles  (mean IPD/PW at offsets 0..+8 from prediction pos)')
         p('-' * W)
-        for name, sp in signature_profiles.items():
-            if name == 'none':
-                continue
+        p('Each row averages over all samples in the named bucket. The signature')
+        p('offsets (***) are where the polymerase-slowing signal of that type is')
+        p('expected. A high IPD at signature offsets and low elsewhere indicates')
+        p('a clean, real methylation signature.')
+
+        # Display order: confirmed meth types first, then none/baseline, then
+        # none/slowed_by_*, finally the legacy combined `none` if present.
+        def _order_key(name: str) -> tuple:
+            if name == 'none':                       return (3, name)
+            if name == 'none/baseline':              return (1, name)
+            if name.startswith('none/slowed_by_'):   return (2, name)
+            return (0, name)
+        ordered = sorted(signature_profiles.keys(), key=_order_key)
+
+        # Locate the matching meth-type signature row for slowed buckets so
+        # we can also report a "vs baseline" and "vs confirmed meth" delta.
+        meth_profile_by_type = {n: signature_profiles[n]
+                                for n in signature_profiles if '/' not in n
+                                and n != 'none'}
+        baseline_profile = signature_profiles.get('none/baseline')
+
+        for name in ordered:
+            sp = signature_profiles[name]
             offsets_str = '  '.join(f'+{i}' for i in range(len(sp['profile_ipd'])))
             ipd_str = '  '.join(f'{v:5.1f}' for v in sp['profile_ipd'])
             pw_str  = '  '.join(f'{v:5.1f}' for v in sp['profile_pw'])
             sig = sp.get('sig_offsets', [])
             sig_marker = '  '.join('***' if i in sig else '   '
                                     for i in range(len(sp['profile_ipd'])))
-            p(f"\n  {name}  (n={sp['n_samples']:,} samples, signature at {sig})")
+            tag = ''
+            if name == 'none/baseline':
+                tag = '  [v4: TRUE baseline — should be FLAT]'
+            elif name.startswith('none/slowed_by_'):
+                t = name.split('none/slowed_by_')[-1]
+                tag = f'  [v4: slowed-by-{t} — should peak at signature offsets]'
+            elif name == 'none':
+                tag = '  [combined none bucket; on a v4 pkl this is empty / unused]'
+            p(f"\n  {name}{tag}  (n={sp['n_samples']:,} samples, signature at {sig})")
             p(f"    Offset      :  {offsets_str}")
             p(f"    Signature   :  {sig_marker}")
             p(f"    IPD profile :  {ipd_str}")
             p(f"    PW  profile :  {pw_str}")
-            # Compute the signature score: mean at sig offsets / mean at non-sig
             if sig:
                 ipd_arr = sp['profile_ipd']
                 sig_idx     = [i for i in sig if 0 <= i < len(ipd_arr)]
                 nonsig_idx  = [i for i in range(len(ipd_arr)) if i not in sig_idx]
                 if sig_idx and nonsig_idx:
-                    score = float(ipd_arr[sig_idx].mean()
-                                   / max(float(ipd_arr[nonsig_idx].mean()), 1.0))
-                    p(f"    Sig/non-sig IPD ratio : {score:.3f}  "
-                      f"(>1.3 expected for real {name})")
+                    sig_mean    = float(ipd_arr[sig_idx].mean())
+                    nonsig_mean = float(ipd_arr[nonsig_idx].mean())
+                    ratio       = sig_mean / max(nonsig_mean, 1.0)
+                    p(f"    Sig/non-sig IPD ratio : {ratio:.3f}  "
+                      f"(>1.3 expected for real signal)")
+            # Extra v4 deltas for slowed buckets
+            if name.startswith('none/slowed_by_') and baseline_profile and sig:
+                slowed_ipd = sp['profile_ipd']
+                base_ipd   = baseline_profile['profile_ipd']
+                t = name.split('none/slowed_by_')[-1]
+                meth_sp = meth_profile_by_type.get(t)
+                lines = []
+                for off in sig:
+                    if not (0 <= off < len(slowed_ipd)):
+                        continue
+                    parts = [f"+{off}: slowed={slowed_ipd[off]:5.1f}",
+                             f"baseline={base_ipd[off]:5.1f}",
+                             f"delta={slowed_ipd[off]-base_ipd[off]:+5.1f}"]
+                    if meth_sp is not None:
+                        m_ipd = meth_sp['profile_ipd'][off]
+                        recovery = (slowed_ipd[off] - base_ipd[off]) / \
+                                   max(m_ipd - base_ipd[off], 1e-6) * 100.0
+                        parts.append(f"meth={m_ipd:5.1f}")
+                        parts.append(f"recovery={recovery:5.1f}% of meth elevation")
+                    lines.append("  ".join(parts))
+                if lines:
+                    p(f"    vs baseline at signature offsets:")
+                    for ln in lines:
+                        p(f"      {ln}")
+            # For confirmed meth buckets, also report separation vs baseline
+            elif (name in meth_profile_by_type and baseline_profile
+                  and sig):
+                m_ipd = sp['profile_ipd']
+                b_ipd = baseline_profile['profile_ipd']
+                lines = []
+                for off in sig:
+                    if not (0 <= off < len(m_ipd)):
+                        continue
+                    delta = m_ipd[off] - b_ipd[off]
+                    rat   = m_ipd[off] / max(b_ipd[off], 1.0)
+                    lines.append(f"+{off}: meth={m_ipd[off]:5.1f}  "
+                                 f"baseline={b_ipd[off]:5.1f}  "
+                                 f"delta={delta:+5.1f}  ratio={rat:5.2f}x")
+                if lines:
+                    p(f"    vs baseline at signature offsets:")
+                    for ln in lines:
+                        p(f"      {ln}")
         p()
+
+        # ── v4 verification summary table ───────────────────────────────
+        if any(n.startswith('none/slowed_by_') for n in signature_profiles):
+            p('-' * W)
+            p('v4 split verification  (slowed-by-T should look like meth-T, not baseline)')
+            p('-' * W)
+            p('At each signature offset of every meth type, compare:')
+            p('  meth-T peak  : kinetic signature in the confirmed-meth bucket')
+            p('  slowed peak  : kinetic signature recovered from (kmer, 0) by pass-2')
+            p('  baseline     : true unmethylated kinetic level')
+            p('  recovery %   : (slowed - baseline) / (meth - baseline) — closer to')
+            p('                 100 % means pass-2 captured the same signal as pass-1.')
+            p()
+            for t in sorted(meth_profile_by_type):
+                slowed = signature_profiles.get(f'none/slowed_by_{t}')
+                if slowed is None:
+                    p(f"  {t}: no slowed-by-{t} bucket (no pass-2 hits) — either")
+                    p(f"       no upstream signature offsets > 0 for {t}, or refine")
+                    p(f"       pass-2 was disabled at refine time.")
+                    continue
+                meth = meth_profile_by_type[t]
+                base = baseline_profile
+                sig = slowed.get('sig_offsets', [])
+                if not sig:
+                    continue
+                p(f"  {t}  (slowed n={slowed['n_samples']:,}, "
+                  f"meth n={meth['n_samples']:,}"
+                  f"{', baseline n=' + format(base['n_samples'], ',') if base else ''})")
+                hdr = f"    {'offset':>8s} {'meth':>8s} {'slowed':>8s} {'baseline':>10s}  {'recovery':>9s}"
+                p(hdr)
+                for off in sig:
+                    if not (0 <= off < len(meth['profile_ipd'])):
+                        continue
+                    m_v = float(meth['profile_ipd'][off])
+                    s_v = float(slowed['profile_ipd'][off])
+                    b_v = float(base['profile_ipd'][off]) if base else 0.0
+                    span = max(m_v - b_v, 1e-6)
+                    recovery = (s_v - b_v) / span * 100.0
+                    p(f"    +{off:<7d} {m_v:8.2f} {s_v:8.2f} {b_v:10.2f}  {recovery:8.1f}%")
+            p()
+
+    # ── 3.6 Methylation-context distribution per bucket ─────────────────
+    if context_distribution:
+        from .utils.encoding import KMER_PRED_IDX
+        from .utils.sample_layout import METH_CTX_LEN, METH_CTX_LEFT
+        p('-' * W)
+        p('Methylation context distribution  (which meth_id sits at each offset')
+        p('around the prediction position, per bucket)')
+        p('-' * W)
+        p(f"Position labels are offsets from the prediction position. The center")
+        p(f"position [C] is at index {KMER_PRED_IDX} (offset 0). Negative offsets are")
+        p(f"upstream of the prediction position (already-read by polymerase),")
+        p(f"positive offsets are downstream.")
+        p()
+        # Position labels: -7..+3
+        pos_labels = []
+        for i in range(METH_CTX_LEN):
+            off = i - METH_CTX_LEFT
+            tag = '[C]' if off == 0 else ''
+            pos_labels.append(f"{off:+d}{tag}")
+
+        def _order_key(name: str) -> tuple:
+            if name == 'none':                       return (3, name)
+            if name == 'none/baseline':              return (1, name)
+            if name.startswith('none/slowed_by_'):   return (2, name)
+            return (0, name)
+        ordered = sorted(context_distribution.keys(), key=_order_key)
+
+        for name in ordered:
+            cd = context_distribution[name]
+            n = cd['n_samples']
+            fractions = cd['fractions']            # (METH_CTX_LEN, NMID)
+            mids = cd['meth_ids']
+            mnames = cd['meth_names']
+            tag = ''
+            if name == 'none/baseline':
+                tag = '  [pass-2 baseline — should be ~100 % none everywhere]'
+            elif name.startswith('none/slowed_by_'):
+                t = name.split('none/slowed_by_')[-1]
+                tag = f'  [pass-2 slowed-by-{t} — expect {t} at the matching upstream offset]'
+            p(f"  {name}{tag}  (n={n:,} samples)")
+
+            # Header row: positions
+            hdr = '    {:8s}'.format('mc_pos')
+            for lbl in pos_labels:
+                hdr += f'{lbl:>7s}'
+            p(hdr)
+
+            # One row per meth_id, percentage at each position
+            for col_idx, (mid, mn) in enumerate(zip(mids, mnames)):
+                # Skip rows that are zero across all positions to keep the
+                # report compact.
+                row = fractions[:, col_idx]
+                if not np.any(row > 0.0005):
+                    continue
+                row_label = f"{mn} (id={mid})"
+                line = f'    {row_label:8s}'
+                for v in row:
+                    pct = v * 100.0
+                    if pct >= 99.95:
+                        line += f"{'100':>7s}"
+                    elif pct < 0.05:
+                        line += f"{'.':>7s}"
+                    else:
+                        line += f"{pct:6.1f} "
+                p(line)
+            p()
 
     # ── 4. Low-coverage warnings ──────────────────────────────────────────
     p('-' * W)
@@ -532,12 +1173,12 @@ def render_txt_report(stats: DictStats, sensitivity: dict, output_path: str,
         p(f'  {category.capitalize()} '
           f'({ns.n_source_entries:,} source kmers, '
           f'{ns.n_pairs_found:,} neighbor pairs):')
-        p(f'    |Δ IPD mean|  :'
+        p(f'    |delta IPD mean|  :'
           f' mean={np.mean(ns.delta_ipd):.4f}'
           f'  median={np.median(ns.delta_ipd):.4f}'
           f'  p75={np.percentile(ns.delta_ipd, 75):.4f}'
           f'  p95={np.percentile(ns.delta_ipd, 95):.4f}')
-        p(f'    |Δ PW  mean|  :'
+        p(f'    |delta PW  mean|  :'
           f' mean={np.mean(ns.delta_pw):.4f}'
           f'  median={np.median(ns.delta_pw):.4f}'
           f'  p75={np.percentile(ns.delta_pw, 75):.4f}'
@@ -550,15 +1191,15 @@ def render_txt_report(stats: DictStats, sensitivity: dict, output_path: str,
                 f'{pos}{tag}:{np.mean(ns.delta_ipd[mask]):.3f}' if np.any(mask) else f'{pos}:n/a')
             pw_by_pos.append(
                 f'{pos}{tag}:{np.mean(ns.delta_pw[mask]):.3f}' if np.any(mask) else f'{pos}:n/a')
-        p(f'    Per-pos |Δ IPD|:')
+        p(f'    Per-pos |delta IPD|:')
         p(f'      {", ".join(ipd_by_pos)}')
-        p(f'    Per-pos |Δ PW|:')
+        p(f'    Per-pos |delta PW|:')
         p(f'      {", ".join(pw_by_pos)}')
         p()
 
     p('=' * W)
 
-    with open(output_path, 'w') as fh:
+    with open(output_path, 'w', encoding='utf-8') as fh:
         fh.write(buf.getvalue())
     print(f'\nTXT report saved: {output_path}')
 
@@ -739,8 +1380,8 @@ def render_html_report(
 
     # ── Figs 8–9: Neighbor sensitivity histograms ─────────────────────────
     for sig_name, delta_attr, title_sig in [
-        ('IPD', 'delta_ipd', '|Δ IPD mean|'),
-        ('PW',  'delta_pw',  '|Δ PW mean|'),
+        ('IPD', 'delta_ipd', '|delta IPD mean|'),
+        ('PW',  'delta_pw',  '|delta PW mean|'),
     ]:
         unmeth_ns = sensitivity.get('unmethylated')
         meth_ns   = sensitivity.get('methylated')
@@ -781,10 +1422,10 @@ def render_html_report(
         positions  = list(range(K))
         pos_labels = [f'{p}[C]' if p == center else str(p) for p in positions]
         fig = make_subplots(rows=1, cols=2,
-                            subplot_titles=['Mean |Δ IPD| per position',
-                                            'Mean |Δ PW|  per position'])
+                            subplot_titles=['Mean |delta IPD| per position',
+                                            'Mean |delta PW|  per position'])
         for col_i, (delta_attr, ylabel) in enumerate(
-                [('delta_ipd', '|Δ IPD|'), ('delta_pw', '|Δ PW|')], start=1):
+                [('delta_ipd', '|delta IPD|'), ('delta_pw', '|delta PW|')], start=1):
             for cat, color, name in [
                 ('unmethylated', _meth_color(0), 'Unmethylated'),
                 ('methylated',   '#EF553B',       'Methylated'),
@@ -818,8 +1459,8 @@ def render_html_report(
     )
     if has_both:
         fig = make_subplots(rows=1, cols=2,
-                            subplot_titles=['|Δ IPD|: meth vs unmeth',
-                                            '|Δ PW|:  meth vs unmeth'])
+                            subplot_titles=['|delta IPD|: meth vs unmeth',
+                                            '|delta PW|:  meth vs unmeth'])
         for col_i, delta_attr in enumerate(['delta_ipd', 'delta_pw'], start=1):
             for ns, name, color in [
                 (sensitivity['unmethylated'], 'Unmethylated', _meth_color(0)),
@@ -1137,8 +1778,15 @@ def analyze_pkl(
     log.info("Computing kinetic signature profiles per meth type...")
     sig_profiles = compute_signature_profiles(data, kmer_size=stats.kmer_size)
 
+    log.info("Computing meth-context distribution per bucket...")
+    ctx_dist = compute_meth_context_distribution(data)
+
     print()
-    render_txt_report(stats, sensitivity, txt_path, signature_profiles=sig_profiles)
+    render_txt_report(
+        stats, sensitivity, txt_path,
+        signature_profiles=sig_profiles,
+        context_distribution=ctx_dist,
+    )
 
     if not no_html:
         log.info("Generating HTML report...")
