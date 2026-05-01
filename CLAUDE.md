@@ -33,29 +33,37 @@ deprives the model of the slowing signal at those offsets.
                --> kinsim train            --> checkpoint.pt
 ```
 
-**Per-position emission rules in v4 extract (`--v4` flag):**
-- METH samples at every motif-match center (candidate methylation).
-- SLOWED samples at positions p+k for each k>0 in `signature_offsets[T]`
-  (k=0 already covered by the meth bucket).
-- BASELINE samples elsewhere, gated by `baseline_min_dist_to_meth ≥ K`
-  so meth_context never contains a methylation. Capped per kmer at
-  `n_baseline_per_kmer` via end-of-stream uniform subsample.
+**Three categories** (col 35 of the 36-col layout):
+- `0` BASELINE  — far from any methylation, meth_context window is empty.
+- `1` SLOWED    — at a signature offset of a methylation. Includes the
+  methylation itself when `0 ∈ signature_offsets[T]` (m6A, m4C). For m5C
+  the methylation center is NEAR_METH, since 0 is not in `[2, 6]`.
+- `2` NEAR_METH — close to a methylation (within `[+1, near_meth_max_dist]`)
+  but NOT at a signature offset of it. Negative control: meth in mc but
+  IPD should look baseline.
 
-**Refine pipeline (single command, two passes internally):**
-- **Pass 1 — GMM** on the CATEGORY_METH pool per type T. Real-meth cluster
-  identified by highest mean signal at signature offsets; samples in other
-  clusters are demoted to CATEGORY_BASELINE (motif false positives kept as
-  negative training examples).
-- **Pass 2 — p95** on the CATEGORY_SLOWED pool. Threshold = p95 of pooled
-  baseline IPD (after pass-1 demotions). Slowed samples below threshold
-  are dropped (the expected slowing did not occur — likely an upstream
-  motif false-positive that pass-1 GMM did not catch at the bucket level).
+**Per-position emission rules in v4 extract (`--v4` flag):**
+For each motif-match position `p` of type `T`:
+- For each `k ∈ signature_offsets[T]` (including 0): position `p+k` →
+  CATEGORY_SLOWED.
+- For each `k ∈ [0, near_meth_max_dist]` NOT in `signature_offsets[T]`:
+  position `p+k` → CATEGORY_NEAR_METH (slowed wins on conflict).
+Positions far from any methylation (distance ≥ `baseline_min_dist_to_meth`,
+default = K = 11) → CATEGORY_BASELINE candidate, capped per kmer at
+`n_baseline_per_kmer` via end-of-stream uniform subsample.
+
+**Refine pipeline:** ONE pass — `slowed_split_v4`. Pools the IPD of all
+CATEGORY_BASELINE samples, computes the `secondary_percentile`-th
+percentile (default 95) as the lower threshold, drops CATEGORY_SLOWED
+samples below the threshold (FP motifs whose expected slowing did not
+occur). CATEGORY_BASELINE and CATEGORY_NEAR_METH pass through
+unchanged. NO GMM step in v4.
 
 **The v3 35-col layout is preserved for backward compatibility** (calling
 `kinsim extract` without `--v4` emits the legacy format). It is no longer
 required for any v4 step. The `--refined-pkl PATH` flag still exists as
-an opt-in oracle for users who want to skip pass-1 GMM using a trusted
-master_clean from a previous run; almost no one needs it.
+an opt-in oracle (uses a trusted master_clean from a previous run as
+confirmation source instead of motif-match); almost no one needs it.
 
 ---
 
@@ -71,7 +79,7 @@ KinSim/
 │   ├── __main__.py                 CLI router (v0.4.0)
 │   │
 │   ├── extract.py                  BAM extraction + shard merging (motif-based, manifest-driven)
-│   ├── refine.py                   v3: GMM only. v4: GMM(meth) + p95(slowed)
+│   ├── refine.py                   v3: GMM only. v4: p95 filter on slowed only
 │   ├── train.py                    supervised training loop (ConvPredictor/MLPPredictor)
 │   ├── generate.py                 BAM generation with trained model
 │   ├── evaluate.py                 calibration report + per-kmer distribution plots
@@ -158,7 +166,7 @@ KinSim/
     │   ├── 00_extract.slurm        kinsim extract — legacy v3 (35-col)
     │   ├── 00b_extract_v4.slurm    kinsim extract --v4 — recommended (36-col CATEGORY)
     │   ├── 01_merge.slurm          kinsim merge shards → master.pkl
-    │   ├── 02_refine.slurm         kinsim refine — auto-detects v3 (GMM only) / v4 (GMM + p95)
+    │   ├── 02_refine.slurm         kinsim refine — v3 (GMM only) / v4 (p95 on slowed)
     │   ├── 03_train.slurm          kinsim train (1 GPU)
     │   ├── 04_generate.slurm       kinsim generate on PBSIM3 reads (array)
     │   ├── 05_evaluate.slurm       kinsim evaluate
@@ -294,17 +302,18 @@ Python (no pysam) so refine/dataset/tests can import it without the
 extract/BAM dependency.
 
 ```python
-SAMPLE_NCOLS_V3 = 35    # legacy bootstrap layout
+SAMPLE_NCOLS_V3 = 35    # legacy v3 layout
 SAMPLE_NCOLS    = 36    # v4 layout (= V3 + 1 CATEGORY column)
 COL_CATEGORY    = 35    # last col on v4
-CATEGORY_BASELINE = 0
-CATEGORY_METH     = 1
-CATEGORY_SLOWED   = 2
+CATEGORY_BASELINE  = 0
+CATEGORY_SLOWED    = 1   # at a signature offset (incl. meth itself if 0 ∈ sig)
+CATEGORY_NEAR_METH = 2   # close to meth but not at signature offset
 
 is_v4_format(arr)    -> bool   # True iff arr.shape[1] >= 36
-get_categories(arr, signature_offsets_by_meth=None) -> int8 ndarray
+get_categories(arr, signature_offsets_by_meth=None,
+               near_meth_max_dist=7) -> int8 ndarray
     # v4: arr[:, COL_CATEGORY]
-    # v3: inferred from meth_context (mc[7] -> meth; upstream sig offset hit -> slowed; else baseline)
+    # v3: inferred from meth_context using sig offsets + proximity window
 
 slice_meth_context(meth_status, center) -> list[11]
 slice_rev_meth(meth_status_complement, center) -> list[3]
@@ -510,8 +519,8 @@ strain1_shard_v4.pkl  strain2_shard_v4.pkl  ...
       |
       v  kinsim refine master_v4.pkl master_v4_clean.pkl
       |   (auto-detects v4 format)
-      |   Pass 1 GMM:  drops FP motifs from CATEGORY_METH (demoted to baseline)
-      |   Pass 2 p95:  drops FP slowed (IPD < p95 of baseline)
+      |   p95 filter on CATEGORY_SLOWED only — drops slowed samples
+      |   whose IPD < p95(baseline). Baseline + near_meth pass through.
 master_v4_clean.pkl
       |
       v  kinsim train master_v4_clean.pkl checkpoints/
