@@ -10,17 +10,20 @@
 #SBATCH --mail-type=FAIL
 
 # ============================================================
-# ML step 00b — v4 extract using a refined master_clean.pkl
+# ML step 00b — v4 standalone extract
 #
 #   sbatch --array=1-N%K slurm_kinsim/ml/00b_extract_v4.slurm \
-#       <manifest.csv> <shards_v4_dir> <master_clean.pkl>
+#       <manifest.csv> <shards_v4_dir>
 #
 # Output: <shards_v4_dir>/<sample_id>_shard_v4.pkl
 #
-# The v4 extract emits METH samples at confirmed methylation centers
-# (kmers that survived the pass-1 GMM in master_clean.pkl), SLOWED
-# samples at signature offsets of those (from kinsim_config.yaml), and
-# BASELINE samples elsewhere capped per kmer.
+# Single-pass v4 extract:
+#   - METH samples at every motif-match center
+#   - SLOWED samples at signature offsets (per kinsim_config.yaml)
+#   - BASELINE samples elsewhere, capped at YAML extract.n_baseline_per_kmer
+#
+# False-positive motifs are dropped downstream by `kinsim refine` (GMM
+# pass-1 on meth pool + p95 pass-2 on slowed). No bootstrap required.
 # ============================================================
 
 set +u
@@ -30,22 +33,19 @@ set -euo pipefail
 
 MANIFEST=${1:?"manifest CSV required"}
 SHARDS=${2:?"shards_v4 dir required"}
-REFINED=${3:?"master_clean.pkl required"}
 
 [ -s "$MANIFEST" ] || { echo "ERROR: manifest missing: $MANIFEST"; exit 1; }
-[ -s "$REFINED"  ] || { echo "ERROR: refined pkl missing: $REFINED"; exit 1; }
 mkdir -p "$SHARDS"
 
 echo "=== ML 00b/extract-v4 — task ${SLURM_ARRAY_TASK_ID} ==="
 echo "Manifest: $MANIFEST"
-echo "Refined:  $REFINED"
 echo "Output:   $SHARDS"
 START=$(date +%s)
 
 kinsim extract \
+    --v4 \
     --manifest    "$MANIFEST" \
     --task        "$SLURM_ARRAY_TASK_ID" \
-    --output-dir  "$SHARDS" \
-    --refined-pkl "$REFINED"
+    --output-dir  "$SHARDS"
 
 echo "Elapsed: $(( $(date +%s) - START ))s"
