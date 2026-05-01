@@ -261,162 +261,9 @@ def slowed_split(
 
 
 # ---------------------------------------------------------------------------
-# v4 pass-1: global GMM filter on the meth pool (drops FP motif matches)
-# ---------------------------------------------------------------------------
-
-
-def gmm_pass1_v4(
-    data:                 dict,
-    seed:                 int,
-) -> tuple[dict, dict]:
-    """v4 pass-1 GMM. Per meth type T, pool all CATEGORY_METH samples whose
-    mc[KMER_PRED_IDX] == T, fit a 2- or 3-component GMM (BIC-selected) on
-    the kinetic profile at the configured signature offsets, identify the
-    real-meth cluster (highest mean signal), and drop samples assigned to
-    the other clusters as motif false positives.
-
-    Demoted samples are re-categorised to CATEGORY_BASELINE (kept in the
-    pool for the p95 baseline reference) rather than dropped outright.
-
-    Mirrors the v3 global GMM behaviour but operates on the v4 dict layout
-    (kmer_id keys, 36-col arrays with explicit CATEGORY column).
-    """
-    from sklearn.mixture import GaussianMixture
-    from .utils.sample_layout import (
-        COL_CATEGORY, COL_IPD, METH_CTX_LEN, PROFILE_LEN,
-        CATEGORY_BASELINE, CATEGORY_METH,
-    )
-    from .utils.config import load_kinsim_config
-    from .utils.encoding import KMER_PRED_IDX, get_meth_ids
-
-    cfg = load_kinsim_config()
-    meth_ids = get_meth_ids()
-    name_by_mid = {v: k for k, v in meth_ids.items()}
-    profile_start_col = 3 + METH_CTX_LEN  # = 14
-
-    # 1. Build a flat index of all meth samples grouped by type T.
-    #    Track (kmer_id, row_index) so we can write back the demotion.
-    by_type: dict[int, list[tuple[int, int]]] = {}
-    for kid, arr in data.items():
-        if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
-            continue
-        if arr.shape[1] <= COL_CATEGORY:
-            continue
-        cats = arr[:, COL_CATEGORY].astype(np.int8)
-        meth_rows = np.where(cats == CATEGORY_METH)[0]
-        if len(meth_rows) == 0:
-            continue
-        center = arr[meth_rows, 3 + KMER_PRED_IDX].astype(np.int32)
-        for r, t in zip(meth_rows, center):
-            t = int(t)
-            if t > 0:
-                by_type.setdefault(t, []).append((int(kid), int(r)))
-
-    # 2. Build a global None reference (baseline pool, log1p) for each type's
-    #    GMM. We use baseline IPDs aggregated across all kmers.
-    baseline_ipds: list = []
-    for kid, arr in data.items():
-        if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
-            continue
-        if arr.shape[1] <= COL_CATEGORY:
-            continue
-        cats = arr[:, COL_CATEGORY].astype(np.int8)
-        bm = (cats == CATEGORY_BASELINE)
-        if bm.any():
-            baseline_ipds.append(arr[bm][:, profile_start_col:profile_start_col + PROFILE_LEN])
-    baseline_profiles = (np.concatenate(baseline_ipds, axis=0)
-                         if baseline_ipds else np.empty((0, PROFILE_LEN)))
-    log.info("[gmm-pass1-v4] baseline pool for GMM anchor: n=%d",
-             len(baseline_profiles))
-
-    rng = np.random.default_rng(seed)
-    stats: dict = {"format": "v4_pass1"}
-
-    # 3. Per type, gather the IPD-profile matrix at signature offsets, fit
-    #    GMM with balanced None pool, identify real cluster, demote others.
-    for T, locations in sorted(by_type.items()):
-        mname = name_by_mid.get(T, f"meth{T}")
-        sig_cfg = cfg.get("kinetic_signatures", {}).get(mname, {})
-        sig_offsets = [int(o) for o in sig_cfg.get("signal_offsets", [])
-                       if isinstance(o, (int, float)) and 0 <= int(o) < PROFILE_LEN]
-        if not sig_offsets:
-            sig_offsets = [0]
-        feature_cols = [profile_start_col + o for o in sig_offsets]
-
-        # Gather meth profile rows
-        rows = np.empty((len(locations), len(feature_cols)), dtype=np.float64)
-        for i, (kid, r) in enumerate(locations):
-            rows[i] = data[kid][r, feature_cols]
-        meth_log = np.log1p(np.maximum(rows, 0))
-
-        # Balanced None pool
-        if len(baseline_profiles) > 0:
-            n_balance = min(len(meth_log), len(baseline_profiles))
-            idx = rng.choice(len(baseline_profiles), n_balance, replace=False)
-            none_log = np.log1p(np.maximum(baseline_profiles[idx][:, sig_offsets], 0))
-        else:
-            none_log = np.empty((0, len(feature_cols)))
-
-        combined = np.concatenate([meth_log, none_log], axis=0)
-        n_combined = len(combined)
-        if n_combined < 6:
-            log.warning("[gmm-pass1-v4] %s: only %d samples — keeping all",
-                        mname, n_combined)
-            stats[f"{mname}_kept"] = len(locations)
-            stats[f"{mname}_demoted"] = 0
-            continue
-
-        best_bic = np.inf
-        best_gmm = None
-        for k in (2, 3):
-            if k * 5 > n_combined:
-                continue
-            try:
-                gmm = GaussianMixture(n_components=k, covariance_type="full",
-                                      reg_covar=1e-4, max_iter=100, n_init=2,
-                                      random_state=seed)
-                gmm.fit(combined)
-                bic = float(gmm.bic(combined))
-                if bic < best_bic:
-                    best_bic = bic; best_gmm = gmm
-            except (ValueError, np.linalg.LinAlgError):
-                continue
-        if best_gmm is None:
-            log.warning("[gmm-pass1-v4] %s: GMM failed — keeping all", mname)
-            stats[f"{mname}_kept"] = len(locations)
-            stats[f"{mname}_demoted"] = 0
-            continue
-
-        cluster_score = best_gmm.means_.mean(axis=1)
-        real_cluster = int(np.argmax(cluster_score))
-        labels = best_gmm.predict(meth_log)
-        keep_mask = (labels == real_cluster)
-
-        n_kept    = int(keep_mask.sum())
-        n_demoted = int((~keep_mask).sum())
-        log.info("[gmm-pass1-v4] %s: BIC K=%d  cluster_means=%s  real=%d  "
-                 "kept=%d  demoted=%d (FP motifs -> baseline)",
-                 mname, best_gmm.n_components,
-                 best_gmm.means_.round(3).tolist(),
-                 real_cluster, n_kept, n_demoted)
-
-        # Demote rejected samples: re-categorise as CATEGORY_BASELINE in place.
-        # NOTE: their meth_context still shows the motif at center, so they
-        # will not be picked up as baseline by the slowed-detection in pass-2.
-        # That is fine — they're "former meth" rejected by GMM; we keep the
-        # rows so the model sees the per-position kinetics.
-        for i, (kid, r) in enumerate(locations):
-            if not keep_mask[i]:
-                data[kid][r, COL_CATEGORY] = CATEGORY_BASELINE
-
-        stats[f"{mname}_kept"] = n_kept
-        stats[f"{mname}_demoted"] = n_demoted
-
-    return data, stats
-
-
-# ---------------------------------------------------------------------------
-# v4 pass-2: secondary p95 filter on category-typed v4 master.pkl
+# v4 refine: p95 filter on slowed (only) — meth has no separate category in
+# the simplified 3-cat scheme; FP motifs that landed in SLOWED are dropped
+# by the same p95 threshold.
 # ---------------------------------------------------------------------------
 
 
@@ -425,26 +272,28 @@ def slowed_split_v4(
     secondary_pct:        float,
     rng:                  np.random.Generator,
 ) -> tuple[dict, dict]:
-    """Pass-2 secondary refine for the v4 36-col format.
+    """v4 refine: drop slowed samples whose IPD falls below the p-th
+    percentile of the baseline IPD distribution.
 
     The v4 master.pkl is dict[int kmer_id -> ndarray(N, 36)] with col 35
-    encoding the category (0=baseline, 1=meth, 2=slowed). This pass:
+    encoding category (0=baseline, 1=slowed, 2=near_meth).
 
-      1. Pools the IPD (col 0) of all baseline samples.
-      2. Computes the secondary_pct percentile of that distribution as the
-         lower threshold for slowed samples.
-      3. Drops any slowed sample whose IPD is below the threshold (the
-         expected slowing did not occur — likely an upstream FP that the
-         pass-1 GMM bucket-level confirmation could not catch at the per-
-         sample level).
-
-    Meth and baseline samples are passed through unchanged.
+    Algorithm:
+      1. Pool the IPD (col 0) of all CATEGORY_BASELINE samples.
+      2. Compute the secondary_pct percentile = lower threshold for slowed.
+      3. Drop CATEGORY_SLOWED samples whose IPD is below that threshold.
+         (FP motifs that landed in slowed have baseline-level IPD; they
+         fail this filter. True slowed samples sit well above baseline.)
+      4. CATEGORY_BASELINE and CATEGORY_NEAR_METH pass through unchanged —
+         near_meth is the negative control (close to a meth, but not at a
+         signature offset, so IPD should look baseline-like; the model
+         needs to see this).
 
     Returns (new_data dict, stats dict).
     """
     from .utils.sample_layout import (
         COL_CATEGORY, COL_IPD,
-        CATEGORY_BASELINE, CATEGORY_METH, CATEGORY_SLOWED,
+        CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH,
     )
 
     # 1. Pool baseline IPDs to compute threshold
@@ -461,59 +310,56 @@ def slowed_split_v4(
     if baseline_ipds:
         pooled = np.concatenate(baseline_ipds)
         threshold = float(np.percentile(pooled, secondary_pct))
-        log.info("[slowed-split-v4] baseline IPD pool: n=%d, mean=%.2f, "
+        log.info("[refine-v4] baseline IPD pool: n=%d, mean=%.2f, "
                  "median=%.2f, p%g=%.2f (threshold for slowed)",
                  len(pooled), float(pooled.mean()), float(np.median(pooled)),
                  secondary_pct, threshold)
     else:
         threshold = 0.0
-        log.warning("[slowed-split-v4] no baseline samples — threshold=0")
+        log.warning("[refine-v4] no baseline samples — threshold=0 (no FP filter)")
 
-    # 2. Filter slowed samples by IPD >= threshold
+    # 2. Filter slowed by IPD >= threshold; baseline + near_meth pass through.
     new_data: dict = {}
-    n_meth_in = n_meth_out = 0
     n_baseline_in = n_baseline_out = 0
-    n_slowed_in = n_slowed_kept = n_slowed_dropped = 0
+    n_near_in     = n_near_out     = 0
+    n_slowed_in   = n_slowed_kept  = n_slowed_dropped = 0
     for kid, arr in data.items():
         if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
             continue
         if arr.shape[1] <= COL_CATEGORY:
             continue
         cats = arr[:, COL_CATEGORY].astype(np.int8)
-        meth_m = (cats == CATEGORY_METH)
         base_m = (cats == CATEGORY_BASELINE)
         slow_m = (cats == CATEGORY_SLOWED)
-        n_meth_in     += int(meth_m.sum())
+        near_m = (cats == CATEGORY_NEAR_METH)
         n_baseline_in += int(base_m.sum())
+        n_near_in     += int(near_m.sum())
         n_slowed_in   += int(slow_m.sum())
-        # Slowed survivors: IPD >= threshold
         slow_keep_mask = slow_m & (arr[:, COL_IPD] >= threshold)
-        slow_drop_mask = slow_m & ~slow_keep_mask
         n_slowed_kept    += int(slow_keep_mask.sum())
-        n_slowed_dropped += int(slow_drop_mask.sum())
-        # Reassemble surviving rows (meth + baseline + filtered slowed).
-        keep_rows = meth_m | base_m | slow_keep_mask
+        n_slowed_dropped += int(slow_m.sum() - slow_keep_mask.sum())
+        keep_rows = base_m | near_m | slow_keep_mask
         if keep_rows.any():
             new_data[int(kid)] = arr[keep_rows].copy()
-            n_meth_out     += int(meth_m.sum())  # all meth pass through
-            n_baseline_out += int(base_m.sum())  # all baseline pass through
+            n_baseline_out += int(base_m.sum())
+            n_near_out     += int(near_m.sum())
 
-    log.info("[slowed-split-v4] meth:     %d in -> %d kept",
-             n_meth_in, n_meth_out)
-    log.info("[slowed-split-v4] baseline: %d in -> %d kept",
+    log.info("[refine-v4] baseline:  %d in -> %d kept (pass-through)",
              n_baseline_in, n_baseline_out)
-    log.info("[slowed-split-v4] slowed:   %d in -> %d kept, %d dropped (IPD < p%g = %.2f)",
+    log.info("[refine-v4] near_meth: %d in -> %d kept (pass-through)",
+             n_near_in, n_near_out)
+    log.info("[refine-v4] slowed:    %d in -> %d kept, %d dropped (IPD < p%g = %.2f)",
              n_slowed_in, n_slowed_kept, n_slowed_dropped, secondary_pct, threshold)
 
     stats = {
         "format":               "v4",
         "secondary_percentile": secondary_pct,
         "threshold":            threshold,
-        "n_meth_in":            n_meth_in,
         "n_baseline_in":        n_baseline_in,
-        "n_slowed_in":          n_slowed_in,
-        "n_meth_out":           n_meth_out,
         "n_baseline_out":       n_baseline_out,
+        "n_near_in":            n_near_in,
+        "n_near_out":           n_near_out,
+        "n_slowed_in":          n_slowed_in,
         "n_slowed_kept":        n_slowed_kept,
         "n_slowed_dropped":     n_slowed_dropped,
     }
@@ -567,40 +413,33 @@ def refine_pkl(
     fmt = _detect_format(data)
     log.info("Refine: detected format = %s", fmt)
 
-    # ---- v4 path: pass-1 GMM (drop FP motifs) + pass-2 p95 (drop FP slowed) ----
+    # ---- v4 path: p95 filter on CATEGORY_SLOWED only ----
     if fmt == "v4":
-        # Strip __meta__ from data so it is not iterated as a key.
         v4_data = {k: v for k, v in data.items()
                    if isinstance(k, (int, np.integer))}
 
-        # Pass-1 GMM on the meth pool — demote FP motifs to baseline in-place.
-        log.info("v4 pass-1: global GMM on CATEGORY_METH pool")
-        v4_data, stats_p1 = gmm_pass1_v4(v4_data, seed=seed)
-
-        # Pass-2 p95 filter on slowed (only if enabled)
         if enable_slowed_split:
             sec_pct = (secondary_percentile if secondary_percentile is not None
                        else 95.0)
-            log.info("v4 pass-2: p95 filter on CATEGORY_SLOWED pool")
-            v4_data, stats_p2 = slowed_split_v4(v4_data, sec_pct, rng)
+            log.info("v4 refine: p95 filter on CATEGORY_SLOWED")
+            v4_data, stats = slowed_split_v4(v4_data, sec_pct, rng)
         else:
-            log.warning("v4 pass-2 skipped (--no-slowed-split). "
-                        "FP slowed samples are NOT filtered.")
-            stats_p2 = {"format": "v4_pass2", "skipped": True}
+            log.warning("v4 refine: p95 disabled (--no-slowed-split) — output "
+                        "is the input verbatim minus __meta__.")
+            stats = {"format": "v4", "skipped": True}
 
         v4_data["__meta__"] = {
             "refined_from":  str(in_path),
-            "method":        "v4_pass1_gmm + v4_pass2_p95",
+            "method":        "v4_p95_slowed",
             "format":        "v4",
             "seed":          seed,
-            "stats_pass1":   stats_p1,
-            "stats_pass2":   stats_p2,
+            "stats":         stats,
             "original_meta": orig_meta,
         }
         log.info("Writing: %s", out_path)
         with open(out_path, "wb") as f:
             pickle.dump(v4_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-        return {"pass1": stats_p1, "pass2": stats_p2}
+        return stats
 
     # ---- v3 path: full pass-1 GMM + optional pass-2 (existing behaviour) ----
 

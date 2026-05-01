@@ -76,6 +76,14 @@ extract:
   n_baseline_per_kmer:        50    # cap on baseline samples per kmer
   baseline_min_dist_to_meth:  11    # in bases; must be >= K (kmer size)
 
+  # NEAR_METH window: positions p+k where k in [1, near_meth_max_dist] and
+  # k is NOT a signature offset for the meth at p. These positions are close
+  # to a methylation (so meth_context will carry the meth) but NOT at an
+  # offset where the polymerase slowing is biophysically expected. They
+  # serve as negative controls: the model must learn that "meth in mc" alone
+  # does not imply elevated IPD — only meth at a signature offset does.
+  near_meth_max_dist:         7     # bases downstream of meth (1..K-1)
+
 # Refinement parameters
 refine:
   # Strategy applied per-type. All currently use the same algorithm
@@ -105,26 +113,12 @@ refine:
     # keep all samples without refinement (single-Gaussian fit on the data).
     min_samples_low: 1
 
-  # ---------- v4: slowed-position vs baseline split ----------
-  # After the global per-meth-type GMM has confirmed the methylated buckets,
-  # the (kmer, none) bucket still contains a mix of:
-  #   - true baseline positions (no methylation upstream within window)
-  #   - "slowed" positions: samples whose center is unmethylated but whose
-  #     meth_context contains a methylation at a signature offset upstream
-  #     (e.g. a sample at p+5 whose mc[2]=m6A, where p is a confirmed m6A).
-  # The polymerase kinetics at slowed positions ARE elevated even though the
-  # base at center is unmethylated — that's the very signal kinetic-aware
-  # methylation calling exploits. We split the none bucket in two and apply
-  # quality control to each:
+  # ---------- v4: secondary p95 filter on slowed samples ----------
+  # The v4 extract emits CATEGORY_SLOWED at every motif-match center +
+  # signature offsets. Some of these are FP (motif scan can be noisy or
+  # the methylation at p might not actually be active). The p95 filter
+  # drops slowed samples whose IPD is below the p95 of the BASELINE
+  # distribution — those are samples whose expected slowing did not
+  # actually occur, so they're FP for our purposes.
   slowed_split:
-    # Cap on truly-baseline samples (no meth at any signature offset
-    # upstream) kept per kmer in the final training set. Prevents the
-    # baseline class from drowning the slowed class.
-    n_baseline_per_kmer: 50
-
-    # Percentile of baseline-IPD distribution used as a lower threshold
-    # for slowed samples: a slowed sample whose center IPD is below the
-    # baseline N-th percentile is treated as a false-positive "expected
-    # slowing did not actually occur" (motif false call upstream, edge
-    # effect, low-coverage artefact) and dropped.
     secondary_percentile: 95

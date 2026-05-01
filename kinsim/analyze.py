@@ -192,7 +192,7 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
     """
     from .utils.sample_layout import (
         METH_CTX_LEN, PROFILE_LEN, COL_CATEGORY,
-        CATEGORY_BASELINE, CATEGORY_METH, CATEGORY_SLOWED,
+        CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH,
     )
     from .utils.config import load_kinsim_config
     from .utils.encoding import KMER_PRED_IDX, get_meth_ids
@@ -203,9 +203,127 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
     needed_cols       = pw_start_col + PROFILE_LEN  # = 32
     meth_ids          = get_meth_ids()
 
-    # Build the upstream-signature target list (same logic as refine.slowed_split).
-    # For each meth type T with signature offset k>0, a (kmer, 0) sample whose
-    # mc[KMER_PRED_IDX-k] == meth_id[T] is a "slowed-by-T" sample.
+    # Per-meth signature offset sets and proximity offsets, used to attribute
+    # SLOWED / NEAR_METH samples to a parent meth type. Probe order: check
+    # mc[KMER_PRED_IDX] first (meth at center), then upstream mc indices.
+    sig_set_by_name: dict[str, set] = {}
+    for mod_name, sig_cfg in (cfg.get("kinetic_signatures") or {}).items():
+        sig_set_by_name[mod_name] = {int(k) for k in sig_cfg.get("signal_offsets", [])
+                                     if isinstance(k, (int, float))}
+
+    fmt = _detect_format_a(data)
+    out: dict = {}
+
+    if fmt == "v4":
+        name_by_mid = {v: k for k, v in meth_ids.items()}
+
+        baseline_acc = [np.zeros(PROFILE_LEN, dtype=np.float64),
+                        np.zeros(PROFILE_LEN, dtype=np.float64), 0]
+        slowed_acc:  dict[str, list] = {}     # by parent meth name
+        near_acc:    dict[str, list] = {}     # by parent meth name
+
+        def _attribute_parent(mc_row, default_kind):
+            """For a SLOWED or NEAR_METH sample, return the parent meth name
+            by inspecting its meth_context. Probe at center first, then
+            upstream offsets."""
+            # 1. center
+            mid = int(mc_row[KMER_PRED_IDX])
+            if mid > 0:
+                return name_by_mid.get(mid)
+            # 2. upstream offsets — for the right "kind" use the right window
+            for k in range(1, KMER_PRED_IDX + 1):
+                idx = KMER_PRED_IDX - k
+                if not (0 <= idx < METH_CTX_LEN):
+                    continue
+                mid = int(mc_row[idx])
+                if mid <= 0:
+                    continue
+                mname = name_by_mid.get(mid)
+                if not mname:
+                    continue
+                sig = sig_set_by_name.get(mname, set())
+                if default_kind == "slowed" and k in sig:
+                    return mname
+                if default_kind == "near"   and k not in sig:
+                    return mname
+            return None
+
+        for kid, v in data.items():
+            if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
+                continue
+            if v.shape[1] < needed_cols:
+                continue
+            if v.shape[1] <= COL_CATEGORY:
+                continue
+            cats = v[:, COL_CATEGORY].astype(np.int8)
+            ipd_prof = v[:, profile_start_col:pw_start_col]
+            pw_prof  = v[:, pw_start_col:needed_cols]
+            mc       = v[:, 3:3 + METH_CTX_LEN].astype(np.int32)
+
+            # Baseline
+            base_m = (cats == CATEGORY_BASELINE)
+            if base_m.any():
+                baseline_acc[0] += ipd_prof[base_m].sum(axis=0)
+                baseline_acc[1] += pw_prof [base_m].sum(axis=0)
+                baseline_acc[2] += int(base_m.sum())
+
+            # Slowed — attribute to a meth type by parent
+            slow_m = (cats == CATEGORY_SLOWED)
+            if slow_m.any():
+                idx_all = np.where(slow_m)[0]
+                for r in idx_all:
+                    mname = _attribute_parent(mc[r], "slowed")
+                    if not mname:
+                        continue
+                    if mname not in slowed_acc:
+                        slowed_acc[mname] = [np.zeros(PROFILE_LEN, dtype=np.float64),
+                                             np.zeros(PROFILE_LEN, dtype=np.float64), 0]
+                    slowed_acc[mname][0] += ipd_prof[r]
+                    slowed_acc[mname][1] += pw_prof [r]
+                    slowed_acc[mname][2] += 1
+
+            # Near_meth — attribute by parent
+            near_m = (cats == CATEGORY_NEAR_METH)
+            if near_m.any():
+                idx_all = np.where(near_m)[0]
+                for r in idx_all:
+                    mname = _attribute_parent(mc[r], "near")
+                    if not mname:
+                        continue
+                    if mname not in near_acc:
+                        near_acc[mname] = [np.zeros(PROFILE_LEN, dtype=np.float64),
+                                           np.zeros(PROFILE_LEN, dtype=np.float64), 0]
+                    near_acc[mname][0] += ipd_prof[r]
+                    near_acc[mname][1] += pw_prof [r]
+                    near_acc[mname][2] += 1
+
+        # Pack accumulators
+        if baseline_acc[2] > 0:
+            out["baseline"] = {
+                "profile_ipd": (baseline_acc[0] / baseline_acc[2]).astype(np.float32),
+                "profile_pw":  (baseline_acc[1] / baseline_acc[2]).astype(np.float32),
+                "n_samples":   baseline_acc[2],
+                "sig_offsets": [],
+            }
+        for mname, (s_i, s_p, n) in slowed_acc.items():
+            sig_offsets = list(sig_set_by_name.get(mname, []))
+            out[f"slowed_by_{mname}"] = {
+                "profile_ipd": (s_i / max(n, 1)).astype(np.float32),
+                "profile_pw":  (s_p / max(n, 1)).astype(np.float32),
+                "n_samples":   n,
+                "sig_offsets": sig_offsets,
+            }
+        for mname, (s_i, s_p, n) in near_acc.items():
+            sig_offsets = list(sig_set_by_name.get(mname, []))
+            out[f"near_meth_by_{mname}"] = {
+                "profile_ipd": (s_i / max(n, 1)).astype(np.float32),
+                "profile_pw":  (s_p / max(n, 1)).astype(np.float32),
+                "n_samples":   n,
+                "sig_offsets": sig_offsets,
+            }
+        return out
+
+    # ---- v3 legacy path: v3 keys (kmer, meth_id) — original behaviour ----
     upstream_targets: list[tuple[int, int, str, int]] = []
     for mod_name, sig_cfg in (cfg.get("kinetic_signatures") or {}).items():
         mid = meth_ids.get(mod_name)
@@ -221,114 +339,6 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
             mc_idx = KMER_PRED_IDX - k
             if 0 <= mc_idx < METH_CTX_LEN:
                 upstream_targets.append((mc_idx, mid, mod_name, k))
-
-    fmt = _detect_format_a(data)
-    out: dict = {}
-
-    if fmt == "v4":
-        # v4 path: iterate int-keyed arrays, dispatch by CATEGORY column.
-        # Build a fast meth_id -> name table and the targets-by-name dict
-        # for slowed-by-T attribution (a CATEGORY_SLOWED sample may be slowed
-        # by any T whose upstream signature offset matches mc[KMER_PRED_IDX-k]).
-        name_by_mid = {v: k for k, v in meth_ids.items()}
-        targets_by_name: dict[str, list[tuple[int, int]]] = {}
-        for mc_idx, mid, mname, k in upstream_targets:
-            targets_by_name.setdefault(mname, []).append((mc_idx, mid))
-
-        # Per-bucket accumulators
-        meth_acc: dict[str, list] = {}     # name -> [sum_ipd, sum_pw, n]
-        baseline_acc = [np.zeros(PROFILE_LEN, dtype=np.float64),
-                        np.zeros(PROFILE_LEN, dtype=np.float64), 0]
-        slowed_acc:  dict[str, list] = {}  # name -> [sum_ipd, sum_pw, n]
-
-        for kid, v in data.items():
-            if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
-                continue
-            if v.shape[1] < needed_cols:
-                continue
-            cats = v[:, COL_CATEGORY].astype(np.int8) if v.shape[1] > COL_CATEGORY else None
-            if cats is None:
-                continue
-            ipd_prof = v[:, profile_start_col:pw_start_col]
-            pw_prof  = v[:, pw_start_col:needed_cols]
-            mc       = v[:, 3:3 + METH_CTX_LEN].astype(np.int32)
-
-            # Meth bucket (CATEGORY_METH): meth_id at center is mc[7]
-            meth_m = (cats == CATEGORY_METH)
-            if meth_m.any():
-                center_ids = mc[meth_m, KMER_PRED_IDX]
-                for mid_val in np.unique(center_ids):
-                    if mid_val == 0:
-                        continue
-                    sub = (center_ids == mid_val)
-                    sub_idx = np.where(meth_m)[0][sub]
-                    name = name_by_mid.get(int(mid_val), f"meth{int(mid_val)}")
-                    if name not in meth_acc:
-                        meth_acc[name] = [np.zeros(PROFILE_LEN, dtype=np.float64),
-                                          np.zeros(PROFILE_LEN, dtype=np.float64), 0]
-                    meth_acc[name][0] += ipd_prof[sub_idx].sum(axis=0)
-                    meth_acc[name][1] += pw_prof [sub_idx].sum(axis=0)
-                    meth_acc[name][2] += len(sub_idx)
-
-            # Baseline bucket
-            base_m = (cats == CATEGORY_BASELINE)
-            if base_m.any():
-                baseline_acc[0] += ipd_prof[base_m].sum(axis=0)
-                baseline_acc[1] += pw_prof [base_m].sum(axis=0)
-                baseline_acc[2] += int(base_m.sum())
-
-            # Slowed bucket — attribute to one of the configured types via
-            # first-match-wins on upstream signature offsets.
-            slow_m = (cats == CATEGORY_SLOWED)
-            if slow_m.any() and targets_by_name:
-                slow_idx_all = np.where(slow_m)[0]
-                assigned = np.full(len(slow_idx_all), -1, dtype=np.int32)
-                mod_names_order = list(targets_by_name.keys())
-                for mname_idx, mname in enumerate(mod_names_order):
-                    still_open = (assigned == -1)
-                    hit = np.zeros(len(slow_idx_all), dtype=bool)
-                    for mc_idx, mid in targets_by_name[mname]:
-                        hit |= (mc[slow_idx_all, mc_idx] == mid)
-                    assigned[still_open & hit] = mname_idx
-                for mname_idx, mname in enumerate(mod_names_order):
-                    sub = (assigned == mname_idx)
-                    if not sub.any():
-                        continue
-                    rows = slow_idx_all[sub]
-                    if mname not in slowed_acc:
-                        slowed_acc[mname] = [np.zeros(PROFILE_LEN, dtype=np.float64),
-                                             np.zeros(PROFILE_LEN, dtype=np.float64), 0]
-                    slowed_acc[mname][0] += ipd_prof[rows].sum(axis=0)
-                    slowed_acc[mname][1] += pw_prof [rows].sum(axis=0)
-                    slowed_acc[mname][2] += len(rows)
-
-        # Pack accumulators into the output dict.
-        for name, (s_i, s_p, n) in meth_acc.items():
-            sig_offsets = list(cfg.get("kinetic_signatures", {})
-                                  .get(name, {}).get("signal_offsets", []))
-            out[name] = {
-                "profile_ipd": (s_i / max(n, 1)).astype(np.float32),
-                "profile_pw":  (s_p / max(n, 1)).astype(np.float32),
-                "n_samples":   n,
-                "sig_offsets": sig_offsets,
-            }
-        if baseline_acc[2] > 0:
-            out["none/baseline"] = {
-                "profile_ipd": (baseline_acc[0] / baseline_acc[2]).astype(np.float32),
-                "profile_pw":  (baseline_acc[1] / baseline_acc[2]).astype(np.float32),
-                "n_samples":   baseline_acc[2],
-                "sig_offsets": [],
-            }
-        for mname, (s_i, s_p, n) in slowed_acc.items():
-            sig_offsets = list(cfg.get("kinetic_signatures", {})
-                                  .get(mname, {}).get("signal_offsets", []))
-            out[f"none/slowed_by_{mname}"] = {
-                "profile_ipd": (s_i / max(n, 1)).astype(np.float32),
-                "profile_pw":  (s_p / max(n, 1)).astype(np.float32),
-                "n_samples":   n,
-                "sig_offsets": sig_offsets,
-            }
-        return out
 
     # v3 path (tuple keys) — original logic preserved below.
     present_ids = sorted({int(k[1]) for k in data.keys()
@@ -475,6 +485,12 @@ def compute_meth_context_distribution(data: dict) -> dict:
     name_by_mid   = {v: k for k, v in meth_ids.items()}
     NMID = len(meth_id_list)
 
+    # Per-meth signature offset sets (used for v4 attribution + v3 inference).
+    sig_set_by_name: dict[str, set] = {}
+    for mod_name, sig_cfg in (cfg.get("kinetic_signatures") or {}).items():
+        sig_set_by_name[mod_name] = {int(k) for k in sig_cfg.get("signal_offsets", [])
+                                     if isinstance(k, (int, float))}
+
     upstream_targets: list[tuple[int, int, str, int]] = []
     for mod_name, sig_cfg in (cfg.get("kinetic_signatures") or {}).items():
         mid = meth_ids.get(mod_name)
@@ -527,35 +543,18 @@ def compute_meth_context_distribution(data: dict) -> dict:
             mc   = v[:, 3:14].astype(np.int32)
             _accumulate(bkt, mc)
     elif fmt == "v4":
-        # v4: dispatch by CATEGORY column. The "standard" buckets are the
-        # confirmed-meth ones (CATEGORY_METH), keyed by mc[KMER_PRED_IDX].
-        from .utils.sample_layout import (
-            COL_CATEGORY, CATEGORY_METH,
-        )
-        for kid, v in data.items():
-            if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
-                continue
-            if v.shape[1] <= COL_CATEGORY:
-                continue
-            cats = v[:, COL_CATEGORY].astype(np.int8)
-            meth_m = (cats == CATEGORY_METH)
-            if not meth_m.any():
-                continue
-            mc = v[:, 3:14].astype(np.int32)
-            center_ids = mc[meth_m, KMER_PRED_IDX]
-            for mid_val in np.unique(center_ids):
-                if mid_val == 0:
-                    continue
-                rows = np.where(meth_m)[0][center_ids == mid_val]
-                name = name_by_mid.get(int(mid_val), f"meth{int(mid_val)}")
-                bkt = standard_buckets.setdefault(name, _empty())
-                _accumulate(bkt, mc[rows])
+        # v4 has only 3 categories — no separate per-meth-type bucket here.
+        # The slowed/near_meth split below produces the per-type breakdown.
+        pass
 
     # ── Slowed / baseline split ─────────────────────────────────────────
     # v3: infer from meth_context using upstream signature targets (legacy).
-    # v4: read CATEGORY column directly; attribute slowed-by-T via mc lookup.
+    # v4: read CATEGORY column directly; attribute slowed/near via mc lookup.
+    # Run for v4 always (independent of upstream_targets, which may be empty
+    # if all signatures are at offset 0). Run for v3 only when upstream targets
+    # exist (v3 inference depends on them).
     split_buckets: dict[str, dict] = {}
-    if upstream_targets:
+    if upstream_targets or fmt == "v4":
         baseline_b = _empty()
         slowed_buckets: dict[str, dict] = {}
         mod_names_order = list(targets_by_name.keys())
@@ -586,8 +585,34 @@ def compute_meth_context_distribution(data: dict) -> dict:
 
         elif fmt == "v4":
             from .utils.sample_layout import (
-                COL_CATEGORY, CATEGORY_BASELINE, CATEGORY_SLOWED,
+                COL_CATEGORY, CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH,
             )
+            near_buckets: dict[str, dict] = {}
+
+            def _v4_attribute_to_meth(mc_row, kind):
+                """For a SLOWED or NEAR_METH sample, return the parent meth
+                name. Probe at center first (the meth's own position when
+                0 ∈ sig for slowed, or 0 ∉ sig for near_meth), then upstream."""
+                mid = int(mc_row[KMER_PRED_IDX])
+                if mid > 0:
+                    return name_by_mid.get(mid)
+                for k in range(1, KMER_PRED_IDX + 1):
+                    idx = KMER_PRED_IDX - k
+                    if not (0 <= idx < METH_CTX_LEN):
+                        continue
+                    mid = int(mc_row[idx])
+                    if mid <= 0:
+                        continue
+                    nm = name_by_mid.get(mid)
+                    if not nm:
+                        continue
+                    sig = sig_set_by_name.get(nm, set())
+                    if kind == "slowed" and k in sig:
+                        return nm
+                    if kind == "near"   and k not in sig:
+                        return nm
+                return None
+
             for kid, v in data.items():
                 if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
                     continue
@@ -601,28 +626,30 @@ def compute_meth_context_distribution(data: dict) -> dict:
                     _accumulate(baseline_b, mc[base_mask])
 
                 slow_mask = (cats == CATEGORY_SLOWED)
-                if slow_mask.any():
-                    slow_idx_all = np.where(slow_mask)[0]
-                    assigned = np.full(len(slow_idx_all), -1, dtype=np.int32)
-                    for idx2, mname in enumerate(mod_names_order):
-                        still_open = (assigned == -1)
-                        hit = np.zeros(len(slow_idx_all), dtype=bool)
-                        for mc_idx, mid in targets_by_name[mname]:
-                            hit |= (mc[slow_idx_all, mc_idx] == mid)
-                        assigned[still_open & hit] = idx2
-                    for idx2, mname in enumerate(mod_names_order):
-                        sub = (assigned == idx2)
-                        if not sub.any():
-                            continue
-                        rows = slow_idx_all[sub]
-                        bkt = slowed_buckets.setdefault(mname, _empty())
-                        _accumulate(bkt, mc[rows])
+                for r in np.where(slow_mask)[0]:
+                    nm = _v4_attribute_to_meth(mc[r], "slowed")
+                    if not nm:
+                        continue
+                    bkt = slowed_buckets.setdefault(nm, _empty())
+                    _accumulate(bkt, mc[r:r+1])
+
+                near_mask = (cats == CATEGORY_NEAR_METH)
+                for r in np.where(near_mask)[0]:
+                    nm = _v4_attribute_to_meth(mc[r], "near")
+                    if not nm:
+                        continue
+                    bkt = near_buckets.setdefault(nm, _empty())
+                    _accumulate(bkt, mc[r:r+1])
 
         if baseline_b["n_samples"] > 0:
-            split_buckets["none/baseline"] = baseline_b
+            split_buckets["baseline"] = baseline_b
         for mname, bkt in slowed_buckets.items():
             if bkt["n_samples"] > 0:
-                split_buckets[f"none/slowed_by_{mname}"] = bkt
+                split_buckets[f"slowed_by_{mname}"] = bkt
+        if fmt == "v4":
+            for mname, bkt in near_buckets.items():
+                if bkt["n_samples"] > 0:
+                    split_buckets[f"near_meth_by_{mname}"] = bkt
 
     # ── Finalise: add fractions, names ──────────────────────────────────
     def _finalise(bkt: dict) -> dict:

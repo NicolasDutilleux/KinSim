@@ -90,9 +90,9 @@ submit_merge_v4() {
 }
 
 submit_refine_v4() {
-    # v4 refine: kinsim refine auto-detects v4 input and runs:
-    #   pass-1 GMM on the CATEGORY_METH pool (drops FP motif matches)
-    #   pass-2 p95 on the CATEGORY_SLOWED pool (drops FP slowed)
+    # v4 refine: kinsim refine auto-detects v4 input and runs the p95
+    # filter on the CATEGORY_SLOWED pool (drops FP slowed). Baseline
+    # and near_meth samples pass through unchanged.
     local prefix=$1; local dep=${2:-}
     local d=""; [ -n "$dep" ] && d="--dependency=afterok:${dep}"
     paths "$prefix"

@@ -12,10 +12,23 @@ Each stored row is `np.float32` with the following 36 columns (v4 format):
     23-31 | profile_PW_0..+8
     32-34 | rev_meth_-1, rev_meth_0, rev_meth_+1 — complementary-strand
             meth_id at active-site neighbours
-    35    | category (v4)
-              0 = baseline   (mc[7]==0 AND no upstream signature meth in window)
-              1 = meth       (mc[7]>0  — methylation at the prediction position)
-              2 = slowed     (mc[7]==0 AND upstream confirmed meth at sig offset)
+    35    | category (v4) — three values only:
+              0 = baseline   (far from any methylation; meth_context is empty)
+              1 = slowed     (the methylation itself OR a downstream signature
+                              offset of an upstream methylation. IPD elevation
+                              is biophysically expected here.
+                              ex. m6A at p has signature [0, 5] -> p and p+5
+                                  are both SLOWED; the m6A position itself is
+                                  classified by its OWN signature offset 0.)
+              2 = near_meth  (close to a methylation but NOT at a signature
+                              offset of it. IPD should look baseline-like.
+                              Negative control teaching the model that meth-
+                              in-context alone does NOT mean elevated IPD.
+                              Window: [+1, +near_meth_max_dist] from the meth,
+                              minus signature offsets.)
+            (No separate "meth" category — methylation positions land in
+             SLOWED if 0 ∈ signature_offsets[T] (m6A, m4C) or NEAR_METH
+             otherwise (m5C, since signature is [+2, +6]).)
 
 v3 format (pre-2026-05) used 35 columns. Loading code that may encounter
 v3 pkls should treat samples with `arr.shape[1] == 35` as having an
@@ -72,13 +85,15 @@ COL_REV_METH       = COL_PROFILE_PW + PROFILE_LEN                    # 32
 COL_CATEGORY       = COL_REV_METH + REV_METH_LEN                     # 35
 
 # Category enum values for col 35.
-CATEGORY_BASELINE = 0   # truly unmethylated, no upstream signature meth
-CATEGORY_METH     = 1   # methylated at center (mc[7] > 0)
-CATEGORY_SLOWED   = 2   # unmethylated at center, upstream confirmed meth at sig offset
+CATEGORY_BASELINE  = 0   # far from any methylation, meth_context empty
+CATEGORY_SLOWED    = 1   # at a signature offset of a meth (the meth itself
+                         # included if 0 ∈ signature_offsets[T]). IPD elevated.
+CATEGORY_NEAR_METH = 2   # close to a meth but not at a signature offset.
+                         # IPD baseline-like. Negative control.
 CATEGORY_NAMES = {
-    CATEGORY_BASELINE: "baseline",
-    CATEGORY_METH:     "meth",
-    CATEGORY_SLOWED:   "slowed",
+    CATEGORY_BASELINE:  "baseline",
+    CATEGORY_SLOWED:    "slowed",
+    CATEGORY_NEAR_METH: "near_meth",
 }
 
 
@@ -146,24 +161,29 @@ def is_v4_format(arr) -> bool:
 
 
 def get_categories(arr, signature_offsets_by_meth: dict | None = None,
-                    pred_idx: int | None = None) -> "np.ndarray":
+                    pred_idx: int | None = None,
+                    near_meth_max_dist: int | None = None) -> "np.ndarray":
     """Return per-sample category as int8 ndarray of length N.
 
     For v4 arrays (36 cols), reads col `COL_CATEGORY` directly.
     For v3 arrays (35 cols), infers category from meth_context:
-      - mc[pred_idx] > 0 → CATEGORY_METH
-      - mc[pred_idx] == 0 AND any signature offset upstream matches → CATEGORY_SLOWED
+
+      The methylation at center (mc[pred_idx] > 0) is itself classified as
+      SLOWED if its own offset 0 is in its signature_offsets, else NEAR_METH.
+      Then any non-meth center sample is checked for upstream methylations:
+      - upstream meth at a signature offset of it → CATEGORY_SLOWED
+      - upstream meth in proximity window but NOT signature → CATEGORY_NEAR_METH
       - else → CATEGORY_BASELINE
 
     `signature_offsets_by_meth` maps meth_name -> list of int offsets.
-    Required only for v3 inference; ignored for v4. If None for v3,
-    every non-meth sample is classified as CATEGORY_BASELINE.
-
-    `pred_idx` defaults to METH_CTX_LEFT (= 7).
+    `near_meth_max_dist` defaults to METH_CTX_LEFT (= 7) — the meth_context
+    only sees up to 7 bases upstream so that's the natural proximity window.
     """
     import numpy as np
     if pred_idx is None:
         pred_idx = METH_CTX_LEFT
+    if near_meth_max_dist is None:
+        near_meth_max_dist = METH_CTX_LEFT
 
     n = len(arr)
     if n == 0:
@@ -176,33 +196,53 @@ def get_categories(arr, signature_offsets_by_meth: dict | None = None,
     cats = np.zeros(n, dtype=np.int8)
     mc = arr[:, COL_METH_CTX_START:COL_METH_CTX_END].astype(np.int32)
     center = mc[:, pred_idx]
-    cats[center > 0] = CATEGORY_METH
 
-    if signature_offsets_by_meth:
-        # Build (mc_idx, expected_meth_id) probes for each upstream sig offset.
-        # Late import to keep this module pysam-free.
-        from .encoding import get_meth_ids
-        meth_ids = get_meth_ids()
-        probes = []
-        for mname, offsets in signature_offsets_by_meth.items():
-            mid = meth_ids.get(mname)
-            if not mid:
+    if not signature_offsets_by_meth:
+        # Without signature info we cannot classify — meth at center counts
+        # as slowed by default, everything else stays baseline.
+        cats[center > 0] = CATEGORY_SLOWED
+        return cats
+
+    from .encoding import get_meth_ids
+    meth_ids = get_meth_ids()
+
+    # 1. Classify the meth center itself: SLOWED if 0 ∈ sig, else NEAR_METH.
+    for mname, offsets in signature_offsets_by_meth.items():
+        mid = meth_ids.get(mname)
+        if not mid:
+            continue
+        sig_set = {int(k) for k in offsets if isinstance(k, (int, float))}
+        target_cat = CATEGORY_SLOWED if 0 in sig_set else CATEGORY_NEAR_METH
+        cats[(center == mid)] = target_cat
+
+    # 2. For non-meth center samples, check upstream meth at sig vs proximity offsets.
+    sig_probes  = []
+    near_probes = []
+    for mname, offsets in signature_offsets_by_meth.items():
+        mid = meth_ids.get(mname)
+        if not mid:
+            continue
+        sig_set = {int(k) for k in offsets if isinstance(k, (int, float))}
+        for k in range(1, near_meth_max_dist + 1):
+            idx = pred_idx - k
+            if not (0 <= idx < METH_CTX_LEN):
                 continue
-            for k in offsets:
-                try:
-                    k = int(k)
-                except (TypeError, ValueError):
-                    continue
-                if k <= 0:
-                    continue
-                idx = pred_idx - k
-                if 0 <= idx < METH_CTX_LEN:
-                    probes.append((idx, mid))
-        if probes:
-            slowed_mask = (cats == CATEGORY_BASELINE)  # only check non-meth
-            hit = np.zeros(n, dtype=bool)
-            for mc_idx, mid in probes:
-                hit |= (mc[:, mc_idx] == mid)
-            cats[slowed_mask & hit] = CATEGORY_SLOWED
+            if k in sig_set:
+                sig_probes.append((idx, mid))
+            else:
+                near_probes.append((idx, mid))
+
+    base_mask = (cats == CATEGORY_BASELINE)   # only the truly-empty baselines
+    if sig_probes:
+        hit = np.zeros(n, dtype=bool)
+        for mc_idx, mid in sig_probes:
+            hit |= (mc[:, mc_idx] == mid)
+        cats[base_mask & hit] = CATEGORY_SLOWED
+    if near_probes:
+        still_base = (cats == CATEGORY_BASELINE)
+        hit = np.zeros(n, dtype=bool)
+        for mc_idx, mid in near_probes:
+            hit |= (mc[:, mc_idx] == mid)
+        cats[still_base & hit] = CATEGORY_NEAR_METH
 
     return cats
