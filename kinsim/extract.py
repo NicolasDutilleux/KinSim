@@ -762,7 +762,7 @@ def _slide_kmers(seq: str, kmer_size: int) -> list:
 def extract_samples_v4_from_bam(
     bam_path:                  str,
     motif_string:              str,
-    refined_pkl_path:          str,
+    refined_pkl_path:          str | None = None,
     n_baseline_per_kmer:       int  = 50,
     baseline_min_dist_to_meth: int  = K,
     revcomp:                   bool = True,
@@ -772,28 +772,40 @@ def extract_samples_v4_from_bam(
     meth_types:                set | None = None,
     seed:                      int  = 42,
 ) -> dict:
-    """v4 extract: emit meth + slowed + baseline samples per read.
+    """v4 extract: single-pass emission of meth + slowed + baseline samples.
+
+    Two modes:
+
+    1. Standalone (refined_pkl_path is None) — DEFAULT.
+       Every motif-match position p of type T is treated as a candidate
+       methylation and emitted as CATEGORY_METH. Positions p+k for each
+       k > 0 in signature_offsets[T] are flagged CATEGORY_SLOWED.
+       False-positive motif matches survive this pass; they are dropped
+       downstream by `kinsim refine` (GMM on the meth pool + p95 filter
+       on the slowed pool). This is the recommended path: ONE extract,
+       ONE refine, no bootstrap loop.
+
+    2. Pre-confirmed (refined_pkl_path given).
+       Only motif matches whose (kmer, meth_id) appears as a bucket in
+       the supplied refined.pkl are flagged. Useful only when you already
+       have a trusted master_clean from a previous run and want to skip
+       the GMM step; in normal use leave this None.
 
     Args:
         bam_path:                Path to a raw HiFi or bystrandified BAM.
         motif_string:            Motif spec used to scan candidate
                                  methylation positions on each read.
-        refined_pkl_path:        Path to master_clean.pkl produced by
-                                 ``kinsim refine`` pass-1 (GMM). Used as the
-                                 source of confirmed (kmer, meth_id) tuples.
+        refined_pkl_path:        Optional. If given, use the bucket set
+                                 from a refined.pkl as the confirmation
+                                 oracle (mode 2).
         n_baseline_per_kmer:     Reservoir cap on baseline samples per kmer.
         baseline_min_dist_to_meth: Minimum distance (bases) a baseline
-                                 candidate must keep from any confirmed-meth
-                                 or slowed position. Defaults to K so the
+                                 candidate must keep from any meth or
+                                 slowed position. Defaults to K so the
                                  meth_context window of a baseline never
                                  contains a methylation.
-        revcomp:                 Scan the reverse-complement motifs too.
-        use_reverse_strand:      Also extract ri/rp complementary-strand
-                                 kinetics (with RC kmers as keys).
-        max_reads:                Smoke-test cap (0 = no limit).
-        kmer_size:               Window size (default K=11).
-        meth_types:              Optional restriction to a subset of types.
-        seed:                    RNG seed for reservoir sampling.
+        revcomp / use_reverse_strand / max_reads / kmer_size /
+        meth_types / seed:       Standard extract knobs.
 
     Returns:
         dict with v4 layout:
@@ -801,9 +813,9 @@ def extract_samples_v4_from_bam(
           - "__meta__"                       → provenance dict
         Column 35 (last) carries the category:
           0 = baseline
-          1 = meth      (center is a confirmed methylation)
+          1 = meth      (center is at a candidate methylation)
           2 = slowed    (center is at a signature offset of an upstream
-                         confirmed methylation)
+                         candidate methylation)
     """
     from .utils.sample_layout import (
         SAMPLE_NCOLS, COL_CATEGORY,
@@ -818,9 +830,30 @@ def extract_samples_v4_from_bam(
     if meth_types is not None:
         motif_string = filter_motif_string_by_types(motif_string, meth_types)
 
-    confirmed, sig_offsets_by_name = _load_confirmed_set(refined_pkl_path)
-    log.info("v4 extract — confirmed buckets: %d  (from %s)",
-             len(confirmed), refined_pkl_path)
+    # Either load a confirmation set (optional) or treat every motif match
+    # as a candidate (default — refine GMM does the filtering downstream).
+    if refined_pkl_path is not None:
+        confirmed, sig_offsets_by_name = _load_confirmed_set(refined_pkl_path)
+        confirmation_mode = "pre-confirmed (refined-pkl)"
+        log.info("v4 extract — confirmed buckets: %d  (from %s)",
+                 len(confirmed), refined_pkl_path)
+    else:
+        confirmed = None
+        from .utils.config import load_kinsim_config
+        cfg = load_kinsim_config()
+        sig_offsets_by_name = {}
+        for mname, scfg in (cfg.get("kinetic_signatures") or {}).items():
+            offs = []
+            for k in scfg.get("signal_offsets", []):
+                try:
+                    offs.append(int(k))
+                except (TypeError, ValueError):
+                    continue
+            sig_offsets_by_name[mname] = offs
+        confirmation_mode = "standalone (motif-match)"
+        log.info("v4 extract — standalone mode: every motif match treated "
+                 "as candidate; refine GMM will drop FP downstream.")
+    log.info("v4 extract — confirmation mode: %s", confirmation_mode)
     log.info("v4 extract — signature offsets: %s", sig_offsets_by_name)
 
     motifs       = parse_motifs(motif_string, revcomp=revcomp)
@@ -862,7 +895,10 @@ def extract_samples_v4_from_bam(
             return
         kmers = _slide_kmers(seq_str[:n], kmer_size)
 
-        # Phase 1: identify confirmed-meth positions and slowed positions.
+        # Phase 1: identify candidate-meth positions and slowed positions.
+        # In standalone mode (`confirmed is None`) every motif-match counts
+        # as a candidate. In pre-confirmed mode only motif-matches whose
+        # (kmer, T) appears in the confirmed set are kept.
         confirmed_pos: dict = {}     # center -> meth_id (the meth itself)
         slowed_pos:    dict = {}     # center -> parent meth_id
         for c in range(n):
@@ -872,23 +908,25 @@ def extract_samples_v4_from_bam(
             kmer_id, valid = kmers[c]
             if not valid:
                 continue
-            if (kmer_id, T) in confirmed:
-                confirmed_pos[c] = T
-                mname = name_by_mid.get(T)
-                if not mname:
+            is_candidate = (confirmed is None) or ((kmer_id, T) in confirmed)
+            if not is_candidate:
+                continue
+            confirmed_pos[c] = T
+            mname = name_by_mid.get(T)
+            if not mname:
+                continue
+            for k in sig_offsets_by_name.get(mname, []):
+                if k <= 0:
                     continue
-                for k in sig_offsets_by_name.get(mname, []):
-                    if k <= 0:
-                        continue
-                    sc = c + k
-                    if 0 <= sc < n and sc not in confirmed_pos:
-                        # only flag positions whose center is unmethylated;
-                        # if sc itself is a meth, it'll be emitted as meth
-                        if int(meth_status_arr[sc]) == 0:
-                            # Last writer wins is fine — multiple parents may
-                            # land on the same offset; track for stats.
-                            slowed_pos[sc] = T
-                            slowed_offset_dist[(mname, k)] += 1
+                sc = c + k
+                if 0 <= sc < n and sc not in confirmed_pos:
+                    # only flag positions whose center is unmethylated;
+                    # if sc itself is a meth, it'll be emitted as meth
+                    if int(meth_status_arr[sc]) == 0:
+                        # Last writer wins is fine — multiple parents may
+                        # land on the same offset; track for stats.
+                        slowed_pos[sc] = T
+                        slowed_offset_dist[(mname, k)] += 1
 
         # Pre-compute distance-to-nearest-flag for baseline gating.
         flagged = sorted(set(confirmed_pos) | set(slowed_pos))
@@ -1009,8 +1047,9 @@ def extract_samples_v4_from_bam(
     result["__meta__"] = {
         "kinsim_version":            _KINSIM_VERSION,
         "extraction_mode":           "v4",
+        "confirmation_mode":         confirmation_mode,
         "source_bam":                str(bam_path),
-        "refined_pkl":               str(refined_pkl_path),
+        "refined_pkl":               str(refined_pkl_path) if refined_pkl_path else None,
         "motifs":                    motif_string,
         "meth_types":                sorted(meth_types) if meth_types else None,
         "kmer_size":                 kmer_size,
@@ -1036,7 +1075,7 @@ def extract_v4_from_manifest_task(
     manifest_path:             str,
     task_index:                int,
     output_dir:                str,
-    refined_pkl_path:          str,
+    refined_pkl_path:          str | None = None,
     n_baseline_per_kmer:       int  = 50,
     baseline_min_dist_to_meth: int  = K,
     revcomp:                   bool = True,
@@ -1045,7 +1084,12 @@ def extract_v4_from_manifest_task(
     kmer_size:                 int  = K,
     meth_types:                set | None = None,
 ) -> None:
-    """Manifest-mode wrapper for the v4 extract path."""
+    """Manifest-mode wrapper for the v4 extract path.
+
+    If `refined_pkl_path` is None (default), runs in standalone mode:
+    every motif match is treated as a candidate and the FP filtering
+    happens in the subsequent `kinsim refine` step.
+    """
     from .utils.config import load_manifest
     from .utils.motifs import load_motif_string as _load_motif_string
 
@@ -1418,26 +1462,31 @@ def main(argv=None) -> None:
                            help="Enable DEBUG-level logging")
 
     # ---- v4 mode flags ----
+    p_extract.add_argument("--v4", action="store_true",
+                           help="Run the v4 extraction (recommended): "
+                                "single-pass emission of meth + slowed + "
+                                "baseline samples in the 36-col CATEGORY "
+                                "format keyed by kmer_id. False-positive "
+                                "motifs are dropped by the subsequent "
+                                "`kinsim refine` (GMM on meth + p95 on "
+                                "slowed). Without --v4 (and without "
+                                "--refined-pkl), kinsim extract emits the "
+                                "legacy v3 35-col (kmer, meth_id) format.")
     p_extract.add_argument("--refined-pkl", default=None,
-                           help="Path to a master_clean.pkl produced by "
-                                "`kinsim refine` pass-1 (GMM). When provided, "
-                                "the extract switches to v4 mode: emits METH "
-                                "samples at confirmed methylation positions, "
-                                "SLOWED samples at signature offsets of those, "
-                                "and BASELINE samples elsewhere (capped per "
-                                "kmer). Output is the v4 36-col format keyed "
-                                "by kmer_id only. Without this flag, extract "
-                                "runs in legacy bootstrap mode (35-col "
-                                "(kmer, meth_id) keys) — needed once to feed "
-                                "refine pass-1 and produce master_clean.pkl.")
+                           help="(v4 only, OPTIONAL) Path to a previously-"
+                                "produced master_clean.pkl. When given, "
+                                "implies --v4 and uses the bucket set as "
+                                "an oracle for motif confirmation, skipping "
+                                "the GMM step. Almost never needed: just use "
+                                "--v4 alone and let refine do the GMM.")
     p_extract.add_argument("--n-baseline-per-kmer", type=int, default=None,
                            help="(v4 only) Cap on baseline samples kept per "
                                 "kmer. Overrides kinsim_config.yaml "
                                 "extract.n_baseline_per_kmer.")
     p_extract.add_argument("--baseline-min-dist", type=int, default=None,
                            help="(v4 only) Minimum distance (bases) a baseline "
-                                "candidate must keep from any confirmed-meth "
-                                "or slowed position. Overrides "
+                                "candidate must keep from any meth or slowed "
+                                "position. Overrides "
                                 "extract.baseline_min_dist_to_meth in YAML.")
 
     # -- merge subcommand --
@@ -1476,8 +1525,9 @@ def main(argv=None) -> None:
     else:   # extract
         meth_types = parse_meth_types_arg(args.meth_types)
 
-        # Resolve v4 params (CLI overrides YAML).
-        v4_mode = args.refined_pkl is not None
+        # Resolve v4 params (CLI overrides YAML). v4 mode is triggered by
+        # either --v4 or --refined-pkl (the latter implies --v4).
+        v4_mode = args.v4 or (args.refined_pkl is not None)
         v4_baseline_n = args.n_baseline_per_kmer
         v4_baseline_d = args.baseline_min_dist
         if v4_mode and (v4_baseline_n is None or v4_baseline_d is None):
