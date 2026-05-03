@@ -974,45 +974,62 @@ def extract_samples_v4_from_bam(
             return best
 
         # Phase 2: emit samples per position.
+        # PERFORMANCE: do the cheap keep/skip decision FIRST. Only call the
+        # expensive _slice_* + _build_row helpers if we know we'll keep the
+        # sample. Most baseline candidates are rejected by the reservoir
+        # roll, so this saves ~99% of the Python work on slowed-by-baseline
+        # reads (typical case for short bacterial motif densities).
         for c in range(n):
             kmer_id, valid = kmers[c]
             if not valid:
                 continue
 
+            # Decide category + decide if we keep, BEFORE building the row.
+            cat = -1
+            slot = -1   # -1 = append, >=0 = replace at this index (baseline reservoir)
+            target_buf = None
+            if c in slowed_pos:
+                cat = CATEGORY_SLOWED
+                target_buf = samples
+            elif c in near_pos:
+                cat = CATEGORY_NEAR_METH
+                target_buf = samples
+            else:
+                if _dist_to_flag(c) < baseline_min_dist_to_meth:
+                    continue
+                n_baseline_seen += 1
+                baseline_seen_per_kmer[kmer_id] += 1
+                seen = baseline_seen_per_kmer[kmer_id]
+                if seen <= n_baseline_per_kmer:
+                    cat = CATEGORY_BASELINE
+                    target_buf = baseline_buffer
+                    slot = -1   # append
+                else:
+                    j = int(rng.integers(0, seen))
+                    if j < n_baseline_per_kmer:
+                        cat = CATEGORY_BASELINE
+                        target_buf = baseline_buffer
+                        slot = j
+                    else:
+                        continue   # rejected by reservoir — skip row construction
+            # Now build the row (expensive)
             ipd_v    = float(ipd_arr[c])
             pw_v     = float(pw_arr[c])
             mc       = _slice_meth_context(meth_status_arr, c)
             profile  = _slice_kinetic_profile(ipd_arr, pw_arr, c)
             rev_meth = _slice_rev_meth(meth_status_complement_arr, c)
-            meth_id_center = int(meth_status_arr[c])
-            frac_v   = frac_lookup.get(meth_id_center, 0.0) if meth_id_center else 0.0
-
-            if c in slowed_pos:
-                samples[kmer_id].append(_build_row(
-                    ipd_v, pw_v, frac_v, mc, profile, rev_meth, CATEGORY_SLOWED))
-                n_slowed += 1
-            elif c in near_pos:
-                samples[kmer_id].append(_build_row(
-                    ipd_v, pw_v, frac_v, mc, profile, rev_meth, CATEGORY_NEAR_METH))
-                n_near += 1
+            if cat == CATEGORY_BASELINE:
+                frac_v = 0.0
             else:
-                # Baseline candidate — must be far enough from any flag.
-                if _dist_to_flag(c) < baseline_min_dist_to_meth:
-                    continue
-                # Streaming reservoir per kmer. Memory bounded at
-                # n_baseline_per_kmer * (# distinct kmers ever seen).
-                n_baseline_seen += 1
-                baseline_seen_per_kmer[kmer_id] += 1
-                seen = baseline_seen_per_kmer[kmer_id]
-                if seen <= n_baseline_per_kmer:
-                    baseline_buffer[kmer_id].append(_build_row(
-                        ipd_v, pw_v, 0.0, mc, profile, rev_meth, CATEGORY_BASELINE))
-                else:
-                    # Replace a random existing slot with prob cap/seen.
-                    j = int(rng.integers(0, seen))
-                    if j < n_baseline_per_kmer:
-                        baseline_buffer[kmer_id][j] = _build_row(
-                            ipd_v, pw_v, 0.0, mc, profile, rev_meth, CATEGORY_BASELINE)
+                meth_id_center = int(meth_status_arr[c])
+                frac_v = frac_lookup.get(meth_id_center, 0.0) if meth_id_center else 0.0
+            row = _build_row(ipd_v, pw_v, frac_v, mc, profile, rev_meth, cat)
+            if slot >= 0:
+                target_buf[kmer_id][slot] = row
+            else:
+                target_buf[kmer_id].append(row)
+            if   cat == CATEGORY_SLOWED:    n_slowed += 1
+            elif cat == CATEGORY_NEAR_METH: n_near   += 1
 
     with pysam.AlignmentFile(bam_path, "rb", check_sq=False) as bam:
         for read in bam:
