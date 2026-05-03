@@ -862,20 +862,26 @@ def extract_samples_v4_from_bam(
     meth_ids     = get_meth_ids()
     name_by_mid  = {v: k for k, v in meth_ids.items()}
 
-    # meth + slowed go directly into `samples`; baseline candidates accumulate
-    # into a separate buffer so we can subsample uniformly to n_baseline_per_kmer
-    # at the end (proper "reservoir at end" instead of biased first-N).
-    # slowed + near_meth are emitted directly (no per-kmer cap — they reflect
-    # the genomic distribution of methylations and their neighbourhoods).
-    # Baseline candidates accumulate in a side buffer so we can subsample
-    # uniformly to n_baseline_per_kmer at the end.
+    # slowed + near_meth are emitted directly to `samples` (no per-kmer cap —
+    # they reflect the genomic distribution of methylations and their
+    # neighbourhoods).
+    #
+    # Baseline candidates use TRUE STREAMING RESERVOIR sampling per kmer:
+    #   - First n_baseline_per_kmer samples for a given kmer go into the buffer.
+    #   - Subsequent samples replace a random existing slot with prob
+    #     n_baseline_per_kmer / seen_so_far.
+    # This keeps memory bounded at n_baseline_per_kmer * n_present_kmers
+    # regardless of how many baseline candidates are seen (~hundreds of
+    # millions for a typical 200k-read run). No collect-then-subsample.
     samples:         dict = defaultdict(list)   # kmer_id -> list of 36-col rows
-    baseline_buffer: dict = defaultdict(list)   # kmer_id -> list of 36-col baseline rows
+    baseline_buffer: dict = defaultdict(list)   # kmer_id -> reservoir (cap = n_baseline_per_kmer)
+    baseline_seen_per_kmer: dict = defaultdict(int)  # kmer_id -> # baseline candidates SEEN
     n_slowed = n_near = n_baseline_seen = 0
     slowed_offset_dist: dict = defaultdict(int)
     near_offset_dist:   dict = defaultdict(int)
     n_reads_processed    = 0
     n_reads_with_reverse = 0
+    PROGRESS_EVERY       = 10_000                # log every N reads
 
     log.info("v4 extract from: %s", bam_path)
     log.info("Motifs: %s  |  reverse_strand=%s", motif_string, use_reverse_strand)
@@ -993,9 +999,20 @@ def extract_samples_v4_from_bam(
                 # Baseline candidate — must be far enough from any flag.
                 if _dist_to_flag(c) < baseline_min_dist_to_meth:
                     continue
-                baseline_buffer[kmer_id].append(_build_row(
-                    ipd_v, pw_v, 0.0, mc, profile, rev_meth, CATEGORY_BASELINE))
+                # Streaming reservoir per kmer. Memory bounded at
+                # n_baseline_per_kmer * (# distinct kmers ever seen).
                 n_baseline_seen += 1
+                baseline_seen_per_kmer[kmer_id] += 1
+                seen = baseline_seen_per_kmer[kmer_id]
+                if seen <= n_baseline_per_kmer:
+                    baseline_buffer[kmer_id].append(_build_row(
+                        ipd_v, pw_v, 0.0, mc, profile, rev_meth, CATEGORY_BASELINE))
+                else:
+                    # Replace a random existing slot with prob cap/seen.
+                    j = int(rng.integers(0, seen))
+                    if j < n_baseline_per_kmer:
+                        baseline_buffer[kmer_id][j] = _build_row(
+                            ipd_v, pw_v, 0.0, mc, profile, rev_meth, CATEGORY_BASELINE)
 
     with pysam.AlignmentFile(bam_path, "rb", check_sq=False) as bam:
         for read in bam:
@@ -1036,14 +1053,21 @@ def extract_samples_v4_from_bam(
                                     rc_meth_status, fwd_in_rc)
 
             n_reads_processed += 1
+            if n_reads_processed % PROGRESS_EVERY == 0:
+                log.info(
+                    "  progress: %d reads | slowed=%d near=%d baseline_seen=%d "
+                    "(buf_kmers=%d, mem~%dMB)",
+                    n_reads_processed, n_slowed, n_near, n_baseline_seen,
+                    len(baseline_buffer),
+                    # crude estimate: each row ~144 bytes, plus samples dict
+                    int((sum(len(v) for v in baseline_buffer.values())
+                         + sum(len(v) for v in samples.values())) * 144 / 1e6),
+                )
 
-    # End-of-stream subsample of baselines: cap each kmer's baseline buffer
-    # at n_baseline_per_kmer with uniform random selection (no first-N bias).
+    # Baseline buffer is already capped at n_baseline_per_kmer per kmer
+    # (streaming reservoir during the read loop). Just merge into samples.
     n_baseline_kept = 0
     for kmer_id, rows in baseline_buffer.items():
-        if len(rows) > n_baseline_per_kmer:
-            idx = rng.choice(len(rows), n_baseline_per_kmer, replace=False)
-            rows = [rows[i] for i in idx]
         if rows:
             samples[kmer_id].extend(rows)
             n_baseline_kept += len(rows)
