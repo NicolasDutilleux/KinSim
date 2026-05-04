@@ -305,9 +305,33 @@ def slowed_split_v4(
     if baseline_ipds:
         pooled = np.concatenate(baseline_ipds)
         threshold = float(np.percentile(pooled, secondary_pct))
-        log.info("[refine-v4] baseline IPD pool: n=%d, mean=%.2f, "
-                 "median=%.2f, p%g=%.2f (threshold for slowed)",
-                 len(pooled), float(pooled.mean()), float(np.median(pooled)),
+        log.info("[refine-v4] baseline IPD pool: n=%d, mean=%.2f, std=%.2f",
+                 len(pooled), float(pooled.mean()), float(pooled.std()))
+        log.info("[refine-v4] baseline quantiles:  "
+                 "p5=%.0f  p25=%.0f  p50=%.0f  p75=%.0f  p90=%.0f  "
+                 "p95=%.0f  p99=%.0f  max=%.0f",
+                 float(np.percentile(pooled, 5)),
+                 float(np.percentile(pooled, 25)),
+                 float(np.percentile(pooled, 50)),
+                 float(np.percentile(pooled, 75)),
+                 float(np.percentile(pooled, 90)),
+                 float(np.percentile(pooled, 95)),
+                 float(np.percentile(pooled, 99)),
+                 float(pooled.max()))
+        # Coarse histogram so user can see where the threshold falls.
+        bins = [0, 16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 256]
+        h, _ = np.histogram(pooled, bins=bins)
+        total = max(len(pooled), 1)
+        log.info("[refine-v4] baseline histogram (bin -> count, %%):")
+        for i in range(len(h)):
+            marker = ''
+            if bins[i] <= threshold < bins[i + 1]:
+                marker = '   <-- threshold here'
+            log.info("    [%3d-%3d): %12d  (%5.2f%%)%s",
+                     bins[i], bins[i + 1], int(h[i]),
+                     100.0 * h[i] / total, marker)
+        log.info("[refine-v4] threshold = p%g(baseline IPD) = %.2f  "
+                 "(slowed samples below this are dropped)",
                  secondary_pct, threshold)
     else:
         threshold = 0.0
@@ -343,8 +367,40 @@ def slowed_split_v4(
              n_baseline_in, n_baseline_out)
     log.info("[refine-v4] near_meth: %d in -> %d kept (pass-through)",
              n_near_in, n_near_out)
-    log.info("[refine-v4] slowed:    %d in -> %d kept, %d dropped (IPD < p%g = %.2f)",
-             n_slowed_in, n_slowed_kept, n_slowed_dropped, secondary_pct, threshold)
+    log.info("[refine-v4] slowed:    %d in -> %d kept, %d dropped (IPD < p%g = %.2f)  "
+             "survival = %.2f%%",
+             n_slowed_in, n_slowed_kept, n_slowed_dropped, secondary_pct, threshold,
+             100.0 * n_slowed_kept / max(n_slowed_in, 1))
+
+    # Distribution of slowed (kept) and near_meth so user sees if filter
+    # actually separates signal from baseline.
+    slowed_kept_ipds: list = []
+    near_ipds:        list = []
+    for kid, arr in new_data.items():
+        if not isinstance(arr, np.ndarray) or arr.shape[1] <= COL_CATEGORY:
+            continue
+        cats_n = arr[:, COL_CATEGORY].astype(np.int8)
+        slowed_kept_ipds.append(arr[cats_n == CATEGORY_SLOWED, COL_IPD])
+        near_ipds.append(arr[cats_n == CATEGORY_NEAR_METH, COL_IPD])
+    if slowed_kept_ipds:
+        sp = np.concatenate(slowed_kept_ipds)
+        if len(sp) > 0:
+            log.info("[refine-v4] slowed kept quantiles:  "
+                     "p5=%.0f  p50=%.0f  p95=%.0f  max=%.0f  mean=%.2f",
+                     float(np.percentile(sp, 5)),
+                     float(np.percentile(sp, 50)),
+                     float(np.percentile(sp, 95)),
+                     float(sp.max()), float(sp.mean()))
+    if near_ipds:
+        np_ = np.concatenate(near_ipds)
+        if len(np_) > 0:
+            log.info("[refine-v4] near_meth quantiles:    "
+                     "p5=%.0f  p50=%.0f  p95=%.0f  max=%.0f  mean=%.2f  "
+                     "(should look like baseline)",
+                     float(np.percentile(np_, 5)),
+                     float(np.percentile(np_, 50)),
+                     float(np.percentile(np_, 95)),
+                     float(np_.max()), float(np_.mean()))
 
     stats = {
         "format":               "v4",
