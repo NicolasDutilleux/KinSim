@@ -291,8 +291,20 @@ def slowed_split_v4(
         CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH,
     )
 
-    # 1. Pool baseline IPDs to compute threshold
-    baseline_ipds: list = []
+    # 1. Threshold from PER-KMER MEAN of baselines (not per-sample).
+    #    Per-sample baseline IPD has a heavy right tail (natural PacBio
+    #    polymerase pauses on unmodified DNA); its p95 catches the
+    #    Poisson noise floor, not the real outliers. Per-kmer mean
+    #    averages out that tail (CLT) so its distribution is tight and
+    #    p95 catches kmers that are GENUINELY shifted vs the bulk.
+    #    Threshold is then applied per-sample (slowed must beat the
+    #    per-kmer-mean p95 of baselines).
+    #    Kmers with too few baseline samples are excluded — their mean
+    #    is too noisy to trust.
+    MIN_BASELINE_PER_KMER_FOR_THRESHOLD = 5
+
+    kmer_baseline_means: list = []
+    pooled_for_stats:    list = []   # kept for histogram + summary stats only
     for kid, arr in data.items():
         if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
             continue
@@ -300,29 +312,48 @@ def slowed_split_v4(
             continue
         cats = arr[:, COL_CATEGORY].astype(np.int8)
         m = (cats == CATEGORY_BASELINE)
-        if m.any():
-            baseline_ipds.append(arr[m, COL_IPD])
-    if baseline_ipds:
-        pooled = np.concatenate(baseline_ipds)
-        threshold = float(np.percentile(pooled, secondary_pct))
-        log.info("[refine-v4] baseline IPD pool: n=%d, mean=%.2f, std=%.2f",
+        n_b = int(m.sum())
+        if n_b == 0:
+            continue
+        ipds = arr[m, COL_IPD]
+        pooled_for_stats.append(ipds)
+        if n_b >= MIN_BASELINE_PER_KMER_FOR_THRESHOLD:
+            kmer_baseline_means.append(float(ipds.mean()))
+
+    if pooled_for_stats and kmer_baseline_means:
+        pooled = np.concatenate(pooled_for_stats)
+        kmer_means = np.array(kmer_baseline_means, dtype=np.float32)
+        threshold = float(np.percentile(kmer_means, secondary_pct))
+
+        log.info("[refine-v4] baseline IPD per-sample: n=%d, mean=%.2f, std=%.2f",
                  len(pooled), float(pooled.mean()), float(pooled.std()))
-        log.info("[refine-v4] baseline quantiles:  "
-                 "p5=%.0f  p25=%.0f  p50=%.0f  p75=%.0f  p90=%.0f  "
-                 "p95=%.0f  p99=%.0f  max=%.0f",
+        log.info("[refine-v4]   per-sample quantiles:   "
+                 "p5=%.0f  p50=%.0f  p75=%.0f  p90=%.0f  p95=%.0f  p99=%.0f  max=%.0f",
                  float(np.percentile(pooled, 5)),
-                 float(np.percentile(pooled, 25)),
                  float(np.percentile(pooled, 50)),
                  float(np.percentile(pooled, 75)),
                  float(np.percentile(pooled, 90)),
                  float(np.percentile(pooled, 95)),
                  float(np.percentile(pooled, 99)),
                  float(pooled.max()))
-        # Coarse histogram so user can see where the threshold falls.
-        bins = [0, 16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 256]
-        h, _ = np.histogram(pooled, bins=bins)
-        total = max(len(pooled), 1)
-        log.info("[refine-v4] baseline histogram (bin -> count, %%):")
+        log.info("[refine-v4] baseline PER-KMER MEAN: n_kmers=%d (>= %d samples each), "
+                 "mean=%.2f, std=%.2f",
+                 len(kmer_means), MIN_BASELINE_PER_KMER_FOR_THRESHOLD,
+                 float(kmer_means.mean()), float(kmer_means.std()))
+        log.info("[refine-v4]   per-kmer-mean quantiles: "
+                 "p5=%.1f  p50=%.1f  p75=%.1f  p90=%.1f  p95=%.1f  p99=%.1f  max=%.1f",
+                 float(np.percentile(kmer_means, 5)),
+                 float(np.percentile(kmer_means, 50)),
+                 float(np.percentile(kmer_means, 75)),
+                 float(np.percentile(kmer_means, 90)),
+                 float(np.percentile(kmer_means, 95)),
+                 float(np.percentile(kmer_means, 99)),
+                 float(kmer_means.max()))
+        # Histogram of per-kmer means (where threshold sits).
+        bins = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 128, 256]
+        h, _ = np.histogram(kmer_means, bins=bins)
+        total = max(len(kmer_means), 1)
+        log.info("[refine-v4] per-kmer-mean histogram (bin -> count, %%):")
         for i in range(len(h)):
             marker = ''
             if bins[i] <= threshold < bins[i + 1]:
@@ -330,8 +361,8 @@ def slowed_split_v4(
             log.info("    [%3d-%3d): %12d  (%5.2f%%)%s",
                      bins[i], bins[i + 1], int(h[i]),
                      100.0 * h[i] / total, marker)
-        log.info("[refine-v4] threshold = p%g(baseline IPD) = %.2f  "
-                 "(slowed samples below this are dropped)",
+        log.info("[refine-v4] threshold = p%g(baseline PER-KMER MEAN) = %.2f  "
+                 "(slowed samples below this IPD are dropped)",
                  secondary_pct, threshold)
     else:
         threshold = 0.0
