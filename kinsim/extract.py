@@ -1,44 +1,30 @@
 """Extract raw IPD/PW training samples from BAM files.
 
-This is the data-preparation pipeline for KinSim MLP training.
-It has no dependency on the model itself.
+Sample-level data preparation for KinSim training. Two output formats
+coexist; both store raw uint8/float32 values (the model applies log1p
+once at training time):
 
-Data format
------------
-Each shard is a pickle file containing:
+  v3 (legacy, 35 cols):
+      dict[(kmer_id, meth_id)] -> np.ndarray(N, 35)
+      Cols: [IPD, PW, fraction, mc_0..mc_10, profile_IPD_0..+8,
+             profile_PW_0..+8, rev_meth_-1, rev_meth_0, rev_meth_+1]
 
-    dict[(kmer_id: int, meth_id: int)] -> np.ndarray(N, 14)
+  v4 (default, 36 cols):
+      dict[kmer_id]            -> np.ndarray(N, 36)
+      Cols 0..34 unchanged; col 35 carries CATEGORY (baseline / slowed /
+      near_meth — see kinsim.utils.sample_layout).
 
-where columns are [IPD, PW, fraction, mc_0, mc_1, ..., mc_10] as raw float32.
-IPD and PW are read from the fi/fp BAM tags (uint8 [0, 255]).
-Column 2 is the stoichiometric methylation fraction.
-Columns 3–13 are the methylation IDs (0=none,1=m6A,2=m4C,3=m5C) for each
-of the 11 positions in the k-mer window, with the active site at mc_5
-(index K//2 = 5).
+Both layouts can carry a ``"__meta__"`` string key with provenance.
+Dataset loaders auto-detect the format and route accordingly.
 
-Backward compatibility: older shards may have only 2 columns [IPD, PW] or
-3 columns [IPD, PW, fraction].  Dataset classes handle all three formats
-by zero-padding the missing meth-context columns.
+CLI — single-BAM mode:
+    kinsim extract             reads.bam motifs shard.pkl    # v3 (legacy)
+    kinsim extract --v4        reads.bam motifs shard.pkl    # v4 (recommended)
 
-A special metadata key ``"__meta__"`` (string, not a tuple) may be present
-in any shard or master .pkl.  It holds provenance information (version,
-motifs, timestamp) and is automatically skipped by dataset classes.
+CLI — manifest mode (recommended for SLURM array jobs):
+    kinsim extract --v4 --manifest manifest.csv --task 3 --output-dir shards/
 
-Why raw (not log-transformed)?
-    The extract/merge pipeline stores raw values so that:
-      - Shards can be inspected and plotted without model knowledge
-      - Different models can apply their own transforms at load time
-      - MLPSignalDataset (data/dataset.py) applies log_transform once
-
-CLI — single-BAM mode (original interface, unchanged):
-    kinsim extract reads.bam "m6A,GATC,1" shard.pkl
-    kinsim merge   shards/   master_data.pkl
-
-CLI — manifest mode (new, recommended for SLURM array jobs):
-    kinsim extract --manifest manifest.csv --task 3 --output-dir shards/
-    kinsim merge   shards/  master_data.pkl
-
-Manifest CSV format (see kinsim/config.py):
+Manifest CSV format:
     sample_id,bam_path,motifs
     strain1,/data/bam1.bam,"m6A,GATC,1"
     strain2,/data/bam2.bam,/data/motifs/strain2.csv
@@ -695,22 +681,25 @@ def extract_samples_from_bam(
 
 
 # ---------------------------------------------------------------------------
-# v4 extract: emits meth + slowed + baseline using a refined master_clean.pkl
-# as the source of confirmed methylations.
+# v4 extract: emits CATEGORY_BASELINE / CATEGORY_SLOWED / CATEGORY_NEAR_METH
+# samples in a single pass over each BAM, in the 36-col layout keyed by
+# kmer_id only (see kinsim/utils/sample_layout.py).
 # ---------------------------------------------------------------------------
 
 
 def _load_confirmed_set(refined_pkl_path: str) -> tuple[set, dict]:
-    """Load a refined master_clean.pkl (output of refine pass-1) and return:
+    """Read an existing master_clean.pkl as a confirmation oracle for
+    motif-match positions.
 
-      confirmed_kmer_meth: set of (kmer_id, meth_id) tuples — the methylated
-        buckets that survived the global GMM filter. We treat any motif-match
-        in a read whose (kmer_at_position, meth_id) belongs to this set as a
-        confirmed methylation.
+    Returns:
+        confirmed_kmer_meth: set of (kmer_id, meth_id) tuples that survived
+            the GMM step of a previous v3 refine. Used to gate which motif
+            matches in the current extract are treated as candidate methylations.
+        sig_offsets_by_name: dict[mod_name -> list[int]] of signature offsets
+            taken from kinsim_config.yaml.
 
-      sig_offsets_by_name: dict[mod_name -> list[int]] of signature offsets
-        from kinsim_config.yaml, used to flag p+k as slowed for each
-        confirmed methylation at p of type mod_name.
+    Optional path: most users call extract without --refined-pkl and the
+    refine GMM downstream filters false positives.
     """
     with open(refined_pkl_path, "rb") as f:
         data = pickle.load(f)
@@ -736,13 +725,14 @@ def _load_confirmed_set(refined_pkl_path: str) -> tuple[set, dict]:
 
 
 def _slide_kmers(seq: str, kmer_size: int) -> list:
-    """Return a per-position list of (kmer_id, valid) tuples.
+    """Per-position kmer encoding (rolling bit-pack).
 
-    Index `c` corresponds to read position `c` as the prediction-position
-    center. A kmer is valid only if the [-LEFT_PAD, +RIGHT_PAD] window fits
-    inside the read; otherwise (kmer_id, valid) is (0, False).
+    Returns a list of length len(seq); element c is (kmer_id, valid) where
+    kmer_id is the 2k-bit encoding of seq[c - KMER_LEFT_PAD : c + KMER_RIGHT_PAD + 1].
+    Positions whose window falls outside the read are (0, False).
 
-    The kmer is computed by encoding seq[c-LEFT_PAD : c+RIGHT_PAD+1].
+    Kept for tests / single-position lookups; the production v4 extract uses
+    the vectorised _vec_kmers nested in extract_samples_v4_from_bam instead.
     """
     n = len(seq)
     out = [(0, False)] * n
@@ -774,50 +764,54 @@ def extract_samples_v4_from_bam(
     meth_types:                set | None = None,
     seed:                      int  = 42,
 ) -> dict:
-    """v4 extract: single-pass emission of meth + slowed + baseline samples.
+    """Extract v4 training samples from a BAM in a single pass.
 
-    Two modes:
+    For each motif-match position p of type T identified by the regex scan:
+      - p + k for k in signature_offsets[T] (incl. 0) → CATEGORY_SLOWED
+        (position where the polymerase slowing is biophysically expected)
+      - p + k for k in [0, near_meth_max_dist] not in sig_offsets[T] →
+        CATEGORY_NEAR_METH (close to the meth but not at a signature
+        offset; serves as negative control teaching the model that a
+        methylation in the meth_context window alone is not enough to
+        predict elevated IPD — only the offset matters)
+    Positions at distance ≥ baseline_min_dist_to_meth from any meth or
+    flag → CATEGORY_BASELINE candidates, capped per kmer at
+    n_baseline_per_kmer via streaming reservoir sampling.
 
-    1. Standalone (refined_pkl_path is None) — DEFAULT.
-       Every motif-match position p of type T is treated as a candidate
-       methylation. The position p and each p+k for k in signature_offsets[T]
-       become CATEGORY_SLOWED. Positions p+k for k in [0, near_meth_max_dist]
-       NOT in signature offsets become CATEGORY_NEAR_METH. Positions far
-       from any meth become CATEGORY_BASELINE candidates (capped per kmer).
-       False-positive motif matches survive this pass; their slowed samples
-       are dropped downstream by `kinsim refine` (p95 filter on slowed).
+    A front-end Bernoulli sample at rate `baseline_sample_rate` skips most
+    baseline candidates before reservoir work — drops Python overhead by
+    ~1/rate while preserving uniform per-kmer sampling thanks to the
+    reservoir downstream.
 
-    2. Pre-confirmed (refined_pkl_path given).
-       Only motif matches whose (kmer, meth_id) appears as a bucket in
-       the supplied refined.pkl are flagged. Useful only when you already
-       have a trusted master_clean from a previous run and want to skip
-       the GMM step; in normal use leave this None.
+    `refined_pkl_path` is optional. When None (default), every motif match
+    is a candidate; `kinsim refine` filters false positives downstream
+    via the p95 IPD threshold. When given, only motif matches whose
+    (kmer_at_p, T) appears in the previous master_clean.pkl are kept.
 
     Args:
-        bam_path:                Path to a raw HiFi or bystrandified BAM.
-        motif_string:            Motif spec used to scan candidate
-                                 methylation positions on each read.
-        refined_pkl_path:        Optional. If given, use the bucket set
-                                 from a refined.pkl as the confirmation
-                                 oracle (mode 2).
-        n_baseline_per_kmer:     Reservoir cap on baseline samples per kmer.
-        baseline_min_dist_to_meth: Minimum distance (bases) a baseline
-                                 candidate must keep from any meth or
-                                 slowed position. Defaults to K so the
-                                 meth_context window of a baseline never
-                                 contains a methylation.
-        revcomp / use_reverse_strand / max_reads / kmer_size /
-        meth_types / seed:       Standard extract knobs.
+        bam_path:                  Raw HiFi or bystrandified BAM (must
+                                   carry fi/fp or ip/pw kinetic tags).
+        motif_string:              Motif spec; one regex scan per read.
+        refined_pkl_path:          Optional confirmation oracle.
+        n_baseline_per_kmer:       Reservoir cap per kmer.
+        baseline_min_dist_to_meth: Min bases between a baseline center and
+                                   any methylation. Default K guarantees
+                                   the meth_context window stays empty.
+        near_meth_max_dist:        Proximity window for NEAR_METH (default 7,
+                                   matches KMER_LEFT_PAD).
+        baseline_sample_rate:      Front-end Bernoulli skip rate (0..1).
+        revcomp:                   Scan reverse-complement motifs too.
+        use_reverse_strand:        Process ri/rp tags as a second strand.
+        max_reads:                 Smoke-test cap (0 = no limit).
+        kmer_size:                 Window size (default K).
+        meth_types:                Optional restriction to a subset of types.
+        seed:                      RNG seed for reservoir + subsampling.
 
     Returns:
-        dict with v4 layout:
-          - int kmer_id                      → np.ndarray(N, 36)
-          - "__meta__"                       → provenance dict
-        Column 35 (last) carries the category:
-          0 = baseline
-          1 = meth      (center is at a candidate methylation)
-          2 = slowed    (center is at a signature offset of an upstream
-                         candidate methylation)
+        dict with the v4 layout:
+            int kmer_id  →  np.ndarray(N, 36)   sample rows
+            "__meta__"   →  dict                provenance
+        See kinsim.utils.sample_layout for column semantics.
     """
     from .utils.sample_layout import (
         SAMPLE_NCOLS, COL_CATEGORY,
@@ -863,26 +857,21 @@ def extract_samples_v4_from_bam(
     meth_ids     = get_meth_ids()
     name_by_mid  = {v: k for k, v in meth_ids.items()}
 
-    # slowed + near_meth are emitted directly to `samples` (no per-kmer cap —
-    # they reflect the genomic distribution of methylations and their
-    # neighbourhoods).
-    #
-    # Baseline candidates use TRUE STREAMING RESERVOIR sampling per kmer:
-    #   - First n_baseline_per_kmer samples for a given kmer go into the buffer.
-    #   - Subsequent samples replace a random existing slot with prob
-    #     n_baseline_per_kmer / seen_so_far.
-    # This keeps memory bounded at n_baseline_per_kmer * n_present_kmers
-    # regardless of how many baseline candidates are seen (~hundreds of
-    # millions for a typical 200k-read run). No collect-then-subsample.
-    samples:         dict = defaultdict(list)   # kmer_id -> list of 36-col rows
-    baseline_buffer: dict = defaultdict(list)   # kmer_id -> reservoir (cap = n_baseline_per_kmer)
-    baseline_seen_per_kmer: dict = defaultdict(int)  # kmer_id -> # baseline candidates SEEN
+    # samples: slowed + near_meth rows go here, no per-kmer cap (the
+    # genomic distribution is what we want to see).
+    # baseline_buffer + baseline_seen_per_kmer implement Vitter's
+    # streaming reservoir sampling per kmer so memory stays bounded at
+    # n_baseline_per_kmer * (# kmers seen) regardless of how many
+    # baseline candidates pass through.
+    samples:         dict = defaultdict(list)
+    baseline_buffer: dict = defaultdict(list)
+    baseline_seen_per_kmer: dict = defaultdict(int)
     n_slowed = n_near = n_baseline_seen = 0
     slowed_offset_dist: dict = defaultdict(int)
     near_offset_dist:   dict = defaultdict(int)
     n_reads_processed    = 0
     n_reads_with_reverse = 0
-    PROGRESS_EVERY       = 10_000                # log every N reads
+    PROGRESS_EVERY       = 10_000
 
     log.info("v4 extract from: %s", bam_path)
     log.info("Motifs: %s  |  reverse_strand=%s", motif_string, use_reverse_strand)
@@ -898,10 +887,8 @@ def extract_samples_v4_from_bam(
         row[COL_CATEGORY] = category
         return row
 
-    # ------------------------------------------------------------------
-    # Pre-compute per-meth-type signature/near offset arrays for vectorised
-    # tagging in Phase 1 below. Computed once per extract call.
-    # ------------------------------------------------------------------
+    # Per-type signature- and near-offset arrays — pre-computed once so the
+    # per-read tagging loop below stays a few cheap numpy ops per type.
     sig_offsets_arr_by_mid: dict[int, np.ndarray] = {}
     near_offsets_arr_by_mid: dict[int, np.ndarray] = {}
     for mname, offs in sig_offsets_by_name.items():
@@ -915,10 +902,12 @@ def extract_samples_v4_from_bam(
         near_offsets_arr_by_mid[int(T_id)] = near
 
     def _vec_kmers(seq_str: str) -> tuple:
-        """Vectorised kmer encoding. Returns (kmer_ids[n], valid_mask[n]).
+        """Vectorised per-position kmer encoding.
 
-        kmer at center c covers seq[c - KMER_LEFT_PAD : c + KMER_RIGHT_PAD + 1].
-        Valid centers are [KMER_LEFT_PAD, n - KMER_RIGHT_PAD - 1].
+        Returns (kmer_ids: uint32[n], valid: bool[n]) for the read seq_str.
+        kmer at center c is the encoding of seq[c-KMER_LEFT_PAD : c+KMER_RIGHT_PAD+1]
+        (length kmer_size). Edge positions whose window falls outside the
+        read are kmer_id=0, valid=False.
         """
         n = len(seq_str)
         kmer_ids = np.zeros(n, dtype=np.uint32)
@@ -946,18 +935,21 @@ def extract_samples_v4_from_bam(
 
     def _process_strand(seq_str, ipd_arr, pw_arr,
                         meth_status_arr, meth_status_complement_arr):
-        """One-strand extract pass — vectorised with numpy.
+        """Extract all samples from one strand of one read into the global
+        accumulators (samples / baseline_buffer).
 
-        Algorithm:
-          1. Compute kmer_ids[c] for every center c in one numpy op.
-          2. Phase 1 (vectorised): for each meth at p, mark p+k positions in
-             slowed/near arrays via numpy fancy indexing.
-          3. Compute baseline_eligible mask via np.cumsum-based dilation
-             (no bisect, no per-position python loop).
-          4. Materialise three index arrays (slowed, near, baseline) and
-             apply baseline subsample with one rng.random() over the array.
-          5. Build all rows for each category in batch via fancy indexing.
-          6. Per-kmer reservoir loop only on the (small) kept-baseline indices.
+        Caller must pre-orient the four arrays so that index i refers to
+        the same physical position on the strand being processed.
+
+        Implementation: vectorised end-to-end. The per-position Python
+        loop and per-position bisect of the previous version are replaced
+        by a handful of numpy ops over arrays of length n:
+          - kmer encoding via sliding_window_view + dot product
+          - signature/near tagging via fancy-index assignment
+          - baseline_eligible mask via cumsum-based dilation
+          - row construction via batched fancy indexing
+        Only the per-emitted-sample kmer-grouping loop (slowed + near +
+        kept-baseline ≈ a few thousand per read) remains in Python.
         """
         nonlocal n_slowed, n_near, n_baseline_seen
         n = min(len(seq_str), len(ipd_arr), len(pw_arr))
@@ -1017,10 +1009,10 @@ def extract_samples_v4_from_bam(
                 near[writeable_idx] = T_id
                 near_offset_dist[(mname, int(k))] += int(writeable.sum())
 
-        # ---- 3. baseline_eligible mask via dilation ----
-        # A position is in the "flag zone" if any motif-match / slowed / near
-        # is within ±baseline_min_dist_to_meth. Compute via cumulative-sum
-        # window count: O(n), fully vectorised.
+        # ---- 3. baseline_eligible mask ----
+        # A position is in the "flag zone" iff any motif / slowed / near
+        # sits within ±baseline_min_dist_to_meth. Implemented as a window
+        # count using cumsum — O(n) vectorised, no per-position bisect.
         flagged = (meth_status_arr > 0) | (slowed > 0) | (near > 0)
         if flagged.any():
             f_int = flagged.astype(np.int32)

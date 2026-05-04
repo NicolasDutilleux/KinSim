@@ -1,47 +1,50 @@
 """Per-sample column layout shared by extract / refine / dataset / generate.
 
-Each stored row is `np.float32` with the following 36 columns (v4 format):
+Two storage formats coexist:
+
+  v3 layout (35 cols, dict[(kmer_id, meth_id)] -> ndarray):
+      Cols 0..34. The methylation type at center is encoded in the dict
+      key. Slowed / near_meth status is implicit in mc[KMER_PRED_IDX-k].
+
+  v4 layout (36 cols, dict[kmer_id] -> ndarray):
+      Cols 0..34 unchanged; col 35 carries an explicit CATEGORY enum.
+      The dict key drops meth_id (already in mc[KMER_PRED_IDX]); the
+      category column distinguishes baseline from slowed/near_meth when
+      mc[KMER_PRED_IDX] == 0.
+
+Column reference:
 
     Cols  | Contents
     ------+------------------------------------------------------------
-    0     | IPD at prediction position
+    0     | IPD at prediction position (raw uint8, stored as float32)
     1     | PW  at prediction position
     2     | stoichiometric fraction (0..1)
-    3-13  | mc_0..mc_10 — meth_id at offsets [-7..+3] from prediction pos
+    3-13  | mc_0..mc_10  — meth_id at offsets [-7..+3] from prediction
     14-22 | profile_IPD_0..+8 — kinetic profile downstream
     23-31 | profile_PW_0..+8
     32-34 | rev_meth_-1, rev_meth_0, rev_meth_+1 — complementary-strand
             meth_id at active-site neighbours
-    35    | category (v4) — three values only:
-              0 = baseline   (far from any methylation; meth_context is empty)
-              1 = slowed     (the methylation itself OR a downstream signature
-                              offset of an upstream methylation. IPD elevation
-                              is biophysically expected here.
-                              ex. m6A at p has signature [0, 5] -> p and p+5
-                                  are both SLOWED; the m6A position itself is
-                                  classified by its OWN signature offset 0.)
-              2 = near_meth  (close to a methylation but NOT at a signature
-                              offset of it. IPD should look baseline-like.
-                              Negative control teaching the model that meth-
-                              in-context alone does NOT mean elevated IPD.
-                              Window: [+1, +near_meth_max_dist] from the meth,
-                              minus signature offsets.)
-            (No separate "meth" category — methylation positions land in
-             SLOWED if 0 ∈ signature_offsets[T] (m6A, m4C) or NEAR_METH
-             otherwise (m5C, since signature is [+2, +6]).)
+    35    | CATEGORY (v4 only) — three values:
+              0 = baseline   far from any methylation
+              1 = slowed     meth itself OR a downstream signature offset
+                             of an upstream methylation; IPD elevation
+                             biophysically expected here
+              2 = near_meth  close to a methylation but NOT at a signature
+                             offset; IPD should look baseline-like — used
+                             as negative control so the model learns that
+                             a methylation in the context window alone is
+                             not sufficient to predict elevated IPD
 
-v3 format (pre-2026-05) used 35 columns. Loading code that may encounter
-v3 pkls should treat samples with `arr.shape[1] == 35` as having an
-implicit category derivable from `mc[7]` and signature offsets.
+    The methylation centers themselves land in SLOWED when 0 is in their
+    signature offsets (m6A, m4C) or NEAR_METH otherwise (m5C, sig [2, 6]).
+    A separate "meth" category is therefore unnecessary in v4.
 
-The v4 storage uses a `dict[kmer_id] -> ndarray(N, 36)` keying instead
-of v3's `dict[(kmer_id, meth_id)] -> ndarray(N, 35)`. The meth_id at
-center is already encoded in `mc[7]` (col 10), and the category column
-distinguishes baseline from slowed when `mc[7]==0`. The (kmer, meth_id)
-key was redundant.
+Why the v4 layout drops meth_id from the key: it is already in mc[7];
+keeping it as a tuple key was redundant. Dropping it lets us index by
+kmer alone, which simplifies merge, refine, dataset and analyze.
 
-The slicing helpers are pure Python so they can be unit-tested without
-pulling in pysam (which extract.py depends on for BAM I/O).
+Helpers in this module are pure Python so they remain importable
+without pysam (which extract.py needs for BAM I/O).
 """
 
 from __future__ import annotations
@@ -67,9 +70,8 @@ PROFILE_LEN   = PROFILE_END - PROFILE_START + 1   # = 9
 REV_METH_OFFSETS = (-1, 0, 1)
 REV_METH_LEN = len(REV_METH_OFFSETS)              # = 3
 
-# Total per-sample column count: 35 v3-cols + 1 category col = 36 (v4).
-# Code that loads pkls should accept both 35 (v3) and 36 (v4) and route
-# accordingly via `infer_category()`.
+# Per-sample row width. Loaders should accept both v3 (35) and v4 (36)
+# and dispatch via `is_v4_format(arr)` / `get_categories(arr, ...)`.
 SAMPLE_NCOLS_V3 = 3 + METH_CTX_LEN + 2 * PROFILE_LEN + REV_METH_LEN  # = 35
 SAMPLE_NCOLS    = SAMPLE_NCOLS_V3 + 1                                # = 36 (v4)
 
@@ -84,12 +86,11 @@ COL_PROFILE_PW     = COL_PROFILE_IPD + PROFILE_LEN                   # 23
 COL_REV_METH       = COL_PROFILE_PW + PROFILE_LEN                    # 32
 COL_CATEGORY       = COL_REV_METH + REV_METH_LEN                     # 35
 
-# Category enum values for col 35.
-CATEGORY_BASELINE  = 0   # far from any methylation, meth_context empty
-CATEGORY_SLOWED    = 1   # at a signature offset of a meth (the meth itself
-                         # included if 0 ∈ signature_offsets[T]). IPD elevated.
-CATEGORY_NEAR_METH = 2   # close to a meth but not at a signature offset.
-                         # IPD baseline-like. Negative control.
+# Category enum values written to col 35 of the v4 layout. See module
+# docstring for the biological meaning of each.
+CATEGORY_BASELINE  = 0
+CATEGORY_SLOWED    = 1
+CATEGORY_NEAR_METH = 2
 CATEGORY_NAMES = {
     CATEGORY_BASELINE:  "baseline",
     CATEGORY_SLOWED:    "slowed",

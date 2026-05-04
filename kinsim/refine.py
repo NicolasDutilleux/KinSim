@@ -1,41 +1,31 @@
-"""Refine a KinSim .pkl in two passes:
+"""Refine a KinSim master .pkl. Auto-detects v3 vs v4 input format.
 
-Pass 1 — confirm methylated buckets (global per-meth-type GMM)
-   For each meth type T (m6A, m4C, m5C, ...) all (kmer, T) buckets are
-   pooled, a balanced None reference is sub-sampled, and a 2-D GMM is fit on
-   the kinetic profile at the configured signature offsets. The cluster with
-   the highest mean signal is treated as "real meth"; samples assigned to
-   any other cluster are dropped as motif false-positives. Buckets that
-   shrink below 3 surviving samples are dropped entirely.
+v3 input — `dict[(kmer, meth_id)] -> ndarray(N, 35)`
+   Per meth type T, pool all (kmer, T) buckets, subsample a balanced None
+   reference, fit a 2-D GMM on the kinetic profile at the configured
+   signature offsets, and keep only the cluster with the highest mean
+   signal (real-meth cluster). Drops false-positive motif matches.
+   Optional pass-2 (motif-context heuristic) further splits the (kmer, 0)
+   bucket into baseline vs slowed samples for v3 backward compatibility.
 
-Pass 2 — split the (kmer, 0) bucket into baseline vs slowed (v4 addition)
-   The polymerase IPD/PW at position c can be elevated even when c itself
-   is unmodified, IF an upstream confirmed methylation sits at a position
-   c-k where k is one of the signature offsets for that mod type
-   (e.g. m6A at c-5 elevates IPD at c). These "slowed" positions look like
-   noise to a model trained only on (kmer, 0) → unmodified label, but the
-   meth_context columns 3..13 actually encode the upstream context FiLM
-   needs to disambiguate them.
+v4 input — `dict[kmer_id] -> ndarray(N, 36)` with CATEGORY at col 35
+   The categorisation already happened at extract time. Refine only
+   applies the secondary p95 IPD filter on CATEGORY_SLOWED samples:
+   pool the IPD of all CATEGORY_BASELINE samples, compute the
+   `secondary_percentile` percentile as the lower threshold, drop slowed
+   samples whose center IPD falls below it. Baseline + near_meth pass
+   through unchanged.
 
-   Pass 2 walks every (kmer, 0) sample, inspects its meth_context for an
-   upstream methylation at a signature offset, and:
-     - flags the sample as 'slowed_T' if a signature offset matches,
-     - else keeps it as a true baseline.
-   Baseline samples are capped at `n_baseline_per_kmer` per kmer (YAML
-   parameter) to prevent class imbalance. The 95-th percentile of the
-   baseline IPD distribution is used as a quality threshold: slowed samples
-   whose center IPD falls below it are dropped (the expected slowing did
-   not actually occur — likely an upstream motif false-call, edge effect,
-   or low-coverage artefact).
-
-   Both surviving baseline and slowed samples remain stored as (kmer, 0)
-   in the output: the meth_context already in cols 3..13 is what FiLM
-   uses to distinguish them at training time. No new dict key is needed.
+Why the p95 filter (v4): a motif that the regex flagged as a candidate
+methylation but that the polymerase did not actually slow down produces
+slowed samples with baseline-level IPD. The threshold separates
+biophysically-real signal from motif-scan false positives without
+requiring a separate GMM step.
 
 Usage:
     kinsim refine in.pkl out.pkl
     kinsim refine in.pkl out.pkl --report report.tsv
-    kinsim refine in.pkl out.pkl --no-slowed-split    # skip pass 2
+    kinsim refine in.pkl out.pkl --no-slowed-split
 """
 
 from __future__ import annotations
@@ -261,9 +251,8 @@ def slowed_split(
 
 
 # ---------------------------------------------------------------------------
-# v4 refine: p95 filter on slowed (only) — meth has no separate category in
-# the simplified 3-cat scheme; FP motifs that landed in SLOWED are dropped
-# by the same p95 threshold.
+# v4 refine: secondary p95 filter on CATEGORY_SLOWED. Baseline + near_meth
+# pass through unchanged (the categorisation itself happened at extract time).
 # ---------------------------------------------------------------------------
 
 
@@ -272,24 +261,30 @@ def slowed_split_v4(
     secondary_pct:        float,
     rng:                  np.random.Generator,
 ) -> tuple[dict, dict]:
-    """v4 refine: drop slowed samples whose IPD falls below the p-th
-    percentile of the baseline IPD distribution.
+    """Drop CATEGORY_SLOWED samples whose IPD is below the secondary_pct
+    percentile of the pooled CATEGORY_BASELINE IPD distribution.
 
-    The v4 master.pkl is dict[int kmer_id -> ndarray(N, 36)] with col 35
-    encoding category (0=baseline, 1=slowed, 2=near_meth).
+    Args:
+        data: dict[kmer_id -> ndarray(N, 36)] in v4 format. Col 35 carries
+            the category enum (0=baseline, 1=slowed, 2=near_meth).
+        secondary_pct: percentile (0..100) of the baseline IPD pool used as
+            the lower threshold for slowed samples. 95 is conservative —
+            keeps only slowed samples whose IPD sits above 95 % of the
+            baseline distribution.
+        rng: numpy Generator (unused in this function but accepted for
+            symmetry with other refine helpers).
 
-    Algorithm:
-      1. Pool the IPD (col 0) of all CATEGORY_BASELINE samples.
-      2. Compute the secondary_pct percentile = lower threshold for slowed.
-      3. Drop CATEGORY_SLOWED samples whose IPD is below that threshold.
-         (FP motifs that landed in slowed have baseline-level IPD; they
-         fail this filter. True slowed samples sit well above baseline.)
-      4. CATEGORY_BASELINE and CATEGORY_NEAR_METH pass through unchanged —
-         near_meth is the negative control (close to a meth, but not at a
-         signature offset, so IPD should look baseline-like; the model
-         needs to see this).
+    Returns:
+        (new_data, stats) — new_data is a fresh dict with the same kmer
+        keys and surviving rows; stats is a small dict with in/out counts
+        per category and the threshold used.
 
-    Returns (new_data dict, stats dict).
+    Rationale: a motif that the regex flagged at extract time but that the
+    polymerase did not actually slow down produces CATEGORY_SLOWED samples
+    sitting at baseline IPD. They fail this filter and get dropped. Real
+    slowed samples sit well above the baseline distribution and survive.
+    Baseline and near_meth are not filtered: near_meth is a deliberate
+    negative control whose IPD *should* look baseline-like.
     """
     from .utils.sample_layout import (
         COL_CATEGORY, COL_IPD,
