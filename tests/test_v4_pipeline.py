@@ -1,24 +1,17 @@
-"""End-to-end unit tests for the v4 storage / refine / analyze pipeline
-(simplified 3-category scheme: baseline / slowed / near_meth — no
-separate METH category since the methylation centers themselves land
-in SLOWED or NEAR_METH depending on whether 0 ∈ signature_offsets[T]).
+"""End-to-end unit tests for the storage / refine / analyze pipeline.
 
-What these tests pin down:
+Three categories: baseline / slowed / near_meth. The methylation
+centers themselves land in SLOWED or NEAR_METH depending on whether 0
+is a signature offset for that type.
 
-1. **Storage spec** — `is_v4_format` and `get_categories` correctly route
-   v3 (35-col) and v4 (36-col) arrays. v3 inference of NEAR_METH from
-   meth_context is also covered.
-
-2. **Refine v4** — `slowed_split_v4` only filters CATEGORY_SLOWED below
-   the configured percentile of baseline IPD. CATEGORY_BASELINE and
-   CATEGORY_NEAR_METH pass through untouched.
-
-3. **Analyze v4** — `compute_signature_profiles` and
-   `compute_meth_context_distribution` produce buckets keyed by
-   "baseline", "slowed_by_<T>", "near_meth_by_<T>".
-
-These tests are the v4 equivalent of `tests/test_refine_slowed_split.py`,
-which still covers the v3 inference path. Both should keep passing.
+Tests cover:
+  1. Storage constants + get_categories on the 36-col layout.
+  2. Refine: slowed_split filters CATEGORY_SLOWED below the
+     per-kmer-mean baseline percentile; CATEGORY_BASELINE and
+     CATEGORY_NEAR_METH pass through untouched.
+  3. Analyze: compute_signature_profiles and
+     compute_meth_context_distribution produce
+     "baseline" / "slowed_by_<T>" / "near_meth_by_<T>" buckets.
 """
 
 from __future__ import annotations
@@ -29,12 +22,12 @@ from pathlib import Path
 
 import numpy as np
 
-from kinsim.refine import refine_pkl, slowed_split_v4, _detect_format
+from kinsim.refine import refine_pkl, slowed_split
 from kinsim.utils.encoding import KMER_PRED_IDX, get_meth_ids
 from kinsim.utils.sample_layout import (
-    SAMPLE_NCOLS, SAMPLE_NCOLS_V3, COL_CATEGORY, COL_IPD,
+    SAMPLE_NCOLS, COL_CATEGORY, COL_IPD,
     CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH, CATEGORY_NAMES,
-    is_v4_format, get_categories,
+    get_categories,
 )
 
 
@@ -43,7 +36,6 @@ from kinsim.utils.sample_layout import (
 # ---------------------------------------------------------------------------
 
 def test_category_constants_are_three():
-    """The simplified v4 scheme has exactly three categories."""
     assert CATEGORY_BASELINE  == 0
     assert CATEGORY_SLOWED    == 1
     assert CATEGORY_NEAR_METH == 2
@@ -53,49 +45,13 @@ def test_category_constants_are_three():
     assert CATEGORY_NAMES[2] == "near_meth"
 
 
-def test_is_v4_format():
-    """is_v4_format gates on the 36-col layout."""
-    arr_v3 = np.zeros((4, SAMPLE_NCOLS_V3), dtype=np.float32)
-    arr_v4 = np.zeros((4, SAMPLE_NCOLS), dtype=np.float32)
-    assert not is_v4_format(arr_v3)
-    assert is_v4_format(arr_v4)
-
-
-def test_get_categories_v4_reads_col35():
-    """v4 path: get_categories returns col 35 verbatim."""
+def test_get_categories_reads_col35():
     arr = np.zeros((3, SAMPLE_NCOLS), dtype=np.float32)
     arr[0, COL_CATEGORY] = CATEGORY_BASELINE
     arr[1, COL_CATEGORY] = CATEGORY_SLOWED
     arr[2, COL_CATEGORY] = CATEGORY_NEAR_METH
     cats = get_categories(arr)
     assert cats.tolist() == [CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH]
-
-
-def test_get_categories_v3_inferred_3cats():
-    """v3 fallback: infers all 3 categories from meth_context.
-
-    Setup:
-      Row 0: empty mc                    → BASELINE
-      Row 1: m6A at center (mc[7])      → SLOWED   (0 ∈ m6A sig=[0,5])
-      Row 2: m5C at center               → NEAR_METH (0 ∉ m5C sig=[2,6])
-      Row 3: m6A at offset -5            → SLOWED   (5 ∈ m6A sig)
-      Row 4: m6A at offset -3            → NEAR_METH (3 ∉ m6A sig, in window)
-    """
-    meth_ids = get_meth_ids()
-    m6a = meth_ids["m6A"]
-    m5c = meth_ids["m5C"]
-    arr = np.zeros((5, SAMPLE_NCOLS_V3), dtype=np.float32)
-    arr[1, 3 + KMER_PRED_IDX]     = m6a
-    arr[2, 3 + KMER_PRED_IDX]     = m5c
-    arr[3, 3 + KMER_PRED_IDX - 5] = m6a
-    arr[4, 3 + KMER_PRED_IDX - 3] = m6a
-
-    sig = {"m6A": [0, 5], "m5C": [2, 6]}
-    cats = get_categories(arr, signature_offsets_by_meth=sig, near_meth_max_dist=7)
-    assert cats.tolist() == [
-        CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH,
-        CATEGORY_SLOWED, CATEGORY_NEAR_METH,
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -129,35 +85,26 @@ def _build_v4_master(n_kmers: int = 10) -> dict:
     return data
 
 
-def test_detect_format_v4():
-    data = _build_v4_master(2)
-    assert _detect_format(data) == "v4"
-
-
-def test_slowed_split_v4_only_filters_slowed():
-    """Only SLOWED below p95(baseline) is dropped. BASELINE and NEAR_METH
-    pass through untouched."""
+def test_slowed_split_only_filters_slowed():
+    """Only SLOWED below the per-kmer-mean baseline percentile is dropped.
+    BASELINE and NEAR_METH pass through untouched."""
     data = _build_v4_master(5)
-    rng = np.random.default_rng(0)
-    new_data, stats = slowed_split_v4(data, secondary_pct=95.0, rng=rng)
+    new_data, stats = slowed_split(data, secondary_pct=95.0)
 
-    assert stats["format"]    == "v4"
-    assert stats["threshold"] == 50.0   # all baselines IPD=50 -> p95=50
-
-    # baseline + near_meth pass through
-    assert stats["n_baseline_in"] == 5 * 50
+    # All kmers have baseline mean = 50 (50 samples, all IPD=50) so
+    # p95 of per-kmer means = 50.
+    assert stats["threshold"] == 50.0
+    assert stats["n_baseline_in"]  == 5 * 50
     assert stats["n_baseline_out"] == 5 * 50
     assert stats["n_near_in"]      == 5 * 25
     assert stats["n_near_out"]     == 5 * 25
-
-    # slowed: high (IPD=180) above threshold survive; low (IPD=20) drop
     assert stats["n_slowed_in"]      == 5 * 50
-    assert stats["n_slowed_kept"]    == 5 * 30
-    assert stats["n_slowed_dropped"] == 5 * 20
+    assert stats["n_slowed_kept"]    == 5 * 30   # IPD=180 above threshold
+    assert stats["n_slowed_dropped"] == 5 * 20   # IPD=20 below
 
 
-def test_refine_pkl_v4_dispatch_writes_output():
-    """refine_pkl detects v4 and runs slowed_split_v4."""
+def test_refine_pkl_writes_output():
+    """refine_pkl loads, runs slowed_split, writes a clean pkl."""
     data = _build_v4_master(3)
     with tempfile.TemporaryDirectory() as td:
         inp = Path(td) / "in.pkl"
@@ -168,8 +115,7 @@ def test_refine_pkl_v4_dispatch_writes_output():
         with open(out, "rb") as f:
             refined = pickle.load(f)
         meta = refined.pop("__meta__")
-        assert meta["format"] == "v4"
-        assert meta["method"] == "v4_p95_slowed"
+        assert meta["method"] == "p95_slowed"
         # Per kmer: 50 baseline + 30 slowed kept + 25 near = 105
         for kid in range(3):
             assert kid in refined
@@ -229,8 +175,8 @@ def _build_v4_with_signatures(n_kmers: int = 5) -> dict:
     return data
 
 
-def test_compute_signature_profiles_v4():
-    """v4 path: profiles aggregated by CATEGORY column."""
+def test_compute_signature_profiles():
+    """Profiles aggregated by CATEGORY column with per-type attribution."""
     from kinsim.analyze import compute_signature_profiles
 
     data = _build_v4_with_signatures(5)
@@ -262,7 +208,7 @@ def test_compute_signature_profiles_v4():
     assert abs(near_c["profile_ipd"][0] - 35.0) < 0.1
 
 
-def test_compute_meth_context_distribution_v4():
+def test_compute_meth_context_distribution():
     """v4 path: context buckets match the CATEGORY split."""
     from kinsim.analyze import compute_meth_context_distribution
 
@@ -292,12 +238,9 @@ def test_compute_meth_context_distribution_v4():
 
 if __name__ == "__main__":
     test_category_constants_are_three();           print("[pass] category constants")
-    test_is_v4_format();                           print("[pass] is_v4_format")
-    test_get_categories_v4_reads_col35();          print("[pass] get_categories v4")
-    test_get_categories_v3_inferred_3cats();       print("[pass] get_categories v3 (3 cats)")
-    test_detect_format_v4();                       print("[pass] _detect_format v4")
-    test_slowed_split_v4_only_filters_slowed();    print("[pass] slowed_split_v4")
-    test_refine_pkl_v4_dispatch_writes_output();   print("[pass] refine_pkl v4 dispatch")
-    test_compute_signature_profiles_v4();          print("[pass] compute_signature_profiles v4")
-    test_compute_meth_context_distribution_v4();   print("[pass] compute_meth_context_distribution v4")
-    print("\nAll v4 tests passed.")
+    test_get_categories_reads_col35();             print("[pass] get_categories")
+    test_slowed_split_only_filters_slowed();       print("[pass] slowed_split")
+    test_refine_pkl_writes_output();               print("[pass] refine_pkl")
+    test_compute_signature_profiles();             print("[pass] compute_signature_profiles")
+    test_compute_meth_context_distribution();      print("[pass] compute_meth_context_distribution")
+    print("\nAll tests passed.")

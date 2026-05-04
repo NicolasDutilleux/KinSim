@@ -10,8 +10,9 @@
 #SBATCH --mail-type=FAIL
 
 # ============================================================
-# ML step 02 — refine master .pkl with EM fixed-None mixture
-#   sbatch slurm_kinsim/ml/02_refine.slurm <master.pkl> <master_clean.pkl> [report.tsv]
+# ML step 02 — refine master .pkl: drop CATEGORY_SLOWED samples
+#              below the per-kmer-mean baseline IPD percentile.
+#   sbatch slurm_kinsim/ml/02_refine.slurm <master.pkl> <master_clean.pkl>
 # ============================================================
 
 set +u
@@ -21,18 +22,12 @@ set -euo pipefail
 
 IN_PKL=${1:?"input master .pkl required"}
 OUT_PKL=${2:?"output master_clean .pkl required"}
-REPORT=${3:-}
 
 echo "=== ML 02/refine ==="
 echo "Input:  $IN_PKL"
 echo "Output: $OUT_PKL"
-[ -n "$REPORT" ] && echo "Report: $REPORT"
 START=$(date +%s)
 
-if [ -n "$REPORT" ]; then
-    kinsim refine "$IN_PKL" "$OUT_PKL" --report "$REPORT" -v
-else
-    kinsim refine "$IN_PKL" "$OUT_PKL" -v
-fi
+kinsim refine "$IN_PKL" "$OUT_PKL" -v
 
 echo "Elapsed: $(( $(date +%s) - START ))s"

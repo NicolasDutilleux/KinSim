@@ -129,31 +129,14 @@ class MLPSignalDataset(Dataset):
         with open(pkl_path, "rb") as f:
             data_dict = pickle.load(f)
 
-        # ── validate pkl structure ─────────────────────────────────────────────
         if not isinstance(data_dict, dict):
             raise TypeError(
-                f"Expected a dict from {pkl_path}, got {type(data_dict).__name__}.\n"
-                "The .pkl must be produced by 'kinsim extract' + 'kinsim merge'."
-            )
+                f"Expected a dict from {pkl_path}, got {type(data_dict).__name__}.")
         if len(data_dict) == 0:
             raise ValueError(f"The .pkl file is empty: {pkl_path}")
 
-        # Auto-detect v3 (tuple keys) vs v4 (int keys) format.
-        fmt = "unknown"
-        for k in data_dict:
-            if k == "__meta__":
-                continue
-            if isinstance(k, tuple):
-                fmt = "v3"
-                break
-            if isinstance(k, (int, np.integer)):
-                fmt = "v4"
-                break
-        if fmt == "unknown":
-            raise ValueError(f"No data keys (tuple or int) found in {pkl_path}")
-        log.info("  Detected format: %s", fmt)
-
         # Probe a representative value to learn column count.
+        first_val = None
         for k, v in data_dict.items():
             if k == "__meta__":
                 continue
@@ -162,135 +145,59 @@ class MLPSignalDataset(Dataset):
         if not isinstance(first_val, np.ndarray) or first_val.ndim != 2:
             raise TypeError(
                 f"Expected dict values to be 2D ndarray, got shape "
-                f"{getattr(first_val, 'shape', '?')}."
-            )
-        n_cols = first_val.shape[1]
-        has_fraction = n_cols >= 3
-        has_meth_ctx = n_cols >= 3 + kmer_size
-        has_category = n_cols >= 36   # v4 has explicit CATEGORY column at idx 35
-
-        if not has_fraction:
-            log.info("  .pkl has 2-column data (legacy format, no fraction).")
-        if not has_meth_ctx:
-            log.info("  .pkl has %d-column data (no meth-context columns).", n_cols)
-        if has_category:
-            log.info("  v4 CATEGORY column present at col 35.")
-        # ──────────────────────────────────────────────────────────────────────
+                f"{getattr(first_val, 'shape', '?')}.")
 
         self._num_meth_types = num_meth_types
         self._kmer_size      = kmer_size
 
-        # Prediction position within meth_context — same for both formats.
         from ..utils.encoding import KMER_PRED_IDX
         pred_idx_in_ctx = KMER_PRED_IDX
 
-        # ── Build flat arrays (all samples, capped per key) ───────────────────
         kmer_ids_list:   list = []
         meth_ids_list:   list = []
         signals_list:    list = []
         fractions_list:  list = []
         meth_ctx_list:   list = []
-
-        n_subsampled  = 0
-        n_keys        = 0
+        n_keys = 0
         n_meth_counts = defaultdict(int)
 
         for key, samples in data_dict.items():
             if key == "__meta__":
                 continue
-
-            # ----- Resolve (kmer_id, meth_id) from key + sample columns -----
-            if fmt == "v3":
-                if not isinstance(key, tuple) or len(key) != 2:
-                    continue
-                kmer_id, meth_id = int(key[0]), int(key[1])
-                # v3 cap: per (kmer, meth) bucket
-                cap = max_unmeth if meth_id == 0 else max_meth
-                if len(samples) > cap:
-                    rng = np.random.default_rng(seed=kmer_id ^ (meth_id << 22))
-                    idx = rng.choice(len(samples), size=cap, replace=False)
-                    samples = samples[idx]
-                    n_subsampled += 1
-                n = len(samples)
-                meth_ids_list.append(np.full(n, meth_id, dtype=np.int8))
-                if has_fraction:
-                    fractions_list.append(samples[:, 2].astype(np.float32))
-                else:
-                    frac_val = 1.0 if meth_id > 0 else 0.0
-                    fractions_list.append(np.full(n, frac_val, dtype=np.float32))
-                kmer_ids_list.append(np.full(n, kmer_id, dtype=np.int32))
-                signals_list.append(samples[:, :2].astype(np.float32))
-                if has_meth_ctx:
-                    meth_ctx_list.append(samples[:, 3:3 + kmer_size].astype(np.uint8))
-                else:
-                    meth_ctx_list.append(np.zeros((n, kmer_size), dtype=np.uint8))
-                n_meth_counts[meth_id] += 1
-
-            else:    # v4
-                if not isinstance(key, (int, np.integer)):
-                    continue
-                kmer_id = int(key)
-                # In v4, meth_id at center is encoded in mc[KMER_PRED_IDX].
-                # Cap per kmer in a category-aware way: v4 extract already
-                # capped baseline at n_baseline_per_kmer, so we leave its
-                # samples alone here (full pass-through). Downstream code
-                # can still resample if it wants.
-                ctx = samples[:, 3:3 + kmer_size].astype(np.uint8)
-                meth_at_center = ctx[:, pred_idx_in_ctx].astype(np.int8)
-                n = len(samples)
-                kmer_ids_list.append(np.full(n, kmer_id, dtype=np.int32))
-                meth_ids_list.append(meth_at_center)
-                signals_list.append(samples[:, :2].astype(np.float32))
-                if has_fraction:
-                    fractions_list.append(samples[:, 2].astype(np.float32))
-                else:
-                    fractions_list.append(np.zeros(n, dtype=np.float32))
-                meth_ctx_list.append(ctx)
-                # Bucket counts per inferred meth_id at center
-                for mid in np.unique(meth_at_center):
-                    n_meth_counts[int(mid)] += int((meth_at_center == mid).sum())
-
+            if not isinstance(key, (int, np.integer)):
+                continue
+            kmer_id = int(key)
+            ctx = samples[:, 3:3 + kmer_size].astype(np.uint8)
+            meth_at_center = ctx[:, pred_idx_in_ctx].astype(np.int8)
+            n = len(samples)
+            kmer_ids_list.append(np.full(n, kmer_id, dtype=np.int32))
+            meth_ids_list.append(meth_at_center)
+            signals_list.append(samples[:, :2].astype(np.float32))
+            fractions_list.append(samples[:, 2].astype(np.float32))
+            meth_ctx_list.append(ctx)
+            for mid in np.unique(meth_at_center):
+                n_meth_counts[int(mid)] += int((meth_at_center == mid).sum())
             n_keys += 1
 
         self._kmer_ids  = np.concatenate(kmer_ids_list)
         self._meth_ids  = np.concatenate(meth_ids_list)
-        # Pre-log-transform signals once at load time — avoids per-item overhead
+        # Pre-log-transform signals once at load time — avoids per-item overhead.
         self._signals   = log_transform(
             torch.from_numpy(np.concatenate(signals_list, axis=0)).float()
         )
         self._fractions = np.concatenate(fractions_list)
-        self._meth_ctx  = np.concatenate(meth_ctx_list)   # (N_total, K) uint8
+        self._meth_ctx  = np.concatenate(meth_ctx_list)
 
         n_total = len(self._kmer_ids)
         meth_labels = {0: "unmeth", 1: "m6A", 2: "m4C", 3: "m5C"}
         meth_summary = ", ".join(
             f"{meth_labels.get(m, str(m))}={n_meth_counts[m]:,}"
-            for m in sorted(n_meth_counts)
-            if n_meth_counts[m] > 0
+            for m in sorted(n_meth_counts) if n_meth_counts[m] > 0
         )
-        if fmt == "v4":
-            log.info(
-                "MLPSignalDataset ready (v4): %s unique kmer keys [%s]\n"
-                "  Total samples: %s  (no resampling — v4 extract caps applied "
-                "upstream)\n  Fraction column: %s\n"
-                "  Meth-context columns (11-pos): %s",
-                f"{n_keys:,}", meth_summary, f"{n_total:,}",
-                "from .pkl (stoichiometric)" if has_fraction else "default 0.0",
-                "from .pkl" if has_meth_ctx else "zero-padded (legacy compat)",
-            )
-        else:
-            log.info(
-                "MLPSignalDataset ready (v3): %s unique (kmer, meth) keys [%s]\n"
-                "  Total capped samples: %s  "
-                "(%s keys subsampled to cap, "
-                "caps: unmeth=%d, meth=%d)\n"
-                "  Fraction column: %s\n"
-                "  Meth-context columns (11-pos): %s",
-                f"{n_keys:,}", meth_summary, f"{n_total:,}",
-                f"{n_subsampled:,}", max_unmeth, max_meth,
-                "from .pkl (stoichiometric)" if has_fraction else "synthesised (legacy compat)",
-                "from .pkl" if has_meth_ctx else "zero-padded (legacy compat)",
-            )
+        log.info(
+            "MLPSignalDataset ready: %s unique kmers, %s samples [%s]",
+            f"{n_keys:,}", f"{n_total:,}", meth_summary,
+        )
 
     def __len__(self) -> int:
         """Total number of individual (IPD, PW) samples across all keys."""
