@@ -1386,14 +1386,309 @@ def render_txt_report(stats: DictStats, sensitivity: dict, output_path: str,
 # HTML report (Plotly)
 # ---------------------------------------------------------------------------
 
+def _build_v4_html_figures(data, category_distributions, signature_profiles, refine_meta):
+    """Five focused Plotly figures for v4 verification.
+
+    The goal is to answer a single question at a glance: does the
+    extract + refine pipeline produce a clean separation between
+    baseline / slowed / near_meth, and is the m6A/m4C/m5C signature
+    visible at the configured offsets ?
+
+    Figures returned (in order):
+      1. IPD distribution per category (overlay histogram)
+      2. Per-kmer baseline mean distribution + threshold marker
+      3. Kinetic signature profiles (offset 0..+8) per bucket
+      4. Sample counts per bucket (bar chart)
+      5. Meth-context distribution (heatmap per bucket)
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    from .utils.sample_layout import (
+        COL_IPD, COL_CATEGORY,
+        CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH,
+    )
+
+    figures: list[tuple[str, object]] = []
+    cat_palette = {
+        'baseline':  '#1f77b4',   # blue
+        'slowed':    '#d62728',   # red
+        'near_meth': '#2ca02c',   # green
+    }
+
+    threshold = None
+    if refine_meta:
+        threshold = (refine_meta.get('stats') or {}).get('threshold')
+
+    # ── Fig 1: IPD distribution per category (overlay histogram) ─────────
+    fig1 = go.Figure()
+    for cat_name in ('baseline', 'slowed', 'near_meth'):
+        d = category_distributions.get(cat_name)
+        if d is None:
+            continue
+        # Re-extract IPD values from data for this category to plot the
+        # full histogram (not just the coarse bins from the table).
+        ipds = []
+        for kid, arr in data.items():
+            if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
+                continue
+            if arr.shape[1] <= COL_CATEGORY:
+                continue
+            cats = arr[:, COL_CATEGORY].astype(np.int8)
+            target = {'baseline': CATEGORY_BASELINE,
+                      'slowed':   CATEGORY_SLOWED,
+                      'near_meth': CATEGORY_NEAR_METH}[cat_name]
+            mask = (cats == target)
+            if mask.any():
+                ipds.append(arr[mask, COL_IPD])
+        if not ipds:
+            continue
+        ipds_pool = np.concatenate(ipds)
+        # Sub-sample for plot performance
+        if len(ipds_pool) > 200_000:
+            idx = np.random.default_rng(0).choice(len(ipds_pool), 200_000, replace=False)
+            ipds_pool = ipds_pool[idx]
+        fig1.add_trace(go.Histogram(
+            x=ipds_pool, name=f'{cat_name} (n={d["n"]:,})',
+            marker_color=cat_palette[cat_name], opacity=0.55,
+            xbins=dict(start=0, end=256, size=4),
+            histnorm='probability density',
+        ))
+    if threshold is not None:
+        fig1.add_vline(x=threshold, line_color='black', line_dash='dash',
+                       annotation_text=f'threshold = {threshold:.1f}',
+                       annotation_position='top right')
+    fig1.update_layout(
+        title='IPD distribution per category  '
+              '(slowed should be right-shifted; near_meth should overlap baseline)',
+        xaxis_title='IPD (uint8 [0, 255])',
+        yaxis_title='Probability density',
+        barmode='overlay',
+    )
+    figures.append(('IPD distribution per category', fig1))
+
+    # ── Fig 2: Per-kmer baseline mean distribution + threshold ───────────
+    kmer_means = []
+    for kid, arr in data.items():
+        if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
+            continue
+        if arr.shape[1] <= COL_CATEGORY:
+            continue
+        cats = arr[:, COL_CATEGORY].astype(np.int8)
+        m = (cats == CATEGORY_BASELINE)
+        if int(m.sum()) >= 5:
+            kmer_means.append(float(arr[m, COL_IPD].mean()))
+    fig2 = go.Figure()
+    if kmer_means:
+        kmer_means_arr = np.array(kmer_means, dtype=np.float32)
+        fig2.add_trace(go.Histogram(
+            x=kmer_means_arr, name=f'per-kmer baseline mean (n={len(kmer_means_arr):,})',
+            marker_color='#1f77b4', xbins=dict(start=0, end=256, size=2),
+        ))
+        if threshold is not None:
+            fig2.add_vline(x=threshold, line_color='black', line_dash='dash',
+                           annotation_text=f'p95 threshold = {threshold:.1f}',
+                           annotation_position='top right')
+        fig2.update_layout(
+            title='Per-kmer baseline mean IPD  '
+                  '(threshold for slowed survival is the p95 of this)',
+            xaxis_title='Mean baseline IPD per kmer',
+            yaxis_title='Number of kmers',
+        )
+        figures.append(('Per-kmer baseline mean distribution', fig2))
+
+    # ── Fig 3: Kinetic signature profiles per bucket (line plot) ─────────
+    if signature_profiles:
+        fig3 = go.Figure()
+        offsets = list(range(9))   # 0..+8
+        # Order: baseline first (ref), then slowed_by_T, then near_meth_by_T
+        ordered = (
+            ['baseline'] +
+            sorted(n for n in signature_profiles if n.startswith('slowed_by_')) +
+            sorted(n for n in signature_profiles if n.startswith('near_meth_by_'))
+        )
+        palette_idx = 0
+        palette = ['#1f77b4', '#d62728', '#ff7f0e', '#9467bd', '#8c564b',
+                   '#2ca02c', '#17becf', '#bcbd22']
+        for name in ordered:
+            sp = signature_profiles.get(name)
+            if sp is None:
+                continue
+            color = palette[palette_idx % len(palette)]
+            palette_idx += 1
+            sig_offs = sp.get('sig_offsets', [])
+            line_dash = 'dash' if name.startswith('near_meth_by_') else 'solid'
+            fig3.add_trace(go.Scatter(
+                x=offsets, y=sp['profile_ipd'],
+                mode='lines+markers',
+                name=f'{name} (n={sp["n_samples"]:,})',
+                line=dict(color=color, width=2, dash=line_dash),
+                marker=dict(size=8),
+            ))
+            # Mark signature offsets with diamonds
+            if sig_offs:
+                fig3.add_trace(go.Scatter(
+                    x=sig_offs,
+                    y=[sp['profile_ipd'][o] for o in sig_offs if 0 <= o < 9],
+                    mode='markers', showlegend=False,
+                    marker=dict(symbol='diamond', size=14, color=color,
+                                line=dict(color='black', width=1)),
+                ))
+        fig3.update_layout(
+            title='Kinetic signature profiles  '
+                  '(diamonds = signature offsets per type — that\'s where IPD should peak)',
+            xaxis=dict(title='Offset from prediction position', dtick=1),
+            yaxis_title='Mean IPD',
+        )
+        figures.append(('Kinetic signature profiles', fig3))
+
+    # ── Fig 4: Sample counts per bucket ──────────────────────────────────
+    if signature_profiles:
+        names = sorted(signature_profiles.keys(),
+                       key=lambda n: (0 if n == 'baseline' else
+                                      (1 if n.startswith('slowed_by_') else 2),
+                                      n))
+        counts = [signature_profiles[n]['n_samples'] for n in names]
+        colors = ['#1f77b4' if n == 'baseline' else
+                  '#d62728' if n.startswith('slowed_by_') else
+                  '#2ca02c' for n in names]
+        fig4 = go.Figure(go.Bar(
+            x=names, y=counts, marker_color=colors,
+            text=[f'{c:,}' for c in counts], textposition='auto',
+        ))
+        fig4.update_layout(
+            title='Sample counts per bucket',
+            yaxis_title='# samples', yaxis_type='log',
+        )
+        figures.append(('Sample counts per bucket', fig4))
+
+    return figures
+
+
+def _write_html_report(figures, stats, output_path: str, meth_summary: str) -> None:
+    """Render a list of (title, plotly Figure) into a self-contained HTML file
+    with header cards, a nav, and one section per figure. Also exports
+    each figure as a standalone .html (and .png if kaleido is installed)
+    in a sibling 'figures/' directory."""
+    import plotly.io as pio
+    K = stats.kmer_size
+    cards = [
+        ('K-mer size',     f'K={K}'),
+        ('Total keys',     f'{stats.total_entries:,}'),
+        ('Total samples',  f'{stats.total_samples:,}'),
+        ('Coverage',       _pct(stats.total_entries, stats.total_possible_kmers)),
+        ('Meth types',     str(len(stats.groups))),
+        ('File size',      f'{stats.file_size_mb:.1f} MB'),
+    ]
+    card_html = '\n'.join(
+        f'<div class="stat-card"><div class="val">{v}</div>'
+        f'<div class="lbl">{k}</div></div>'
+        for k, v in cards
+    )
+    nav_links = '\n'.join(
+        f'<a href="#section-{i}">{title}</a>'
+        for i, (title, _) in enumerate(figures)
+    )
+    html_parts = [f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KinSim Analysis — {Path(stats.pkl_path).name}</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#333}}
+.page{{max-width:1600px;margin:0 auto;padding:24px}}
+.header{{background:linear-gradient(135deg,#1a2a4a,#2c5282);color:#fff;padding:32px;border-radius:12px;margin-bottom:24px}}
+.header h1{{font-size:1.9em;margin-bottom:6px}}
+.header p{{opacity:.8;font-size:.9em}}
+.stat-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:16px;margin-bottom:24px}}
+.stat-card{{background:#fff;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,.08);text-align:center}}
+.stat-card .val{{font-size:1.7em;font-weight:700;color:#2c5282}}
+.stat-card .lbl{{color:#718096;margin-top:6px;font-size:.82em}}
+.nav{{background:#fff;padding:14px 20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,.08);margin-bottom:24px;display:flex;flex-wrap:wrap;gap:10px;align-items:center}}
+.nav span{{font-weight:600;color:#4a5568}}
+.nav a{{color:#3182ce;text-decoration:none;font-size:.88em;padding:3px 10px;border:1px solid #bee3f8;border-radius:20px}}
+.nav a:hover{{background:#ebf8ff}}
+.section{{background:#fff;padding:24px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,.08);margin-bottom:24px}}
+.section h2{{color:#2c5282;border-bottom:3px solid #3182ce;padding-bottom:10px;margin-bottom:18px}}
+.plot-box{{width:100%;min-height:480px}}
+.footer{{text-align:center;color:#a0aec0;font-size:.8em;padding:20px 0}}
+</style></head><body>
+<div class="page">
+<div class="header">
+  <h1>KinSim Training Data Analysis</h1>
+  <p>{Path(stats.pkl_path).name}</p>
+  <p style="margin-top:6px;opacity:.65">{meth_summary}</p>
+</div>
+<div class="stat-grid">{card_html}</div>
+<div class="nav"><span>Jump to:</span>
+{nav_links}
+</div>
+"""]
+    for i, (title, fig) in enumerate(figures):
+        plot_json = pio.to_json(fig)
+        html_parts.append(f"""
+<div class="section" id="section-{i}">
+  <h2>{title}</h2>
+  <div id="plot_{i}" class="plot-box"></div>
+  <script>(function(){{
+    var spec = {plot_json};
+    spec.layout = spec.layout || {{}};
+    spec.layout.autosize = true;
+    Plotly.newPlot('plot_{i}', spec.data, spec.layout,
+                   {{responsive:true, displayModeBar:true}});
+  }})();</script>
+</div>""")
+    html_parts.append("""
+<div class="footer">Generated by KinSim &mdash; kinsim analyze</div>
+</div></body></html>""")
+    with open(output_path, 'w', encoding='utf-8') as fh:
+        fh.write('\n'.join(html_parts))
+    log.info("HTML report saved: %s", output_path)
+
+    # Standalone per-figure exports.
+    export_dir = Path(output_path).parent / 'figures'
+    export_dir.mkdir(parents=True, exist_ok=True)
+    has_kaleido = True
+    try:
+        import kaleido  # noqa: F401
+    except ImportError:
+        has_kaleido = False
+    for i, (title, fig) in enumerate(figures):
+        slug = title.lower().replace(' ', '_').replace('/', '_')
+        slug = ''.join(c for c in slug if c.isalnum() or c == '_')
+        fig_path = export_dir / f'{i:02d}_{slug}.html'
+        pio.write_html(fig, str(fig_path), include_plotlyjs='cdn')
+        if has_kaleido:
+            png_path = export_dir / f'{i:02d}_{slug}.png'
+            try:
+                fig.write_image(str(png_path), scale=3)
+            except Exception:
+                pass
+    log.info("Individual figures exported to: %s/", export_dir)
+
+
 def render_html_report(
     stats: DictStats,
     sensitivity: dict,
     output_path: str,
     max_scatter: int = 10_000,
     min_ipd_m6a: float = 0.0,
+    signature_profiles: dict | None = None,
+    category_distributions: dict | None = None,
+    refine_meta: dict | None = None,
+    data: dict | None = None,
 ) -> None:
-    """Generate a self-contained interactive HTML report using Plotly."""
+    """Generate a self-contained interactive HTML report using Plotly.
+
+    For v4 inputs (when `data`+`category_distributions` are provided),
+    the report focuses on 4 verification figures: IPD distribution per
+    category, per-kmer baseline mean distribution with threshold marker,
+    kinetic signature profiles, and sample counts per bucket. Skips the
+    legacy v3 plots which are not meaningful in the v4 layout.
+
+    For v3 inputs the original plots are kept.
+    """
     try:
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
@@ -1415,6 +1710,18 @@ def render_html_report(
 
     def clr(mid: int) -> str:
         return _meth_color(mid)
+
+    # v4 path: focused report with 4 figures only.
+    if category_distributions and data is not None:
+        figures = _build_v4_html_figures(
+            data, category_distributions,
+            signature_profiles or {}, refine_meta,
+        )
+        # v4 done — write the focused report and return.
+        meth_summary = (f'baseline / slowed / near_meth — '
+                        f'{stats.total_samples:,} samples')
+        _write_html_report(figures, stats, output_path, meth_summary)
+        return
 
     # ── Fig 1: Coverage bar chart ─────────────────────────────────────────
     fig = go.Figure(go.Bar(
@@ -1787,112 +2094,11 @@ def render_html_report(
         except np.linalg.LinAlgError:
             log.warning("KDE failed for combined surface — skipping.")
 
-    # ── Assemble HTML ─────────────────────────────────────────────────────
+    # v3 path — write the report using the shared HTML helper.
     meth_summary = ', '.join(
         f'{lbl(m)}: {stats.groups[m].n_entries:,}' for m in meth_ids_sorted
     )
-    cards = [
-        ('K-mer size',     f'K={K}'),
-        ('Total keys',     f'{stats.total_entries:,}'),
-        ('Total samples',  f'{stats.total_samples:,}'),
-        ('Coverage',       _pct(stats.total_entries, stats.total_possible_kmers)),
-        ('Meth types',     str(len(stats.groups))),
-        ('File size',      f'{stats.file_size_mb:.1f} MB'),
-    ]
-    card_html = '\n'.join(
-        f'<div class="stat-card">'
-        f'<div class="val">{v}</div>'
-        f'<div class="lbl">{k}</div>'
-        f'</div>'
-        for k, v in cards
-    )
-    nav_links = '\n'.join(
-        f'<a href="#section-{i}">{title}</a>'
-        for i, (title, _) in enumerate(figures)
-    )
-
-    html_parts = [f"""<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>KinSim Analysis — {Path(stats.pkl_path).name}</title>
-<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#333}}
-.page{{max-width:1600px;margin:0 auto;padding:24px}}
-.header{{background:linear-gradient(135deg,#1a2a4a,#2c5282);color:#fff;padding:32px;border-radius:12px;margin-bottom:24px}}
-.header h1{{font-size:1.9em;margin-bottom:6px}}
-.header p{{opacity:.8;font-size:.9em}}
-.stat-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:16px;margin-bottom:24px}}
-.stat-card{{background:#fff;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,.08);text-align:center}}
-.stat-card .val{{font-size:1.7em;font-weight:700;color:#2c5282}}
-.stat-card .lbl{{color:#718096;margin-top:6px;font-size:.82em}}
-.nav{{background:#fff;padding:14px 20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,.08);margin-bottom:24px;display:flex;flex-wrap:wrap;gap:10px;align-items:center}}
-.nav span{{font-weight:600;color:#4a5568}}
-.nav a{{color:#3182ce;text-decoration:none;font-size:.88em;padding:3px 10px;border:1px solid #bee3f8;border-radius:20px}}
-.nav a:hover{{background:#ebf8ff}}
-.section{{background:#fff;padding:24px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,.08);margin-bottom:24px}}
-.section h2{{color:#2c5282;border-bottom:3px solid #3182ce;padding-bottom:10px;margin-bottom:18px}}
-.plot-box{{width:100%;min-height:480px}}
-.footer{{text-align:center;color:#a0aec0;font-size:.8em;padding:20px 0}}
-</style></head><body>
-<div class="page">
-<div class="header">
-  <h1>KinSim Training Data Analysis</h1>
-  <p>{Path(stats.pkl_path).name}</p>
-  <p style="margin-top:6px;opacity:.65">{meth_summary}</p>
-</div>
-<div class="stat-grid">{card_html}</div>
-<div class="nav"><span>Jump to:</span>
-{nav_links}
-</div>
-"""]
-
-    for i, (title, fig) in enumerate(figures):
-        plot_json = pio.to_json(fig)
-        html_parts.append(f"""
-<div class="section" id="section-{i}">
-  <h2>{title}</h2>
-  <div id="plot_{i}" class="plot-box"></div>
-  <script>(function(){{
-    var spec = {plot_json};
-    spec.layout = spec.layout || {{}};
-    spec.layout.autosize = true;
-    Plotly.newPlot('plot_{i}', spec.data, spec.layout,
-                   {{responsive:true, displayModeBar:true}});
-  }})();</script>
-</div>""")
-
-    html_parts.append("""
-<div class="footer">Generated by KinSim &mdash; kinsim analyze</div>
-</div></body></html>""")
-
-    with open(output_path, 'w') as fh:
-        fh.write('\n'.join(html_parts))
-    log.info("HTML report saved: %s", output_path)
-
-    # ── Export individual figures as standalone HTML files ─────────────────
-    export_dir = Path(output_path).parent / 'figures'
-    export_dir.mkdir(parents=True, exist_ok=True)
-    has_kaleido = True
-    try:
-        import kaleido  # noqa: F401
-    except ImportError:
-        has_kaleido = False
-
-    for i, (title, fig) in enumerate(figures):
-        slug = title.lower().replace(' ', '_').replace('/', '_')
-        slug = ''.join(c for c in slug if c.isalnum() or c == '_')
-        fig_path = export_dir / f'{i:02d}_{slug}.html'
-        pio.write_html(fig, str(fig_path), include_plotlyjs='cdn')
-        if has_kaleido:
-            png_path = export_dir / f'{i:02d}_{slug}.png'
-            fig.write_image(str(png_path), scale=3)
-    if has_kaleido:
-        log.info("Individual figures exported to: %s/  (%d HTML + %d PNG)", export_dir, len(figures), len(figures))
-    else:
-        log.info("Individual figures exported to: %s/  (%d HTML, install kaleido for PNG)", export_dir, len(figures))
+    _write_html_report(figures, stats, output_path, meth_summary)
 
 
 # ---------------------------------------------------------------------------
@@ -1975,7 +2181,14 @@ def analyze_pkl(
 
     if not no_html:
         log.info("Generating HTML report...")
-        render_html_report(stats, sensitivity, html_path, max_scatter=max_scatter, min_ipd_m6a=min_ipd_m6a)
+        render_html_report(
+            stats, sensitivity, html_path,
+            max_scatter=max_scatter, min_ipd_m6a=min_ipd_m6a,
+            signature_profiles=sig_profiles,
+            category_distributions=cat_dist,
+            refine_meta=refine_meta,
+            data=data,
+        )
 
     log.info("Analysis complete in %.1fs", time.time() - t0)
 
