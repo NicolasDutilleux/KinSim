@@ -178,6 +178,72 @@ def _detect_format_a(data: dict) -> str:
     return "unknown"
 
 
+def compute_category_distributions(data: dict) -> dict:
+    """Per-category IPD/PW distribution stats for the v4 layout.
+
+    Returns dict[category_name] -> {
+        'n':           int,
+        'ipd_mean':    float, 'ipd_std': float,
+        'ipd_quantiles': dict {p: value} for p in [5, 25, 50, 75, 90, 95, 99],
+        'ipd_max':     float,
+        'pw_mean':     float, 'pw_std': float,
+        'pw_quantiles': same shape,
+        'ipd_hist':    np.array — counts in fixed bins for ASCII histogram,
+        'ipd_hist_edges': bin edges,
+    }
+
+    Returns {} if input is not v4. The caller (render_txt_report) adds
+    this section to the report only when present.
+    """
+    from .utils.sample_layout import (
+        COL_CATEGORY, COL_IPD, COL_PW,
+        CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH,
+        CATEGORY_NAMES,
+    )
+    fmt = _detect_format_a(data)
+    if fmt != "v4":
+        return {}
+
+    # Gather (ipd, pw) per category.
+    by_cat: dict[int, list] = {0: [], 1: [], 2: []}
+    for kid, arr in data.items():
+        if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
+            continue
+        if arr.shape[1] <= COL_CATEGORY:
+            continue
+        cats = arr[:, COL_CATEGORY].astype(np.int8)
+        for cat_id in (CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH):
+            m = (cats == cat_id)
+            if m.any():
+                by_cat[cat_id].append(arr[m][:, [COL_IPD, COL_PW]])
+
+    # Histogram bins for IPD (uint8 [0, 255]).
+    bins = np.array([0, 16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 256], dtype=np.float32)
+
+    out: dict = {}
+    qs = [5, 25, 50, 75, 90, 95, 99]
+    for cat_id, chunks in by_cat.items():
+        if not chunks:
+            continue
+        pooled = np.concatenate(chunks, axis=0)
+        ipd = pooled[:, 0].astype(np.float32)
+        pw  = pooled[:, 1].astype(np.float32)
+        h, _ = np.histogram(ipd, bins=bins)
+        out[CATEGORY_NAMES[cat_id]] = {
+            "n":             int(len(ipd)),
+            "ipd_mean":      float(ipd.mean()),
+            "ipd_std":       float(ipd.std()),
+            "ipd_quantiles": {p: float(np.percentile(ipd, p)) for p in qs},
+            "ipd_max":       float(ipd.max()),
+            "pw_mean":       float(pw.mean()),
+            "pw_std":        float(pw.std()),
+            "pw_quantiles":  {p: float(np.percentile(pw, p)) for p in qs},
+            "ipd_hist":      h.astype(np.int64),
+            "ipd_hist_edges": bins,
+        }
+    return out
+
+
 def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
     """Aggregate the kinetic profile per meth type across all keys.
 
@@ -867,7 +933,9 @@ def compute_neighbor_sensitivity(
 
 def render_txt_report(stats: DictStats, sensitivity: dict, output_path: str,
                        signature_profiles: dict | None = None,
-                       context_distribution: dict | None = None) -> None:
+                       context_distribution: dict | None = None,
+                       category_distributions: dict | None = None,
+                       refine_meta: dict | None = None) -> None:
     """Print TXT report to stdout and write to *output_path*."""
     buf = io.StringIO()
     K = stats.kmer_size
@@ -1097,6 +1165,89 @@ def render_txt_report(stats: DictStats, sensitivity: dict, output_path: str,
                     recovery = (s_v - b_v) / span * 100.0
                     p(f"    +{off:<7d} {m_v:8.2f} {s_v:8.2f} {b_v:10.2f}  {recovery:8.1f}%")
             p()
+
+    # ── 3.55 IPD distribution per category + p95 threshold check ────────
+    if category_distributions:
+        p('-' * W)
+        p('IPD distribution per category  (raw uint8 from PacBio fi/fp tags)')
+        p('-' * W)
+        # Threshold info from refine
+        threshold = None
+        if refine_meta:
+            stats_ref = refine_meta.get('stats') or {}
+            threshold = stats_ref.get('threshold')
+            sec_pct   = stats_ref.get('secondary_percentile')
+            if threshold is not None:
+                p(f'Refine v4 secondary filter: p{sec_pct:g}(baseline) = {threshold:.2f}')
+                ni = stats_ref.get('n_slowed_in', 0)
+                nk = stats_ref.get('n_slowed_kept', 0)
+                nd = stats_ref.get('n_slowed_dropped', 0)
+                if ni:
+                    p(f'  slowed survival: {nk:,}/{ni:,} = {100.0*nk/ni:.1f}% '
+                      f'(dropped {nd:,} below threshold)')
+            p()
+
+        # Per-category quantile table
+        p(f"  {'category':<12s} {'n':>12s} {'mean':>7s} {'std':>7s} "
+          f"{'p5':>5s} {'p25':>5s} {'p50':>5s} {'p75':>5s} {'p90':>5s} {'p95':>5s} "
+          f"{'p99':>5s} {'max':>5s}")
+        for cat_name in ('baseline', 'slowed', 'near_meth'):
+            d = category_distributions.get(cat_name)
+            if d is None:
+                continue
+            q = d['ipd_quantiles']
+            p(f"  {cat_name:<12s} {d['n']:>12,d} {d['ipd_mean']:>7.2f} "
+              f"{d['ipd_std']:>7.2f} {q[5]:>5.0f} {q[25]:>5.0f} {q[50]:>5.0f} "
+              f"{q[75]:>5.0f} {q[90]:>5.0f} {q[95]:>5.0f} {q[99]:>5.0f} {d['ipd_max']:>5.0f}")
+        p()
+
+        # ASCII histogram of baseline + threshold marker
+        bd = category_distributions.get('baseline')
+        if bd is not None and bd['n'] > 0:
+            p('  Baseline IPD histogram  (where the threshold sits in the distribution)')
+            edges = bd['ipd_hist_edges']
+            counts = bd['ipd_hist']
+            total = float(counts.sum()) or 1.0
+            max_bar = 50
+            max_pct = float(counts.max() / total * 100.0)
+            for i in range(len(counts)):
+                lo, hi = float(edges[i]), float(edges[i + 1])
+                pct = float(counts[i]) / total * 100.0
+                bar_len = int((pct / max_pct) * max_bar)
+                bar = '#' * bar_len
+                marker = ''
+                if threshold is not None and lo <= threshold < hi:
+                    marker = f'   <-- p95 threshold = {threshold:.0f}'
+                p(f"    [{lo:5.0f}-{hi:5.0f})  {bar:<{max_bar}s}  {pct:5.2f}% "
+                  f"({int(counts[i]):>10,d}){marker}")
+            p()
+
+        # PW distribution (compact)
+        p('  PW distribution per category (mean / median / p95):')
+        for cat_name in ('baseline', 'slowed', 'near_meth'):
+            d = category_distributions.get(cat_name)
+            if d is None:
+                continue
+            q = d['pw_quantiles']
+            p(f"    {cat_name:<12s} mean={d['pw_mean']:5.1f}  median={q[50]:5.1f}  "
+              f"p95={q[95]:5.1f}  std={d['pw_std']:5.2f}")
+        p()
+
+        # Sanity check vs threshold
+        if threshold is not None and 'slowed' in category_distributions:
+            s = category_distributions['slowed']
+            min_kept = s['ipd_quantiles'][5]
+            if min_kept < threshold:
+                p(f'  WARNING: some kept slowed samples have IPD < threshold? '
+                  f'(p5={min_kept:.1f} < {threshold:.1f})')
+            else:
+                p(f'  Sanity OK: all kept slowed samples have IPD >= threshold '
+                  f'({threshold:.1f}) — minimum kept p5 = {min_kept:.1f}')
+            if 'near_meth' in category_distributions:
+                n = category_distributions['near_meth']
+                near_above = sum(1 for q in [n['ipd_quantiles'][p] for p in (50, 75, 90)] if q > threshold)
+                p(f'  Sanity: near_meth median={n["ipd_quantiles"][50]:.1f} (should look like baseline)')
+        p()
 
     # ── 3.6 Methylation-context distribution per bucket ─────────────────
     if context_distribution:
@@ -1808,11 +1959,18 @@ def analyze_pkl(
     log.info("Computing meth-context distribution per bucket...")
     ctx_dist = compute_meth_context_distribution(data)
 
+    log.info("Computing per-category IPD distribution...")
+    cat_dist = compute_category_distributions(data)
+
+    refine_meta = data.get('__meta__') if isinstance(data.get('__meta__'), dict) else None
+
     print()
     render_txt_report(
         stats, sensitivity, txt_path,
         signature_profiles=sig_profiles,
         context_distribution=ctx_dist,
+        category_distributions=cat_dist,
+        refine_meta=refine_meta,
     )
 
     if not no_html:

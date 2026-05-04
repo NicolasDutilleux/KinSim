@@ -857,6 +857,21 @@ def extract_samples_v4_from_bam(
     meth_ids     = get_meth_ids()
     name_by_mid  = {v: k for k, v in meth_ids.items()}
 
+    # Log v4 knobs + motif breakdown so the run is fully traceable.
+    log.info("v4 extract — knobs: n_baseline_per_kmer=%d  baseline_min_dist=%d  "
+             "near_meth_max_dist=%d  baseline_sample_rate=%.2f  kmer_size=%d  seed=%d",
+             n_baseline_per_kmer, baseline_min_dist_to_meth,
+             near_meth_max_dist, baseline_sample_rate, kmer_size, seed)
+    motifs_by_type: dict = defaultdict(int)
+    for m in motifs:
+        motifs_by_type[name_by_mid.get(int(m['id']), f"meth{m['id']}")] += 1
+    log.info("v4 extract — motifs parsed: %d total (%s)",
+             len(motifs),
+             ", ".join(f"{name}={cnt}" for name, cnt in sorted(motifs_by_type.items())))
+    log.info("v4 extract — fraction_lookup: %s",
+             {name_by_mid.get(mid, f"meth{mid}"): f"{frac:.3f}"
+              for mid, frac in frac_lookup.items() if mid > 0})
+
     # samples: slowed + near_meth rows go here, no per-kmer cap (the
     # genomic distribution is what we want to see).
     # baseline_buffer + baseline_seen_per_kmer implement Vitter's
@@ -1148,14 +1163,33 @@ def extract_samples_v4_from_bam(
 
             n_reads_processed += 1
             if n_reads_processed % PROGRESS_EVERY == 0:
+                # Mem estimate (rows ~144B + python overhead ~100B per ndarray
+                # in a list -> ~250B per stored sample).
+                n_buf = sum(len(v) for v in baseline_buffer.values())
+                n_smp = sum(len(v) for v in samples.values())
+                mem_mb = int((n_buf + n_smp) * 250 / 1e6)
+                # Running IPD stats per category from a sample of the buffer.
+                # Sampling: peek at the first 5 rows of the first 200 kmer
+                # buffers to keep this O(1) regardless of buffer size.
+                def _peek_ipd(buf, max_kmers=200, max_per=5):
+                    vals = []
+                    for i, rows in enumerate(buf.values()):
+                        if i >= max_kmers:
+                            break
+                        for r in rows[:max_per]:
+                            vals.append(float(r[0]))
+                    return vals
+                slow_pw = _peek_ipd({k: v for k, v in samples.items()})
+                base_pw = _peek_ipd(baseline_buffer)
+                slow_med = float(np.median(slow_pw)) if slow_pw else 0.0
+                base_med = float(np.median(base_pw)) if base_pw else 0.0
                 log.info(
                     "  progress: %d reads | slowed=%d near=%d baseline_seen=%d "
-                    "(buf_kmers=%d, mem~%dMB)",
+                    "kept=%d | buf_kmers=%d mem~%dMB | "
+                    "running IPD median: samples=%.1f baseline_buf=%.1f",
                     n_reads_processed, n_slowed, n_near, n_baseline_seen,
-                    len(baseline_buffer),
-                    # crude estimate: each row ~144 bytes, plus samples dict
-                    int((sum(len(v) for v in baseline_buffer.values())
-                         + sum(len(v) for v in samples.values())) * 144 / 1e6),
+                    n_buf, len(baseline_buffer), mem_mb,
+                    slow_med, base_med,
                 )
 
     # Baseline buffer is already capped at n_baseline_per_kmer per kmer
