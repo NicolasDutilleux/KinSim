@@ -766,6 +766,7 @@ def extract_samples_v4_from_bam(
     n_baseline_per_kmer:       int  = 50,
     baseline_min_dist_to_meth: int  = K,
     near_meth_max_dist:        int  = 7,
+    baseline_sample_rate:      float = 0.10,
     revcomp:                   bool = True,
     use_reverse_strand:        bool = True,
     max_reads:                 int  = 0,
@@ -995,6 +996,13 @@ def extract_samples_v4_from_bam(
                 cat = CATEGORY_NEAR_METH
                 target_buf = samples
             else:
+                # Front-end subsample: skip 1-rate of baseline candidates
+                # CHEAPLY before doing the dist check or reservoir work.
+                # The reservoir downstream still caps at n_baseline_per_kmer,
+                # so this only loses the rarely-seen kmers some samples;
+                # it does NOT bias the overall IPD distribution per kmer.
+                if baseline_sample_rate < 1.0 and rng.random() > baseline_sample_rate:
+                    continue
                 if _dist_to_flag(c) < baseline_min_dist_to_meth:
                     continue
                 n_baseline_seen += 1
@@ -1149,6 +1157,7 @@ def extract_v4_from_manifest_task(
     n_baseline_per_kmer:       int  = 50,
     baseline_min_dist_to_meth: int  = K,
     near_meth_max_dist:        int  = 7,
+    baseline_sample_rate:      float = 0.10,
     revcomp:                   bool = True,
     use_reverse_strand:        bool = True,
     max_reads:                 int  = 0,
@@ -1186,6 +1195,7 @@ def extract_v4_from_manifest_task(
         n_baseline_per_kmer=n_baseline_per_kmer,
         baseline_min_dist_to_meth=baseline_min_dist_to_meth,
         near_meth_max_dist=near_meth_max_dist,
+        baseline_sample_rate=baseline_sample_rate,
         revcomp=revcomp,
         use_reverse_strand=use_reverse_strand,
         max_reads=max_reads,
@@ -1565,6 +1575,12 @@ def main(argv=None) -> None:
                                 "CATEGORY_NEAR_METH samples (proximity window "
                                 "around each methylation). Defaults to YAML "
                                 "extract.near_meth_max_dist (typically 7).")
+    p_extract.add_argument("--baseline-sample-rate", type=float, default=None,
+                           help="(v4 only) Front-end subsample rate for "
+                                "baseline candidates (0..1). Defaults to "
+                                "YAML extract.baseline_sample_rate (typically "
+                                "0.10). Lower = faster + less memory but "
+                                "fewer baselines for rare kmers.")
 
     # -- merge subcommand --
     p_merge = sub.add_parser(
@@ -1608,6 +1624,7 @@ def main(argv=None) -> None:
         v4_baseline_n = args.n_baseline_per_kmer
         v4_baseline_d = args.baseline_min_dist
         v4_near_d     = args.near_meth_max_dist
+        v4_sample_r   = args.baseline_sample_rate
         if v4_mode:
             from .utils.config import load_kinsim_config
             cfg = load_kinsim_config()
@@ -1618,6 +1635,8 @@ def main(argv=None) -> None:
                 v4_baseline_d = int(ext.get("baseline_min_dist_to_meth", K))
             if v4_near_d is None:
                 v4_near_d = int(ext.get("near_meth_max_dist", 7))
+            if v4_sample_r is None:
+                v4_sample_r = float(ext.get("baseline_sample_rate", 0.10))
 
         if args.manifest:
             # ---- Manifest mode ----
@@ -1636,6 +1655,7 @@ def main(argv=None) -> None:
                     n_baseline_per_kmer      = v4_baseline_n,
                     baseline_min_dist_to_meth= v4_baseline_d,
                     near_meth_max_dist       = v4_near_d,
+                    baseline_sample_rate     = v4_sample_r,
                     revcomp                  = not args.no_revcomp,
                     use_reverse_strand       = not args.no_reverse_strand,
                     max_reads                = args.max_reads,
@@ -1686,6 +1706,7 @@ def main(argv=None) -> None:
                     n_baseline_per_kmer       = v4_baseline_n,
                     baseline_min_dist_to_meth = v4_baseline_d,
                     near_meth_max_dist        = v4_near_d,
+                    baseline_sample_rate      = v4_sample_r,
                     revcomp                   = not args.no_revcomp,
                     use_reverse_strand        = not args.no_reverse_strand,
                     max_reads                 = args.max_reads,

@@ -76,6 +76,16 @@ extract:
   n_baseline_per_kmer:        50    # cap on baseline samples per kmer
   baseline_min_dist_to_meth:  11    # in bases; must be >= K (kmer size)
 
+  # Front-end subsampling of baseline CANDIDATES before the reservoir cap.
+  # 10% means we randomly skip 90% of would-be baseline positions before
+  # any further per-position work. The reservoir (n_baseline_per_kmer)
+  # still guarantees uniform-ish final sampling per kmer; the front-end
+  # skip just trades a tiny uniformity loss for ~10x speedup AND ~10x
+  # less memory in the dict overhead.
+  # On a 17kb HiFi read with sparse motifs there are ~17k baseline
+  # candidates -> 1.7k after this filter. Reservoir caps to 50 per kmer.
+  baseline_sample_rate:       0.10  # in [0, 1], 1.0 = no front-end skip
+
   # NEAR_METH window: positions p+k where k in [1, near_meth_max_dist] and
   # k is NOT a signature offset for the meth at p. These positions are close
   # to a methylation (so meth_context will carry the meth) but NOT at an
