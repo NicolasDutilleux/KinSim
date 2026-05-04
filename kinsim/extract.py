@@ -898,146 +898,223 @@ def extract_samples_v4_from_bam(
         row[COL_CATEGORY] = category
         return row
 
+    # ------------------------------------------------------------------
+    # Pre-compute per-meth-type signature/near offset arrays for vectorised
+    # tagging in Phase 1 below. Computed once per extract call.
+    # ------------------------------------------------------------------
+    sig_offsets_arr_by_mid: dict[int, np.ndarray] = {}
+    near_offsets_arr_by_mid: dict[int, np.ndarray] = {}
+    for mname, offs in sig_offsets_by_name.items():
+        T_id = meth_ids.get(mname)
+        if not T_id:
+            continue
+        sig_set = {int(o) for o in offs}
+        sig_offsets_arr_by_mid[int(T_id)] = np.array(sorted(sig_set), dtype=np.int32)
+        near = np.array(sorted(k for k in range(0, near_meth_max_dist + 1)
+                               if k not in sig_set), dtype=np.int32)
+        near_offsets_arr_by_mid[int(T_id)] = near
+
+    def _vec_kmers(seq_str: str) -> tuple:
+        """Vectorised kmer encoding. Returns (kmer_ids[n], valid_mask[n]).
+
+        kmer at center c covers seq[c - KMER_LEFT_PAD : c + KMER_RIGHT_PAD + 1].
+        Valid centers are [KMER_LEFT_PAD, n - KMER_RIGHT_PAD - 1].
+        """
+        n = len(seq_str)
+        kmer_ids = np.zeros(n, dtype=np.uint32)
+        valid    = np.zeros(n, dtype=bool)
+        if n < kmer_size:
+            return kmer_ids, valid
+        # Encode bases via ord & 6 trick: A=65 -> 0, C=67 -> 1, G=71 -> 3, T=84 -> 2 (incorrect)
+        # Use explicit table to be safe.
+        seq_bytes = np.frombuffer(seq_str.encode("ascii", errors="replace"), dtype=np.uint8)
+        base = np.zeros(n, dtype=np.uint32)
+        base[seq_bytes == ord('A')] = 0
+        base[seq_bytes == ord('C')] = 1
+        base[seq_bytes == ord('G')] = 2
+        base[seq_bytes == ord('T')] = 3
+        # Sliding rolling hash via stride tricks
+        from numpy.lib.stride_tricks import sliding_window_view
+        windows = sliding_window_view(base, kmer_size)        # (n-K+1, K)
+        weights = (np.uint32(4) ** np.arange(kmer_size - 1, -1, -1).astype(np.uint32))
+        kmers_at_start = windows.astype(np.uint32) @ weights  # (n-K+1,)
+        # start s -> center s + KMER_LEFT_PAD; valid centers [KMER_LEFT_PAD, n-K+KMER_LEFT_PAD]
+        n_starts = n - kmer_size + 1
+        kmer_ids[KMER_LEFT_PAD:KMER_LEFT_PAD + n_starts] = kmers_at_start
+        valid[KMER_LEFT_PAD:KMER_LEFT_PAD + n_starts] = True
+        return kmer_ids, valid
+
     def _process_strand(seq_str, ipd_arr, pw_arr,
                         meth_status_arr, meth_status_complement_arr):
-        """One-strand extract pass. Caller pre-orients the arrays so position
-        i in seq_str corresponds to ipd_arr[i] and meth_status_arr[i].
+        """One-strand extract pass — vectorised with numpy.
 
-        Three categories emitted:
-          SLOWED    = position is at a signature offset (k in sig_offsets[T])
-                      of some methylation. Includes the meth itself when
-                      0 ∈ sig_offsets[T].
-          NEAR_METH = position is within [+1, near_meth_max_dist] of a meth
-                      but k is NOT a signature offset. Negative control.
-          BASELINE  = far from any meth/slowed/near (>= baseline_min_dist).
+        Algorithm:
+          1. Compute kmer_ids[c] for every center c in one numpy op.
+          2. Phase 1 (vectorised): for each meth at p, mark p+k positions in
+             slowed/near arrays via numpy fancy indexing.
+          3. Compute baseline_eligible mask via np.cumsum-based dilation
+             (no bisect, no per-position python loop).
+          4. Materialise three index arrays (slowed, near, baseline) and
+             apply baseline subsample with one rng.random() over the array.
+          5. Build all rows for each category in batch via fancy indexing.
+          6. Per-kmer reservoir loop only on the (small) kept-baseline indices.
         """
         nonlocal n_slowed, n_near, n_baseline_seen
         n = min(len(seq_str), len(ipd_arr), len(pw_arr))
         if n < kmer_size:
             return
-        kmers = _slide_kmers(seq_str[:n], kmer_size)
+        # Force numpy arrays — pysam tags may be array.array
+        meth_status_arr = np.asarray(meth_status_arr[:n], dtype=np.int32)
+        meth_status_complement_arr = np.asarray(meth_status_complement_arr[:n], dtype=np.int32)
+        ipd_arr = np.asarray(ipd_arr[:n], dtype=np.float32)
+        pw_arr  = np.asarray(pw_arr[:n],  dtype=np.float32)
 
-        # Phase 1: walk every motif-match position p of type T and tag the
-        # downstream positions p+k as slowed (k ∈ sig) or near_meth (k in
-        # proximity window but not sig). slowed wins over near_meth.
-        slowed_pos: dict = {}     # center -> parent meth_id (sig hit)
-        near_pos:   dict = {}     # center -> parent meth_id (proximity, non-sig)
-        for c in range(n):
-            T = int(meth_status_arr[c])
-            if T == 0:
-                continue
-            kmer_id, valid = kmers[c]
-            if not valid:
-                continue
-            is_candidate = (confirmed is None) or ((kmer_id, T) in confirmed)
-            if not is_candidate:
-                continue
-            mname = name_by_mid.get(T)
-            if not mname:
-                continue
-            sig_set = {int(o) for o in sig_offsets_by_name.get(mname, [])}
-            # Slowed offsets (including k=0 — the meth itself when 0 ∈ sig).
-            for k in sig_set:
-                sc = c + k
-                if 0 <= sc < n:
-                    slowed_pos[sc] = T
-                    slowed_offset_dist[(mname, k)] += 1
-            # Near_meth offsets in [0, near_meth_max_dist] not in sig.
-            # k=0 is included so the meth itself ends up in NEAR_METH when
-            # 0 is not in its signature (e.g. m5C, signature [+2, +6]).
-            # slowed wins over near_meth at any conflicting offset.
-            for k in range(0, near_meth_max_dist + 1):
-                if k in sig_set:
-                    continue
-                nc = c + k
-                if not (0 <= nc < n) or nc in slowed_pos:
-                    continue
-                if nc not in near_pos:
-                    near_pos[nc] = T
-                    near_offset_dist[(mname, k)] += 1
+        # ---- 1. Kmer encoding (vectorised) ----
+        kmer_ids, kmer_valid = _vec_kmers(seq_str[:n])
 
-        # Pre-compute distance-to-nearest-flag for baseline gating.
-        # Baseline positions must be far from any slowed OR near_meth flag
-        # (and from any motif match) so their meth_context window stays
-        # methylation-free.
-        flagged = sorted(set(slowed_pos) | set(near_pos)
-                         | {c for c in range(n) if int(meth_status_arr[c]) > 0})
-        import bisect
-        def _dist_to_flag(c: int) -> int:
-            if not flagged:
-                return 10**9
-            i = bisect.bisect_left(flagged, c)
-            best = 10**9
-            if i < len(flagged):
-                best = min(best, flagged[i] - c)
-            if i > 0:
-                best = min(best, c - flagged[i - 1])
-            return best
+        # ---- 2. Phase 1: tag slowed and near positions (vectorised) ----
+        # slowed[c] = parent meth_id if c is at signature offset of some meth, else 0
+        # near[c]   = parent meth_id if c is in proximity window (non-sig) and not slowed
+        slowed = np.zeros(n, dtype=np.int8)
+        near   = np.zeros(n, dtype=np.int8)
+        # Find motif positions (sparse, ~tens to hundreds per read)
+        motif_mask = (meth_status_arr > 0) & kmer_valid
+        motif_centers = np.where(motif_mask)[0]
+        # Optional refined-pkl gate: keep only motif positions whose
+        # (kmer_at_p, T) is in `confirmed`. Sparse loop in Python — OK.
+        if confirmed is not None and len(motif_centers) > 0:
+            keep_mask = np.zeros(len(motif_centers), dtype=bool)
+            for i, p in enumerate(motif_centers):
+                T = int(meth_status_arr[p])
+                if (int(kmer_ids[p]), T) in confirmed:
+                    keep_mask[i] = True
+            motif_centers = motif_centers[keep_mask]
 
-        # Phase 2: emit samples per position.
-        # PERFORMANCE: do the cheap keep/skip decision FIRST. Only call the
-        # expensive _slice_* + _build_row helpers if we know we'll keep the
-        # sample. Most baseline candidates are rejected by the reservoir
-        # roll, so this saves ~99% of the Python work on slowed-by-baseline
-        # reads (typical case for short bacterial motif densities).
-        for c in range(n):
-            kmer_id, valid = kmers[c]
-            if not valid:
+        # Tag slowed/near via vectorised offset broadcast per type.
+        for T_id, sig_off in sig_offsets_arr_by_mid.items():
+            mask_T = meth_status_arr[motif_centers] == T_id
+            centers_T = motif_centers[mask_T]
+            if len(centers_T) == 0:
                 continue
+            mname = name_by_mid.get(T_id, f"meth{T_id}")
+            # SLOWED: positions p+k for each k in sig_off (k incl. 0)
+            for k in sig_off.tolist():
+                tgt = centers_T + k
+                in_range = (tgt >= 0) & (tgt < n)
+                tgt_in = tgt[in_range]
+                slowed[tgt_in] = T_id
+                slowed_offset_dist[(mname, int(k))] += int(in_range.sum())
+            # NEAR: positions p+k for k in [0, near_max] not in sig, only
+            # if not already slowed and meth_status[c]==0 for that target.
+            for k in near_offsets_arr_by_mid[T_id].tolist():
+                tgt = centers_T + k
+                in_range = (tgt >= 0) & (tgt < n)
+                tgt_in = tgt[in_range]
+                # Only assign where slowed is still 0 AND near is still 0
+                # (first writer wins for near).
+                writeable = (slowed[tgt_in] == 0) & (near[tgt_in] == 0)
+                writeable_idx = tgt_in[writeable]
+                near[writeable_idx] = T_id
+                near_offset_dist[(mname, int(k))] += int(writeable.sum())
 
-            # Decide category + decide if we keep, BEFORE building the row.
-            cat = -1
-            slot = -1   # -1 = append, >=0 = replace at this index (baseline reservoir)
-            target_buf = None
-            if c in slowed_pos:
-                cat = CATEGORY_SLOWED
-                target_buf = samples
-            elif c in near_pos:
-                cat = CATEGORY_NEAR_METH
-                target_buf = samples
-            else:
-                # Front-end subsample: skip 1-rate of baseline candidates
-                # CHEAPLY before doing the dist check or reservoir work.
-                # The reservoir downstream still caps at n_baseline_per_kmer,
-                # so this only loses the rarely-seen kmers some samples;
-                # it does NOT bias the overall IPD distribution per kmer.
-                if baseline_sample_rate < 1.0 and rng.random() > baseline_sample_rate:
-                    continue
-                if _dist_to_flag(c) < baseline_min_dist_to_meth:
-                    continue
-                n_baseline_seen += 1
-                baseline_seen_per_kmer[kmer_id] += 1
-                seen = baseline_seen_per_kmer[kmer_id]
+        # ---- 3. baseline_eligible mask via dilation ----
+        # A position is in the "flag zone" if any motif-match / slowed / near
+        # is within ±baseline_min_dist_to_meth. Compute via cumulative-sum
+        # window count: O(n), fully vectorised.
+        flagged = (meth_status_arr > 0) | (slowed > 0) | (near > 0)
+        if flagged.any():
+            f_int = flagged.astype(np.int32)
+            cs = np.concatenate(([0], np.cumsum(f_int)))   # length n+1
+            d = baseline_min_dist_to_meth
+            lo = np.clip(np.arange(n) - d,         0, n)
+            hi = np.clip(np.arange(n) + d + 1,     0, n)
+            in_zone = (cs[hi] - cs[lo]) > 0
+        else:
+            in_zone = np.zeros(n, dtype=bool)
+
+        # ---- 4. Materialise index arrays per category ----
+        slowed_mask = (slowed > 0) & kmer_valid
+        near_mask   = (near   > 0) & kmer_valid & ~slowed_mask
+        baseline_mask = ~in_zone & kmer_valid & ~slowed_mask & ~near_mask
+        # Front-end subsample for baseline:
+        if baseline_sample_rate < 1.0 and baseline_mask.any():
+            r = rng.random(n).astype(np.float32)
+            baseline_mask &= (r < baseline_sample_rate)
+
+        slowed_idx   = np.where(slowed_mask)[0]
+        near_idx     = np.where(near_mask)[0]
+        baseline_idx = np.where(baseline_mask)[0]
+
+        n_slowed += len(slowed_idx)
+        n_near   += len(near_idx)
+        n_baseline_seen += len(baseline_idx)
+
+        # ---- 5. Build rows in batch via numpy fancy indexing ----
+        def _batch_rows(idx, cat, frac_arr=None):
+            if len(idx) == 0:
+                return np.empty((0, SAMPLE_NCOLS), dtype=np.float32)
+            m = len(idx)
+            rows = np.zeros((m, SAMPLE_NCOLS), dtype=np.float32)
+            rows[:, 0] = ipd_arr[idx]
+            rows[:, 1] = pw_arr[idx]
+            if frac_arr is not None:
+                rows[:, 2] = frac_arr
+            # meth_context cols 3..13: mc[k] for sample i = meth_status[idx[i] - 7 + k]
+            for k in range(METH_CTX_LEN):
+                tgt = idx + (k - METH_CTX_LEFT)
+                in_r = (tgt >= 0) & (tgt < n)
+                rows[in_r, 3 + k] = meth_status_arr[tgt[in_r]]
+            # profile_IPD cols 14..22, profile_PW cols 23..31
+            for k in range(PROFILE_LEN):
+                tgt = idx + (PROFILE_START + k)
+                in_r = (tgt >= 0) & (tgt < n)
+                rows[in_r, 14 + k] = ipd_arr[tgt[in_r]]
+                rows[in_r, 23 + k] = pw_arr [tgt[in_r]]
+            # rev_meth cols 32..34
+            for k, off in enumerate(REV_METH_OFFSETS):
+                tgt = idx + off
+                in_r = (tgt >= 0) & (tgt < n)
+                rows[in_r, 32 + k] = meth_status_complement_arr[tgt[in_r]]
+            rows[:, COL_CATEGORY] = cat
+            return rows
+
+        # Slowed rows: frac_v from frac_lookup of meth at center
+        if len(slowed_idx) > 0:
+            slowed_meth_at_center = meth_status_arr[slowed_idx]
+            slowed_fracs = np.array(
+                [frac_lookup.get(int(m), 0.0) for m in slowed_meth_at_center],
+                dtype=np.float32,
+            )
+            slowed_rows = _batch_rows(slowed_idx, CATEGORY_SLOWED, slowed_fracs)
+            slowed_kmers = kmer_ids[slowed_idx]
+            for i in range(len(slowed_idx)):
+                samples[int(slowed_kmers[i])].append(slowed_rows[i])
+
+        if len(near_idx) > 0:
+            near_meth_at_center = meth_status_arr[near_idx]
+            near_fracs = np.array(
+                [frac_lookup.get(int(m), 0.0) for m in near_meth_at_center],
+                dtype=np.float32,
+            )
+            near_rows = _batch_rows(near_idx, CATEGORY_NEAR_METH, near_fracs)
+            near_kmers = kmer_ids[near_idx]
+            for i in range(len(near_idx)):
+                samples[int(near_kmers[i])].append(near_rows[i])
+
+        # ---- 6. Baseline reservoir: per-kmer cap via streaming reservoir ----
+        if len(baseline_idx) > 0:
+            baseline_rows = _batch_rows(baseline_idx, CATEGORY_BASELINE, None)
+            baseline_kmers = kmer_ids[baseline_idx]
+            for i in range(len(baseline_idx)):
+                kid = int(baseline_kmers[i])
+                baseline_seen_per_kmer[kid] += 1
+                seen = baseline_seen_per_kmer[kid]
                 if seen <= n_baseline_per_kmer:
-                    cat = CATEGORY_BASELINE
-                    target_buf = baseline_buffer
-                    slot = -1   # append
+                    baseline_buffer[kid].append(baseline_rows[i])
                 else:
                     j = int(rng.integers(0, seen))
                     if j < n_baseline_per_kmer:
-                        cat = CATEGORY_BASELINE
-                        target_buf = baseline_buffer
-                        slot = j
-                    else:
-                        continue   # rejected by reservoir — skip row construction
-            # Now build the row (expensive)
-            ipd_v    = float(ipd_arr[c])
-            pw_v     = float(pw_arr[c])
-            mc       = _slice_meth_context(meth_status_arr, c)
-            profile  = _slice_kinetic_profile(ipd_arr, pw_arr, c)
-            rev_meth = _slice_rev_meth(meth_status_complement_arr, c)
-            if cat == CATEGORY_BASELINE:
-                frac_v = 0.0
-            else:
-                meth_id_center = int(meth_status_arr[c])
-                frac_v = frac_lookup.get(meth_id_center, 0.0) if meth_id_center else 0.0
-            row = _build_row(ipd_v, pw_v, frac_v, mc, profile, rev_meth, cat)
-            if slot >= 0:
-                target_buf[kmer_id][slot] = row
-            else:
-                target_buf[kmer_id].append(row)
-            if   cat == CATEGORY_SLOWED:    n_slowed += 1
-            elif cat == CATEGORY_NEAR_METH: n_near   += 1
+                        baseline_buffer[kid][j] = baseline_rows[i]
 
     with pysam.AlignmentFile(bam_path, "rb", check_sq=False) as bam:
         for read in bam:
