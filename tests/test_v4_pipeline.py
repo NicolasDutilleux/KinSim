@@ -123,6 +123,94 @@ def test_analyze_uses_parent_meth_column_not_meth_context():
     assert profiles["slowed_by_m5C_at_+0"]["n_samples"] == 1
 
 
+def test_validate_mod_pos_passes_on_correct_position():
+    """When the (mod_type, pattern, mod_pos) trio is internally consistent,
+    _validate_mod_pos is a no-op (returns None silently).
+
+    The motif format `mod_type,pattern,pos` is unambiguous by design:
+    pos is 1-based, mod_type fixes the modified base (m6A → A; m4C/m5C
+    → C). A correct entry passes through with no exception."""
+    from kinsim.utils.motifs import _validate_mod_pos
+
+    # GATC m6A at the A (0-based index 1) — concrete A.
+    _validate_mod_pos("GATC", 1, "m6A")
+    # CCWGG m5C — both Cs (indices 0 and 1) are valid concrete C.
+    _validate_mod_pos("CCWGG", 0, "m5C")
+    _validate_mod_pos("CCWGG", 1, "m5C")
+    # IUPAC R (= A or G) at index 0 includes the expected A — user
+    # knowingly used an ambiguous code, so this passes.
+    _validate_mod_pos("RGATCY", 0, "m6A")
+    _validate_mod_pos("RGATCY", 2, "m6A")  # concrete A, also valid
+
+
+def _assert_raises(exc_type, fn, *args, **kwargs):
+    """Tiny helper: assert ``fn(*args, **kwargs)`` raises ``exc_type``,
+    return the exception. Avoids a pytest dependency in this test
+    module — the rest of the suite uses the same plain-asserts style."""
+    try:
+        fn(*args, **kwargs)
+    except exc_type as e:
+        return e
+    else:
+        raise AssertionError(f"expected {exc_type.__name__} from {fn.__name__}, got no error")
+
+
+def test_validate_mod_pos_raises_on_wrong_base():
+    """An inconsistent trio raises ValueError with a clear message naming
+    the offending entry. No silent auto-correction — the bug is in the
+    upstream motifs.csv and must be fixed there."""
+    from kinsim.utils.motifs import _validate_mod_pos
+
+    # Position 0 in GATC is G, not A → m6A spec is wrong.
+    err = _assert_raises(ValueError, _validate_mod_pos, "GATC", 0, "m6A")
+    assert "GATC" in str(err) and "m6A" in str(err) and "'G'" in str(err), str(err)
+
+    # Position 4 in CCWGG is G, not C → m5C spec is wrong.
+    err = _assert_raises(ValueError, _validate_mod_pos, "CCWGG", 4, "m5C")
+    assert "CCWGG" in str(err) and "m5C" in str(err) and "'G'" in str(err), str(err)
+
+    # Position 1 in RGATCY is G, doesn't include A → m6A spec is wrong.
+    err = _assert_raises(ValueError, _validate_mod_pos, "RGATCY", 1, "m6A")
+    assert "RGATCY" in str(err) and "m6A" in str(err) and "'G'" in str(err), str(err)
+
+
+def test_parse_motifs_fails_loudly_on_wrong_centerpos():
+    """parse_motifs aggregates ALL invalid entries before raising, so the
+    user sees every bad row at once and fixes the source motifs.csv in
+    one pass. The format `m6A,GATC,1` (1-based pos=1 → idx 0 → G) is
+    invalid for m6A and must be rejected."""
+    from kinsim.utils.motifs import parse_motifs
+
+    bad = "m6A,GATC,1;m6A,CTGAAG,1"  # both rows point to a non-A base
+    err = _assert_raises(ValueError, parse_motifs, bad, revcomp=False)
+    msg = str(err)
+    # Both bad rows must be reported, not just the first.
+    assert "GATC" in msg, f"first bad entry not in error message: {msg}"
+    assert "CTGAAG" in msg, f"second bad entry not in error message: {msg}"
+    # The error must give a clear hint about the format.
+    assert "1-based" in msg or "fix" in msg.lower(), (
+        f"error message lacks corrective hint: {msg}"
+    )
+
+
+def test_parse_motifs_accepts_correct_entries():
+    """Sanity check: a well-formed motif string parses without error and
+    produces motifs that scan_sequence can use."""
+    from kinsim.utils.motifs import parse_motifs, scan_sequence
+
+    # All correct: GATC m6A 1-based pos=2 (the A); CCWGG m5C pos=2 (a C).
+    motifs = parse_motifs("m6A,GATC,2;m5C,CCWGG,2", revcomp=False)
+    assert len(motifs) == 2
+    assert motifs[0]["pos"] == 1  # 1-based 2 → 0-based 1 → A in GATC
+    assert motifs[1]["pos"] == 1  # 1-based 2 → 0-based 1 → C in CCWGG
+
+    # End-to-end: scan a sequence containing GATC; the A at index 6 is flagged.
+    seq = "TTTTTGATCAAAAA"
+    status = scan_sequence(seq, motifs)
+    assert status[6] == 1, f"m6A flag should be at the A (index 6), status={status}"
+    assert status[5] == 0, "m6A flag must NOT be at the G"
+
+
 def test_refine_fails_fast_on_obsolete_layout():
     """refine_pkl exits with code 1 when input lacks parent-meth columns."""
     import sys

@@ -3,102 +3,165 @@
 #
 # Centralised knowledge file for the data pipeline. Edit values here to
 # adjust extraction, refine, and analysis behaviour without touching code.
+# Every consumer (extract, refine, analyze, generate, train) reads from
+# this file via `kinsim.utils.config.load_kinsim_config()`. Adding a new
+# methylation type, changing a signature offset, or tweaking baseline
+# subsampling is a YAML edit only — never touch source.
 # ============================================================
 
-# Per-modification kinetic signature: where the IPD/PW signal is observable
-# relative to the modified base position (PacBio HiFi).
+# ─────────────────────────────────────────────────────────────────────────
+# Per-modification kinetic signature
+# ─────────────────────────────────────────────────────────────────────────
+# Each entry declares one methylation type. KinSim refuses to run if a
+# type appears in your motifs.csv but is missing here (no silent
+# fallback — see kinsim/utils/config.py:get_signature_offsets).
 #
-# IMPORTANT — USERS MUST FILL THIS IN for every methylation type their data
-# contains. The signature offsets drive the refine step: GMM clustering
-# happens at these specific positions of the kinetic profile, and a sample
-# must look "real meth" at every signature offset to be kept.
+# Required fields per entry:
+#   modified_base   one of A/C/G/T — concrete base this mod sits on. Used
+#                   by the motif-position validator (kinsim/utils/motifs.py:
+#                   _validate_mod_pos) to refuse motifs.csv rows whose
+#                   `centerPos` doesn't actually point to a base of this
+#                   chemistry. m6A modifies adenine (A); m4C and m5C both
+#                   modify cytosine (C).
+#   signal_offsets  list of integer offsets (in bases, downstream of the
+#                   modified base) where the polymerase pause is
+#                   biophysically expected. Drives extract's CATEGORY
+#                   tagging (positions p+k for k in signal_offsets become
+#                   CATEGORY_SLOWED) and analyze's per-(meth, offset)
+#                   bucketing in the diagnostic plots.
 #
-# If a methylation type is missing here, KinSim falls back to `[0]` (signal
-# expected only at the modification position itself). This is correct for
-# m4C but WRONG for m5C (whose signal is at +2 and +6, not at the C).
+# Optional:
+#   description   free text shown in logs.
 #
-# Reference: PacBio "Detecting DNA Base Modifications" application note.
-# If you discover a strain-specific signature (e.g. m6A at +8 instead of +5),
-# add or override the entry here — no code change needed.
+# Reference: PacBio "Detecting DNA Base Modifications" application note —
+# 5-mC has signals 2 and 6 bases downstream; 4-mC at the modification
+# only; 6-mA at the modification and often +5 downstream. Strain-specific
+# signatures (e.g. m6A at +8 in some R-M systems) override here.
 kinetic_signatures:
   m6A:
+    modified_base:  A           # base this modification sits on (one of A/C/G/T)
     signal_offsets: [0, 5]      # at the modified A AND ~5 bases downstream
+    aliases:        [6mA, 6-mA] # extra names this type goes by in upstream caller outputs
     description: "Signal at modified A and +5 downstream"
   m4C:
+    modified_base:  C
     signal_offsets: [0]         # at the modified C only
+    aliases:        [4mC, 4-mC]
     description: "Signal at modified C only"
   m5C:
+    modified_base:  C
     signal_offsets: [2, 6]      # +2 and +6 downstream — NOT at the C itself
+    aliases:        [5mC, 5-mC, 5hmC]   # 5hmC (hydroxymethyl-C) is treated as m5C by KinSim
     description: "Signal at +2 and +6 downstream of modified C"
-  # Add new methylation types here, e.g.:
+  # Add new methylation types here.
+  #   modified_base   REQUIRED  the concrete base (A/C/G/T) this mod sits on.
+  #                             The motif-position validator (parse_motifs)
+  #                             rejects motifs.csv rows whose centerPos
+  #                             doesn't actually point to a base of this
+  #                             chemistry, so this field is what makes
+  #                             KinSim reject bogus inputs.
+  #   signal_offsets  REQUIRED  list of int offsets (downstream of the
+  #                             modified base) where the polymerase pause
+  #                             is biophysically expected. Drives extract's
+  #                             SLOWED tagging and analyze's per-(meth,
+  #                             offset) bucketing.
+  #   aliases         OPTIONAL  alternative names for the same modification
+  #                             type as they may appear in upstream caller
+  #                             output (e.g. modkit prints '5mC' for m5C).
+  #                             CombinedParser maps any alias to the
+  #                             canonical name; PacBio motifs.csv normally
+  #                             uses canonical names directly.
+  #   description     OPTIONAL  free text for logs.
+  # Example: hypothetical N4-methylcytosine variant
   # m4mC:
+  #   modified_base:  C
   #   signal_offsets: [0, 3]
+  #   aliases:        [4mmC, m4mC]
   #   description: "..."
 
-# Methylation context window fed to the model (FiLM input).
-# The window is asymmetric and biased UPSTREAM because all kinetic signatures
-# are downstream of the modification — to predict IPD at a position Y we need
-# to see modifications upstream of Y (whose downstream effect reaches Y).
+# ─────────────────────────────────────────────────────────────────────────
+# Methylation-context window — input to the model's FiLM conditioner
+# ─────────────────────────────────────────────────────────────────────────
+# Around each prediction position Y, KinSim feeds the model a window of
+# meth_id values at offsets [-left, +right] (`mc_0..mc_10` columns of the
+# stored sample). The window is asymmetric (more upstream than downstream)
+# because PacBio kinetic signatures sit DOWNSTREAM of the modification:
+# to predict IPD/PW at Y, the model must see any methylation that is
+# upstream of Y whose footprint extends to Y. Window length = left+1+right.
+# Inspired by Feng et al. 2013 (kineticsTools, [-7, +2] for unmodified DNA),
+# widened by one to keep K=11 = left + 1 + right.
 meth_context:
-  left:  7     # bases before prediction position
-  right: 3     # bases after prediction position
-  # total length = left + 1 + right = 11
-  # Inspired by Feng et al. 2013 (kineticsTools) [-7, +2] for unmodified DNA,
-  # extended to 11 bases. The window is asymmetric upstream because all
-  # kinetic signatures (m6A +5, m5C +2/+6) are downstream of the modification
-  # — so to predict IPD at position Y the model needs to see modifications
-  # that are upstream of Y (whose downstream effect reaches here).
+  left:  7      # bases of meth context BEFORE the prediction position
+  right: 3      # bases AFTER the prediction position
 
-# Kinetic profile extracted alongside each sample. Used by refine to validate
-# the signature pattern. Range covers all known signature offsets with a
-# safety margin.
-kinetic_profile:
-  start: 0     # offset relative to prediction position (inclusive)
-  end:   8     # offset (inclusive)
-  # length = end - start + 1 = 9
-
-# Extraction parameters (v4)
+# ─────────────────────────────────────────────────────────────────────────
+# Kinetic profile — per-sample IPD/PW snapshot stored at extract time
+# ─────────────────────────────────────────────────────────────────────────
+# For each sample (one row of the .pkl), KinSim stores not just the IPD/PW
+# at the prediction position itself, but a small downstream "profile":
+# raw IPD and PW at offsets [start, end] from the prediction position
+# (cols 14..22 = profile_IPD, cols 23..31 = profile_PW in the 38-col
+# layout, see kinsim/utils/sample_layout.py).
 #
-# v4 changes how kinsim extract emits samples:
-#   - For each *confirmed* methylation at p of type T (i.e. (kmer, T) is a
-#     bucket present in the master_clean.pkl produced by refine pass-1),
-#     positions p+k for k in signature_offsets[T] are flagged "slowed".
-#   - Slowed positions are ALWAYS emitted (no subsampling) — they carry the
-#     downstream kinetic footprint of the upstream methylation.
-#   - Confirmed methylated positions (the meth itself, k=0) are emitted as
-#     CATEGORY_METH samples.
-#   - All other positions in the read are baseline candidates, capped per
-#     kmer at `n_baseline_per_kmer` via reservoir sampling. The baseline must
-#     also be at least `baseline_min_dist_to_meth` bases away from any
-#     confirmed methylation in either direction so its meth_context window
-#     never accidentally contains a methylation.
+# Why we keep this snapshot:
+#   - analyze (Fig 3) plots the mean profile per (meth, offset) bucket so
+#     you can SEE whether the IPD spike lands at the configured signature
+#     offset — a primary diagnostic for "is the motif's centerPos correct".
+#   - refine could in principle use it to validate the signature shape per
+#     sample (currently it only uses the (IPD, PW) at the centre).
+#
+# Range MUST cover every signal_offset declared above plus a safety margin.
+# With m6A's +5 signature the minimum is end >= 5; we use end = 8 to leave
+# room for the bilateral palindrome footprint (+8..+9 in some R-M systems).
+kinetic_profile:
+  start: 0      # first offset stored (inclusive, relative to prediction position)
+  end:   8      # last offset stored  (inclusive). Profile length = end - start + 1
+
+# ─────────────────────────────────────────────────────────────────────────
+# Extraction parameters
+# ─────────────────────────────────────────────────────────────────────────
+# Controls how `kinsim extract` walks each read of each BAM and emits
+# rows of the per-sample storage layout (38 cols, see
+# kinsim/utils/sample_layout.py). For every motif-match position p of
+# type T:
+#   - positions p+k for k in signal_offsets[T]  → CATEGORY_SLOWED
+#     (real kinetic footprint expected here)
+#   - positions p+k for k in [1..near_meth_max_dist] and k NOT in
+#     signal_offsets[T]                          → CATEGORY_NEAR_METH
+#     (negative-control: meth in context but no slowing expected)
+#   - positions ≥ baseline_min_dist_to_meth from any motif → BASELINE
+#     candidates, capped per kmer via reservoir sampling.
 extract:
-  n_baseline_per_kmer:        50    # cap on baseline samples per kmer
-  baseline_min_dist_to_meth:  11    # in bases; must be >= K (kmer size)
+  n_baseline_per_kmer:        50    # cap on baseline samples per kmer (Vitter reservoir)
+  baseline_min_dist_to_meth:  11    # min distance (bases) from any motif. Must be >= K
+                                    #   so the meth_context window of a baseline never
+                                    #   accidentally overlaps a motif.
 
-  # Front-end subsampling of baseline CANDIDATES before the reservoir cap.
-  # 10% means we randomly skip 90% of would-be baseline positions before
-  # any further per-position work. The reservoir (n_baseline_per_kmer)
-  # still guarantees uniform-ish final sampling per kmer; the front-end
-  # skip just trades a tiny uniformity loss for ~10x speedup AND ~10x
-  # less memory in the dict overhead.
-  # On a 17kb HiFi read with sparse motifs there are ~17k baseline
-  # candidates -> 1.7k after this filter. Reservoir caps to 50 per kmer.
-  baseline_sample_rate:       0.10  # in [0, 1], 1.0 = no front-end skip
+  # Front-end subsampling of baseline CANDIDATES before the reservoir.
+  # 10 % means we randomly skip 90 % of would-be baseline positions
+  # before any per-position work. The reservoir cap still guarantees
+  # uniform-ish per-kmer sampling; this just trades a tiny uniformity
+  # loss for ~10× speedup and ~10× less memory in the dict overhead.
+  # On a 17 kb HiFi read with sparse motifs: ~17 k baseline candidates
+  # → ~1.7 k after this filter → 50/kmer after the reservoir.
+  baseline_sample_rate:       0.10  # in [0, 1]; 1.0 = no front-end skip
 
-  # NEAR_METH window: positions p+k where k in [1, near_meth_max_dist] and
-  # k is NOT a signature offset for the meth at p. These positions are close
-  # to a methylation (so meth_context will carry the meth) but NOT at an
-  # offset where the polymerase slowing is biophysically expected. They
-  # serve as negative controls: the model must learn that "meth in mc" alone
-  # does not imply elevated IPD — only meth at a signature offset does.
-  near_meth_max_dist:         7     # bases downstream of meth (1..K-1)
+  # Range scanned for NEAR_METH labelling. Each motif at p contributes
+  # NEAR_METH labels at p+k for k in [1, near_meth_max_dist] minus any k
+  # that IS a signature offset (those are SLOWED, not NEAR). Used as a
+  # negative control during training: the model must learn that "meth
+  # somewhere in the meth_context" alone does NOT imply elevated IPD —
+  # only meth at a configured signal offset does.
+  near_meth_max_dist:         7     # bases downstream of the motif centre (1..K-1)
 
+# ─────────────────────────────────────────────────────────────────────────
 # Refinement parameters
+# ─────────────────────────────────────────────────────────────────────────
+# `kinsim refine` filters motif-FP rows from the SLOWED category. The
+# default method is per-(meth_type, offset) 2D Gaussian Mixture (see
+# kinsim/refine.py); the p95 method below is the legacy single-threshold
+# fallback. ``secondary_percentile`` is read only when refine runs with
+# ``--method p95`` — the GMM path ignores it.
 refine:
-  # Single pass: drop CATEGORY_SLOWED samples whose IPD falls below the
-  # `secondary_percentile`-th percentile of the per-kmer baseline mean.
-  # Per-kmer mean (not per-sample) avoids the per-sample Poisson tail and
-  # keeps weak signals (m4C/m5C) from being wiped by noise.
   slowed_split:
-    secondary_percentile: 95
+    secondary_percentile: 95   # p95 of per-kmer baseline mean → drop SLOWED below this

@@ -124,7 +124,16 @@ _LOSS_FUNCTIONS = {
     "huber": _huber_loss,
 }
 
-_METH_NAMES = {0: "none", 1: "m6A", 2: "m4C", 3: "m5C"}
+def _meth_names() -> dict[int, str]:
+    """Return ``{meth_id: meth_name}`` derived from kinsim_config.yaml.
+
+    Lazy: rebuilt on each call so changes to the YAML during a long
+    process (rare) take effect. Used only for human-readable metric
+    labels in :func:`_compute_metrics` — not for ID encoding.
+    """
+    from .utils.encoding import get_meth_ids
+
+    return {v: k for k, v in get_meth_ids().items()}
 
 
 def _pearson(a: np.ndarray, b: np.ndarray) -> float:
@@ -179,7 +188,7 @@ def _compute_metrics(
         sig_m = all_sigma[mask]
         true_m = all_true[mask]
         diff_m = mu_m - true_m
-        name = _METH_NAMES.get(int(meth_id), f"meth{meth_id}")
+        name = _meth_names().get(int(meth_id), f"meth{meth_id}")
         by_type[name] = {
             "n": int(mask.sum()),
             "pearson_ipd": _pearson(mu_m[:, 0], true_m[:, 0]),
@@ -220,7 +229,7 @@ def _compute_metrics(
         idx = rng.choice(n_avail, n_pick, replace=False)
         mu_sel = all_mu[mask][idx]  # (n_pick, 2)
         sig_sel = all_sigma[mask][idx]  # (n_pick, 2)
-        name = _METH_NAMES.get(int(meth_id), f"meth{meth_id}")
+        name = _meth_names().get(int(meth_id), f"meth{meth_id}")
         dist_samples[name] = {
             "mu_ipd": mu_sel[:, 0],
             "mu_pw": mu_sel[:, 1],

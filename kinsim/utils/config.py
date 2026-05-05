@@ -260,9 +260,9 @@ def load_yaml_config(path: str) -> dict:
 # Numbers match the YAML at the repo root; keep in sync.
 _DEFAULT_KINSIM_CONFIG = {
     "kinetic_signatures": {
-        "m6A": {"signal_offsets": [0, 5]},
-        "m4C": {"signal_offsets": [0]},
-        "m5C": {"signal_offsets": [2, 6]},
+        "m6A": {"modified_base": "A", "signal_offsets": [0, 5]},
+        "m4C": {"modified_base": "C", "signal_offsets": [0]},
+        "m5C": {"modified_base": "C", "signal_offsets": [2, 6]},
     },
     "meth_context": {"left": 7, "right": 3},
     "kinetic_profile": {"start": 0, "end": 8},
@@ -318,13 +318,108 @@ def load_kinsim_config(explicit_path: str | None = None) -> dict:
     return _DEFAULT_KINSIM_CONFIG
 
 
-def get_signature_offsets(meth_name: str) -> list[int]:
-    """Return the list of signature offsets for a methylation type name."""
+def _get_meth_entry(meth_name: str) -> dict:
+    """Return the YAML entry for ``meth_name`` or raise with a helpful message.
+
+    Single source of truth: every helper that asks the config for a
+    per-type field (signal_offsets, modified_base, …) goes through here
+    so the error message is consistent and lists what IS declared.
+    """
     cfg = load_kinsim_config()
-    sigs = cfg.get("kinetic_signatures", {}).get(meth_name)
+    sigs = (cfg.get("kinetic_signatures") or {}).get(meth_name)
     if sigs is None:
-        return [0]
-    return list(sigs.get("signal_offsets", [0]))
+        declared = sorted((cfg.get("kinetic_signatures") or {}).keys())
+        raise ValueError(
+            f"kinsim_config.yaml is missing 'kinetic_signatures.{meth_name}'. "
+            f"Declared types: {declared}. Add an entry like:\n"
+            f"  kinetic_signatures:\n"
+            f"    {meth_name}:\n"
+            f"      modified_base:  A      # one of A/C/G/T — base this mod sits on\n"
+            f"      signal_offsets: [0]    # adjust for the actual biology of this mod\n"
+            f"and re-run."
+        )
+    return sigs
+
+
+def get_signature_offsets(meth_name: str) -> list[int]:
+    """Return the signature offsets for a methylation type, from kinsim_config.yaml.
+
+    Raises ValueError if ``meth_name`` is not declared in the config.
+    The previous behaviour was to silently return ``[0]`` — correct only
+    for m4C, silently wrong for m5C (real signal is +2/+6) and incomplete
+    for m6A (misses the +5 footprint).
+    """
+    return list(_get_meth_entry(meth_name).get("signal_offsets", [0]))
+
+
+def get_modified_base(meth_name: str) -> str:
+    """Return the concrete base (A/C/G/T) that ``meth_name`` modifies.
+
+    Reads ``kinetic_signatures.<meth_name>.modified_base`` from
+    kinsim_config.yaml. This is the single, code-free way to declare
+    the chemistry of a new modification: any module that needs to know
+    "what base does m6A sit on" goes through here, no hardcoding.
+
+    Raises ValueError on missing entry, missing field, or an invalid
+    base (anything outside A/C/G/T).
+    """
+    entry = _get_meth_entry(meth_name)
+    base = entry.get("modified_base")
+    if base is None:
+        raise ValueError(
+            f"kinsim_config.yaml: kinetic_signatures.{meth_name} is missing "
+            f"the required 'modified_base' field. Set it to the concrete base "
+            f"(A/C/G/T) this modification sits on, e.g. 'modified_base: A' for m6A."
+        )
+    base = str(base).upper()
+    if base not in ("A", "C", "G", "T"):
+        raise ValueError(
+            f"kinsim_config.yaml: kinetic_signatures.{meth_name}.modified_base "
+            f"must be one of A/C/G/T, got '{base}'."
+        )
+    return base
+
+
+def get_modified_base_map() -> dict[str, str]:
+    """Return ``{meth_name: modified_base}`` for every declared meth type.
+
+    Used by parsers (PacBioParser, validators) that need to know the
+    chemistry of every modification at once, without hardcoding
+    ``{"m6A": "A", "m4C": "C", "m5C": "C"}`` in source.
+    """
+    cfg = load_kinsim_config()
+    out: dict[str, str] = {}
+    for mname in (cfg.get("kinetic_signatures") or {}):
+        out[mname] = get_modified_base(mname)
+    return out
+
+
+def get_meth_alias_map() -> dict[str, str]:
+    """Return ``{alias: canonical_meth_name}`` for every declared meth type.
+
+    Built from kinsim_config.yaml's ``aliases`` field per meth-type
+    entry. Each canonical name maps to itself, plus any alternative
+    names declared. Lets upstream callers (modkit, fibertools, hand-
+    edited combined CSVs) write whichever convention they use ('5mC',
+    '5-mC', 'm5C', etc.) and KinSim normalises to the canonical
+    ``meth_name`` (the dict key in ``kinetic_signatures``).
+
+    Example output for the default YAML::
+
+        {'m6A': 'm6A', '6mA': 'm6A', '6-mA': 'm6A',
+         'm4C': 'm4C', '4mC': 'm4C', '4-mC': 'm4C',
+         'm5C': 'm5C', '5mC': 'm5C', '5-mC': 'm5C', '5hmC': 'm5C'}
+
+    Adding a new alias requires only a YAML edit — never a code change.
+    """
+    cfg = load_kinsim_config()
+    sigs = cfg.get("kinetic_signatures") or {}
+    out: dict[str, str] = {}
+    for canonical, entry in sigs.items():
+        out[canonical] = canonical
+        for alias in entry.get("aliases") or []:
+            out[str(alias)] = canonical
+    return out
 
 
 # ---------------------------------------------------------------------------

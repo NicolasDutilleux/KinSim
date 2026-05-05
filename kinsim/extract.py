@@ -223,14 +223,34 @@ def extract_samples_from_bam(
     from .utils.config import load_kinsim_config
 
     cfg = load_kinsim_config()
+    cfg_sigs = cfg.get("kinetic_signatures") or {}
+    if not cfg_sigs:
+        raise ValueError(
+            "kinsim_config.yaml has no `kinetic_signatures` declared. "
+            "Extract cannot tag SLOWED / NEAR_METH positions without per-meth-type "
+            "signature offsets. Add at least one entry, e.g.:\n"
+            "  kinetic_signatures:\n"
+            "    m6A: { signal_offsets: [0, 5] }\n"
+            "    m4C: { signal_offsets: [0] }\n"
+            "    m5C: { signal_offsets: [2, 6] }\n"
+            "and re-run."
+        )
     sig_offsets_by_name: dict = {}
-    for mname, scfg in (cfg.get("kinetic_signatures") or {}).items():
+    for mname, scfg in cfg_sigs.items():
         offs = []
         for k in scfg.get("signal_offsets", []):
             try:
                 offs.append(int(k))
-            except (TypeError, ValueError):
-                continue
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"kinsim_config.yaml: kinetic_signatures.{mname}.signal_offsets "
+                    f"contains non-integer value {k!r}: {e}"
+                ) from None
+        if not offs:
+            raise ValueError(
+                f"kinsim_config.yaml: kinetic_signatures.{mname}.signal_offsets "
+                f"is empty. Declare at least one offset (e.g. [0] for the modified base)."
+            )
         sig_offsets_by_name[mname] = offs
     log.info("extract — signature offsets: %s", sig_offsets_by_name)
 
@@ -258,6 +278,20 @@ def extract_samples_from_bam(
         len(motifs),
         ", ".join(f"{name}={cnt}" for name, cnt in sorted(motifs_by_type.items())),
     )
+
+    # Cross-check: every meth type present in the motif file must have a
+    # signature offset declared in kinsim_config.yaml. Otherwise extract
+    # would scan for matches but never tag any SLOWED/NEAR_METH positions
+    # for that type — silently producing a useless dataset.
+    missing_in_yaml = sorted(set(motifs_by_type) - set(sig_offsets_by_name))
+    if missing_in_yaml:
+        raise ValueError(
+            f"Motif file contains meth types {missing_in_yaml} that are NOT "
+            f"declared in kinsim_config.yaml under `kinetic_signatures`. "
+            f"Declared types: {sorted(sig_offsets_by_name)}. Add the missing "
+            f"entries (with their signal_offsets) and re-run, or remove those "
+            f"motifs from the motif file."
+        )
     log.info(
         "extract — fraction_lookup: %s",
         {

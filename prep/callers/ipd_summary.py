@@ -30,11 +30,29 @@ from .registry import register
 
 log = logging.getLogger(__name__)
 
-# ipdSummary base codes -> KinSim mod types
-_BASE_TO_METH = {
-    "A": "m6A",
-    "C": "m4C",
-}
+# ipdSummary reports per-base IPD ratios but does not name the
+# modification type — we must infer it from the base at the called
+# position. The mapping below is derived from kinsim_config.yaml's
+# ``modified_base`` declarations at first call (so adding a new mod
+# type is a YAML edit only). When two meth types share the same base
+# (e.g. m4C and m5C both modify C), the inference cannot disambiguate
+# and the row is dropped — ipdSummary lacks the resolution to tell
+# them apart anyway.
+_BASE_TO_METH_CACHE: dict[str, str] | None = None
+
+
+def _base_to_meth() -> dict[str, str]:
+    global _BASE_TO_METH_CACHE
+    if _BASE_TO_METH_CACHE is None:
+        from kinsim.utils.config import get_modified_base_map
+
+        by_base: dict[str, list[str]] = {}
+        for mod_type, base in get_modified_base_map().items():
+            by_base.setdefault(base, []).append(mod_type)
+        # ipdSummary historically only resolves m6A/m4C unambiguously; m5C
+        # collides with m4C on the C base. Keep only single-meth mappings.
+        _BASE_TO_METH_CACHE = {b: mods[0] for b, mods in by_base.items() if len(mods) == 1}
+    return _BASE_TO_METH_CACHE
 
 # GFF attribute parser
 _GFF_ATTR_RE = re.compile(r"(\w+)=([^;]+)")
@@ -87,7 +105,7 @@ class IpdSummaryParser(BaseOutputParser):
 
             for _lineno, row in enumerate(reader, 2):
                 base = row.get("base", "").strip().upper()
-                mod_type = _BASE_TO_METH.get(base)
+                mod_type = _base_to_meth().get(base)
                 if mod_type is None:
                     continue  # G/T bases are not methylation targets
 
@@ -160,7 +178,7 @@ class IpdSummaryParser(BaseOutputParser):
                     context = attrs.get("context", "")
                     if context:
                         base = context[0].upper()
-                        mod_type = _BASE_TO_METH.get(base, "")
+                        mod_type = _base_to_meth().get(base, "")
                     else:
                         continue
 

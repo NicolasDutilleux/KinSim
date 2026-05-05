@@ -23,12 +23,50 @@ from .registry import register
 
 log = logging.getLogger(__name__)
 
-# Resolve ambiguous "modified_base" by the base at centerPos (forward strand)
-_BASE_TO_METH = {"A": "m6A", "C": "m4C"}
 
-# When the base at centerPos is on the complement strand (G or T),
-# the actual modified base is the complement: C→m4C, A→m6A
-_COMP_BASE_TO_METH = {"G": "m4C", "T": "m6A"}
+# Resolve ambiguous "modified_base" entries by inspecting the base at
+# centerPos. Built from kinsim_config.yaml's ``modified_base`` declarations
+# at first call so adding a new modification type (e.g. m4mC at C) is a
+# YAML edit only — no code change. When two meth types share the same
+# base (e.g. m4C and m5C both modify C), the mapping leaves that base out
+# (the user MUST set modificationType explicitly in their motifs.csv).
+_BASE_TO_METH_CACHE: dict[str, str] | None = None
+_COMP_BASE_TO_METH_CACHE: dict[str, str] | None = None
+
+_DNA_COMPLEMENT = {"A": "T", "C": "G", "G": "C", "T": "A"}
+
+
+def _base_to_meth() -> dict[str, str]:
+    """Return ``{forward-strand base: meth_type}`` derived from the YAML."""
+    global _BASE_TO_METH_CACHE
+    if _BASE_TO_METH_CACHE is None:
+        from kinsim.utils.config import get_modified_base_map
+
+        by_base: dict[str, list[str]] = {}
+        for mod_type, base in get_modified_base_map().items():
+            by_base.setdefault(base, []).append(mod_type)
+        _BASE_TO_METH_CACHE = {b: mods[0] for b, mods in by_base.items() if len(mods) == 1}
+    return _BASE_TO_METH_CACHE
+
+
+def _comp_base_to_meth() -> dict[str, str]:
+    """Return ``{complement-strand base: meth_type}`` from the YAML.
+
+    Used when ``motifs.csv`` reports a centerPos pointing at a non-modifiable
+    base (G or T on the forward strand): the modified base of the reverse-
+    complement strand maps via the standard ACGT complement, so we look up
+    the complement and check whether THAT base is declared as a meth-target.
+    """
+    global _COMP_BASE_TO_METH_CACHE
+    if _COMP_BASE_TO_METH_CACHE is None:
+        fwd = _base_to_meth()
+        out: dict[str, str] = {}
+        for base, comp in _DNA_COMPLEMENT.items():
+            mod = fwd.get(comp)
+            if mod is not None:
+                out[base] = mod
+        _COMP_BASE_TO_METH_CACHE = out
+    return _COMP_BASE_TO_METH_CACHE
 
 
 @register
@@ -130,10 +168,12 @@ class PacBioParser(BaseOutputParser):
                         )
                         continue
                     base = motif_seq[idx].upper()
-                    resolved = _BASE_TO_METH.get(base)
+                    resolved = _base_to_meth().get(base)
                     if resolved is None:
-                        # Try complement strand: G→C→m4C, T→A→m6A
-                        comp_resolved = _COMP_BASE_TO_METH.get(base)
+                        # Forward base wasn't a known meth target. Try the
+                        # complement strand (G→C, T→A — base on the rev
+                        # strand IS what's actually modified).
+                        comp_resolved = _comp_base_to_meth().get(base)
                         if comp_resolved is not None:
                             rc_motif = reverse_complement(motif_seq)
                             rc_idx = len(motif_seq) - 1 - idx

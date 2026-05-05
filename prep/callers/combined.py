@@ -30,16 +30,15 @@ from .registry import register
 
 log = logging.getLogger(__name__)
 
-# Map user's mod_type names to KinSim mod types
-_COMBINED_MOD_MAP = {
-    "5mC": "m5C",
-    "m5C": "m5C",
-    "6mA": "m6A",
-    "m6A": "m6A",
-    "4mC": "m4C",
-    "m4C": "m4C",
-    "5hmC": "m5C",  # hydroxymethylcytosine -> treat as m5C
-}
+
+# Combined CSVs use various conventions for mod names ('5mC' vs 'm5C',
+# '6mA' vs 'm6A'). The alias-to-canonical mapping is derived from
+# kinsim_config.yaml's ``aliases`` field per meth type, so adding a new
+# methylation (or a new alias for an existing one) is a YAML edit only.
+def _combined_mod_map() -> dict[str, str]:
+    from kinsim.utils.config import get_meth_alias_map
+
+    return get_meth_alias_map()
 
 
 @register
@@ -66,7 +65,7 @@ class CombinedParser(BaseOutputParser):
             for lineno, row in enumerate(reader, 2):
                 # -- mod_type (required) --
                 raw_mod = row.get("mod_type", "").strip()
-                mod_type = _COMBINED_MOD_MAP.get(raw_mod)
+                mod_type = _combined_mod_map().get(raw_mod)
                 if mod_type is None:
                     log.warning(
                         "Combined CSV line %d: unknown mod_type '%s' -- skipped", lineno, raw_mod

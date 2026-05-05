@@ -57,6 +57,29 @@ IUPAC_TO_REGEX = {
     "V": "[ACG]",
 }
 
+# Concrete bases that an IUPAC code can match.  Used by `_validate_mod_pos`
+# to check whether a declared mod_pos lands on the right base for a given
+# methylation type. The mapping (mod_type → expected base) is itself read
+# from kinsim_config.yaml so adding a new modification type is a YAML edit
+# only — no code change.
+_IUPAC_EXPANSIONS = {
+    "A": "A",
+    "C": "C",
+    "G": "G",
+    "T": "T",
+    "N": "ACGT",
+    "R": "AG",
+    "Y": "CT",
+    "S": "GC",
+    "W": "AT",
+    "K": "GT",
+    "M": "AC",
+    "B": "CGT",
+    "D": "AGT",
+    "H": "ACT",
+    "V": "ACG",
+}
+
 COMPLEMENT = {
     "A": "T",
     "C": "G",
@@ -75,8 +98,30 @@ COMPLEMENT = {
     "H": "D",
 }
 
-# PacBio CSV: resolve ambiguous "modified_base" by the base at centerPos
-_BASE_TO_METH = {"A": "m6A", "C": "m4C"}
+# PacBio CSV "modified_base" resolver: when modificationType is blank or
+# generic, infer the meth type from the base at centerPos. Built lazily
+# from kinsim_config.yaml's ``modified_base`` fields so the mapping is
+# generalisable — adding a new modification (e.g. m4mC at C) is a YAML
+# edit only.
+def _build_base_to_meth() -> dict[str, str]:
+    """Build {base: mod_type} from YAML.
+
+    If multiple meth types modify the same base (e.g. m4C and m5C both
+    modify C), the resolver cannot disambiguate and the user MUST set
+    the ``modificationType`` column explicitly in their motifs.csv.
+    Returns the mapping with such ambiguous bases mapped to ``None``.
+    """
+    from .config import get_modified_base_map
+
+    by_base: dict[str, list[str]] = {}
+    for mod_type, base in get_modified_base_map().items():
+        by_base.setdefault(base, []).append(mod_type)
+    out: dict[str, str] = {}
+    for base, mods in by_base.items():
+        if len(mods) == 1:
+            out[base] = mods[0]
+        # else: ambiguous → caller must look at modificationType, not base
+    return out
 
 # GFF attribute parser: extracts pattern name from fuzznuc GFF output.
 # Matches "Pattern_name=...", "Name=...", or "pattern=..." (case-insensitive).
@@ -91,6 +136,62 @@ _GFF_ATTR_NAME_RE = re.compile(r"(?:Pattern_name|Name|pattern)=([^;]+)", re.IGNO
 def iupac_to_re(motif):
     """Convert an IUPAC motif string to a regex pattern string."""
     return "".join(IUPAC_TO_REGEX.get(b, b) for b in motif)
+
+
+def _iupac_includes(iupac_char: str, base: str) -> bool:
+    """Return True if the IUPAC code ``iupac_char`` can match concrete ``base``.
+
+    e.g. ``_iupac_includes("R", "A") == True`` (R = A/G).
+    """
+    if not iupac_char or not base:
+        return False
+    return base.upper() in _IUPAC_EXPANSIONS.get(iupac_char.upper(), "")
+
+
+def _validate_mod_pos(seq: str, mod_pos: int, meth_type: str) -> None:
+    """Hard-validate that ``seq[mod_pos]`` matches ``meth_type``'s modified base.
+
+    The motif format ``mod_type,pattern,pos`` is unambiguous by design:
+    ``pos`` is the 1-based position of the modified base in ``pattern``,
+    and the modified base is determined by ``mod_type`` via the
+    ``modified_base`` field of ``kinetic_signatures.<mod_type>`` in
+    kinsim_config.yaml. If the trio is internally inconsistent the
+    motif spec is wrong — silently auto-correcting would hide bugs in
+    the upstream caller / motif file and corrupt training data with no
+    visible failure.
+
+    This function therefore RAISES ``ValueError`` on any mismatch with
+    a message naming the offending entry. The caller (``parse_motifs``)
+    aggregates these and reports all bad rows at once before failing,
+    so the user fixes the source motifs.csv instead of re-running and
+    re-failing one row at a time.
+
+    IUPAC codes that *include* the expected base (e.g. R for m6A — R
+    can be A or G) pass: the motif designer knowingly used an
+    ambiguous code, accepting that some forward-strand matches will
+    not actually carry the modification.
+
+    Methylation types that aren't declared in kinsim_config.yaml will
+    fail upstream (parse_motifs raises before reaching here), so this
+    function never sees an unknown type in practice. As a final guard,
+    a missing-from-YAML lookup raises with the same helpful message as
+    every other config-gap path.
+    """
+    from .config import get_modified_base
+
+    if not seq:
+        return
+    expected = get_modified_base(meth_type)  # raises if meth_type undeclared
+    n = len(seq)
+    if 0 <= mod_pos < n and _iupac_includes(seq[mod_pos], expected):
+        return
+    actual = seq[mod_pos] if 0 <= mod_pos < n else "<out-of-range>"
+    raise ValueError(
+        f"Motif '{seq}' ({meth_type}): position {mod_pos} (0-based) points to "
+        f"'{actual}', but {meth_type} modifies '{expected}'. Fix the source "
+        f"motifs.csv (the 'pos' column for this entry is wrong: it should "
+        f"point to a base that is — or includes via IUPAC — '{expected}')."
+    )
 
 
 def reverse_complement(seq):
@@ -199,11 +300,38 @@ def parse_motifs(motif_string, revcomp=True):
         user_entries.append(parts)
     user_seqs = {parts[1] for parts in user_entries}
 
+    # First pass: parse + validate every entry. Collect ALL errors so the user
+    # sees every bad row at once, not one-per-rerun. Bail before building any
+    # regexes if validation fails — partial state would confuse downstream
+    # callers that try/except around the failure.
+    parsed: list[tuple] = []
+    errors: list[str] = []
     for parts in user_entries:
         m_type, seq, pos = parts[0], parts[1], parts[2]
-        m_id = get_meth_ids().get(m_type, 0)
-        mod_pos = int(pos) - 1  # 1-based input → 0-based internal
+        try:
+            mod_pos = int(pos) - 1
+        except ValueError:
+            errors.append(f"Motif '{seq}' ({m_type}): pos='{pos}' is not an integer.")
+            continue
+        try:
+            _validate_mod_pos(seq, mod_pos, m_type)
+        except ValueError as e:
+            errors.append(str(e))
+            continue
+        parsed.append((m_type, seq, mod_pos, parts))
 
+    if errors:
+        bullet = "\n  - ".join(errors)
+        raise ValueError(
+            f"parse_motifs: {len(errors)} invalid motif "
+            f"{'entry' if len(errors) == 1 else 'entries'} "
+            f"(out of {len(user_entries)}). The motif format is "
+            f"'mod_type,pattern,1-based_pos[,nDetected,fraction]'. "
+            f"Fix the source motifs.csv and re-run.\n  - {bullet}"
+        )
+
+    for m_type, seq, mod_pos, parts in parsed:
+        m_id = get_meth_ids().get(m_type, 0)
         pairs = [(seq, mod_pos)]
         if revcomp:
             rc = reverse_complement(seq)
@@ -332,10 +460,13 @@ def parse_motifs_csv(csv_path, min_fraction=0.40, min_detected=20):
                     )
                     continue
                 base = motif_seq[idx].upper()
-                resolved = _BASE_TO_METH.get(base)
+                resolved = _build_base_to_meth().get(base)
                 if resolved is None:
                     log.warning(
-                        "motifs.csv line %d: cannot infer mod type at %s[%d]='%s' — skipped",
+                        "motifs.csv line %d: cannot infer mod type at %s[%d]='%s' "
+                        "(base not declared in kinsim_config.yaml's "
+                        "kinetic_signatures, or multiple meth types share this "
+                        "base — set modificationType column explicitly) — skipped",
                         lineno,
                         motif_seq,
                         center_pos,

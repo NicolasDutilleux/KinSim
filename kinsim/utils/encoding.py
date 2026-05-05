@@ -28,30 +28,40 @@ BASE_MAP = {"A": 0, "C": 1, "G": 2, "T": 3}
 INT_TO_BASE = {0: "A", 1: "C", 2: "G", 3: "T"}
 VALID_BASES = set("ACGT")
 
-# Default methylation type → integer mapping. Extended at runtime by
-# `get_meth_ids()` based on the entries declared in kinsim_config.yaml's
-# `kinetic_signatures` section. The default fallback below covers the three
-# standard PacBio modifications; users adding new types only need to declare
-# them in kinsim_config.yaml — no code change required.
+# Default methylation type → integer mapping. The three standard PacBio
+# modifications (m6A=1, m4C=2, m5C=3) are listed here so that pickled
+# datasets remain readable even when kinsim_config.yaml is unavailable.
+# At runtime, `get_meth_ids()` extends this with any additional types
+# declared in the YAML (`kinetic_signatures.<type>`), with stable IDs
+# assigned in YAML-declaration order.
+#
+# Stability of IDs across runs matters because IDs end up encoded in the
+# stored pkls (col COL_PARENT_METH); changing a type's ID would silently
+# misinterpret older shards. We therefore keep the three standard IDs
+# pinned by name and only auto-assign IDs for types not in this dict.
 METH_IDS = {"none": 0, "m6A": 1, "m4C": 2, "m5C": 3}
 
 
 def get_meth_ids() -> dict:
-    """Return a complete mod_type → int mapping, expanded from kinsim_config.yaml.
+    """Return ``{mod_type: int_id}`` from the YAML, with stable IDs.
 
-    Always includes 'none' = 0. Then assigns sequential integers (1, 2, ...)
-    to the methylation types declared under `kinetic_signatures` in
-    kinsim_config.yaml. Standard types (m6A, m4C, m5C) keep their default IDs
-    when present; new types declared in the YAML get auto-assigned.
+    Algorithm:
+      1. Always include ``'none' = 0``.
+      2. For each pinned-ID type in :data:`METH_IDS` (m6A=1, m4C=2,
+         m5C=3) that is also declared in the YAML, keep its pinned ID.
+      3. Walk the YAML's ``kinetic_signatures`` keys in declaration order
+         and assign the next free integer to each as-yet-unassigned type.
 
-    Adding a new methylation type to KinSim:
-      1. Edit kinsim_config.yaml:
-           kinetic_signatures:
-             m4mC:
-               signal_offsets: [0, 3]
-               description: "..."
-      2. That's it. extract / refine / generate / analyze all pick it up
-         from get_meth_ids() at runtime.
+    This guarantees:
+      - Older pkls (which encoded m6A=1, m4C=2, m5C=3) remain decodable.
+      - Adding a new type ``m4mC`` to the YAML is a config-only change;
+        it will get the next free ID (typically 4) automatically and
+        every consumer (extract, refine, train, analyze) picks it up
+        with no code change.
+
+    Falls back to the bare :data:`METH_IDS` if the YAML can't be loaded
+    (e.g. during early imports before the config file is on disk) — this
+    is intentional: the encoding module must be importable in any state.
     """
     try:
         # Lazy import to avoid circular dependency: utils.config imports motifs
@@ -62,15 +72,18 @@ def get_meth_ids() -> dict:
     except Exception:
         return dict(METH_IDS)
 
-    user_types = list(cfg.get("kinetic_signatures", {}).keys())
-    out = {"none": 0}
+    user_types = list(cfg.get("kinetic_signatures") or {})
+    out: dict[str, int] = {"none": 0}
     next_id = 1
-    # Preserve standard IDs when present
-    for std in ("m6A", "m4C", "m5C"):
-        if std in user_types:
-            out[std] = METH_IDS.get(std, next_id)
-            next_id = max(next_id, out[std] + 1)
-    # Assign IDs to any additional user-declared types
+    # Pinned IDs first (so they keep their canonical integer regardless
+    # of where they sit in the YAML).
+    for pinned, pinned_id in METH_IDS.items():
+        if pinned == "none":
+            continue
+        if pinned in user_types:
+            out[pinned] = pinned_id
+            next_id = max(next_id, pinned_id + 1)
+    # Then assign sequential IDs to any additional user-declared types.
     for name in user_types:
         if name in out:
             continue

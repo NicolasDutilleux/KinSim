@@ -304,12 +304,17 @@ def _parse_pacbio_rows(reader: csv.DictReader, filepath: str) -> list[dict]:
             log.warning("%s line %d: invalid centerPos -- skipped", filepath, lineno)
             continue
 
-        # modificationType
+        # modificationType — infer from the base at centerPos when blank.
+        # PacBio motifs.csv uses 1-based centerPos, so the index into
+        # `motif_seq` is ``offset - 1``. Using ``offset`` directly would
+        # land one base upstream of the modified base — a silent bug
+        # that flagged the wrong base type.
         mod_raw = row.get("modificationType", "").strip() if has_mod_type else ""
         norm_mod = _MOD_NORMALIZE.get(mod_raw, "")
         if not norm_mod:
             if mod_raw in ("modified_base", ""):
-                if offset >= len(motif_seq):
+                idx_0b = offset - 1
+                if idx_0b < 0 or idx_0b >= len(motif_seq):
                     log.warning(
                         "%s line %d: centerPos %d OOB for '%s' -- skipped",
                         filepath,
@@ -318,15 +323,16 @@ def _parse_pacbio_rows(reader: csv.DictReader, filepath: str) -> list[dict]:
                         motif_seq,
                     )
                     continue
-                base = motif_seq[offset].upper()
+                base = motif_seq[idx_0b].upper()
                 norm_mod = _base_to_meth.get(base, "")
                 if not norm_mod:
                     log.warning(
-                        "%s line %d: cannot infer mod type from '%s'[%d] -- skipped",
+                        "%s line %d: cannot infer mod type from '%s'[centerPos=%d] = '%s' -- skipped",
                         filepath,
                         lineno,
                         motif_seq,
                         offset,
+                        base,
                     )
                     continue
             else:

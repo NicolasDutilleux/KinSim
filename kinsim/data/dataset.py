@@ -215,9 +215,15 @@ class MLPSignalDataset(Dataset):
         self._meth_ctx = flat["meth_ctx"]
 
         n_total = len(self._kmer_ids)
-        meth_labels = {0: "unmeth", 1: "m6A", 2: "m4C", 3: "m5C"}
+        # Derive id→name from the YAML so adding a new methylation type
+        # only requires editing kinsim_config.yaml; "0" stays "unmeth"
+        # in this log line because the canonical name "none" reads worse.
+        from ..utils.encoding import get_meth_ids
+
+        _name_by_id = {v: k for k, v in get_meth_ids().items()}
+        _name_by_id[0] = "unmeth"
         meth_summary = ", ".join(
-            f"{meth_labels.get(m, str(m))}={flat['meth_counts'][m]:,}"
+            f"{_name_by_id.get(m, str(m))}={flat['meth_counts'][m]:,}"
             for m in sorted(flat["meth_counts"])
             if flat["meth_counts"][m] > 0
         )
