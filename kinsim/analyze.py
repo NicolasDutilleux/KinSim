@@ -828,7 +828,7 @@ def render_txt_report(
                 hdr += f"{lbl:>7s}"
             p(hdr)
 
-            for col_idx, (mid, mn) in enumerate(zip(mids, mnames, strict=False)):
+            for col_idx, (mid, mn) in enumerate(zip(mids, mnames)):
                 row = fractions[:, col_idx]
                 if not np.any(row > 0.0005):
                     continue
@@ -1207,14 +1207,23 @@ def _build_ipd_pw_density_figure(data: dict):
                 z=z,
                 name=f"{name} (n={len(x):,})",
                 showscale=False,
-                opacity=0.6,
-                colorscale=[[0.0, color], [1.0, color]],
+                opacity=1.0,
+                # Lighting gives the opaque surfaces some shape definition
+                # so adjacent peaks are still visually distinguishable.
+                lighting=dict(
+                    ambient=0.55,
+                    diffuse=0.55,
+                    specular=0.4,
+                    roughness=0.7,
+                ),
+                colorscale=[[0.0, _darken_hex(color, 0.4)], [1.0, color]],
                 showlegend=True,
             )
         )
 
     fig.update_layout(
-        title="Joint (IPD, PW) density per bucket  (rotate to compare distributions)",
+        title="Joint (IPD, PW) density per bucket  "
+        "(opaque surfaces — click legend entries to isolate buckets, drag to rotate)",
         scene=dict(
             xaxis_title="IPD (uint8 [0, 255])",
             yaxis_title="PW  (uint8 [0, 255])",

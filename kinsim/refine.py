@@ -260,7 +260,7 @@ def slowed_split_gmm(
     posterior_threshold: float = 0.5,
     baseline_validation_min: float = 0.85,
     min_samples_for_gmm: int = 100,
-    n_components: int | tuple[int, ...] = (2, 3),
+    n_components: int | tuple[int, ...] = (2, 3, 4),
     seed: int = 42,
 ) -> tuple[dict, dict]:
     """Per-meth-type 2D GMM filter on ``CATEGORY_SLOWED`` rows with BIC-based K selection.

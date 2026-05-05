@@ -428,7 +428,7 @@ def plot_kmer_distribution(
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     labels = ["IPD", "PW"]
 
-    for i, (ax, label) in enumerate(zip(axes, labels, strict=False)):
+    for i, (ax, label) in enumerate(zip(axes, labels)):
         col = actual_log[:, i]
         mu_i = mu_log[i]
         sig_i = sigma[i]

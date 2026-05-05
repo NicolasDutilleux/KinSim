@@ -528,7 +528,7 @@ def deduplicate_motifs(entries: list[dict]) -> list[dict]:
                         shorter["offset"],
                     )
 
-        kept = [m for m, r in zip(sorted_m, redundant, strict=False) if not r]
+        kept = [m for m, r in zip(sorted_m, redundant) if not r]
         for m in kept:
             log.info("  [FINAL]    %s %s offset=%d", mod_type, m["motif"], m["offset"])
         n_removed = n - len(kept)

@@ -396,7 +396,7 @@ def generate_report(
                 continue
             w(f"  {label}:")
             for i, (wi, mi, si) in enumerate(
-                zip(res["comp_weights"], res["comp_means"], res["comp_sigmas"], strict=False)
+                zip(res["comp_weights"], res["comp_means"], res["comp_sigmas"])
             ):
                 w(f"    comp {i}: weight={wi:.3f}  μ={mi:.3f}  σ={si:.3f}")
         w("")
@@ -728,7 +728,7 @@ Examples:
     # Load and build stats
     datasets = []
     bimodality_results: list[tuple[str, dict | None]] = []
-    for label, path in zip(labels, paths, strict=False):
+    for label, path in zip(labels, paths):
         if not os.path.isfile(path):
             log.error("File not found: %s", path)
             sys.exit(1)

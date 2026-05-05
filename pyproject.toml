@@ -104,6 +104,7 @@ ignore = [
     "N806",    # variable in function should be lowercase — same reason
     "N812",    # lowercase imported as non-lowercase — `import numpy as np` etc.
     "B008",    # function call in default arg — argparse / config patterns
+    "B905",    # zip(strict=...) — Python 3.10+ only; cluster envs may be older
     "RUF001",  # ambiguous unicode in string — μ, σ, →, — used intentionally
     "RUF002",  # ambiguous unicode in docstring — same reason
     "RUF003",  # ambiguous unicode in comment — same reason
