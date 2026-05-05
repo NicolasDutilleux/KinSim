@@ -76,7 +76,7 @@ def filter_pkl(
         sys.exit(1)
 
     log.info("Loading General Dictionary: %s", input_path)
-    with open(input_file, 'rb') as f:
+    with open(input_file, "rb") as f:
         data = pickle.load(f)
 
     # Separate metadata from data keys
@@ -91,8 +91,9 @@ def filter_pkl(
             if mt in METH_IDS:
                 allowed_meth_ids.add(METH_IDS[mt])
             else:
-                log.warning("Unknown mod type '%s' -- ignored. Valid: %s",
-                            mt, list(METH_IDS.keys()))
+                log.warning(
+                    "Unknown mod type '%s' -- ignored. Valid: %s", mt, list(METH_IDS.keys())
+                )
 
     keys_in = len(data)
     samples_in = sum(len(v) for v in data.values() if isinstance(v, np.ndarray))
@@ -104,7 +105,7 @@ def filter_pkl(
         if not isinstance(key, tuple) or len(key) != 2:
             continue
 
-        kmer_id, meth_id = key
+        _kmer_id, meth_id = key
 
         # Mod type filter
         if allowed_meth_ids is not None and meth_id not in allowed_meth_ids:
@@ -117,25 +118,21 @@ def filter_pkl(
             continue
 
         # Fraction filter: only for methylated keys with a fraction column
-        if min_fraction > 0.0 and meth_id != 0:
-            if value.ndim == 2 and value.shape[1] >= 3:
-                mean_frac = float(np.mean(value[:, 2]))
-                if mean_frac < min_fraction:
-                    fraction_dropped += 1
-                    continue
+        if min_fraction > 0.0 and meth_id != 0 and value.ndim == 2 and value.shape[1] >= 3:
+            mean_frac = float(np.mean(value[:, 2]))
+            if mean_frac < min_fraction:
+                fraction_dropped += 1
+                continue
 
         filtered[key] = value
 
     # Max keys filter (keep the most data-rich)
     if max_keys > 0 and len(filtered) > max_keys:
-        sorted_keys = sorted(filtered.keys(),
-                             key=lambda k: len(filtered[k]),
-                             reverse=True)
+        sorted_keys = sorted(filtered.keys(), key=lambda k: len(filtered[k]), reverse=True)
         filtered = {k: filtered[k] for k in sorted_keys[:max_keys]}
 
     keys_out = len(filtered)
-    samples_out = sum(len(v) for v in filtered.values()
-                      if isinstance(v, np.ndarray))
+    samples_out = sum(len(v) for v in filtered.values() if isinstance(v, np.ndarray))
 
     # Re-attach metadata with filter provenance
     if meta is not None:
@@ -152,7 +149,7 @@ def filter_pkl(
     # Write output
     output_file = Path(output_path)
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_file, 'wb') as f:
+    with open(output_file, "wb") as f:
         pickle.dump(filtered, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     stats = {
@@ -163,10 +160,13 @@ def filter_pkl(
         "fraction_dropped": fraction_dropped,
     }
 
-    log.info("Filtered: %d -> %d keys, %d -> %d samples",
-             keys_in, keys_out, samples_in, samples_out)
+    log.info(
+        "Filtered: %d -> %d keys, %d -> %d samples", keys_in, keys_out, samples_in, samples_out
+    )
     if fraction_dropped:
-        log.info("  Dropped by min_fraction=%.2f: %d methylated keys", min_fraction, fraction_dropped)
+        log.info(
+            "  Dropped by min_fraction=%.2f: %d methylated keys", min_fraction, fraction_dropped
+        )
     log.info("Training Dictionary written to: %s", output_path)
 
     return stats
@@ -196,24 +196,35 @@ def main(argv=None) -> None:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("input",
-                        help="General Dictionary .pkl file")
-    parser.add_argument("output",
-                        help="Output Training Dictionary .pkl file")
-    parser.add_argument("--min-coverage", type=int, default=0,
-                        help="Minimum samples per (kmer, meth) key (default: 0)")
-    parser.add_argument("--min-fraction", type=float, default=0.0,
-                        help="Minimum mean methylation fraction for methylated keys "
-                             "(0.0–1.0, default: 0.0). Keys with meth_id!=0 and mean "
-                             "fraction below this are dropped. Unmethylated keys are unaffected.")
-    parser.add_argument("--mod-type", type=str, default=None,
-                        help="Comma-separated mod types to keep (e.g. m6A,m5C). "
-                             "Default: keep all.")
-    parser.add_argument("--max-keys", type=int, default=0,
-                        help="Maximum number of keys to retain (0 = unlimited). "
-                             "Keeps the most data-rich keys.")
-    parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Enable DEBUG-level logging")
+    parser.add_argument("input", help="General Dictionary .pkl file")
+    parser.add_argument("output", help="Output Training Dictionary .pkl file")
+    parser.add_argument(
+        "--min-coverage",
+        type=int,
+        default=0,
+        help="Minimum samples per (kmer, meth) key (default: 0)",
+    )
+    parser.add_argument(
+        "--min-fraction",
+        type=float,
+        default=0.0,
+        help="Minimum mean methylation fraction for methylated keys "
+        "(0.0–1.0, default: 0.0). Keys with meth_id!=0 and mean "
+        "fraction below this are dropped. Unmethylated keys are unaffected.",
+    )
+    parser.add_argument(
+        "--mod-type",
+        type=str,
+        default=None,
+        help="Comma-separated mod types to keep (e.g. m6A,m5C). Default: keep all.",
+    )
+    parser.add_argument(
+        "--max-keys",
+        type=int,
+        default=0,
+        help="Maximum number of keys to retain (0 = unlimited). Keeps the most data-rich keys.",
+    )
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG-level logging")
 
     args = parser.parse_args(argv)
     setup_logging(verbose=args.verbose)
@@ -232,17 +243,20 @@ def main(argv=None) -> None:
     )
 
     # Summary to stdout
-    pct_keys = (stats["keys_out"] / stats["keys_in"] * 100
-                if stats["keys_in"] > 0 else 0)
-    pct_samples = (stats["samples_out"] / stats["samples_in"] * 100
-                   if stats["samples_in"] > 0 else 0)
-    print(f"Keys:    {stats['keys_in']:>10,} -> {stats['keys_out']:>10,}  "
-          f"({pct_keys:.1f}% retained)")
+    pct_keys = stats["keys_out"] / stats["keys_in"] * 100 if stats["keys_in"] > 0 else 0
+    pct_samples = stats["samples_out"] / stats["samples_in"] * 100 if stats["samples_in"] > 0 else 0
+    print(
+        f"Keys:    {stats['keys_in']:>10,} -> {stats['keys_out']:>10,}  ({pct_keys:.1f}% retained)"
+    )
     if stats.get("fraction_dropped"):
-        print(f"  Dropped by --min-fraction {args.min_fraction}: "
-              f"{stats['fraction_dropped']:,} methylated keys")
-    print(f"Samples: {stats['samples_in']:>10,} -> {stats['samples_out']:>10,}  "
-          f"({pct_samples:.1f}% retained)")
+        print(
+            f"  Dropped by --min-fraction {args.min_fraction}: "
+            f"{stats['fraction_dropped']:,} methylated keys"
+        )
+    print(
+        f"Samples: {stats['samples_in']:>10,} -> {stats['samples_out']:>10,}  "
+        f"({pct_samples:.1f}% retained)"
+    )
     print(f"Output:  {args.output}")
 
 

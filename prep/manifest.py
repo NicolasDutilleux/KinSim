@@ -23,7 +23,8 @@ import sys
 
 def main(argv=None) -> None:
     import argparse
-    from kinsim.utils.config import load_manifest, validate_manifest, setup_logging
+
+    from kinsim.utils.config import load_manifest, setup_logging, validate_manifest
 
     parser = argparse.ArgumentParser(
         prog="kinsim-prep manifest",
@@ -31,15 +32,14 @@ def main(argv=None) -> None:
             "Inspect and validate a KinSim manifest CSV.\n\n"
             "Manifest format:\n"
             "  sample_id,bam_path,motifs\n"
-            "  strain1,/data/bams/s1.bam,\"m6A,GATC,1\"\n"
+            '  strain1,/data/bams/s1.bam,"m6A,GATC,1"\n'
             "  strain2,/data/bams/s2.bam,/data/motifs/s2.csv\n\n"
             "Comment rows (# ...) and blank rows are skipped, matching the\n"
             "exact row indices used by 'kinsim extract --task N'."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Enable DEBUG-level logging")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG-level logging")
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
     # -- count --
@@ -69,9 +69,10 @@ def main(argv=None) -> None:
     )
     p_validate.add_argument("manifest", help="Path to the manifest CSV file")
     p_validate.add_argument(
-        "--no-check-files", action="store_true",
+        "--no-check-files",
+        action="store_true",
         help="Skip file-existence checks (validate structure only; "
-             "useful when BAMs are on a remote cluster)"
+        "useful when BAMs are on a remote cluster)",
     )
 
     # -- list --
@@ -81,8 +82,9 @@ def main(argv=None) -> None:
     )
     p_list.add_argument("manifest", help="Path to the manifest CSV file")
     p_list.add_argument(
-        "--no-truncate", action="store_true",
-        help="Print full paths (default: truncate long paths to 50 characters)"
+        "--no-truncate",
+        action="store_true",
+        help="Print full paths (default: truncate long paths to 50 characters)",
     )
 
     args = parser.parse_args(argv)
@@ -129,16 +131,16 @@ def main(argv=None) -> None:
 
         def _fmt(s: str, width: int) -> str:
             if not args.no_truncate and len(s) > width:
-                return "..." + s[-(width - 3):]
+                return "..." + s[-(width - 3) :]
             return s
 
         # Header
-        id_w   = max(len(e.sample_id) for e in entries)
-        bam_w  = min(max_path, max(len(e.bam_path) for e in entries))
-        mot_w  = min(max_path, max(len(e.motifs) for e in entries))
-        id_w   = max(id_w, 9)    # at least "sample_id"
-        bam_w  = max(bam_w, 8)   # at least "bam_path"
-        mot_w  = max(mot_w, 6)   # at least "motifs"
+        id_w = max(len(e.sample_id) for e in entries)
+        bam_w = min(max_path, max(len(e.bam_path) for e in entries))
+        mot_w = min(max_path, max(len(e.motifs) for e in entries))
+        id_w = max(id_w, 9)  # at least "sample_id"
+        bam_w = max(bam_w, 8)  # at least "bam_path"
+        mot_w = max(mot_w, 6)  # at least "motifs"
 
         header = f"{'#':>4}  {'sample_id':<{id_w}}  {'bam_path':<{bam_w}}  {'motifs':<{mot_w}}"
         print(header)

@@ -42,6 +42,7 @@ from .utils.encoding import METH_IDS, decode_kmer
 
 try:
     from sklearn.mixture import GaussianMixture
+
     _HAS_SKLEARN = True
 except ImportError:
     _HAS_SKLEARN = False
@@ -58,6 +59,7 @@ def _meth_name(meth_id: int) -> str:
 # ---------------------------------------------------------------------------
 # Per-kmer stats extraction
 # ---------------------------------------------------------------------------
+
 
 def _build_kmer_dict(data: dict) -> dict:
     """Build per-kmer stats from a .pkl data dict.
@@ -106,6 +108,7 @@ def load_pkl(path: str) -> dict:
 # IPD ratio computation
 # ---------------------------------------------------------------------------
 
+
 def compute_ipd_ratios(stats: dict, meth_id: int, min_samples: int = 10):
     """Compute per-kmer IPD ratio: meth_mean / unmeth_mean.
 
@@ -138,6 +141,7 @@ def compute_ipd_ratios(stats: dict, meth_id: int, min_samples: int = 10):
 # ---------------------------------------------------------------------------
 # Bimodality check on the unmeth class
 # ---------------------------------------------------------------------------
+
 
 def _pool_unmeth_signals(
     data: dict,
@@ -183,8 +187,10 @@ def check_unmeth_bimodality(
     or there are no unmeth samples.
     """
     if not _HAS_SKLEARN:
-        log.warning("sklearn not installed — skipping bimodality check. "
-                    "Install with: pip install scikit-learn")
+        log.warning(
+            "sklearn not installed — skipping bimodality check. "
+            "Install with: pip install scikit-learn"
+        )
         return None
 
     x = _pool_unmeth_signals(data, max_samples=max_samples)
@@ -193,25 +199,26 @@ def check_unmeth_bimodality(
     x_col = x.reshape(-1, 1)
 
     gmm1 = GaussianMixture(n_components=1, random_state=42).fit(x_col)
-    gmm2 = GaussianMixture(n_components=2, random_state=42,
-                           covariance_type="full", n_init=3).fit(x_col)
+    gmm2 = GaussianMixture(n_components=2, random_state=42, covariance_type="full", n_init=3).fit(
+        x_col
+    )
 
     # Sort components by mean so the report is deterministic.
-    means   = gmm2.means_.ravel()
-    sigmas  = np.sqrt(gmm2.covariances_.ravel())
+    means = gmm2.means_.ravel()
+    sigmas = np.sqrt(gmm2.covariances_.ravel())
     weights = gmm2.weights_.ravel()
-    order   = np.argsort(means)
+    order = np.argsort(means)
 
     return {
-        "n_samples":    int(len(x)),
-        "mean":         float(x.mean()),
-        "std":          float(x.std()),
-        "bic_1":        float(gmm1.bic(x_col)),
-        "bic_2":        float(gmm2.bic(x_col)),
-        "delta_bic":    float(gmm1.bic(x_col) - gmm2.bic(x_col)),
+        "n_samples": len(x),
+        "mean": float(x.mean()),
+        "std": float(x.std()),
+        "bic_1": float(gmm1.bic(x_col)),
+        "bic_2": float(gmm2.bic(x_col)),
+        "delta_bic": float(gmm1.bic(x_col) - gmm2.bic(x_col)),
         "comp_weights": weights[order].tolist(),
-        "comp_means":   means[order].tolist(),
-        "comp_sigmas":  sigmas[order].tolist(),
+        "comp_means": means[order].tolist(),
+        "comp_sigmas": sigmas[order].tolist(),
     }
 
 
@@ -231,6 +238,7 @@ def _bimodality_verdict(delta_bic: float) -> str:
 # ---------------------------------------------------------------------------
 # Text report
 # ---------------------------------------------------------------------------
+
 
 def generate_report(
     datasets: list[tuple[str, dict]],
@@ -271,9 +279,7 @@ def generate_report(
         w("")
 
     # --- Per-meth-type stats ---
-    all_meth_ids = sorted(set(
-        mid for _, stats in datasets for _, mid in stats.keys()
-    ))
+    all_meth_ids = sorted(set(mid for _, stats in datasets for _, mid in stats.keys()))
 
     w("=== Per-Type Signal Statistics ===")
     w("")
@@ -285,7 +291,7 @@ def generate_report(
 
     for mid in all_meth_ids:
         row = f"{_meth_name(mid):<10}"
-        for label, stats in datasets:
+        for _label, stats in datasets:
             ipd_vals = [s["ipd_mean"] for (k, m), s in stats.items() if m == mid]
             pw_vals = [s["pw_mean"] for (k, m), s in stats.items() if m == mid]
             if ipd_vals:
@@ -312,9 +318,11 @@ def generate_report(
             if len(ratios) == 0:
                 w(f"  {label:<20} {'n/a':>8}")
                 continue
-            w(f"  {label:<20} {len(ratios):>8d} {np.median(ratios):>8.3f} {np.mean(ratios):>8.3f}"
-              f" {np.percentile(ratios, 10):>8.3f} {np.percentile(ratios, 25):>8.3f}"
-              f" {np.percentile(ratios, 75):>8.3f} {np.percentile(ratios, 90):>8.3f}")
+            w(
+                f"  {label:<20} {len(ratios):>8d} {np.median(ratios):>8.3f} {np.mean(ratios):>8.3f}"
+                f" {np.percentile(ratios, 10):>8.3f} {np.percentile(ratios, 25):>8.3f}"
+                f" {np.percentile(ratios, 75):>8.3f} {np.percentile(ratios, 90):>8.3f}"
+            )
         w("")
 
     # --- PW deltas ---
@@ -332,8 +340,10 @@ def generate_report(
             if len(pw_deltas) == 0:
                 w(f"  {label:<20} {'n/a':>8}")
                 continue
-            w(f"  {label:<20} {len(pw_deltas):>8d} {np.median(pw_deltas):>8.3f}"
-              f" {np.mean(pw_deltas):>8.3f} {np.std(pw_deltas):>8.3f}")
+            w(
+                f"  {label:<20} {len(pw_deltas):>8d} {np.median(pw_deltas):>8.3f}"
+                f" {np.mean(pw_deltas):>8.3f} {np.std(pw_deltas):>8.3f}"
+            )
         w("")
 
     # --- Kmer overlap ---
@@ -365,26 +375,29 @@ def generate_report(
         w("  A large ΔBIC on the unmeth class suggests hidden distributions,")
         w("  typically unlabelled modifications leaking into unmeth.")
         w("")
-        header_b = (f"  {'Dataset':<16} {'N':>10} {'mean':>7} {'std':>7} "
-                    f"{'ΔBIC':>10}  {'verdict':<46}")
+        header_b = (
+            f"  {'Dataset':<16} {'N':>10} {'mean':>7} {'std':>7} {'ΔBIC':>10}  {'verdict':<46}"
+        )
         w(header_b)
         w("-" * len(header_b))
         for label, res in bimodality:
             if res is None:
                 w(f"  {label:<16} {'n/a':>10}  (no unmeth data or sklearn missing)")
                 continue
-            w(f"  {label:<16} {res['n_samples']:>10,} {res['mean']:>7.3f} "
-              f"{res['std']:>7.3f} {res['delta_bic']:>10.1f}  "
-              f"{_bimodality_verdict(res['delta_bic']):<46}")
+            w(
+                f"  {label:<16} {res['n_samples']:>10,} {res['mean']:>7.3f} "
+                f"{res['std']:>7.3f} {res['delta_bic']:>10.1f}  "
+                f"{_bimodality_verdict(res['delta_bic']):<46}"
+            )
         w("")
         w("  2-component fit details:")
         for label, res in bimodality:
             if res is None:
                 continue
             w(f"  {label}:")
-            for i, (wi, mi, si) in enumerate(zip(
-                res["comp_weights"], res["comp_means"], res["comp_sigmas"]
-            )):
+            for i, (wi, mi, si) in enumerate(
+                zip(res["comp_weights"], res["comp_means"], res["comp_sigmas"], strict=False)
+            ):
                 w(f"    comp {i}: weight={wi:.3f}  μ={mi:.3f}  σ={si:.3f}")
         w("")
 
@@ -394,6 +407,7 @@ def generate_report(
 # ---------------------------------------------------------------------------
 # CSV export
 # ---------------------------------------------------------------------------
+
 
 def export_kmer_csv(datasets: list[tuple[str, dict]], output_path: str) -> None:
     """Export full per-kmer stats table for all datasets."""
@@ -410,10 +424,15 @@ def export_kmer_csv(datasets: list[tuple[str, dict]], output_path: str) -> None:
 
         header = ["kmer_seq", "kmer_id", "meth_type", "meth_id"]
         for label in labels:
-            header.extend([
-                f"{label}_n", f"{label}_ipd_mean", f"{label}_ipd_std",
-                f"{label}_pw_mean", f"{label}_pw_std",
-            ])
+            header.extend(
+                [
+                    f"{label}_n",
+                    f"{label}_ipd_mean",
+                    f"{label}_ipd_std",
+                    f"{label}_pw_mean",
+                    f"{label}_pw_std",
+                ]
+            )
         writer.writerow(header)
 
         for kmer_id, meth_id in all_keys:
@@ -426,8 +445,15 @@ def export_kmer_csv(datasets: list[tuple[str, dict]], output_path: str) -> None:
             for _, stats in datasets:
                 s = stats.get((kmer_id, meth_id))
                 if s:
-                    row.extend([s["n"], f"{s['ipd_mean']:.2f}", f"{s['ipd_std']:.2f}",
-                                f"{s['pw_mean']:.2f}", f"{s['pw_std']:.2f}"])
+                    row.extend(
+                        [
+                            s["n"],
+                            f"{s['ipd_mean']:.2f}",
+                            f"{s['ipd_std']:.2f}",
+                            f"{s['pw_mean']:.2f}",
+                            f"{s['pw_std']:.2f}",
+                        ]
+                    )
                 else:
                     row.extend(["", "", "", "", ""])
             writer.writerow(row)
@@ -439,21 +465,19 @@ def export_kmer_csv(datasets: list[tuple[str, dict]], output_path: str) -> None:
 # HTML report with Plotly
 # ---------------------------------------------------------------------------
 
+
 def generate_html(datasets: list[tuple[str, dict]], output_path: str) -> None:
     """Generate interactive HTML comparison plots."""
     try:
         import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
     except ImportError:
         log.warning("plotly not installed — skipping HTML report")
         return
 
-    all_meth_ids = sorted(set(
-        mid for _, stats in datasets for _, mid in stats.keys()
-    ))
+    all_meth_ids = sorted(set(mid for _, stats in datasets for _, mid in stats.keys()))
     meth_types_no_unmeth = [m for m in all_meth_ids if m != 0]
 
-    colors = ['#636EFA', '#EF553B', '#00CC96', '#AB63FA', '#FFA15A', '#19D3F3']
+    colors = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#19D3F3"]
 
     figs = []
 
@@ -464,18 +488,22 @@ def generate_html(datasets: list[tuple[str, dict]], output_path: str) -> None:
             _, ratios, _ = compute_ipd_ratios(stats, mid)
             if len(ratios) == 0:
                 continue
-            fig.add_trace(go.Histogram(
-                x=ratios, name=label,
-                opacity=0.6,
-                nbinsx=100,
-                marker_color=colors[i % len(colors)],
-            ))
+            fig.add_trace(
+                go.Histogram(
+                    x=ratios,
+                    name=label,
+                    opacity=0.6,
+                    nbinsx=100,
+                    marker_color=colors[i % len(colors)],
+                )
+            )
         fig.update_layout(
             title=f"IPD Ratio Distribution — {_meth_name(mid)}",
             xaxis_title="IPD ratio (meth / unmeth)",
             yaxis_title="Count (kmers)",
             barmode="overlay",
-            width=900, height=500,
+            width=900,
+            height=500,
         )
         figs.append(fig)
 
@@ -485,9 +513,7 @@ def generate_html(datasets: list[tuple[str, dict]], output_path: str) -> None:
             label_a, stats_a = datasets[0]
             label_b, stats_b = datasets[1]
 
-            common_kmers = set(
-                kid for kid, m in stats_a.keys() if m == mid
-            ) & set(
+            common_kmers = set(kid for kid, m in stats_a.keys() if m == mid) & set(
                 kid for kid, m in stats_b.keys() if m == mid
             )
 
@@ -504,23 +530,32 @@ def generate_html(datasets: list[tuple[str, dict]], output_path: str) -> None:
             y = [stats_b[(k, mid)]["ipd_mean"] for k in common]
 
             fig = go.Figure()
-            fig.add_trace(go.Scattergl(
-                x=x, y=y, mode="markers",
-                marker=dict(size=2, opacity=0.3),
-                name=f"{_meth_name(mid)} ({len(common):,} kmers)",
-            ))
+            fig.add_trace(
+                go.Scattergl(
+                    x=x,
+                    y=y,
+                    mode="markers",
+                    marker=dict(size=2, opacity=0.3),
+                    name=f"{_meth_name(mid)} ({len(common):,} kmers)",
+                )
+            )
             # Add y=x line
             mx = max(max(x), max(y))
-            fig.add_trace(go.Scatter(
-                x=[0, mx], y=[0, mx], mode="lines",
-                line=dict(dash="dash", color="gray"),
-                showlegend=False,
-            ))
+            fig.add_trace(
+                go.Scatter(
+                    x=[0, mx],
+                    y=[0, mx],
+                    mode="lines",
+                    line=dict(dash="dash", color="gray"),
+                    showlegend=False,
+                )
+            )
             fig.update_layout(
                 title=f"IPD Mean: {label_a} vs {label_b} — {_meth_name(mid)}",
                 xaxis_title=f"{label_a} IPD mean",
                 yaxis_title=f"{label_b} IPD mean",
-                width=700, height=700,
+                width=700,
+                height=700,
             )
             figs.append(fig)
 
@@ -530,9 +565,7 @@ def generate_html(datasets: list[tuple[str, dict]], output_path: str) -> None:
             label_a, stats_a = datasets[0]
             label_b, stats_b = datasets[1]
 
-            common_kmers = set(
-                kid for kid, m in stats_a.keys() if m == mid
-            ) & set(
+            common_kmers = set(kid for kid, m in stats_a.keys() if m == mid) & set(
                 kid for kid, m in stats_b.keys() if m == mid
             )
 
@@ -548,22 +581,31 @@ def generate_html(datasets: list[tuple[str, dict]], output_path: str) -> None:
             y = [stats_b[(k, mid)]["pw_mean"] for k in common]
 
             fig = go.Figure()
-            fig.add_trace(go.Scattergl(
-                x=x, y=y, mode="markers",
-                marker=dict(size=2, opacity=0.3),
-                name=f"{_meth_name(mid)} ({len(common):,} kmers)",
-            ))
+            fig.add_trace(
+                go.Scattergl(
+                    x=x,
+                    y=y,
+                    mode="markers",
+                    marker=dict(size=2, opacity=0.3),
+                    name=f"{_meth_name(mid)} ({len(common):,} kmers)",
+                )
+            )
             mx = max(max(x), max(y))
-            fig.add_trace(go.Scatter(
-                x=[0, mx], y=[0, mx], mode="lines",
-                line=dict(dash="dash", color="gray"),
-                showlegend=False,
-            ))
+            fig.add_trace(
+                go.Scatter(
+                    x=[0, mx],
+                    y=[0, mx],
+                    mode="lines",
+                    line=dict(dash="dash", color="gray"),
+                    showlegend=False,
+                )
+            )
             fig.update_layout(
                 title=f"PW Mean: {label_a} vs {label_b} — {_meth_name(mid)}",
                 xaxis_title=f"{label_a} PW mean",
                 yaxis_title=f"{label_b} PW mean",
-                width=700, height=700,
+                width=700,
+                height=700,
             )
             figs.append(fig)
 
@@ -598,6 +640,7 @@ def generate_html(datasets: list[tuple[str, dict]], output_path: str) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
         prog="kinsim compare",
@@ -611,40 +654,52 @@ Examples:
 """,
     )
     parser.add_argument(
-        "pkl_files", nargs="+",
+        "pkl_files",
+        nargs="+",
         help="Input .pkl files to compare (2+ recommended).",
     )
     parser.add_argument(
-        "--label", action="append", dest="labels", default=[],
+        "--label",
+        action="append",
+        dest="labels",
+        default=[],
         help="Label for the NEXT .pkl file. Use before each .pkl path. "
-             "If omitted, filenames are used as labels.",
+        "If omitted, filenames are used as labels.",
     )
     parser.add_argument(
-        "--output-dir", "-o", default=".",
+        "--output-dir",
+        "-o",
+        default=".",
         help="Directory for output files (default: cwd).",
     )
     parser.add_argument(
-        "--min-samples", type=int, default=10,
+        "--min-samples",
+        type=int,
+        default=10,
         help="Minimum samples per kmer for ratio computation (default: 10).",
     )
     parser.add_argument(
-        "--no-html", action="store_true",
+        "--no-html",
+        action="store_true",
         help="Skip HTML report (text + CSV only).",
     )
     parser.add_argument(
-        "--no-csv", action="store_true",
+        "--no-csv",
+        action="store_true",
         help="Skip CSV kmer dictionary export.",
     )
     parser.add_argument(
-        "--bimodality", action="store_true",
+        "--bimodality",
+        action="store_true",
         help="Fit 1- and 2-component GMMs to the unmeth IPD distribution of "
-             "each dataset, to detect hidden sub-populations (e.g. an unlabelled "
-             "modification contaminating the unmeth class).",
+        "each dataset, to detect hidden sub-populations (e.g. an unlabelled "
+        "modification contaminating the unmeth class).",
     )
     parser.add_argument(
-        "--bimodality-max-samples", type=int, default=500_000,
-        help="Max unmeth samples pooled per dataset for the GMM fit "
-             "(default: 500,000).",
+        "--bimodality-max-samples",
+        type=int,
+        default=500_000,
+        help="Max unmeth samples pooled per dataset for the GMM fit (default: 500,000).",
     )
 
     args = parser.parse_args(argv)
@@ -667,13 +722,13 @@ Examples:
         # Shorten common prefixes
         for prefix in ("master_", "shards_", "training_"):
             if name.startswith(prefix):
-                name = name[len(prefix):]
+                name = name[len(prefix) :]
         labels.append(name)
 
     # Load and build stats
     datasets = []
     bimodality_results: list[tuple[str, dict | None]] = []
-    for label, path in zip(labels, paths):
+    for label, path in zip(labels, paths, strict=False):
         if not os.path.isfile(path):
             log.error("File not found: %s", path)
             sys.exit(1)
@@ -683,8 +738,7 @@ Examples:
         if args.bimodality:
             log.info("Fitting GMM on unmeth IPD for %s ...", label)
             bimodality_results.append(
-                (label, check_unmeth_bimodality(
-                    data, max_samples=args.bimodality_max_samples))
+                (label, check_unmeth_bimodality(data, max_samples=args.bimodality_max_samples))
             )
         del data  # free memory
 
@@ -693,7 +747,8 @@ Examples:
 
     # Text report
     report = generate_report(
-        datasets, str(out_dir),
+        datasets,
+        str(out_dir),
         bimodality=bimodality_results if args.bimodality else None,
     )
     print(report)

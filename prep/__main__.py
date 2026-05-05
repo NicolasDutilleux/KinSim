@@ -44,6 +44,7 @@ def _suggest(word, candidates, n=1, cutoff=0.6):
 
 def main(argv=None):
     from kinsim.utils.config import setup_logging
+
     args = argv if argv is not None else sys.argv[1:]
 
     setup_logging(verbose=False)
@@ -60,32 +61,39 @@ def main(argv=None):
 
     if cmd == "parse":
         from kinsim.utils.motifs import main as run
+
         run(rest)
 
     elif cmd == "rebase":
         from .rebase import main as run
+
         run(rest)
 
     elif cmd == "merge-motifs":
         from .motif_merge import main as run
+
         run(rest)
 
     elif cmd == "manifest":
         from .manifest import main as run
+
         run(rest)
 
     elif cmd == "filter":
         from .filter import main as run
+
         run(rest)
 
     elif cmd == "balance":
         from .balance import main as run
+
         run(rest)
 
     elif cmd == "refine":
         print("ERROR: 'refine' has moved to the main CLI.", file=sys.stderr)
-        print("  Use:  kinsim refine <input.pkl> <output.pkl> [--report report.tsv]",
-              file=sys.stderr)
+        print(
+            "  Use:  kinsim refine <input.pkl> <output.pkl> [--report report.tsv]", file=sys.stderr
+        )
         sys.exit(2)
 
     else:

@@ -23,20 +23,20 @@ For project-level overview see the [top-level README](../README.md).
 
 | Stage | Module | What it does |
 |---|---|---|
-| `extract` | `extract.py` | Parse a BAM read by read, scan for motifs in the read sequence, record `(IPD, PW)` per `(11-mer, methylation)` bucket |
-| `merge` | `extract.py:merge_shards` | Concatenate per-sample shards into one master `.pkl` |
-| `refine` | `refine.py` | Joint-GMM on combined `(None + Meth)` populations per signature offset; drops contamination |
-| `train` | `train.py` | Gaussian-NLL training of `ConvPredictor` or `MLPPredictor` |
-| `generate` | `generate.py` | For each input read, predict `(IPD, PW)` per position; write a synthetic BAM |
-| `evaluate` | `evaluate.py` | Per-key calibration plots, μ/σ residuals |
-| `verify-generate` | `verify_generate.py` | Per-`(kmer, meth)` distribution comparison: real vs generated BAM |
-| `analyze` | `analyze.py` | Stats on a `.pkl`: coverage, signal distributions, signature profiles, neighbor sensitivity |
+| `extract` | [extract.py](extract.py) | Parse a BAM read by read, scan for motifs, emit `(IPD, PW, profile, mc, rev_meth, CATEGORY)` rows per kmer |
+| `merge` | [extract.py](extract.py) (`merge_shards`) | Concatenate per-sample shards into one master `.pkl` |
+| `refine` | [refine.py](refine.py) | Drop CATEGORY_SLOWED rows whose IPD falls below the per-kmer-baseline-mean p95 (motif false positives) |
+| `train` | [train.py](train.py) | Gaussian-NLL training of `ConvPredictor` (default) or `MLPPredictor` |
+| `generate` | [generate.py](generate.py) | For each input read, predict `(IPD, PW)` per position; write a synthetic BAM |
+| `evaluate` | [evaluate.py](evaluate.py) | Per-key calibration plots, μ / σ residuals |
+| `verify-generate` | [verify_generate.py](verify_generate.py) | Per-(kmer, meth) distribution comparison: real vs generated BAM |
+| `analyze` | [analyze.py](analyze.py) | Stats on a `.pkl`: coverage, signal distributions, signature profiles |
 
 ---
 
-## Architecture (v3)
+## Architecture
 
-KinSim v3 uses three asymmetric design choices:
+KinSim uses three asymmetric design choices:
 
 ### 1. Asymmetric kmer / methylation window — `[−7, +3]`
 
@@ -47,43 +47,51 @@ context (modifications whose downstream effect reaches Y).
 
 Inspired by Feng *et al.* 2013 (`kineticsTools`/`ipdSummary`, `[−7, +2]`
 for unmodified DNA), extended to 11 positions to fit a single packed-integer
-11-mer encoding. Prediction position sits at index 7 of the kmer.
+11-mer encoding. The prediction position sits at index 7 of the kmer.
 
 ### 2. Kinetic profile storage — `[0, +8]`
 
 Every sample stores not just the `(IPD, PW)` at the prediction position
-but also the **profile** (IPD and PW at offsets 0 to +8). This enables
-refine to validate methylation events by checking whether the kinetic
-signature is actually present at the configured offsets.
+but also the **profile** (IPD and PW at offsets 0 to +8). The downstream
+profile is what makes the methylation signature visible — analyse uses
+it to confirm a motif's real biological effect.
 
-### 3. Joint-GMM refine per signature offset
+### 3. Three-category single-pass extract + p95 refine
 
-For each `(kmer, meth_id)` bucket, refine fits one **joint Gaussian
-Mixture Model** per signature offset on the combined `(None + Meth)`
-sample population:
+`extract` emits one of three category labels per sample (col 35 of the
+36-col layout):
 
-- **m6A** — fits a GMM on IPD@+0, another on IPD@+5; intersection of "real meth" assignments kept
-- **m4C** — single GMM on IPD@+0
-- **m5C** — GMMs on IPD@+2 and IPD@+6
+| Category | Code | Meaning |
+|---|---|---|
+| `BASELINE` | 0 | Far from any methylation; meth-context window is empty |
+| `SLOWED` | 1 | At a signature offset of a methylation (or the methylation itself when `0 ∈ signature_offsets[T]`) |
+| `NEAR_METH` | 2 | Close to a methylation but NOT at a signature offset — negative control |
 
-A sample is kept only if it falls in the **highest-IPD cluster** at
-*every* signature offset. Methylation only **slows** the polymerase
-(IPD goes up, never down) — so contamination always sits at lower IPD
-than real meth.
+`refine` then runs a single pass — `slowed_split` — that pools every
+`BASELINE` sample's IPD per kmer, computes the per-kmer mean, and uses
+the `secondary_percentile`-th percentile (default p95) of the per-kmer
+mean distribution as the lower threshold for `SLOWED`. Slowed samples
+below the threshold are motif false positives (the polymerase did not
+actually slow). `BASELINE` and `NEAR_METH` pass through unchanged.
 
-Older `--method em`, `--method clustered`, and `--method mahalanobis`
-remain available as fallbacks.
+Per-kmer mean (rather than per-sample) avoids the natural per-sample
+Poisson tail that PacBio polymerase pauses produce on unmodified DNA;
+under CLT the per-kmer mean is much tighter, so the p95 reflects truly
+anomalous kmers and weak signals (m4C, m5C) survive.
 
-### Storage layout (`.pkl`, 35 columns)
+### Storage layout (`.pkl`, 38 columns)
 
 | Cols | Contents |
 |---|---|
 | 0–1 | `IPD`, `PW` at the prediction position (uint8 [0, 255]) |
 | 2 | stoichiometric `fraction` (soft label from upstream caller) |
-| 3–13 | `mc_0..mc_10` — methylation context across 11 positions `[−7, +3]` |
+| 3–13 | `mc_0..mc_10` — meth_id at offsets `[−7, +3]` from prediction position |
 | 14–22 | `profile_IPD_0..+8` — IPD profile at downstream offsets |
 | 23–31 | `profile_PW_0..+8` — PW profile |
-| 32–34 | `rev_meth_−1, 0, +1` — complementary-strand methylation (active-site footprint) |
+| 32–34 | `rev_meth_−1, 0, +1` — complementary-strand methylation |
+| 35 | `CATEGORY` — 0=baseline, 1=slowed, 2=near_meth |
+| 36 | `PARENT_METH` — meth_id of the parent meth (0 for baseline) |
+| 37 | `PARENT_OFFSET` — offset (row pos − parent meth pos), in `[0, 7]` |
 
 `kmer_id` is a 22-bit integer encoding 11 bases (A=0, C=1, G=2, T=3).
 `meth_id ∈ {0=none, 1=m6A, 2=m4C, 3=m5C}`.
@@ -94,22 +102,19 @@ remain available as fallbacks.
 
 | Model | Params | Strategy |
 |---|---|---|
-| **ConvPredictor** (default) | ~140K | Per-base + positional embeddings, **global FiLM** methylation conditioning, Conv1D backbone, dual readout (center + global pool) |
+| **ConvPredictor** (default) | ~140K | Per-base + positional embeddings, **global FiLM** methylation conditioning, Conv1D backbone, dual readout (centre + global pool) |
 | **MLPPredictor** (legacy) | ~268M | Flat 4M-row k-mer embedding table + 2-layer MLP |
 
 ConvPredictor uses **global FiLM** (Feature-wise Linear Modulation):
 
 ```
-meth_full (B, N, M)  ──flatten──►  Linear(N·M → 32)
+meth_full (B, K, M)  ──flatten──►  Linear(K·M → 32)
                                           │
                                           ▼
                                     (γ, β) broadcast over kmer positions
                                           │
 base_embed + pos_embed  ─────► (1 + γ) ⊙ x + β  ─►  Conv1D backbone  ─►  (μ, log σ)
 ```
-
-The global embedding decouples methylation context length from kmer length —
-useful when extending the meth context to include complementary-strand info.
 
 Loss: Gaussian NLL in log1p space.
 
@@ -127,7 +132,7 @@ At inference, `inv_log_transform = expm1` returns the value to the raw
 ### `kinsim extract`
 
 ```bash
-# Manifest mode (SLURM array)
+# Manifest mode (recommended for SLURM array jobs)
 kinsim extract --manifest manifest.csv --task ${SLURM_ARRAY_TASK_ID} --output-dir shards/
 
 # Single-BAM mode
@@ -142,46 +147,39 @@ Supported BAM formats:
 | Bystrandified | `ip/pw` (×2 reads) | ✅ Each strand = own read |
 | Aligned (post-pbmm2) | `ip/pw` only | ❌ `ri/rp` dropped — half the data |
 
-The tag pair is auto-detected (`validate_bam_kinetics`). **Aligned BAMs
+Tag pair auto-detected (`validate_bam_kinetics`). **Aligned BAMs
 are not supported** — pass an unaligned (raw or bystrandified) BAM.
 
-Useful flags:
+### `kinsim merge`
 
-- `--max-reads N` — smoke-test mode (early stop, biased)
-- `--max-samples N` — reservoir cap per `(kmer, meth)` key (default 10000)
-- `--no-binarize` — keep raw fractions instead of forcing 0/1
+```bash
+kinsim merge shards/ master.pkl
+```
+
+Concatenates per-sample shards into one master `.pkl`.
 
 ### `kinsim refine`
 
 ```bash
-kinsim refine in.pkl out.pkl --report report.tsv [--method gmm_signature|mahalanobis|em] [-v]
+kinsim refine master.pkl master_clean.pkl [--secondary-percentile 95] [-v]
 ```
 
-Default `--method gmm_signature`. Reads signature offsets from
-`kinsim_config.yaml`. Status codes in the report TSV:
-
-| Status | Meaning |
-|---|---|
-| `gmm_2_2_real_kept` | K=2 at both offsets, samples in real-meth cluster kept |
-| `gmm_3_2_real_kept` | K=3 at first offset, K=2 at second |
-| `gmm_all1_kept` | All offsets resulted in K=1 (no separation possible — kept) |
-| `skip_gmm_no_valid` | No real-meth cluster found → bucket rejected |
-| `lowN_mahal_kept` | Too few samples for GMM, Mahalanobis fallback kept some |
-| `no_none_pair` | No `(kmer, none)` baseline available — bucket skipped |
+Single pass: drops `SLOWED` samples whose IPD falls below the
+`secondary_percentile`-th percentile of the per-kmer baseline mean
+distribution (default 95, configurable in `kinsim_config.yaml`).
+`BASELINE` and `NEAR_METH` pass through unchanged.
 
 ### `kinsim train`
 
 ```bash
-kinsim train master_clean.pkl checkpoints/ \
-    [--architecture conv|mlp] [--config training.yaml]
+kinsim train master_clean.pkl checkpoints/ [--architecture conv|mlp] [--config training.yaml]
 ```
 
 Saves `model_config.json` + per-epoch checkpoints + `metrics.csv` +
 TensorBoard logs. Resumable.
 
-Training config YAML (optional):
-
 ```yaml
+# training.yaml (optional)
 architecture: conv          # or 'mlp'
 batch_size: 4096
 epochs: 50
@@ -207,16 +205,15 @@ kinsim generate <input.bam> <ref.fna> <checkpoint.pt> <motifs> <output.bam>
 kinsim generate <fq.gz> <maf.gz> <ref.fna> <ckpt.pt> <motifs> <out.bam>
 ```
 
-`--deterministic` writes μ directly. Default is stochastic sampling from
-`N(μ, Σ)`.
+`--deterministic` writes μ directly; default is stochastic sampling
+from `N(μ, Σ)`.
 
 For each input read, `generate.py` calls the model twice:
 
 1. Forward kmers → produces `fi:B:C` / `fp:B:C` tags
 2. Reverse-complement kmers → produces `ri:B:C` / `rp:B:C` tags
 
-This produces a single-read-per-molecule BAM (raw HiFi format), ready
-to be re-bystrandified for downstream tools.
+This produces a single-read-per-molecule BAM (raw HiFi format).
 
 ### `kinsim evaluate`
 
@@ -225,7 +222,7 @@ kinsim evaluate <ckpt_dir> <pkl>
 ```
 
 Reads the latest checkpoint, runs inference on the validation split,
-produces calibration plots and per-key μ/σ residuals.
+produces calibration plots and per-key μ / σ residuals.
 
 ### `kinsim verify-generate`
 
@@ -233,24 +230,22 @@ produces calibration plots and per-key μ/σ residuals.
 kinsim verify-generate <ref.bam> <gen.bam> <motifs> <report.tsv>
 ```
 
-Per-`(kmer, meth)` bucket comparison: extracts samples from both BAMs,
+Per-(kmer, meth) bucket comparison: extracts samples from both BAMs,
 computes Pearson correlation and MAE on per-key means and sigmas.
 
 ### `kinsim analyze`
 
 ```bash
-kinsim analyze <pkl> [--output-dir reports/] [--no-html]
+kinsim analyze <master_clean.pkl> [--output-dir reports/] [--no-html]
 ```
 
-Outputs in the chosen directory:
+Writes `<basename>_report.txt` and `<basename>_report.html`. The HTML
+report focuses on four verification figures:
 
-- `<basename>_report.txt` — text summary
-- `<basename>_report.html` — full interactive report
-- `figures/00..12_*.html` — 13 individual Plotly figures
-
-Sections: overview, per-meth coverage, signal statistics, **kinetic
-signature profile per type**, low-coverage warnings, neighbor
-sensitivity, 3D density surfaces.
+1. IPD distribution per category (with refine threshold)
+2. Per-kmer baseline-mean distribution (where the threshold sits)
+3. Kinetic signature profiles per bucket (offsets 0 to +8)
+4. Sample counts per bucket
 
 ---
 
@@ -262,7 +257,7 @@ kinsim/
 ├── __main__.py             — CLI router
 │
 ├── extract.py              — BAM extraction, shard merging, sample storage layout
-├── refine.py               — joint-GMM cleanup per signature offset
+├── refine.py               — slowed_split: per-kmer baseline mean p95 filter
 ├── train.py                — supervised training loop (Gaussian NLL)
 ├── generate.py             — BAM generation with trained model
 ├── evaluate.py             — calibration report
@@ -284,7 +279,8 @@ kinsim/
     ├── encoding.py         — 11-mer bit-packing (K, KMER_PRED_IDX, BASE_MAP, METH_IDS)
     ├── motifs.py           — IUPAC parsing, sequence scanning, meth maps
     ├── config.py           — manifest CSV loader, kinsim_config loader, logging setup
-    └── io.py               — FASTA loading, MAF parsing, PBSIM3 discovery
+    ├── io.py               — FASTA loading, MAF parsing, PBSIM3 discovery
+    └── sample_layout.py    — 36-col layout, CATEGORY enum, slice helpers
 ```
 
 Imports follow:

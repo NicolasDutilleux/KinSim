@@ -45,13 +45,14 @@ import torch
 import torch.nn as nn
 
 # Log-space transforms for training/inference signal conversion.
-from ..data.dataset import log_transform, inv_log_transform  # noqa: F401
-from ..utils.encoding import K as _DEFAULT_K, KMER_PRED_IDX, kmer_mask
-
+from ..data.dataset import inv_log_transform, log_transform  # noqa: F401
+from ..utils.encoding import KMER_PRED_IDX
+from ..utils.encoding import K as _DEFAULT_K
 
 # =========================================================================
 # MLPPredictor (legacy architecture)
 # =========================================================================
+
 
 class MLPPredictor(nn.Module):
     """Flat k-mer embedding + MLP.  Legacy architecture (architecture="mlp").
@@ -84,13 +85,13 @@ class MLPPredictor(nn.Module):
         super().__init__()
 
         self.kmer_embed_dim = kmer_embed_dim
-        self.hidden_dim     = hidden_dim
-        self.meth_proj_dim  = meth_proj_dim
-        self.dropout        = dropout
-        self.kmer_size      = kmer_size
+        self.hidden_dim = hidden_dim
+        self.meth_proj_dim = meth_proj_dim
+        self.dropout = dropout
+        self.kmer_size = kmer_size
         self.num_meth_types = num_meth_types
 
-        _num_kmers = 4 ** kmer_size
+        _num_kmers = 4**kmer_size
         self.kmer_embed = nn.Embedding(_num_kmers, kmer_embed_dim)
         # Accepts full K*M flat context
         self.meth_proj = nn.Linear(kmer_size * num_meth_types, meth_proj_dim, bias=False)
@@ -101,12 +102,10 @@ class MLPPredictor(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(0.2),
             nn.Dropout(dropout),
-
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(0.2),
             nn.Dropout(dropout),
-
             nn.Linear(hidden_dim, 4),
         )
 
@@ -123,7 +122,7 @@ class MLPPredictor(nn.Module):
 
     def forward(
         self,
-        kmer_ids:   torch.Tensor,
+        kmer_ids: torch.Tensor,
         meth_probs: torch.Tensor,
     ) -> torch.Tensor:
         """Forward pass.
@@ -138,8 +137,9 @@ class MLPPredictor(nn.Module):
         if meth_probs.dim() == 2:
             # Legacy (B, M): place at center position, zeros elsewhere
             B, M = meth_probs.shape
-            full = torch.zeros(B, self.kmer_size, M,
-                               device=meth_probs.device, dtype=meth_probs.dtype)
+            full = torch.zeros(
+                B, self.kmer_size, M, device=meth_probs.device, dtype=meth_probs.dtype
+            )
             full[:, KMER_PRED_IDX, :] = meth_probs
             meth_flat = full.view(B, -1)
         else:
@@ -152,11 +152,11 @@ class MLPPredictor(nn.Module):
 
     @torch.no_grad()
     def sample(self, kmer_ids: torch.Tensor, meth_probs: torch.Tensor) -> torch.Tensor:
-        params  = self.forward(kmer_ids, meth_probs)
-        mu      = params[:, :2]
+        params = self.forward(kmer_ids, meth_probs)
+        mu = params[:, :2]
         log_sig = torch.clamp(params[:, 2:], -6.0, 3.0)
-        sigma   = torch.exp(log_sig)
-        z       = torch.randn_like(mu)
+        sigma = torch.exp(log_sig)
+        z = torch.randn_like(mu)
         return inv_log_transform(mu + sigma * z)
 
     @torch.no_grad()
@@ -167,12 +167,12 @@ class MLPPredictor(nn.Module):
     def get_config(self) -> dict:
         """Return architecture config for model_config.json."""
         return {
-            "architecture":   "mlp",
-            "kmer_size":      self.kmer_size,
+            "architecture": "mlp",
+            "kmer_size": self.kmer_size,
             "kmer_embed_dim": self.kmer_embed_dim,
-            "hidden_dim":     self.hidden_dim,
-            "meth_proj_dim":  self.meth_proj_dim,
-            "dropout":        self.dropout,
+            "hidden_dim": self.hidden_dim,
+            "meth_proj_dim": self.meth_proj_dim,
+            "dropout": self.dropout,
             "num_meth_types": self.num_meth_types,
         }
 
@@ -180,6 +180,7 @@ class MLPPredictor(nn.Module):
 # =========================================================================
 # ConvPredictor (new architecture)
 # =========================================================================
+
 
 class ConvPredictor(nn.Module):
     """1D-convolutional predictor with FiLM methylation conditioning.
@@ -244,13 +245,13 @@ class ConvPredictor(nn.Module):
 
         self.base_embed_dim = base_embed_dim
         self.num_meth_types = num_meth_types
-        self.meth_proj_dim  = meth_proj_dim
-        self.conv_dim       = conv_dim
-        self.n_conv_layers  = n_conv_layers
-        self.kernel_size    = kernel_size
-        self.head_dim       = head_dim
-        self.dropout_p      = dropout
-        self.kmer_size      = kmer_size
+        self.meth_proj_dim = meth_proj_dim
+        self.conv_dim = conv_dim
+        self.n_conv_layers = n_conv_layers
+        self.kernel_size = kernel_size
+        self.head_dim = head_dim
+        self.dropout_p = dropout
+        self.kmer_size = kmer_size
 
         # --- Per-base embedding: A=0, C=1, G=2, T=3 ---
         self.base_embed = nn.Embedding(4, base_embed_dim)
@@ -266,14 +267,13 @@ class ConvPredictor(nn.Module):
         # prediction position (length 11), independent of the kmer's [-5, +5]
         # window. Flatten to (B, 11*M) and project to a single embedding so
         # FiLM conditioning is decoupled from per-position alignment.
-        self.meth_proj = nn.Linear(kmer_size * num_meth_types, meth_proj_dim,
-                                   bias=False)
+        self.meth_proj = nn.Linear(kmer_size * num_meth_types, meth_proj_dim, bias=False)
 
         # --- FiLM conditioning: meth -> (gamma, beta) -> modulate base emb ---
         # x_modulated = (1 + gamma) * x_base + beta, broadcast over positions.
         # Zero-init ensures identity when methylation context is empty.
         self.film_gamma = nn.Linear(meth_proj_dim, base_embed_dim)
-        self.film_beta  = nn.Linear(meth_proj_dim, base_embed_dim)
+        self.film_beta = nn.Linear(meth_proj_dim, base_embed_dim)
 
         # --- Conv1d backbone ---
         # Learns local and medium-range spatial patterns.
@@ -281,11 +281,13 @@ class ConvPredictor(nn.Module):
         conv_layers: list[nn.Module] = []
         in_ch = base_embed_dim
         for _ in range(n_conv_layers):
-            conv_layers.extend([
-                nn.Conv1d(in_ch, conv_dim, kernel_size, padding=kernel_size // 2),
-                nn.BatchNorm1d(conv_dim),
-                nn.GELU(),
-            ])
+            conv_layers.extend(
+                [
+                    nn.Conv1d(in_ch, conv_dim, kernel_size, padding=kernel_size // 2),
+                    nn.BatchNorm1d(conv_dim),
+                    nn.GELU(),
+                ]
+            )
             in_ch = conv_dim
         self.conv = nn.Sequential(*conv_layers)
 
@@ -375,8 +377,7 @@ class ConvPredictor(nn.Module):
             (B, kmer_size, M) tensor with meth_probs at center, zeros elsewhere.
         """
         B, M = meth_probs.shape
-        full = torch.zeros(B, self.kmer_size, M,
-                           device=meth_probs.device, dtype=meth_probs.dtype)
+        full = torch.zeros(B, self.kmer_size, M, device=meth_probs.device, dtype=meth_probs.dtype)
         full[:, KMER_PRED_IDX, :] = meth_probs
         return full
 
@@ -399,28 +400,28 @@ class ConvPredictor(nn.Module):
             (B, 4) Float tensor: [mu_ipd, mu_pw, log_sigma_ipd, log_sigma_pw].
         """
         # Per-base embedding + positional encoding
-        x = self.base_embed(bases) + self.pos_embed     # (B, 11, base_embed_dim)
+        x = self.base_embed(bases) + self.pos_embed  # (B, 11, base_embed_dim)
 
         # FiLM conditioning: GLOBAL meth context modulates the kmer uniformly.
         # Flatten the per-position meth context (B, 11, M) into (B, 11*M),
         # project to a single embedding, derive (gamma, beta), broadcast.
         # When meth_full is all zeros -> meth_feat=0 -> gamma=0, beta=0 -> identity.
         meth_flat = meth_full.reshape(meth_full.shape[0], -1)  # (B, 11*M)
-        meth_feat = self.meth_proj(meth_flat)                  # (B, meth_proj_dim)
-        gamma = self.film_gamma(meth_feat).unsqueeze(1)        # (B, 1, base_embed_dim)
-        beta  = self.film_beta(meth_feat).unsqueeze(1)         # (B, 1, base_embed_dim)
+        meth_feat = self.meth_proj(meth_flat)  # (B, meth_proj_dim)
+        gamma = self.film_gamma(meth_feat).unsqueeze(1)  # (B, 1, base_embed_dim)
+        beta = self.film_beta(meth_feat).unsqueeze(1)  # (B, 1, base_embed_dim)
         x = (1.0 + gamma) * x + beta
 
         # Conv1D expects (B, C, L)
-        x = x.transpose(1, 2)                           # (B, base_embed_dim, 11)
-        x = self.conv(x)                                # (B, conv_dim, 11)
+        x = x.transpose(1, 2)  # (B, base_embed_dim, 11)
+        x = self.conv(x)  # (B, conv_dim, 11)
 
         # Dual readout: center (active site) + global context
-        center      = x[:, :, KMER_PRED_IDX]            # (B, conv_dim)
-        global_pool = x.mean(dim=2)                      # (B, conv_dim)
-        readout     = torch.cat([center, global_pool], dim=1)  # (B, 2*conv_dim)
+        center = x[:, :, KMER_PRED_IDX]  # (B, conv_dim)
+        global_pool = x.mean(dim=2)  # (B, conv_dim)
+        readout = torch.cat([center, global_pool], dim=1)  # (B, 2*conv_dim)
 
-        return self.head(readout)                        # (B, 4)
+        return self.head(readout)  # (B, 4)
 
     # ------------------------------------------------------------------
     # Public forward (compatible with existing pipeline)
@@ -428,7 +429,7 @@ class ConvPredictor(nn.Module):
 
     def forward(
         self,
-        kmer_ids:   torch.Tensor,
+        kmer_ids: torch.Tensor,
         meth_probs: torch.Tensor,
     ) -> torch.Tensor:
         """Predict Gaussian parameters from packed k-mer IDs and methylation.
@@ -455,7 +456,7 @@ class ConvPredictor(nn.Module):
 
     def forward_positional(
         self,
-        bases:     torch.Tensor,
+        bases: torch.Tensor,
         meth_full: torch.Tensor,
     ) -> torch.Tensor:
         """Forward pass with explicit per-position inputs (future pipeline).
@@ -476,11 +477,11 @@ class ConvPredictor(nn.Module):
     @torch.no_grad()
     def sample(self, kmer_ids: torch.Tensor, meth_probs: torch.Tensor) -> torch.Tensor:
         """Sample (IPD, PW) from the predicted Gaussian.  Stochastic."""
-        params  = self.forward(kmer_ids, meth_probs)
-        mu      = params[:, :2]
+        params = self.forward(kmer_ids, meth_probs)
+        mu = params[:, :2]
         log_sig = torch.clamp(params[:, 2:], -6.0, 3.0)
-        sigma   = torch.exp(log_sig)
-        z       = torch.randn_like(mu)
+        sigma = torch.exp(log_sig)
+        z = torch.randn_like(mu)
         return inv_log_transform(mu + sigma * z)
 
     @torch.no_grad()
@@ -492,22 +493,23 @@ class ConvPredictor(nn.Module):
     def get_config(self) -> dict:
         """Return architecture config for model_config.json."""
         return {
-            "architecture":   "conv",
-            "kmer_size":      self.kmer_size,
+            "architecture": "conv",
+            "kmer_size": self.kmer_size,
             "base_embed_dim": self.base_embed_dim,
             "num_meth_types": self.num_meth_types,
-            "meth_proj_dim":  self.meth_proj_dim,
-            "conv_dim":       self.conv_dim,
-            "n_conv_layers":  self.n_conv_layers,
-            "kernel_size":    self.kernel_size,
-            "head_dim":       self.head_dim,
-            "dropout":        self.dropout_p,
+            "meth_proj_dim": self.meth_proj_dim,
+            "conv_dim": self.conv_dim,
+            "n_conv_layers": self.n_conv_layers,
+            "kernel_size": self.kernel_size,
+            "head_dim": self.head_dim,
+            "dropout": self.dropout_p,
         }
 
 
 # =========================================================================
 # Factory: reconstruct model from model_config.json
 # =========================================================================
+
 
 def create_from_config(config: dict) -> nn.Module:
     """Reconstruct a model from a model_config.json dict.
@@ -548,6 +550,5 @@ def create_from_config(config: dict) -> nn.Module:
         )
     else:
         raise ValueError(
-            f"Unknown architecture '{arch}' in model_config.json. "
-            "Expected 'mlp' or 'conv'."
+            f"Unknown architecture '{arch}' in model_config.json. Expected 'mlp' or 'conv'."
         )

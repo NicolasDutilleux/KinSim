@@ -32,7 +32,7 @@ def strip_kinetics(input_bam: str, output_bam: str) -> None:
     with pysam.AlignmentFile(input_bam, "rb", check_sq=False) as bam_in:
         header = bam_in.header.to_dict()
         with pysam.AlignmentFile(output_bam, "wb", header=header) as bam_out:
-            n_reads    = 0
+            n_reads = 0
             n_stripped = 0
             for read in bam_in:
                 removed_any = False
@@ -47,8 +47,7 @@ def strip_kinetics(input_bam: str, output_bam: str) -> None:
 
     log.info("Done. %d reads written to %s", n_reads, output_bam)
     log.info("      %d reads had kinetic tags stripped", n_stripped)
-    log.info("      %d reads had no kinetic tags (passed through)",
-             n_reads - n_stripped)
+    log.info("      %d reads had no kinetic tags (passed through)", n_reads - n_stripped)
 
 
 def main(argv=None):
@@ -64,7 +63,7 @@ def main(argv=None):
             "with synthetic ones while keeping the read sequences and alignments."
         ),
     )
-    parser.add_argument("input_bam",  help="Source BAM (read-only, not modified)")
+    parser.add_argument("input_bam", help="Source BAM (read-only, not modified)")
     parser.add_argument("output_bam", help="Destination BAM without kinetic tags")
     args = parser.parse_args(argv)
 

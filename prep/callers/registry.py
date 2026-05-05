@@ -30,10 +30,8 @@ def create_parser(name: str, **kwargs) -> BaseOutputParser:
         KeyError: If no parser is registered with that name.
     """
     if name not in _REGISTRY:
-        available = ', '.join(sorted(_REGISTRY))
-        raise KeyError(
-            f"Unknown parser '{name}'. Available: {available}"
-        )
+        available = ", ".join(sorted(_REGISTRY))
+        raise KeyError(f"Unknown parser '{name}'. Available: {available}")
     return _REGISTRY[name](**kwargs)
 
 

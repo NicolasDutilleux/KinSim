@@ -51,7 +51,7 @@ def _load_npz(path: str) -> dict:
     return dict(npz)
 
 
-def inspect_model(path: str, dump_csv: str = None) -> str:
+def inspect_model(path: str, dump_csv: str | None = None) -> str:
     """Inspect the null model and return a text report."""
     data = _load_npz(path)
 
@@ -69,7 +69,7 @@ def inspect_model(path: str, dump_csv: str = None) -> str:
     for key in sorted(data.keys()):
         arr = data[key]
         if isinstance(arr, np.ndarray):
-            w(f"  {key:<30} shape={str(arr.shape):<20} dtype={arr.dtype}")
+            w(f"  {key:<30} shape={arr.shape!s:<20} dtype={arr.dtype}")
         else:
             w(f"  {key:<30} type={type(arr).__name__}  value={arr}")
     w("")
@@ -116,9 +116,9 @@ def inspect_model(path: str, dump_csv: str = None) -> str:
             n = len(arr)
             # Check if n is a power of 4 (4^k = context size)
             k = 1
-            while 4 ** k < n:
+            while 4**k < n:
                 k += 1
-            if 4 ** k == n:
+            if 4**k == n:
                 w(f"  {key}: {n:,} entries = 4^{k} → likely {k}-mer context")
             else:
                 w(f"  {key}: {n:,} entries (not a power of 4)")
@@ -127,20 +127,22 @@ def inspect_model(path: str, dump_csv: str = None) -> str:
             if arr.dtype.kind == "f":
                 nonzero = arr[arr > 0]
                 if len(nonzero) > 0:
-                    w(f"    Non-zero entries: {len(nonzero):,} / {n:,} ({100*len(nonzero)/n:.1f}%)")
+                    w(
+                        f"    Non-zero entries: {len(nonzero):,} / {n:,} ({100 * len(nonzero) / n:.1f}%)"
+                    )
                     w(f"    Non-zero mean:    {np.mean(nonzero):.4f}")
                     w(f"    Non-zero std:     {np.std(nonzero):.4f}")
                     w(f"    This represents expected IPD values for each {k}-mer context")
-                    w(f"    in unmodified DNA. ipdSummary divides observed IPD by these")
-                    w(f"    values to compute the IPD ratio.")
+                    w("    in unmodified DNA. ipdSummary divides observed IPD by these")
+                    w("    values to compute the IPD ratio.")
             w("")
 
         elif arr.ndim == 2:
             w(f"  {key}: {arr.shape[0]:,} rows × {arr.shape[1]} cols")
             if arr.shape[1] == 2:
-                w(f"    Possibly (mean, variance) per context")
+                w("    Possibly (mean, variance) per context")
             elif arr.shape[1] == 4:
-                w(f"    Possibly per-base or per-strand breakdown")
+                w("    Possibly per-base or per-strand breakdown")
             w("")
 
     # --- Dump CSV ---

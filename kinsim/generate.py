@@ -53,13 +53,27 @@ import torch.nn as nn
 
 from .models.predictor import MLPPredictor, create_from_config
 from .utils.encoding import (
-    BASE_MAP, K, KMER_LEFT_PAD, KMER_MASK, KMER_PRED_IDX, KMER_RIGHT_PAD,
+    BASE_MAP,
+    KMER_MASK,
+    KMER_RIGHT_PAD,
+    K,
 )
-from .utils.motifs import (build_reference_frac_map, build_reference_meth_map,
-                     filter_motif_string_by_types, load_motif_string,
-                     parse_meth_types_arg, parse_motifs, scan_sequence)
-from .utils.io import (find_pbsim3_files, resolve_motifs_for_species,
-                        get_extended_context, load_reference, parse_maf)
+from .utils.io import (
+    find_pbsim3_files,
+    get_extended_context,
+    load_reference,
+    parse_maf,
+    resolve_motifs_for_species,
+)
+from .utils.motifs import (
+    build_reference_frac_map,
+    build_reference_meth_map,
+    filter_motif_string_by_types,
+    load_motif_string,
+    parse_meth_types_arg,
+    parse_motifs,
+    scan_sequence,
+)
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +81,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # RC kmer helper
 # ---------------------------------------------------------------------------
+
 
 def _rc_kmer(kmer_id: int) -> int:
     """Reverse complement a 22-bit encoded 11-mer.
@@ -78,9 +93,9 @@ def _rc_kmer(kmer_id: int) -> int:
     Example: encode_kmer("ACGT...") → _rc_kmer() → encode_kmer(reverse_complement("ACGT..."))
     """
     rc = 0
-    for _ in range(K):   # K = 11 iterations, one per base
+    for _ in range(K):  # K = 11 iterations, one per base
         base = kmer_id & 3
-        rc   = (rc << 2) | (base ^ 3)   # complement: 0↔3 (A↔T), 1↔2 (C↔G)
+        rc = (rc << 2) | (base ^ 3)  # complement: 0↔3 (A↔T), 1↔2 (C↔G)
         kmer_id >>= 2
     return rc
 
@@ -88,6 +103,7 @@ def _rc_kmer(kmer_id: int) -> int:
 # ---------------------------------------------------------------------------
 # Fraction lookup from motif string
 # ---------------------------------------------------------------------------
+
 
 def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
     """Parse motif string to build a meth_id → fraction lookup.
@@ -101,10 +117,10 @@ def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
     fracs: dict[int, float] = {0: 0.0}
     if not motif_string:
         return fracs
-    for entry in motif_string.split(';'):
-        if not entry or ',' not in entry:
+    for entry in motif_string.split(";"):
+        if not entry or "," not in entry:
             continue
-        parts = entry.split(',')
+        parts = entry.split(",")
         if len(parts) < 3:
             continue
         m_id = METH_IDS.get(parts[0], 0)
@@ -116,6 +132,7 @@ def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
 # ---------------------------------------------------------------------------
 # Batched MLP inference
 # ---------------------------------------------------------------------------
+
 
 @torch.no_grad()
 def generate_signals_batch(
@@ -152,25 +169,26 @@ def generate_signals_batch(
     CHUNK = 50_000  # positions per GPU forward pass — prevents OOM on long reads
 
     # Binarize center fractions: coin-flip → each position is 100% meth or not.
-    meth_ids_bin  = np.array(meth_ids,  dtype=np.int64)
+    meth_ids_bin = np.array(meth_ids, dtype=np.int64)
     fractions_bin = np.array(fractions, dtype=np.float32)
-    partial_mask  = (meth_ids_bin > 0) & (fractions_bin < 1.0)
+    partial_mask = (meth_ids_bin > 0) & (fractions_bin < 1.0)
     if partial_mask.any():
         coins = np.random.random(partial_mask.sum())
         thresholds = fractions_bin[partial_mask]
         is_meth = coins < thresholds
         idx = np.where(partial_mask)[0]
-        fractions_bin[idx[is_meth]]  = 1.0
+        fractions_bin[idx[is_meth]] = 1.0
         fractions_bin[idx[~is_meth]] = 0.0
-        meth_ids_bin[idx[~is_meth]]  = 0
+        meth_ids_bin[idx[~is_meth]] = 0
 
     # Build (N, L, M) meth context tensor matching the asymmetric window
     # [-8, +2] used at extraction time. Prediction position lives at index
     # METH_CTX_LEFT (= 8), NOT at K_SIZE // 2.
     from .extract import METH_CTX_LEFT, METH_CTX_LEN
+
     K_SIZE = METH_CTX_LEN
     PRED_IDX = METH_CTX_LEFT
-    NUM_M  = 4
+    NUM_M = 4
     ctx_np = np.array(meth_contexts, dtype=np.int64)  # (N, L)
     meth_full_np = np.zeros((N, K_SIZE, NUM_M), dtype=np.float32)
 
@@ -178,7 +196,7 @@ def generate_signals_batch(
     for pos in range(K_SIZE):
         if pos == PRED_IDX:
             continue
-        flanking_m = ctx_np[:, pos]       # (N,)
+        flanking_m = ctx_np[:, pos]  # (N,)
         mask = flanking_m > 0
         if mask.any():
             rows = np.where(mask)[0]
@@ -188,7 +206,7 @@ def generate_signals_batch(
     meth_full_np[np.arange(N), PRED_IDX, meth_ids_bin] = fractions_bin
 
     def _run_chunk(k_slice, mf_slice):
-        k_t  = torch.tensor(k_slice,  dtype=torch.long,  device=device)
+        k_t = torch.tensor(k_slice, dtype=torch.long, device=device)
         mf_t = torch.tensor(mf_slice, dtype=torch.float, device=device)
         if deterministic:
             return model.predict_mean(k_t, mf_t).cpu().numpy()
@@ -201,16 +219,19 @@ def generate_signals_batch(
     chunks = []
     for start in range(0, N, CHUNK):
         end = min(start + CHUNK, N)
-        chunks.append(_run_chunk(
-            np.array(kmer_ids[start:end]),
-            meth_full_np[start:end],
-        ))
+        chunks.append(
+            _run_chunk(
+                np.array(kmer_ids[start:end]),
+                meth_full_np[start:end],
+            )
+        )
     return np.concatenate(chunks, axis=0)
 
 
 # ---------------------------------------------------------------------------
 # Model loading helper
 # ---------------------------------------------------------------------------
+
 
 def _read_ckpt_meth_types(checkpoint_path: str) -> list[str] | None:
     """Return the ``meth_types`` list stored in the checkpoint's model_config.json.
@@ -223,7 +244,7 @@ def _read_ckpt_meth_types(checkpoint_path: str) -> list[str] | None:
     if not os.path.exists(config_path):
         return None
     try:
-        with open(config_path, "r") as f:
+        with open(config_path) as f:
             return json.load(f).get("meth_types")
     except (OSError, json.JSONDecodeError):
         return None
@@ -260,7 +281,9 @@ def _resolve_meth_types(
             log.warning(
                 "--meth-types requests %s but checkpoint was trained on %s. "
                 "Signal for the extra type(s) %s will be unreliable.",
-                sorted(cli_meth_types), sorted(ckpt_set), sorted(extra),
+                sorted(cli_meth_types),
+                sorted(ckpt_set),
+                sorted(extra),
             )
     log.info("Using CLI --meth-types override: %s", sorted(cli_meth_types))
     return cli_meth_types
@@ -310,7 +333,7 @@ def _load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
         )
         sys.exit(1)
 
-    with open(config_path, "r") as f:
+    with open(config_path) as f:
         config = json.load(f)
 
     model = create_from_config(config).to(device)
@@ -319,14 +342,19 @@ def _load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
 
     arch = config.get("architecture", "mlp")
     n_params = sum(p.numel() for p in model.parameters())
-    log.info("Model loaded: architecture=%s  params=%s  checkpoint=%s",
-             arch, f"{n_params:,}", os.path.basename(checkpoint_path))
+    log.info(
+        "Model loaded: architecture=%s  params=%s  checkpoint=%s",
+        arch,
+        f"{n_params:,}",
+        os.path.basename(checkpoint_path),
+    )
     return model
 
 
 # ---------------------------------------------------------------------------
 # Main injection
 # ---------------------------------------------------------------------------
+
 
 def generate_signals(
     fastq_path: str,
@@ -372,9 +400,9 @@ def generate_signals(
 
     backend = "regex (forced)" if no_fuzznuc else "fuzznuc (primary, regex fallback)"
     log.info("Pre-scanning reference for methylation sites (%s)...", backend)
-    meth_map = build_reference_meth_map(ref_seqs, motif_string,
-                                        revcomp=revcomp,
-                                        no_fuzznuc=no_fuzznuc)
+    meth_map = build_reference_meth_map(
+        ref_seqs, motif_string, revcomp=revcomp, no_fuzznuc=no_fuzznuc
+    )
 
     # Per-position fraction map: each methylated site gets the fraction from
     # the specific motif that matched it (avoids collapsing different fractions
@@ -396,66 +424,100 @@ def generate_signals(
     maf_mapping = parse_maf(maf_path)
 
     log.info("Generating signals for reads from %s...", fastq_path)
-    n_reads    = 0
-    n_mapped   = 0
+    n_reads = 0
+    n_mapped = 0
     n_unmapped = 0
 
-    header = pysam.AlignmentHeader.from_dict({
-        "HD": {"VN": "1.6", "SO": "unknown"},
-        "RG": [{"ID": "00000001", "PL": "PACBIO", "DS": "READTYPE=CCS"}],
-    })
+    header = pysam.AlignmentHeader.from_dict(
+        {
+            "HD": {"VN": "1.6", "SO": "unknown"},
+            "RG": [{"ID": "00000001", "PL": "PACBIO", "DS": "READTYPE=CCS"}],
+        }
+    )
 
     open_func = gzip.open if fastq_path.endswith(".gz") else open
 
-    with pysam.AlignmentFile(output_bam, "wb", header=header) as bam_out, \
-         open_func(fastq_path, "rt") as fq:
-
+    with (
+        pysam.AlignmentFile(output_bam, "wb", header=header) as bam_out,
+        open_func(fastq_path, "rt") as fq,
+    ):
         batch = []
 
         while True:
             hdr_line = fq.readline()
             if not hdr_line:
                 break
-            seq_line  = fq.readline()
-            fq.readline()   # '+'
+            seq_line = fq.readline()
+            fq.readline()  # '+'
             qual_line = fq.readline()
 
             read_name = hdr_line.strip()[1:].split()[0]
-            seq       = seq_line.strip()
-            qual_str  = qual_line.strip()
-            read_len  = len(seq)
-            n_reads  += 1
+            seq = seq_line.strip()
+            qual_str = qual_line.strip()
+            read_len = len(seq)
+            n_reads += 1
 
-            batch.append({"name": read_name, "seq": seq,
-                          "qual": qual_str,  "len": read_len})
+            batch.append({"name": read_name, "seq": seq, "qual": qual_str, "len": read_len})
 
             if len(batch) >= batch_reads:
                 n_m, n_u = _process_batch(
-                    batch, ref_seqs, maf_mapping, meth_map, frac_map,
-                    frac_lookup, fallback_motifs,
-                    model, device, deterministic, circular, bam_out, header)
-                n_mapped   += n_m
+                    batch,
+                    ref_seqs,
+                    maf_mapping,
+                    meth_map,
+                    frac_map,
+                    frac_lookup,
+                    fallback_motifs,
+                    model,
+                    device,
+                    deterministic,
+                    circular,
+                    bam_out,
+                    header,
+                )
+                n_mapped += n_m
                 n_unmapped += n_u
                 batch = []
 
         if batch:
             n_m, n_u = _process_batch(
-                batch, ref_seqs, maf_mapping, meth_map, frac_map,
-                frac_lookup, fallback_motifs,
-                model, device, deterministic, circular, bam_out, header)
-            n_mapped   += n_m
+                batch,
+                ref_seqs,
+                maf_mapping,
+                meth_map,
+                frac_map,
+                frac_lookup,
+                fallback_motifs,
+                model,
+                device,
+                deterministic,
+                circular,
+                bam_out,
+                header,
+            )
+            n_mapped += n_m
             n_unmapped += n_u
 
-    log.info("Done. %d reads processed (%d with ref context, %d without).",
-             n_reads, n_mapped, n_unmapped)
+    log.info(
+        "Done. %d reads processed (%d with ref context, %d without).", n_reads, n_mapped, n_unmapped
+    )
     log.info("Output: %s", output_bam)
 
 
 def _process_batch(
-    batch, ref_seqs, maf_mapping, meth_map, frac_map, frac_lookup,
+    batch,
+    ref_seqs,
+    maf_mapping,
+    meth_map,
+    frac_map,
+    frac_lookup,
     fallback_motifs,
-    model, device, deterministic, circular, bam_out, header,
-
+    model,
+    device,
+    deterministic,
+    circular,
+    bam_out,
+    header,
 ):
     """Process a batch of reads with batched MLP inference.
 
@@ -471,51 +533,52 @@ def _process_batch(
     Returns:
         Tuple (n_mapped, n_unmapped) — read counts for the batch.
     """
-    all_kmer_ids    = []
-    all_meth_ids    = []
-    all_fractions   = []      # stoichiometric fraction per position
-    all_rc_kmer_ids = []      # RC kmer IDs for ri/rp inference
-    all_meth_ctxs   = []      # (L,) int array per position — meth context [-8, +2]
-    is_n_context    = []      # Per-position flag: True = N-context, use default signal
-    read_offsets    = [0]
-    _K      = K
-    from .extract import METH_CTX_LEFT, METH_CTX_RIGHT, METH_CTX_LEN
-    _LEFT     = METH_CTX_LEFT     # 8
-    _RIGHT    = METH_CTX_RIGHT    # 2
-    _CTX_LEN  = METH_CTX_LEN      # 11
-    _PRED_IDX = METH_CTX_LEFT     # prediction position inside the context array
+    all_kmer_ids = []
+    all_meth_ids = []
+    all_fractions = []  # stoichiometric fraction per position
+    all_rc_kmer_ids = []  # RC kmer IDs for ri/rp inference
+    all_meth_ctxs = []  # (L,) int array per position — meth context [-8, +2]
+    is_n_context = []  # Per-position flag: True = N-context, use default signal
+    read_offsets = [0]
+    _K = K
+    from .extract import METH_CTX_LEFT, METH_CTX_LEN, METH_CTX_RIGHT
+
+    _LEFT = METH_CTX_LEFT  # 8
+    _RIGHT = METH_CTX_RIGHT  # 2
+    _CTX_LEN = METH_CTX_LEN  # 11
+    _PRED_IDX = METH_CTX_LEFT  # prediction position inside the context array
     _ZERO_CTX = np.zeros(_CTX_LEN, dtype=np.int64)  # placeholder for N/unmapped
 
     n_mapped = n_unmapped = 0
 
     for read_data in batch:
         read_name = read_data["name"]
-        seq       = read_data["seq"]
-        read_len  = read_data["len"]
+        seq = read_data["seq"]
+        read_len = read_data["len"]
 
         maf_info = maf_mapping.get(read_name)
 
         if maf_info and maf_info[0] in ref_seqs:
             # ---- Mapped path: use reference context for edge bases ----
             ref_name, ref_start, _ref_strand, _ref_src_size = maf_info
-            ref_seq  = ref_seqs[ref_name]
-            ref_len  = len(ref_seq)
+            ref_seq = ref_seqs[ref_name]
+            ref_len = len(ref_seq)
             ref_meth = meth_map[ref_name]
-            ref_frac = frac_map[ref_name] if ref_name in frac_map else None
+            ref_frac = frac_map.get(ref_name, None)
 
             # Extended context pads K//2 bases on each side from the reference,
             # ensuring accurate 11-mer encoding at the read edges.
-            ext_context  = get_extended_context(ref_seq, ref_start, read_len, circular)
+            ext_context = get_extended_context(ref_seq, ref_start, read_len, circular)
             current_kmer = 0
 
             for i in range(len(ext_context)):
-                base_val     = BASE_MAP.get(ext_context[i], 0)
+                base_val = BASE_MAP.get(ext_context[i], 0)
                 current_kmer = ((current_kmer << 2) | base_val) & KMER_MASK
 
                 if i >= K - 1:
                     read_pos = i - (K - 1)
                     if 0 <= read_pos < read_len:
-                        context_window = ext_context[i - (K - 1): i + 1]
+                        context_window = ext_context[i - (K - 1) : i + 1]
                         has_n = "N" in context_window
                         is_n_context.append(has_n)
 
@@ -545,7 +608,7 @@ def _process_batch(
                                 # Bernoulli: this read is either methylated
                                 # (prob=frac) or not — produces bimodal signal
                                 meth_id = meth_id if np.random.random() < frac else 0
-                                frac    = 1.0 if meth_id > 0 else 0.0
+                                frac = 1.0 if meth_id > 0 else 0.0
                             # Asymmetric meth context [-8, +2] from reference map
                             ctx = np.zeros(_CTX_LEN, dtype=np.int64)
                             for k_pos in range(_CTX_LEN):
@@ -568,11 +631,11 @@ def _process_batch(
             # Per-read regex scanning (fuzznuc is only used for the reference
             # pre-scan above; subprocess calls per read would be too slow).
             # Uses frac_lookup (per-meth_id) since there is no reference context.
-            meth_status  = scan_sequence(seq, fallback_motifs)
+            meth_status = scan_sequence(seq, fallback_motifs)
             current_kmer = 0
 
             for i in range(read_len):
-                base_val     = BASE_MAP.get(seq[i], 0)
+                base_val = BASE_MAP.get(seq[i], 0)
                 current_kmer = ((current_kmer << 2) | base_val) & KMER_MASK
 
                 if i < K - 1:
@@ -587,14 +650,14 @@ def _process_batch(
                     is_n_context.append(False)
                     # Asymmetric kmer: prediction position is at offset
                     # KMER_RIGHT_PAD before the kmer's right edge i.
-                    center  = i - KMER_RIGHT_PAD
+                    center = i - KMER_RIGHT_PAD
                     meth_id = int(meth_status[center])
                     frac = frac_lookup.get(meth_id, 0.0)
                     if meth_id > 0:
                         # Bernoulli: this read is either methylated
                         # (prob=frac) or not — produces bimodal signal
                         meth_id = meth_id if np.random.random() < frac else 0
-                        frac    = 1.0 if meth_id > 0 else 0.0
+                        frac = 1.0 if meth_id > 0 else 0.0
                     # Asymmetric meth context [-8, +2] from per-read scan
                     ctx = np.zeros(_CTX_LEN, dtype=np.int64)
                     n_status = len(meth_status)
@@ -619,42 +682,48 @@ def _process_batch(
     # Same meth_ids/fractions for both: the meth_map (built with revcomp=True)
     # encodes both-strand methylation at each reference position.
     if len(all_kmer_ids) > 0:
-        all_signals    = generate_signals_batch(model, all_kmer_ids, all_meth_ids,
-                                                all_fractions, all_meth_ctxs,
-                                                device, deterministic)
-        all_rc_signals = generate_signals_batch(model, all_rc_kmer_ids, all_meth_ids,
-                                                all_fractions, all_meth_ctxs,
-                                                device, deterministic)
+        all_signals = generate_signals_batch(
+            model, all_kmer_ids, all_meth_ids, all_fractions, all_meth_ctxs, device, deterministic
+        )
+        all_rc_signals = generate_signals_batch(
+            model,
+            all_rc_kmer_ids,
+            all_meth_ids,
+            all_fractions,
+            all_meth_ctxs,
+            device,
+            deterministic,
+        )
     else:
-        all_signals    = np.zeros((0, 2), dtype=np.float32)
+        all_signals = np.zeros((0, 2), dtype=np.float32)
         all_rc_signals = np.zeros((0, 2), dtype=np.float32)
 
     # Split signals back to individual reads and write BAM records
     for idx, read_data in enumerate(batch):
-        start      = read_offsets[idx]
-        end        = read_offsets[idx + 1]
-        signals    = all_signals[start:end]
+        start = read_offsets[idx]
+        end = read_offsets[idx + 1]
+        signals = all_signals[start:end]
         rc_signals = all_rc_signals[start:end]
-        is_n       = is_n_context[start:end]
+        is_n = is_n_context[start:end]
 
-        ipd_vals = np.clip(signals[:, 0],    0, 255).astype(np.uint8)
-        pw_vals  = np.clip(signals[:, 1],    0, 255).astype(np.uint8)
-        ri_vals  = np.clip(rc_signals[:, 0], 0, 255).astype(np.uint8)
-        rp_vals  = np.clip(rc_signals[:, 1], 0, 255).astype(np.uint8)
+        ipd_vals = np.clip(signals[:, 0], 0, 255).astype(np.uint8)
+        pw_vals = np.clip(signals[:, 1], 0, 255).astype(np.uint8)
+        ri_vals = np.clip(rc_signals[:, 0], 0, 255).astype(np.uint8)
+        rp_vals = np.clip(rc_signals[:, 1], 0, 255).astype(np.uint8)
 
         # N-context positions: replace with a safe default of 1 (not 0, which
         # could be mis-interpreted as a missing tag by downstream tools)
         for pos_idx, n_flag in enumerate(is_n):
             if n_flag:
                 ipd_vals[pos_idx] = 1
-                pw_vals[pos_idx]  = 1
-                ri_vals[pos_idx]  = 1
-                rp_vals[pos_idx]  = 1
+                pw_vals[pos_idx] = 1
+                ri_vals[pos_idx] = 1
+                rp_vals[pos_idx] = 1
 
         seg = pysam.AlignedSegment(header)
-        seg.query_name      = read_data["name"]
-        seg.flag            = 4   # unmapped
-        seg.query_sequence  = read_data["seq"]
+        seg.query_name = read_data["name"]
+        seg.flag = 4  # unmapped
+        seg.query_sequence = read_data["seq"]
         seg.query_qualities = pysam.qualitystring_to_array(read_data["qual"])
         rg_id = header.to_dict().get("RG", [{}])[0].get("ID", "00000001")
         seg.set_tag("RG", rg_id)
@@ -670,6 +739,7 @@ def _process_batch(
 # ---------------------------------------------------------------------------
 # Directory mode
 # ---------------------------------------------------------------------------
+
 
 def generate_directory(
     pbsim3_dir: str,
@@ -703,8 +773,7 @@ def generate_directory(
     log.info("Found %d species in %s", len(genomes), pbsim3_dir)
 
     for fq_path, maf_path, ref_path, species in genomes:
-        motif_string = resolve_motifs_for_species(motif_source, species,
-                                                   min_fraction, min_detected)
+        motif_string = resolve_motifs_for_species(motif_source, species, min_fraction, min_detected)
         if not motif_string:
             log.error("No motifs found for species '%s'.", species)
             sys.exit(1)
@@ -714,10 +783,18 @@ def generate_directory(
         out_bam = os.path.join(output_dir, species + "_mlp.bam")
         log.info("--- %s ---", species)
         generate_signals(
-            fq_path, maf_path, ref_path, checkpoint_path, motif_string, out_bam,
-            circular=circular, revcomp=revcomp,
-            device=device, batch_reads=batch_reads,
-            no_fuzznuc=no_fuzznuc, deterministic=deterministic,
+            fq_path,
+            maf_path,
+            ref_path,
+            checkpoint_path,
+            motif_string,
+            out_bam,
+            circular=circular,
+            revcomp=revcomp,
+            device=device,
+            batch_reads=batch_reads,
+            no_fuzznuc=no_fuzznuc,
+            deterministic=deterministic,
         )
 
     log.info("All done. %d BAM(s) written to: %s", len(genomes), output_dir)
@@ -730,6 +807,7 @@ def generate_directory(
 # ---------------------------------------------------------------------------
 # BAM input mode
 # ---------------------------------------------------------------------------
+
 
 def generate_from_bam(
     input_bam: str,
@@ -762,12 +840,12 @@ def generate_from_bam(
 
     backend = "regex (forced)" if no_fuzznuc else "fuzznuc (primary, regex fallback)"
     log.info("Pre-scanning reference for methylation sites (%s)...", backend)
-    meth_map = build_reference_meth_map(ref_seqs, motif_string,
-                                        revcomp=revcomp, no_fuzznuc=no_fuzznuc)
+    meth_map = build_reference_meth_map(
+        ref_seqs, motif_string, revcomp=revcomp, no_fuzznuc=no_fuzznuc
+    )
     log.info("Building per-position fraction map...")
-    frac_map       = build_reference_frac_map(ref_seqs, motif_string,
-                                              revcomp=revcomp)
-    frac_lookup    = _build_fraction_lookup(motif_string)
+    frac_map = build_reference_frac_map(ref_seqs, motif_string, revcomp=revcomp)
+    frac_lookup = _build_fraction_lookup(motif_string)
     fallback_motifs = parse_motifs(motif_string, revcomp=revcomp)
 
     log.info("Loading checkpoint: %s", checkpoint_path)
@@ -789,48 +867,63 @@ def generate_from_bam(
         if "RG" in in_dict:
             out_dict["RG"] = in_dict["RG"]
         else:
-            out_dict["RG"] = [{"ID": "00000001", "PL": "PACBIO",
-                               "DS": "READTYPE=CCS"}]
+            out_dict["RG"] = [{"ID": "00000001", "PL": "PACBIO", "DS": "READTYPE=CCS"}]
         header_out = pysam.AlignmentHeader.from_dict(out_dict)
 
-    with pysam.AlignmentFile(input_bam, "rb", check_sq=False) as bam_in, \
-         pysam.AlignmentFile(output_bam, "wb", header=header_out) as bam_out:
-
+    with (
+        pysam.AlignmentFile(input_bam, "rb", check_sq=False) as bam_in,
+        pysam.AlignmentFile(output_bam, "wb", header=header_out) as bam_out,
+    ):
         for read in bam_in:
             if read.query_sequence is None:
                 continue
 
-            seq      = read.query_sequence
-            qual     = read.query_qualities
-            qual_str = pysam.array_to_qualitystring(qual) if qual is not None \
-                       else "I" * len(seq)
+            seq = read.query_sequence
+            qual = read.query_qualities
+            qual_str = pysam.array_to_qualitystring(qual) if qual is not None else "I" * len(seq)
 
-            batch.append({
-                "name": read.query_name,
-                "seq":  seq,
-                "qual": qual_str,
-                "len":  len(seq),
-            })
+            batch.append(
+                {
+                    "name": read.query_name,
+                    "seq": seq,
+                    "qual": qual_str,
+                    "len": len(seq),
+                }
+            )
 
             # Build maf_mapping entry from BAM alignment — same fields parse_maf returns
-            if (not read.is_unmapped
-                    and read.reference_name is not None
-                    and read.reference_name in ref_seqs):
+            if (
+                not read.is_unmapped
+                and read.reference_name is not None
+                and read.reference_name in ref_seqs
+            ):
                 ref_len = len(ref_seqs[read.reference_name])
                 batch_maf[read.query_name] = (
-                    read.reference_name, read.reference_start, "+", ref_len
+                    read.reference_name,
+                    read.reference_start,
+                    "+",
+                    ref_len,
                 )
 
             n_reads += 1
 
             if len(batch) >= batch_reads:
                 n_m, n_u = _process_batch(
-                    batch, ref_seqs, batch_maf, meth_map, frac_map,
-                    frac_lookup, fallback_motifs, model, device_obj,
+                    batch,
+                    ref_seqs,
+                    batch_maf,
+                    meth_map,
+                    frac_map,
+                    frac_lookup,
+                    fallback_motifs,
+                    model,
+                    device_obj,
                     deterministic,
-                    circular, bam_out, header_out,
+                    circular,
+                    bam_out,
+                    header_out,
                 )
-                n_mapped   += n_m
+                n_mapped += n_m
                 n_unmapped += n_u
                 batch = []
                 batch_maf = {}
@@ -839,16 +932,26 @@ def generate_from_bam(
 
         if batch:
             n_m, n_u = _process_batch(
-                batch, ref_seqs, batch_maf, meth_map, frac_map,
-                frac_lookup, fallback_motifs, model, device_obj,
+                batch,
+                ref_seqs,
+                batch_maf,
+                meth_map,
+                frac_map,
+                frac_lookup,
+                fallback_motifs,
+                model,
+                device_obj,
                 deterministic,
-                circular, bam_out, header_out,
+                circular,
+                bam_out,
+                header_out,
             )
-            n_mapped   += n_m
+            n_mapped += n_m
             n_unmapped += n_u
 
-    log.info("Done. %d reads processed (%d with ref context, %d without).",
-             n_reads, n_mapped, n_unmapped)
+    log.info(
+        "Done. %d reads processed (%d with ref context, %d without).", n_reads, n_mapped, n_unmapped
+    )
     log.info("Output: %s", output_bam)
 
 
@@ -867,30 +970,36 @@ def _main_from_bam(argv):
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("input_bam",   help="Aligned BAM with fi/fp/ri/rp stripped")
-    parser.add_argument("ref",         help="Reference genome FASTA (.fna / .fa / .gz)")
-    parser.add_argument("checkpoint",  help="Trained checkpoint (.pt)")
-    parser.add_argument("motifs",      help="Motif string, PacBio motifs.csv, or REBASE file")
-    parser.add_argument("output",      help="Output BAM with synthetic fi/fp/ri/rp tags")
-    parser.add_argument("--linear",       action="store_true",
-                        help="Treat genome as linear (default: circular for bacteria)")
-    parser.add_argument("--device",       default="cuda", choices=["cuda", "cpu"])
-    parser.add_argument("--batch-reads",  type=int, default=1000)
-    parser.add_argument("--no-revcomp",   action="store_true")
-    parser.add_argument("--no-fuzznuc",   action="store_true")
+    parser.add_argument("input_bam", help="Aligned BAM with fi/fp/ri/rp stripped")
+    parser.add_argument("ref", help="Reference genome FASTA (.fna / .fa / .gz)")
+    parser.add_argument("checkpoint", help="Trained checkpoint (.pt)")
+    parser.add_argument("motifs", help="Motif string, PacBio motifs.csv, or REBASE file")
+    parser.add_argument("output", help="Output BAM with synthetic fi/fp/ri/rp tags")
+    parser.add_argument(
+        "--linear",
+        action="store_true",
+        help="Treat genome as linear (default: circular for bacteria)",
+    )
+    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    parser.add_argument("--batch-reads", type=int, default=1000)
+    parser.add_argument("--no-revcomp", action="store_true")
+    parser.add_argument("--no-fuzznuc", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--min-fraction", type=float, default=0.40)
     parser.add_argument("--min-detected", type=int, default=20)
-    parser.add_argument("--meth-types", default=None,
-                        help="Comma-separated methylation types to simulate "
-                             "(e.g. 'm6A,m4C'). Filters the motif source "
-                             "before generation. Default: use the checkpoint's "
-                             "training alphabet. 'all' disables the filter.")
+    parser.add_argument(
+        "--meth-types",
+        default=None,
+        help="Comma-separated methylation types to simulate "
+        "(e.g. 'm6A,m4C'). Filters the motif source "
+        "before generation. Default: use the checkpoint's "
+        "training alphabet. 'all' disables the filter.",
+    )
     args = parser.parse_args(argv)
 
-    motif_string = load_motif_string(args.motifs,
-                                     min_fraction=args.min_fraction,
-                                     min_detected=args.min_detected)
+    motif_string = load_motif_string(
+        args.motifs, min_fraction=args.min_fraction, min_detected=args.min_detected
+    )
     if not motif_string:
         log.error("No motifs found from the provided source.")
         sys.exit(1)
@@ -954,38 +1063,66 @@ def _main_directory(argv):
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("pbsim3_dir",
-                        help="Directory containing species subdirs or flat .fq.gz files")
+    parser.add_argument(
+        "pbsim3_dir", help="Directory containing species subdirs or flat .fq.gz files"
+    )
     parser.add_argument("checkpoint", help="Trained MLP checkpoint (.pt)")
-    parser.add_argument("motifs",
-                        help="Motifs: KinSim string (applied to all), PacBio .csv, "
-                             "REBASE file, or per-species file ('species|motif_string' per line)")
-    parser.add_argument("output_dir",
-                        help="Output directory for generated BAM files")
-    parser.add_argument("--linear", action="store_true",
-                        help="Treat genomes as linear (default: circular for bacteria)")
-    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"],
-                        help="Device to use (default: cuda)")
-    parser.add_argument("--batch-reads", type=int, default=1000,
-                        help="Number of reads to batch for GPU inference (default: 1000)")
-    parser.add_argument("--no-revcomp", action="store_true",
-                        help="Do not scan reverse complement strand for motifs")
-    parser.add_argument("--no-fuzznuc", action="store_true",
-                        help="Force Python regex for reference methylation scanning")
-    parser.add_argument("--deterministic", action="store_true",
-                        help="Use predicted mean (mu) only - no stochastic sampling. "
-                             "Produces identical signals for every read at the same "
-                             "context (useful for ablations). Default: stochastic.")
-    parser.add_argument("--min-fraction", type=float, default=0.40,
-                        help="Minimum fraction threshold (PacBio CSV only, default: 0.40)")
-    parser.add_argument("--min-detected", type=int, default=20,
-                        help="Minimum nDetected threshold (PacBio CSV only, default: 20)")
-    parser.add_argument("--meth-types", default=None,
-                        help="Comma-separated methylation types to simulate "
-                             "(e.g. 'm6A,m4C'). Filters each species' motif "
-                             "string before generation. Default: use the "
-                             "checkpoint's training alphabet. 'all' disables "
-                             "the filter.")
+    parser.add_argument(
+        "motifs",
+        help="Motifs: KinSim string (applied to all), PacBio .csv, "
+        "REBASE file, or per-species file ('species|motif_string' per line)",
+    )
+    parser.add_argument("output_dir", help="Output directory for generated BAM files")
+    parser.add_argument(
+        "--linear",
+        action="store_true",
+        help="Treat genomes as linear (default: circular for bacteria)",
+    )
+    parser.add_argument(
+        "--device", default="cuda", choices=["cuda", "cpu"], help="Device to use (default: cuda)"
+    )
+    parser.add_argument(
+        "--batch-reads",
+        type=int,
+        default=1000,
+        help="Number of reads to batch for GPU inference (default: 1000)",
+    )
+    parser.add_argument(
+        "--no-revcomp", action="store_true", help="Do not scan reverse complement strand for motifs"
+    )
+    parser.add_argument(
+        "--no-fuzznuc",
+        action="store_true",
+        help="Force Python regex for reference methylation scanning",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Use predicted mean (mu) only - no stochastic sampling. "
+        "Produces identical signals for every read at the same "
+        "context (useful for ablations). Default: stochastic.",
+    )
+    parser.add_argument(
+        "--min-fraction",
+        type=float,
+        default=0.40,
+        help="Minimum fraction threshold (PacBio CSV only, default: 0.40)",
+    )
+    parser.add_argument(
+        "--min-detected",
+        type=int,
+        default=20,
+        help="Minimum nDetected threshold (PacBio CSV only, default: 20)",
+    )
+    parser.add_argument(
+        "--meth-types",
+        default=None,
+        help="Comma-separated methylation types to simulate "
+        "(e.g. 'm6A,m4C'). Filters each species' motif "
+        "string before generation. Default: use the "
+        "checkpoint's training alphabet. 'all' disables "
+        "the filter.",
+    )
     args = parser.parse_args(argv)
 
     cli_meth_types = parse_meth_types_arg(args.meth_types)
@@ -1027,46 +1164,76 @@ def _main_per_genome(argv):
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("fastq",      help="PBSIM3 simulated reads (.fq or .fq.gz)")
-    parser.add_argument("maf",        help="PBSIM3 alignment file (.maf or .maf.gz)")
-    parser.add_argument("ref",        help="Reference genome FASTA (.fna, .fa, or .gz)")
+    parser.add_argument("fastq", help="PBSIM3 simulated reads (.fq or .fq.gz)")
+    parser.add_argument("maf", help="PBSIM3 alignment file (.maf or .maf.gz)")
+    parser.add_argument("ref", help="Reference genome FASTA (.fna, .fa, or .gz)")
     parser.add_argument("checkpoint", help="Trained MLP checkpoint (.pt)")
-    parser.add_argument("motifs",
-                        help="Motif source: KinSim string ('m6A,GATC,1'), "
-                             "PacBio motifs.csv, or REBASE file (auto-detected)")
-    parser.add_argument("output",     help="Output unaligned BAM file")
-    parser.add_argument("--linear", action="store_true",
-                        help="Treat genome as linear (default: circular for bacteria)")
-    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"],
-                        help="Device to use (default: cuda)")
-    parser.add_argument("--batch-reads", type=int, default=1000,
-                        help="Number of reads to batch for GPU inference (default: 1000)")
-    parser.add_argument("--no-revcomp", action="store_true",
-                        help="Do not scan reverse complement strand for motifs "
-                             "(use when motif source already includes both orientations)")
-    parser.add_argument("--no-fuzznuc", action="store_true",
-                        help="Force Python regex for reference methylation scanning. "
-                             "By default, EMBOSS fuzznuc is tried first as the primary "
-                             "backend and falls back to regex automatically if fuzznuc "
-                             "is not installed.")
-    parser.add_argument("--deterministic", action="store_true",
-                        help="Use predicted mean (mu) only - no stochastic sampling. "
-                             "Produces identical signals for every read at the same "
-                             "context (useful for ablations). Default: stochastic.")
-    parser.add_argument("--min-fraction", type=float, default=0.40,
-                        help="Minimum fraction threshold (PacBio CSV only, default: 0.40)")
-    parser.add_argument("--min-detected", type=int, default=20,
-                        help="Minimum nDetected threshold (PacBio CSV only, default: 20)")
-    parser.add_argument("--meth-types", default=None,
-                        help="Comma-separated methylation types to simulate "
-                             "(e.g. 'm6A,m4C'). Filters the motif source "
-                             "before generation. Default: use the checkpoint's "
-                             "training alphabet. 'all' disables the filter.")
+    parser.add_argument(
+        "motifs",
+        help="Motif source: KinSim string ('m6A,GATC,1'), "
+        "PacBio motifs.csv, or REBASE file (auto-detected)",
+    )
+    parser.add_argument("output", help="Output unaligned BAM file")
+    parser.add_argument(
+        "--linear",
+        action="store_true",
+        help="Treat genome as linear (default: circular for bacteria)",
+    )
+    parser.add_argument(
+        "--device", default="cuda", choices=["cuda", "cpu"], help="Device to use (default: cuda)"
+    )
+    parser.add_argument(
+        "--batch-reads",
+        type=int,
+        default=1000,
+        help="Number of reads to batch for GPU inference (default: 1000)",
+    )
+    parser.add_argument(
+        "--no-revcomp",
+        action="store_true",
+        help="Do not scan reverse complement strand for motifs "
+        "(use when motif source already includes both orientations)",
+    )
+    parser.add_argument(
+        "--no-fuzznuc",
+        action="store_true",
+        help="Force Python regex for reference methylation scanning. "
+        "By default, EMBOSS fuzznuc is tried first as the primary "
+        "backend and falls back to regex automatically if fuzznuc "
+        "is not installed.",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Use predicted mean (mu) only - no stochastic sampling. "
+        "Produces identical signals for every read at the same "
+        "context (useful for ablations). Default: stochastic.",
+    )
+    parser.add_argument(
+        "--min-fraction",
+        type=float,
+        default=0.40,
+        help="Minimum fraction threshold (PacBio CSV only, default: 0.40)",
+    )
+    parser.add_argument(
+        "--min-detected",
+        type=int,
+        default=20,
+        help="Minimum nDetected threshold (PacBio CSV only, default: 20)",
+    )
+    parser.add_argument(
+        "--meth-types",
+        default=None,
+        help="Comma-separated methylation types to simulate "
+        "(e.g. 'm6A,m4C'). Filters the motif source "
+        "before generation. Default: use the checkpoint's "
+        "training alphabet. 'all' disables the filter.",
+    )
     args = parser.parse_args(argv)
 
-    motif_string = load_motif_string(args.motifs,
-                                     min_fraction=args.min_fraction,
-                                     min_detected=args.min_detected)
+    motif_string = load_motif_string(
+        args.motifs, min_fraction=args.min_fraction, min_detected=args.min_detected
+    )
     if not motif_string:
         log.error("No motifs found from the provided source.")
         sys.exit(1)

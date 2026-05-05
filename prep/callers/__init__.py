@@ -22,14 +22,13 @@ Usage:
         motif_string = parser.parse("/data/output.csv")
 """
 
-from .base import BaseOutputParser
-from .registry import auto_detect_parser, create_parser, list_parsers
-
 # Import parsers to trigger @register decorators
 from . import combined as _combined  # noqa: F401
 from . import ipd_summary as _ipd_summary  # noqa: F401
 from . import modkit as _modkit  # noqa: F401
 from . import pacbio as _pacbio  # noqa: F401
+from .base import BaseOutputParser
+from .registry import auto_detect_parser, create_parser, list_parsers
 
 __all__ = [
     "BaseOutputParser",

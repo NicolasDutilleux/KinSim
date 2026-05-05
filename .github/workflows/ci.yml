@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main, Develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - run: uv tool install ruff
+      - run: ruff check .
+      - run: ruff format --check .
+
+  test:
+    name: Test (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+      # Install with the [ml] extra disabled to avoid pulling torch in CI:
+      # tests under tests/ exercise pure-numpy code paths only.
+      - name: Install package
+        run: uv pip install --system -e ".[plot]" pytest pytest-cov
+      - name: Run tests
+        run: pytest --cov=kinsim --cov=prep --cov-report=xml -v
+      - name: Upload coverage
+        if: matrix.python == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml

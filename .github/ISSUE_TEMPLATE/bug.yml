@@ -1,0 +1,61 @@
+name: Bug report
+description: Something is broken or unexpected.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. The more detail you give,
+        the easier it is to reproduce and fix.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear and concise description of the bug.
+      placeholder: e.g. "kinsim refine crashes on master.pkl with KeyError ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: |
+        Exact commands you ran and any minimal input that triggers the bug.
+        Include the full traceback if relevant.
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: kinsim-version
+    attributes:
+      label: KinSim version
+      description: Output of `kinsim --version`.
+      placeholder: "kinsim 0.4.0"
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      description: Output of `python --version`.
+      placeholder: "Python 3.12.4"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: e.g. Ubuntu 22.04, macOS 14, Windows 11.
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Logs, screenshots, related issues — anything else relevant.

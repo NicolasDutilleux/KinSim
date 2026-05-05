@@ -1,4 +1,0 @@
-pyyaml
-numpy
-pysam
-scikit-learn

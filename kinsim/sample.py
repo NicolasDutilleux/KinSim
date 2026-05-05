@@ -108,13 +108,20 @@ def sample_pkl(
         "samples_in": samples_in,
         "samples_out": samples_out,
     }
-    log.info("Sampled: %d/%d keys, %d/%d samples -> %s",
-             keys_out, keys_in, samples_out, samples_in, output_path)
+    log.info(
+        "Sampled: %d/%d keys, %d/%d samples -> %s",
+        keys_out,
+        keys_in,
+        samples_out,
+        samples_in,
+        output_path,
+    )
     return stats
 
 
 def main(argv=None):
     import argparse
+
     from .utils.config import setup_logging
 
     parser = argparse.ArgumentParser(
@@ -139,13 +146,16 @@ def main(argv=None):
     )
     parser.add_argument("input", help="Input dictionary .pkl file")
     parser.add_argument("output", help="Output sampled .pkl file")
-    parser.add_argument("--n-samples", type=int, required=True,
-                        help="Max samples to keep per (kmer, meth) key")
-    parser.add_argument("--seed", type=int, default=0,
-                        help="Random seed (default: 0)")
-    parser.add_argument("--exclude", default=None, metavar="PKL",
-                        help="Exclude keys present in this .pkl "
-                             "(e.g. exclude test set keys from training)")
+    parser.add_argument(
+        "--n-samples", type=int, required=True, help="Max samples to keep per (kmer, meth) key"
+    )
+    parser.add_argument("--seed", type=int, default=0, help="Random seed (default: 0)")
+    parser.add_argument(
+        "--exclude",
+        default=None,
+        metavar="PKL",
+        help="Exclude keys present in this .pkl (e.g. exclude test set keys from training)",
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
 
     args = parser.parse_args(argv)

@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+title: "KinSim: PacBio HiFi kinetic signal simulator for methylation-aware metagenomic binning"
+message: "If you use KinSim in your work, please cite this software."
+type: software
+authors:
+  - family-names: Dutilleux
+    given-names: Nicolas
+    affiliation: "University of Fribourg"
+    email: nicolas.dutilleux@unifr.ch
+repository-code: "https://github.com/NicolasDutilleux/KinSim"
+url: "https://github.com/NicolasDutilleux/KinSim"
+license: MIT
+version: 0.4.0
+date-released: 2026-05-04
+keywords:
+  - PacBio
+  - kinetics
+  - methylation
+  - metagenomics
+  - simulator
+  - bioinformatics
+abstract: >
+  KinSim learns per-context IPD/PW kinetic distributions from real PacBio HiFi
+  reads and injects realistic kinetic signals into PBSIM3-simulated reads.
+  Output BAMs carry standard PacBio fi/fp tags, usable by any downstream
+  tool that consumes kinetic information (modkit, ipdSummary, jasmine,
+  motif callers).

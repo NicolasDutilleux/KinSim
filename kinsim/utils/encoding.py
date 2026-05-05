@@ -9,7 +9,7 @@ import numpy as np
 
 # Default k-mer size — change here to shift the whole pipeline default.
 K = 11
-KMER_BITS = 2 * K       # 22 for K=11
+KMER_BITS = 2 * K  # 22 for K=11
 KMER_MASK = (1 << KMER_BITS) - 1  # mask for default K
 
 # Asymmetric kmer/meth-context window around the prediction position.
@@ -19,21 +19,21 @@ KMER_MASK = (1 << KMER_BITS) - 1  # mask for default K
 # IPD/PW at position Y we want more upstream context than downstream.
 # Inspired by Feng et al. 2013 (kineticsTools/ipdSummary, [-7, +2] for
 # unmodified DNA), extended to 11 bases for our k-mer.
-KMER_LEFT_PAD  = 7      # bases before prediction position
-KMER_RIGHT_PAD = 3      # bases after prediction position
-KMER_PRED_IDX  = KMER_LEFT_PAD                         # = 7
+KMER_LEFT_PAD = 7  # bases before prediction position
+KMER_RIGHT_PAD = 3  # bases after prediction position
+KMER_PRED_IDX = KMER_LEFT_PAD  # = 7
 assert KMER_LEFT_PAD + 1 + KMER_RIGHT_PAD == K, "KMER_PAD must sum to K"
 
-BASE_MAP     = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
-INT_TO_BASE  = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
-VALID_BASES  = set('ACGT')
+BASE_MAP = {"A": 0, "C": 1, "G": 2, "T": 3}
+INT_TO_BASE = {0: "A", 1: "C", 2: "G", 3: "T"}
+VALID_BASES = set("ACGT")
 
 # Default methylation type → integer mapping. Extended at runtime by
 # `get_meth_ids()` based on the entries declared in kinsim_config.yaml's
 # `kinetic_signatures` section. The default fallback below covers the three
 # standard PacBio modifications; users adding new types only need to declare
 # them in kinsim_config.yaml — no code change required.
-METH_IDS = {'none': 0, 'm6A': 1, 'm4C': 2, 'm5C': 3}
+METH_IDS = {"none": 0, "m6A": 1, "m4C": 2, "m5C": 3}
 
 
 def get_meth_ids() -> dict:
@@ -57,15 +57,16 @@ def get_meth_ids() -> dict:
         # Lazy import to avoid circular dependency: utils.config imports motifs
         # which imports encoding.
         from .config import load_kinsim_config
+
         cfg = load_kinsim_config()
     except Exception:
         return dict(METH_IDS)
 
     user_types = list(cfg.get("kinetic_signatures", {}).keys())
-    out = {'none': 0}
+    out = {"none": 0}
     next_id = 1
     # Preserve standard IDs when present
-    for std in ('m6A', 'm4C', 'm5C'):
+    for std in ("m6A", "m4C", "m5C"):
         if std in user_types:
             out[std] = METH_IDS.get(std, next_id)
             next_id = max(next_id, out[std] + 1)
@@ -78,7 +79,7 @@ def get_meth_ids() -> dict:
     return out
 
 
-TOTAL_POSSIBLE_KMERS = 4 ** K  # 4,194,304 for K=11
+TOTAL_POSSIBLE_KMERS = 4**K  # 4,194,304 for K=11
 
 
 def kmer_mask(k: int = K) -> int:
@@ -116,7 +117,7 @@ def decode_kmer(val: int, k: int = K) -> str:
     for _ in range(k):
         bases.append(INT_TO_BASE[val & 3])
         val >>= 2
-    return ''.join(reversed(bases))
+    return "".join(reversed(bases))
 
 
 def get_ipd_stats(acc):
@@ -125,7 +126,7 @@ def get_ipd_stats(acc):
     if n < 1:
         return 1.0, 0.1
     mu = acc[1] / n
-    var = max(0, (acc[2] / n) - mu ** 2)
+    var = max(0, (acc[2] / n) - mu**2)
     return mu, np.sqrt(var)
 
 
@@ -135,5 +136,5 @@ def get_pw_stats(acc):
     if n < 1:
         return 1.0, 0.1
     mu = acc[3] / n
-    var = max(0, (acc[4] / n) - mu ** 2)
+    var = max(0, (acc[4] / n) - mu**2)
     return mu, np.sqrt(var)

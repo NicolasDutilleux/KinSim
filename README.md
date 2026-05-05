@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img alt="Python" src="https://img.shields.io/badge/python-3.9%2B-blue">
+  <img alt="Python" src="https://img.shields.io/badge/python-3.10%2B-blue">
   <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-%E2%89%A52.0-orange">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Linux%20%7C%20SLURM-lightgrey">
@@ -61,11 +61,11 @@ Real PacBio BAMs              Synthetic reads (PBSIM3)
 
 | Component | Tested version | Role |
 |---|---|---|
-| **Python** | 3.9 (cluster) / 3.10+ (local) | runtime |
+| **Python** | 3.10+ | runtime |
 | **PyTorch** | ≥ 2.0 | neural network framework |
 | **pysam** | 0.22+ | BAM I/O |
 | **numpy** | 1.26+ | numerical core |
-| **scikit-learn** | 1.4+ | `GaussianMixture` for refine clustering |
+| **scikit-learn** | 1.4+ | utilities used by baselines |
 | **pandas** | 2.2+ | report tables |
 | **plotly** | 5.20+ | interactive HTML reports |
 | **pyyaml** | 6.0+ | `kinsim_config.yaml` loader |
@@ -119,8 +119,9 @@ EX=$(sbatch --parsable --array=1-${N}%8 slurm_kinsim/ml/00_extract.slurm \
 MG=$(sbatch --parsable --dependency=afterany:$EX slurm_kinsim/ml/01_merge.slurm \
     $SHARDS $MASTER)
 RF=$(sbatch --parsable --dependency=afterok:$MG slurm_kinsim/ml/02_refine.slurm \
-    $MASTER ${MASTER%.pkl}_clean.pkl ${MASTER%.pkl}_refine.tsv)
-sbatch --dependency=afterok:$RF slurm_kinsim/ml/03_train.slurm    ${MASTER%.pkl}_clean.pkl checkpoints/
+    $MASTER ${MASTER%.pkl}_clean.pkl)
+sbatch --dependency=afterok:$RF slurm_kinsim/ml/03_train.slurm \
+    ${MASTER%.pkl}_clean.pkl checkpoints/
 ```
 
 See [`kinsim/README.md`](kinsim/README.md) for the full ML pipeline reference.

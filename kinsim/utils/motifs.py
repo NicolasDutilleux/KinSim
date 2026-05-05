@@ -25,43 +25,68 @@ Motif string format:
 
 from __future__ import annotations
 
-import logging
-import sys
 import csv
+import logging
 import os
 import re
 import subprocess
+import sys
 import tempfile
+
 import numpy as np
+
 from .encoding import METH_IDS, get_meth_ids
 
 log = logging.getLogger(__name__)
 
 IUPAC_TO_REGEX = {
-    'A': 'A', 'C': 'C', 'G': 'G', 'T': 'T', 'N': '.',
-    'R': '[AG]', 'Y': '[CT]', 'S': '[GC]', 'W': '[AT]',
-    'K': '[GT]', 'M': '[AC]', 'B': '[CGT]', 'D': '[AGT]',
-    'H': '[ACT]', 'V': '[ACG]'
+    "A": "A",
+    "C": "C",
+    "G": "G",
+    "T": "T",
+    "N": ".",
+    "R": "[AG]",
+    "Y": "[CT]",
+    "S": "[GC]",
+    "W": "[AT]",
+    "K": "[GT]",
+    "M": "[AC]",
+    "B": "[CGT]",
+    "D": "[AGT]",
+    "H": "[ACT]",
+    "V": "[ACG]",
 }
 
 COMPLEMENT = {
-    'A': 'T', 'C': 'G', 'G': 'C', 'T': 'A', 'N': 'N',
-    'Y': 'R', 'R': 'Y', 'S': 'S', 'W': 'W', 'K': 'M', 'M': 'K',
-    'B': 'V', 'V': 'B', 'D': 'H', 'H': 'D'
+    "A": "T",
+    "C": "G",
+    "G": "C",
+    "T": "A",
+    "N": "N",
+    "Y": "R",
+    "R": "Y",
+    "S": "S",
+    "W": "W",
+    "K": "M",
+    "M": "K",
+    "B": "V",
+    "V": "B",
+    "D": "H",
+    "H": "D",
 }
 
 # PacBio CSV: resolve ambiguous "modified_base" by the base at centerPos
-_BASE_TO_METH = {'A': 'm6A', 'C': 'm4C'}
+_BASE_TO_METH = {"A": "m6A", "C": "m4C"}
 
 # GFF attribute parser: extracts pattern name from fuzznuc GFF output.
 # Matches "Pattern_name=...", "Name=...", or "pattern=..." (case-insensitive).
-_GFF_ATTR_NAME_RE = re.compile(r'(?:Pattern_name|Name|pattern)=([^;]+)',
-                                re.IGNORECASE)
+_GFF_ATTR_NAME_RE = re.compile(r"(?:Pattern_name|Name|pattern)=([^;]+)", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
 # IUPAC helpers
 # ---------------------------------------------------------------------------
+
 
 def iupac_to_re(motif):
     """Convert an IUPAC motif string to a regex pattern string."""
@@ -77,6 +102,7 @@ def reverse_complement(seq):
 # Modification-type filter
 # ---------------------------------------------------------------------------
 
+
 def parse_meth_types_arg(arg: str | None) -> set[str] | None:
     """Parse a ``--meth-types`` CLI value into a set of mod type strings.
 
@@ -89,13 +115,12 @@ def parse_meth_types_arg(arg: str | None) -> set[str] | None:
     if arg is None:
         return None
     s = arg.strip()
-    if not s or s.lower() == 'all':
+    if not s or s.lower() == "all":
         return None
-    return {tok.strip() for tok in s.split(',') if tok.strip()}
+    return {tok.strip() for tok in s.split(",") if tok.strip()}
 
 
-def filter_motif_string_by_types(motif_string: str,
-                                  allowed_mods: set[str] | None) -> str:
+def filter_motif_string_by_types(motif_string: str, allowed_mods: set[str] | None) -> str:
     """Keep only motif entries whose mod type is in ``allowed_mods``.
 
     Used at both extract time (upstream of motif-based scanning) and generate
@@ -114,18 +139,19 @@ def filter_motif_string_by_types(motif_string: str,
     if not motif_string or allowed_mods is None:
         return motif_string
     kept = []
-    for entry in motif_string.split(';'):
-        if not entry or ',' not in entry:
+    for entry in motif_string.split(";"):
+        if not entry or "," not in entry:
             continue
-        mod_type = entry.split(',', 1)[0].strip()
+        mod_type = entry.split(",", 1)[0].strip()
         if mod_type in allowed_mods:
             kept.append(entry)
-    return ';'.join(kept)
+    return ";".join(kept)
 
 
 # ---------------------------------------------------------------------------
 # KinSim motif string: parse and scan (in-memory regex backend)
 # ---------------------------------------------------------------------------
+
 
 def parse_motifs(motif_string, revcomp=True):
     """Parse a motif string and compile regex for forward + reverse complement.
@@ -164,10 +190,10 @@ def parse_motifs(motif_string, revcomp=True):
     # the actual methylated base on either strand (the user's two motifs
     # already cover both strand views explicitly).
     user_entries = []
-    for entry in motif_string.split(';'):
-        if not entry or ',' not in entry:
+    for entry in motif_string.split(";"):
+        if not entry or "," not in entry:
             continue
-        parts = entry.split(',')
+        parts = entry.split(",")
         if len(parts) < 3:
             continue
         user_entries.append(parts)
@@ -189,9 +215,8 @@ def parse_motifs(motif_string, revcomp=True):
         frac = float(parts[4]) if len(parts) >= 5 else 1.0
 
         for s, offset in pairs:
-            regex_pattern = re.compile(f'(?=({iupac_to_re(s)}))')
-            motifs.append({'pattern': regex_pattern, 'id': m_id, 'pos': offset,
-                           'frac': frac})
+            regex_pattern = re.compile(f"(?=({iupac_to_re(s)}))")
+            motifs.append({"pattern": regex_pattern, "id": m_id, "pos": offset, "frac": frac})
     return motifs
 
 
@@ -208,16 +233,17 @@ def scan_sequence(seq, motifs):
     """
     status = np.zeros(len(seq), dtype=np.int8)
     for motif in motifs:
-        for match in motif['pattern'].finditer(seq):
-            target_pos = match.start() + motif['pos']
+        for match in motif["pattern"].finditer(seq):
+            target_pos = match.start() + motif["pos"]
             if 0 <= target_pos < len(seq):
-                status[target_pos] = motif['id']
+                status[target_pos] = motif["id"]
     return status
 
 
 # ---------------------------------------------------------------------------
 # PacBio motifs.csv parser
 # ---------------------------------------------------------------------------
+
 
 def parse_motifs_csv(csv_path, min_fraction=0.40, min_detected=20):
     """Parse a PacBio motifs.csv and return a KinSim motif string.
@@ -242,21 +268,21 @@ def parse_motifs_csv(csv_path, min_fraction=0.40, min_detected=20):
         Fields: MOD_TYPE, MOTIF, POS, nDetected, fraction
     """
     entries = []
-    with open(csv_path, 'r') as f:
+    with open(csv_path) as f:
         reader = csv.DictReader(f)
         fieldnames = set(reader.fieldnames or [])
 
         # Required columns — return "" if absent (not a PacBio CSV)
-        if 'motifString' not in fieldnames or 'centerPos' not in fieldnames:
+        if "motifString" not in fieldnames or "centerPos" not in fieldnames:
             return ""
 
-        has_fraction   = 'fraction'         in fieldnames
-        has_ndetected  = 'nDetected'        in fieldnames
-        has_mod_type   = 'modificationType' in fieldnames
+        has_fraction = "fraction" in fieldnames
+        has_ndetected = "nDetected" in fieldnames
+        has_mod_type = "modificationType" in fieldnames
 
         for lineno, row in enumerate(reader, 2):
-            motif_seq  = row.get('motifString', '').strip()
-            center_str = row.get('centerPos', '').strip()
+            motif_seq = row.get("motifString", "").strip()
+            center_str = row.get("centerPos", "").strip()
             if not motif_seq or not center_str:
                 continue
 
@@ -269,7 +295,7 @@ def parse_motifs_csv(csv_path, min_fraction=0.40, min_detected=20):
             # fraction — blank → bypass filter
             fraction: float | None = None
             if has_fraction:
-                frac_str = row.get('fraction', '').strip()
+                frac_str = row.get("fraction", "").strip()
                 if frac_str:
                     try:
                         fraction = float(frac_str)
@@ -282,7 +308,7 @@ def parse_motifs_csv(csv_path, min_fraction=0.40, min_detected=20):
             # nDetected — blank → bypass filter
             n_detected: int | None = None
             if has_ndetected:
-                nd_str = row.get('nDetected', '').strip()
+                nd_str = row.get("nDetected", "").strip()
                 if nd_str:
                     try:
                         n_detected = int(nd_str)
@@ -293,33 +319,43 @@ def parse_motifs_csv(csv_path, min_fraction=0.40, min_detected=20):
                 continue
 
             # modificationType
-            mod_type = row.get('modificationType', '').strip() if has_mod_type else ''
+            mod_type = row.get("modificationType", "").strip() if has_mod_type else ""
 
-            if mod_type in ('modified_base', ''):
-                idx = center_pos - 1   # centerPos is 1-based in CSV
+            if mod_type in ("modified_base", ""):
+                idx = center_pos - 1  # centerPos is 1-based in CSV
                 if idx < 0 or idx >= len(motif_seq):
-                    log.warning("motifs.csv line %d: centerPos %d OOB for '%s' — skipped",
-                                lineno, center_pos, motif_seq)
+                    log.warning(
+                        "motifs.csv line %d: centerPos %d OOB for '%s' — skipped",
+                        lineno,
+                        center_pos,
+                        motif_seq,
+                    )
                     continue
                 base = motif_seq[idx].upper()
                 resolved = _BASE_TO_METH.get(base)
                 if resolved is None:
-                    log.warning("motifs.csv line %d: cannot infer mod type at "
-                                "%s[%d]='%s' — skipped",
-                                lineno, motif_seq, center_pos, base)
+                    log.warning(
+                        "motifs.csv line %d: cannot infer mod type at %s[%d]='%s' — skipped",
+                        lineno,
+                        motif_seq,
+                        center_pos,
+                        base,
+                    )
                     continue
                 mod_type = resolved
 
             if mod_type not in METH_IDS:
-                log.warning("motifs.csv line %d: unknown mod type '%s' for "
-                            "%s — skipped", lineno, mod_type, motif_seq)
+                log.warning(
+                    "motifs.csv line %d: unknown mod type '%s' for %s — skipped",
+                    lineno,
+                    mod_type,
+                    motif_seq,
+                )
                 continue
 
-            nd_out  = n_detected if n_detected is not None else 0
-            fr_out  = fraction   if fraction   is not None else 1.0
-            entries.append(
-                f"{mod_type},{motif_seq},{center_pos},{nd_out},{fr_out:.6g}"
-            )
+            nd_out = n_detected if n_detected is not None else 0
+            fr_out = fraction if fraction is not None else 1.0
+            entries.append(f"{mod_type},{motif_seq},{center_pos},{nd_out},{fr_out:.6g}")
 
     return ";".join(entries)
 
@@ -328,8 +364,8 @@ def parse_motifs_csv(csv_path, min_fraction=0.40, min_detected=20):
 # Unified motif-string loader (auto-detect source)
 # ---------------------------------------------------------------------------
 
-def load_motif_string(motifs_arg, min_fraction=0.40, min_detected=20,
-                      parser_name=None):
+
+def load_motif_string(motifs_arg, min_fraction=0.40, min_detected=20, parser_name=None):
     """Load a KinSim motif string from a file path or return the argument as-is.
 
     Auto-detection (when parser_name is None):
@@ -352,33 +388,32 @@ def load_motif_string(motifs_arg, min_fraction=0.40, min_detected=20,
     # Explicit parser requested
     if parser_name is not None:
         from prep.callers import create_parser
+
         parser = create_parser(parser_name)
-        return parser.parse(motifs_arg,
-                            min_fraction=min_fraction,
-                            min_detected=min_detected)
+        return parser.parse(motifs_arg, min_fraction=min_fraction, min_detected=min_detected)
 
     if os.path.isfile(motifs_arg):
         # Try the callers registry first (covers combined CSV, PacBio CSV,
         # modkit, ipd_summary) — auto-detection is more precise than the
         # legacy parse_motifs_csv fallback.
         from prep.callers import auto_detect_parser
+
         parser = auto_detect_parser(motifs_arg)
         if parser is not None:
-            return parser.parse(motifs_arg,
-                                min_fraction=min_fraction,
-                                min_detected=min_detected)
+            return parser.parse(motifs_arg, min_fraction=min_fraction, min_detected=min_detected)
 
         # Legacy PacBio CSV parser (returns "" when columns are missing,
         # so it is safe to try on any .csv file)
-        if motifs_arg.lower().endswith('.csv'):
-            result = parse_motifs_csv(motifs_arg,
-                                      min_fraction=min_fraction,
-                                      min_detected=min_detected)
+        if motifs_arg.lower().endswith(".csv"):
+            result = parse_motifs_csv(
+                motifs_arg, min_fraction=min_fraction, min_detected=min_detected
+            )
             if result:
                 return result
 
         # Fall through to REBASE
         from prep.rebase import parse_rebase_file
+
         return parse_rebase_file(motifs_arg)
 
     return motifs_arg
@@ -388,8 +423,8 @@ def load_motif_string(motifs_arg, min_fraction=0.40, min_detected=20,
 # Reference-level methylation map (pre-scan entire genome once)
 # ---------------------------------------------------------------------------
 
-def build_reference_meth_map(ref_seqs, motif_string, revcomp=True,
-                              no_fuzznuc=False):
+
+def build_reference_meth_map(ref_seqs, motif_string, revcomp=True, no_fuzznuc=False):
     """Pre-scan a reference genome for methylation sites.
 
     PRIMARY BACKEND: EMBOSS fuzznuc — tried first unless no_fuzznuc=True.
@@ -421,13 +456,13 @@ def build_reference_meth_map(ref_seqs, motif_string, revcomp=True,
             # fall back to regex (fuzznuc can silently produce empty results)
             total_hits = sum(int(np.count_nonzero(arr)) for arr in meth_map.values())
             if total_hits == 0 and motif_string:
-                log.warning("fuzznuc returned 0 methylation sites — "
-                            "falling back to Python regex scanner")
+                log.warning(
+                    "fuzznuc returned 0 methylation sites — falling back to Python regex scanner"
+                )
                 return _build_meth_map_regex(ref_seqs, motif_string, revcomp)
             return meth_map
         except FileNotFoundError:
-            log.warning("fuzznuc not found on PATH — "
-                        "falling back to Python regex scanner")
+            log.warning("fuzznuc not found on PATH — falling back to Python regex scanner")
     return _build_meth_map_regex(ref_seqs, motif_string, revcomp)
 
 
@@ -451,10 +486,10 @@ def build_reference_frac_map(ref_seqs, motif_string, revcomp=True):
     for name, seq in ref_seqs.items():
         fmap = np.zeros(len(seq), dtype=np.float32)
         for motif in motifs:
-            for match in motif['pattern'].finditer(seq):
-                target_pos = match.start() + motif['pos']
+            for match in motif["pattern"].finditer(seq):
+                target_pos = match.start() + motif["pos"]
                 if 0 <= target_pos < len(seq):
-                    fmap[target_pos] = motif['frac']
+                    fmap[target_pos] = motif["frac"]
         frac_map[name] = fmap
     return frac_map
 
@@ -476,62 +511,67 @@ def _build_meth_map_fuzznuc(ref_seqs, motif_string, revcomp=True):
     from prep.rebase import write_fuzznuc_pattern_file
 
     if not motif_string:
-        return {name: np.zeros(len(seq), dtype=np.int8)
-                for name, seq in ref_seqs.items()}
+        return {name: np.zeros(len(seq), dtype=np.int8) for name, seq in ref_seqs.items()}
 
-    meth_map = {name: np.zeros(len(seq), dtype=np.int8)
-                for name, seq in ref_seqs.items()}
+    meth_map = {name: np.zeros(len(seq), dtype=np.int8) for name, seq in ref_seqs.items()}
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Write reference FASTA
-        ref_fa = os.path.join(tmpdir, 'ref.fa')
-        with open(ref_fa, 'w') as fh:
+        ref_fa = os.path.join(tmpdir, "ref.fa")
+        with open(ref_fa, "w") as fh:
             for name, seq in ref_seqs.items():
-                fh.write(f'>{name}\n{seq}\n')
+                fh.write(f">{name}\n{seq}\n")
 
         # Write named-pattern file and get lookup dict
-        pattern_file = os.path.join(tmpdir, 'patterns.txt')
+        pattern_file = os.path.join(tmpdir, "patterns.txt")
         pattern_lookup = write_fuzznuc_pattern_file(motif_string, pattern_file)
 
         if not pattern_lookup:
             return meth_map
 
-        out_gff = os.path.join(tmpdir, 'hits.gff')
+        out_gff = os.path.join(tmpdir, "hits.gff")
         cmd = [
-            'fuzznuc',
-            '-sequence', ref_fa,
-            '-pattern', f'@{pattern_file}',
-            '-pmismatch', '0',
-            '-complement', 'Y' if revcomp else 'N',
-            '-rformat', 'gff',
-            '-outfile', out_gff,
-            '-auto',
+            "fuzznuc",
+            "-sequence",
+            ref_fa,
+            "-pattern",
+            f"@{pattern_file}",
+            "-pmismatch",
+            "0",
+            "-complement",
+            "Y" if revcomp else "N",
+            "-rformat",
+            "gff",
+            "-outfile",
+            out_gff,
+            "-auto",
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            log.warning("fuzznuc failed (exit %d): %s — "
-                        "falling back to Python regex scanner",
-                        result.returncode, result.stderr.strip())
+            log.warning(
+                "fuzznuc failed (exit %d): %s — falling back to Python regex scanner",
+                result.returncode,
+                result.stderr.strip(),
+            )
             return _build_meth_map_regex(ref_seqs, motif_string, revcomp)
 
         if not os.path.exists(out_gff):
-            log.warning("fuzznuc produced no output file — "
-                        "falling back to Python regex scanner")
+            log.warning("fuzznuc produced no output file — falling back to Python regex scanner")
             return _build_meth_map_regex(ref_seqs, motif_string, revcomp)
 
         # Parse GFF output: extract pattern name from attributes to identify motif
         with open(out_gff) as gff:
             for line in gff:
-                if line.startswith('#') or not line.strip():
+                if line.startswith("#") or not line.strip():
                     continue
-                cols = line.split('\t')
+                cols = line.split("\t")
                 if len(cols) < 7:
                     continue
-                ref_name   = cols[0]
-                start_1b   = int(cols[3])
-                end_1b     = int(cols[4])
-                strand     = cols[6]
-                attrs      = cols[8].strip() if len(cols) > 8 else ''
+                ref_name = cols[0]
+                start_1b = int(cols[3])
+                end_1b = int(cols[4])
+                strand = cols[6]
+                attrs = cols[8].strip() if len(cols) > 8 else ""
 
                 if ref_name not in meth_map:
                     continue
@@ -546,9 +586,10 @@ def _build_meth_map_fuzznuc(ref_seqs, motif_string, revcomp=True):
                     else:
                         # Try decode from name convention directly
                         from prep.rebase import decode_fuzznuc_pattern_name
+
                         meth_id, mod_pos = decode_fuzznuc_pattern_name(pname)
 
-                if strand == '+':
+                if strand == "+":
                     meth_pos = (start_1b - 1) + mod_pos
                 else:
                     meth_pos = (end_1b - 1) - mod_pos
@@ -564,8 +605,10 @@ def _build_meth_map_fuzznuc(ref_seqs, motif_string, revcomp=True):
 # CLI: kinsim motifs
 # ---------------------------------------------------------------------------
 
+
 def main(argv=None):
     import argparse
+
     parser = argparse.ArgumentParser(
         prog="kinsim motifs",
         description=(
@@ -580,17 +623,24 @@ def main(argv=None):
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("input",
-                        help="PacBio motifs.csv, REBASE file, or KinSim motif string")
-    parser.add_argument("--min-fraction", type=float, default=0.40,
-                        help="Minimum fraction threshold for PacBio CSV (default: 0.40)")
-    parser.add_argument("--min-detected", type=int, default=20,
-                        help="Minimum nDetected threshold for PacBio CSV (default: 20)")
+    parser.add_argument("input", help="PacBio motifs.csv, REBASE file, or KinSim motif string")
+    parser.add_argument(
+        "--min-fraction",
+        type=float,
+        default=0.40,
+        help="Minimum fraction threshold for PacBio CSV (default: 0.40)",
+    )
+    parser.add_argument(
+        "--min-detected",
+        type=int,
+        default=20,
+        help="Minimum nDetected threshold for PacBio CSV (default: 20)",
+    )
     args = parser.parse_args(argv)
 
-    result = load_motif_string(args.input,
-                               min_fraction=args.min_fraction,
-                               min_detected=args.min_detected)
+    result = load_motif_string(
+        args.input, min_fraction=args.min_fraction, min_detected=args.min_detected
+    )
     if result:
         print(result)
     else:

@@ -27,7 +27,6 @@ position 0. Downstream KinSim tools can still use these for training.
 
 import logging
 
-from kinsim.utils.encoding import METH_IDS
 from .base import BaseOutputParser
 from .registry import register
 
@@ -35,13 +34,13 @@ log = logging.getLogger(__name__)
 
 # modkit mod codes -> KinSim mod types
 _MODKIT_CODE_MAP = {
-    'a': 'm6A',
-    '6mA': 'm6A',
-    'm': 'm5C',
-    '5mC': 'm5C',
-    'h': 'm5C',     # 5hmC -> treat as m5C
-    '5hmC': 'm5C',
-    '21839': 'm4C',  # SAM spec numeric code for m4C
+    "a": "m6A",
+    "6mA": "m6A",
+    "m": "m5C",
+    "5mC": "m5C",
+    "h": "m5C",  # 5hmC -> treat as m5C
+    "5hmC": "m5C",
+    "21839": "m4C",  # SAM spec numeric code for m4C
 }
 
 
@@ -64,28 +63,31 @@ class ModkitParser(BaseOutputParser):
         with open(filepath) as f:
             for lineno, line in enumerate(f, 1):
                 line = line.strip()
-                if not line or line.startswith('#'):
+                if not line or line.startswith("#"):
                     continue
 
-                fields = line.split('\t')
+                fields = line.split("\t")
                 if len(fields) < 11:
-                    log.warning("modkit line %d: expected >=11 columns, "
-                                "got %d -- skipped", lineno, len(fields))
+                    log.warning(
+                        "modkit line %d: expected >=11 columns, got %d -- skipped",
+                        lineno,
+                        len(fields),
+                    )
                     continue
 
                 mod_code = fields[3].strip()
                 mod_type = _MODKIT_CODE_MAP.get(mod_code)
                 if mod_type is None:
-                    log.warning("modkit line %d: unknown mod code '%s' "
-                                "-- skipped", lineno, mod_code)
+                    log.warning(
+                        "modkit line %d: unknown mod code '%s' -- skipped", lineno, mod_code
+                    )
                     continue
 
                 try:
                     n_valid = int(fields[9])
                     frac_pct = float(fields[10])
                 except (ValueError, IndexError):
-                    log.warning("modkit line %d: invalid Nvalid/fraction "
-                                "-- skipped", lineno)
+                    log.warning("modkit line %d: invalid Nvalid/fraction -- skipped", lineno)
                     continue
 
                 fraction = frac_pct / 100.0  # percent -> [0,1]
@@ -108,20 +110,22 @@ class ModkitParser(BaseOutputParser):
     def is_file_for_this_parser(self, filepath: str) -> bool:
         """Match .bed or .tsv files with modkit-like content."""
         lower = filepath.lower()
-        if not (lower.endswith('.bed') or lower.endswith('.tsv')
-                or 'modkit' in lower or 'bedmethyl' in lower):
+        if not (
+            lower.endswith(".bed")
+            or lower.endswith(".tsv")
+            or "modkit" in lower
+            or "bedmethyl" in lower
+        ):
             return False
         try:
             with open(filepath) as f:
                 for line in f:
                     line = line.strip()
-                    if not line or line.startswith('#'):
+                    if not line or line.startswith("#"):
                         continue
-                    fields = line.split('\t')
+                    fields = line.split("\t")
                     # modkit bedMethyl has 11+ columns, col 3 is mod code
-                    if len(fields) >= 11 and fields[3].strip() in _MODKIT_CODE_MAP:
-                        return True
-                    return False
+                    return bool(len(fields) >= 11 and fields[3].strip() in _MODKIT_CODE_MAP)
         except OSError:
             return False
         return False

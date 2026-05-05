@@ -1,28 +1,158 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kinsim"
-version = "0.4.0"
-description = "PacBio kinetic signal simulator for metagenomic binning"
-license = "MIT"
-requires-python = ">=3.9"
+name            = "kinsim"
+version         = "0.4.0"
+description     = "PacBio HiFi kinetic signal simulator for methylation-aware metagenomic binning"
+readme          = "README.md"
+license         = "MIT"
+license-files   = ["LICENSE"]
+requires-python = ">=3.10"
+authors         = [{ name = "Nicolas Dutilleux", email = "nicolas.dutilleux@unifr.ch" }]
+keywords        = ["pacbio", "kinetics", "methylation", "metagenomics", "simulator", "bioinformatics"]
+classifiers     = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
 dependencies = [
-    "numpy",
-    "pysam",
-    "scikit-learn",
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+    "pysam>=0.22",
+    "scikit-learn>=1.4",
+]
+
+[project.optional-dependencies]
+ml = [
+    "torch>=2.0",
+    "pytorch-lightning>=2.0",
+]
+plot = [
+    "plotly>=5.20",
+    "matplotlib>=3.8",
+    "pandas>=2.2",
+    "kaleido",         # static image export from plotly
+]
+hpo = ["optuna"]
+tb  = ["tensorboard"]
+dev = [
+    "ruff>=0.6",
+    "pre-commit>=3.6",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "kinsim[ml,plot]",
 ]
 
 [project.scripts]
 kinsim      = "kinsim.__main__:main"
 kinsim-prep = "prep.__main__:main"
 
-[project.optional-dependencies]
-ml      = ["torch>=2.0", "pytorch-lightning>=2.0"]
-hpo     = ["optuna"]
-plot    = ["matplotlib"]
-tb      = ["tensorboard"]
+[project.urls]
+Homepage      = "https://github.com/NicolasDutilleux/KinSim"
+Repository    = "https://github.com/NicolasDutilleux/KinSim"
+Issues        = "https://github.com/NicolasDutilleux/KinSim/issues"
+Documentation = "https://github.com/NicolasDutilleux/KinSim#readme"
+
+# ----------------------------------------------------------------------------
+# Build configuration
+# ----------------------------------------------------------------------------
 
 [tool.setuptools.packages.find]
 include = ["kinsim*", "prep*"]
+
+[tool.setuptools.package-data]
+kinsim = ["py.typed"]
+prep   = ["py.typed"]
+
+# ----------------------------------------------------------------------------
+# Lint / format — ruff (replaces flake8 + isort + pyupgrade + pydocstyle)
+# ----------------------------------------------------------------------------
+
+[tool.ruff]
+line-length    = 100
+target-version = "py310"
+extend-exclude = [
+    "archive",           # legacy code, frozen
+    "baseline",          # baselines for comparison, frozen
+    "nextflow",          # generated workflow files
+    "kinsim.egg-info",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes (unused imports, names, etc.)
+    "W",   # pycodestyle warnings
+    "I",   # isort (import order)
+    "N",   # pep8-naming
+    "UP",  # pyupgrade (modern syntax)
+    "B",   # flake8-bugbear (likely-bug patterns)
+    "SIM", # flake8-simplify (simplifiable patterns)
+    "RUF", # ruff-specific rules
+]
+ignore = [
+    "E501",    # line-too-long — long log strings + dataframe-style code
+    "N803",    # arg name should be lowercase — K, IPD, PW are scientific names
+    "N806",    # variable in function should be lowercase — same reason
+    "N812",    # lowercase imported as non-lowercase — `import numpy as np` etc.
+    "B008",    # function call in default arg — argparse / config patterns
+    "RUF001",  # ambiguous unicode in string — μ, σ, →, — used intentionally
+    "RUF002",  # ambiguous unicode in docstring — same reason
+    "RUF003",  # ambiguous unicode in comment — same reason
+    "RUF012",  # mutable class default — false positive on dataclass fields
+    "SIM105",  # `try/except: pass` is clearer than `with contextlib.suppress`
+    "SIM108",  # `if/else` is often more readable than a packed ternary
+    "SIM118",  # `key in dict.keys()` — explicit is fine
+    "E701",    # multi-statement-on-one-line — common pattern in scientific code
+    "E702",    # same, with semicolons (test fixture builders)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011", "SIM117"]  # asserts and nested with-statements are fine in tests
+
+[tool.ruff.lint.isort]
+known-first-party = ["kinsim", "prep"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ----------------------------------------------------------------------------
+# pytest
+# ----------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+minversion   = "8.0"
+addopts      = ["-ra", "--strict-markers", "--strict-config"]
+testpaths    = ["tests"]
+pythonpath   = ["."]
+python_files = ["test_*.py"]
+
+# ----------------------------------------------------------------------------
+# coverage
+# ----------------------------------------------------------------------------
+
+[tool.coverage.run]
+branch = true
+source = ["kinsim", "prep"]
+omit   = [
+    "*/__main__.py",   # CLI dispatch — covered by integration runs
+    "archive/*",
+    "baseline/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+show_missing = true

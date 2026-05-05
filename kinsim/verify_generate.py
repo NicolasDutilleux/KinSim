@@ -26,10 +26,10 @@ from pathlib import Path
 
 import numpy as np
 
-from .utils.encoding import decode_kmer
-from .utils.config import setup_logging
-from .utils.motifs import load_motif_string
 from .refine import MOD_NAMES
+from .utils.config import setup_logging
+from .utils.encoding import decode_kmer
+from .utils.motifs import load_motif_string
 
 log = logging.getLogger(__name__)
 
@@ -43,11 +43,13 @@ def _summarize(d: dict) -> dict:
         if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] < 2:
             continue
         ipd = arr[:, 0].astype(np.float32)
-        pw  = arr[:, 1].astype(np.float32)
+        pw = arr[:, 1].astype(np.float32)
         out[key] = (
             int(arr.shape[0]),
-            float(ipd.mean()), float(ipd.std(ddof=1) if len(ipd) > 1 else 0.0),
-            float(pw.mean()),  float(pw.std(ddof=1)  if len(pw)  > 1 else 0.0),
+            float(ipd.mean()),
+            float(ipd.std(ddof=1) if len(ipd) > 1 else 0.0),
+            float(pw.mean()),
+            float(pw.std(ddof=1) if len(pw) > 1 else 0.0),
         )
     return out
 
@@ -78,7 +80,8 @@ def verify(
 
     log.info("=== Extracting from REFERENCE BAM: %s ===", ref_bam)
     ref = extract_samples_from_bam(
-        ref_bam, motif_string,
+        ref_bam,
+        motif_string,
         max_samples_per_key=max_samples_per_key,
         use_reverse_strand=True,
         binarize=False,
@@ -87,7 +90,8 @@ def verify(
 
     log.info("=== Extracting from GENERATED BAM: %s ===", gen_bam)
     gen = extract_samples_from_bam(
-        gen_bam, motif_string,
+        gen_bam,
+        motif_string,
         max_samples_per_key=max_samples_per_key,
         use_reverse_strand=True,
         binarize=False,
@@ -97,14 +101,13 @@ def verify(
     ref_stats = _summarize(ref)
     gen_stats = _summarize(gen)
     all_keys = sorted(set(ref_stats) | set(gen_stats))
-    log.info("Keys: ref=%d  gen=%d  union=%d",
-             len(ref_stats), len(gen_stats), len(all_keys))
+    log.info("Keys: ref=%d  gen=%d  union=%d", len(ref_stats), len(gen_stats), len(all_keys))
 
     output_tsv.parent.mkdir(parents=True, exist_ok=True)
     log.info("Writing TSV: %s", output_tsv)
 
     mu_ipd_ref_arr, mu_ipd_gen_arr = [], []
-    mu_pw_ref_arr,  mu_pw_gen_arr  = [], []
+    mu_pw_ref_arr, mu_pw_gen_arr = [], []
     n_written = 0
 
     with open(output_tsv, "w") as f:
@@ -123,7 +126,7 @@ def verify(
             kmer_str = decode_kmer(kmer_id) if kmer_id >= 0 else "?"
             meth_str = MOD_NAMES.get(meth_id, f"mod{meth_id}")
             d_mu_ipd = g[1] - r[1]
-            d_mu_pw  = g[3] - r[3]
+            d_mu_pw = g[3] - r[3]
             f.write(
                 f"{kmer_id}\t{kmer_str}\t{meth_str}\t"
                 f"{r[0]}\t{r[1]:.4f}\t{r[2]:.4f}\t{r[3]:.4f}\t{r[4]:.4f}\t"
@@ -132,18 +135,28 @@ def verify(
             )
             n_written += 1
             if r[0] >= min_samples and g[0] >= min_samples:
-                mu_ipd_ref_arr.append(r[1]); mu_ipd_gen_arr.append(g[1])
-                mu_pw_ref_arr.append(r[3]);  mu_pw_gen_arr.append(g[3])
+                mu_ipd_ref_arr.append(r[1])
+                mu_ipd_gen_arr.append(g[1])
+                mu_pw_ref_arr.append(r[3])
+                mu_pw_gen_arr.append(g[3])
 
     mu_ipd_ref_arr = np.asarray(mu_ipd_ref_arr, dtype=np.float64)
     mu_ipd_gen_arr = np.asarray(mu_ipd_gen_arr, dtype=np.float64)
-    mu_pw_ref_arr  = np.asarray(mu_pw_ref_arr,  dtype=np.float64)
-    mu_pw_gen_arr  = np.asarray(mu_pw_gen_arr,  dtype=np.float64)
+    mu_pw_ref_arr = np.asarray(mu_pw_ref_arr, dtype=np.float64)
+    mu_pw_gen_arr = np.asarray(mu_pw_gen_arr, dtype=np.float64)
 
     r_ipd = _pearson(mu_ipd_ref_arr, mu_ipd_gen_arr)
-    r_pw  = _pearson(mu_pw_ref_arr,  mu_pw_gen_arr)
-    mae_ipd = float(np.mean(np.abs(mu_ipd_gen_arr - mu_ipd_ref_arr))) if len(mu_ipd_ref_arr) else float("nan")
-    mae_pw  = float(np.mean(np.abs(mu_pw_gen_arr  - mu_pw_ref_arr )))  if len(mu_pw_ref_arr ) else float("nan")
+    r_pw = _pearson(mu_pw_ref_arr, mu_pw_gen_arr)
+    mae_ipd = (
+        float(np.mean(np.abs(mu_ipd_gen_arr - mu_ipd_ref_arr)))
+        if len(mu_ipd_ref_arr)
+        else float("nan")
+    )
+    mae_pw = (
+        float(np.mean(np.abs(mu_pw_gen_arr - mu_pw_ref_arr)))
+        if len(mu_pw_ref_arr)
+        else float("nan")
+    )
 
     log.info("=" * 56)
     log.info("  VERIFY-GENERATE SUMMARY")
@@ -157,12 +170,12 @@ def verify(
     log.info("=" * 56)
 
     return {
-        "n_rows":           n_written,
-        "n_paired":         int(len(mu_ipd_ref_arr)),
-        "pearson_mu_ipd":   r_ipd,
-        "pearson_mu_pw":    r_pw,
-        "mae_mu_ipd":       mae_ipd,
-        "mae_mu_pw":        mae_pw,
+        "n_rows": n_written,
+        "n_paired": len(mu_ipd_ref_arr),
+        "pearson_mu_ipd": r_ipd,
+        "pearson_mu_pw": r_pw,
+        "mae_mu_ipd": mae_ipd,
+        "mae_mu_pw": mae_pw,
     }
 
 
@@ -174,12 +187,20 @@ def main(argv=None):
     )
     ap.add_argument("ref_bam", help="Reference (real) BAM with fi/fp kinetic tags")
     ap.add_argument("gen_bam", help="Generated BAM with fi/fp synthetic tags")
-    ap.add_argument("motifs",  help="KinSim motif string OR path to motifs.csv / REBASE file")
+    ap.add_argument("motifs", help="KinSim motif string OR path to motifs.csv / REBASE file")
     ap.add_argument("output_tsv", help="Output TSV with per-(kmer, meth) comparison")
-    ap.add_argument("--max-samples", type=int, default=50_000,
-                    help="Reservoir cap per (kmer, meth_id) key during extraction (default 50000)")
-    ap.add_argument("--min-samples", type=int, default=5,
-                    help="Drop rows where both BAMs have fewer than this many samples (default 5)")
+    ap.add_argument(
+        "--max-samples",
+        type=int,
+        default=50_000,
+        help="Reservoir cap per (kmer, meth_id) key during extraction (default 50000)",
+    )
+    ap.add_argument(
+        "--min-samples",
+        type=int,
+        default=5,
+        help="Drop rows where both BAMs have fewer than this many samples (default 5)",
+    )
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -193,7 +214,9 @@ def main(argv=None):
         sys.exit(1)
 
     verify(
-        args.ref_bam, args.gen_bam, args.motifs,
+        args.ref_bam,
+        args.gen_bam,
+        args.motifs,
         Path(args.output_tsv),
         max_samples_per_key=args.max_samples,
         min_samples=args.min_samples,

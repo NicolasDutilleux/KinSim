@@ -24,6 +24,7 @@ import logging
 import re
 
 from kinsim.utils.encoding import METH_IDS
+
 from .base import BaseOutputParser
 from .registry import register
 
@@ -31,12 +32,12 @@ log = logging.getLogger(__name__)
 
 # ipdSummary base codes -> KinSim mod types
 _BASE_TO_METH = {
-    'A': 'm6A',
-    'C': 'm4C',
+    "A": "m6A",
+    "C": "m4C",
 }
 
 # GFF attribute parser
-_GFF_ATTR_RE = re.compile(r'(\w+)=([^;]+)')
+_GFF_ATTR_RE = re.compile(r"(\w+)=([^;]+)")
 
 
 @register
@@ -56,14 +57,14 @@ class IpdSummaryParser(BaseOutputParser):
         with open(filepath) as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith('#'):
+                if not line or line.startswith("#"):
                     continue
-                if line.startswith('##gff'):
+                if line.startswith("##gff"):
                     return self._parse_gff(filepath, min_fraction, min_detected)
                 # CSV: check for header or tab-separated GFF
-                if '\t' in line and not line.startswith('refName'):
-                    fields = line.split('\t')
-                    if len(fields) == 9 and fields[2] in ('modified_base', 'kinetic'):
+                if "\t" in line and not line.startswith("refName"):
+                    fields = line.split("\t")
+                    if len(fields) == 9 and fields[2] in ("modified_base", "kinetic"):
                         return self._parse_gff(filepath, min_fraction, min_detected)
                 break
 
@@ -84,14 +85,14 @@ class IpdSummaryParser(BaseOutputParser):
                 log.warning("ipdSummary CSV: empty file '%s'", filepath)
                 return ""
 
-            for lineno, row in enumerate(reader, 2):
-                base = row.get('base', '').strip().upper()
+            for _lineno, row in enumerate(reader, 2):
+                base = row.get("base", "").strip().upper()
                 mod_type = _BASE_TO_METH.get(base)
                 if mod_type is None:
                     continue  # G/T bases are not methylation targets
 
                 # Score/pvalue filtering
-                score_str = row.get('score', '0').strip()
+                score_str = row.get("score", "0").strip()
                 try:
                     score = float(score_str)
                 except ValueError:
@@ -102,9 +103,9 @@ class IpdSummaryParser(BaseOutputParser):
                 if score < 20:  # roughly p < 0.01
                     continue
 
-                ref_name = row.get('refName', '').strip()
-                tpl = row.get('tpl', '0').strip()
-                strand = row.get('strand', '0').strip()
+                ref_name = row.get("refName", "").strip()
+                tpl = row.get("tpl", "0").strip()
+                strand = row.get("strand", "0").strip()
 
                 entry = f"{mod_type},{ref_name}:{tpl}:{strand},0,1,1.0"
                 entries.append(entry)
@@ -121,17 +122,17 @@ class IpdSummaryParser(BaseOutputParser):
         entries: list[str] = []
 
         with open(filepath) as f:
-            for lineno, line in enumerate(f, 1):
+            for _lineno, line in enumerate(f, 1):
                 line = line.strip()
-                if not line or line.startswith('#'):
+                if not line or line.startswith("#"):
                     continue
 
-                fields = line.split('\t')
+                fields = line.split("\t")
                 if len(fields) < 9:
                     continue
 
                 feature = fields[2]
-                if feature not in ('modified_base', 'kinetic'):
+                if feature not in ("modified_base", "kinetic"):
                     continue
 
                 seqname = fields[0]
@@ -150,16 +151,16 @@ class IpdSummaryParser(BaseOutputParser):
 
                 # Parse attributes
                 attrs = dict(_GFF_ATTR_RE.findall(attributes))
-                mod_type_raw = attrs.get('modificationType', '')
+                mod_type_raw = attrs.get("modificationType", "")
 
                 if mod_type_raw in METH_IDS:
                     mod_type = mod_type_raw
                 else:
                     # Try to resolve from context
-                    context = attrs.get('context', '')
+                    context = attrs.get("context", "")
                     if context:
                         base = context[0].upper()
-                        mod_type = _BASE_TO_METH.get(base, '')
+                        mod_type = _BASE_TO_METH.get(base, "")
                     else:
                         continue
 
@@ -174,15 +175,15 @@ class IpdSummaryParser(BaseOutputParser):
     def is_file_for_this_parser(self, filepath: str) -> bool:
         """Match .gff or .csv files with ipdSummary-like content."""
         lower = filepath.lower()
-        if 'ipdsummary' in lower or 'kinetics' in lower:
+        if "ipdsummary" in lower or "kinetics" in lower:
             return True
-        if lower.endswith('.gff') or lower.endswith('.gff3'):
+        if lower.endswith(".gff") or lower.endswith(".gff3"):
             try:
                 with open(filepath) as f:
                     for line in f:
-                        if 'kinetic' in line.lower() or 'ipdRatio' in line:
+                        if "kinetic" in line.lower() or "ipdRatio" in line:
                             return True
-                        if not line.startswith('#'):
+                        if not line.startswith("#"):
                             break
             except OSError:
                 pass

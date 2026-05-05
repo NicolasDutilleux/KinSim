@@ -13,36 +13,46 @@ Two CLI tools are installed from the same repository:
 - **`kinsim`**      — ML pipeline: extract, merge, train, generate, evaluate, analyze
 - **`kinsim-prep`** — Data preparation: rebase, merge-motifs, manifest, filter, balance, parse
 
-## v4 Training Set (current — single-pass extract)
+## Training Set
 
-The v4 architecture (April-May 2026) extends extraction to capture
-**positions of expected kinetic signature** in addition to methylation
-positions themselves. Rationale: m6A/m4C/m5C signatures are observed at
+`extract` is a single-pass pipeline that captures **positions of
+expected kinetic signature** in addition to methylation positions
+themselves. Rationale: m6A/m4C/m5C signatures are observed at
 configured downstream offsets (m6A at 0 and +5, m5C at +2 and +6, etc.,
 declared in `kinsim_config.yaml`). Training only on methylation centers
-deprives the model of the slowing signal at those offsets.
-
-**Single-pass pipeline (no bootstrap):**
+would deprive the model of the slowing signal at those offsets.
 
 ```
-  BAM + motifs --> kinsim extract --v4    --> shard_v4.pkl
-                                                 (36 cols, key=kmer_id, CATEGORY at col 35)
-               --> kinsim merge            --> master_v4.pkl
-               --> kinsim refine           --> master_v4_clean.pkl
-                       (auto-detects v4)
-               --> kinsim train            --> checkpoint.pt
+  BAM + motifs --> kinsim extract  --> shard.pkl  (36 cols, key=kmer_id, CATEGORY at col 35)
+               --> kinsim merge    --> master.pkl
+               --> kinsim refine   --> master_clean.pkl  (drops motif-FP slowed samples)
+               --> kinsim train    --> checkpoint.pt
 ```
 
-**Three categories** (col 35 of the 36-col layout):
-- `0` BASELINE  — far from any methylation, meth_context window is empty.
+**Three categories** (col 35 of the 38-col layout):
+- `0` BASELINE  — far from any methylation; meth_context window is empty.
 - `1` SLOWED    — at a signature offset of a methylation. Includes the
   methylation itself when `0 ∈ signature_offsets[T]` (m6A, m4C). For m5C
-  the methylation center is NEAR_METH, since 0 is not in `[2, 6]`.
+  the methylation centre is NEAR_METH, since 0 is not in `[2, 6]`.
 - `2` NEAR_METH — close to a methylation (within `[+1, near_meth_max_dist]`)
   but NOT at a signature offset of it. Negative control: meth in mc but
   IPD should look baseline.
 
-**Per-position emission rules in v4 extract (`--v4` flag):**
+**Parent meth attribution** (col 36 PARENT_METH + col 37 PARENT_OFFSET):
+extract knows which methylation produced each SLOWED/NEAR_METH row (it's
+iterating "for each motif match of type T at position p"). Both columns
+are written at emission time, so analyze can bucket rows per
+`(category, parent meth)` cleanly with a vectorised mask — no need to
+re-infer the parent from the mc[] window.
+
+Precedence on overlapping motif claims (rare):
+- SLOWED beats NEAR_METH (existing rule).
+- Within SLOWED: last writer wins (deterministic given the YAML's
+  meth-type iteration order).
+- Within NEAR_METH: first writer wins (only assign where neither
+  `slowed[c]` nor `near[c]` is set yet).
+
+**Per-position emission rules in `extract`:**
 For each motif-match position `p` of type `T`:
 - For each `k ∈ signature_offsets[T]` (including 0): position `p+k` →
   CATEGORY_SLOWED.
@@ -50,20 +60,18 @@ For each motif-match position `p` of type `T`:
   position `p+k` → CATEGORY_NEAR_METH (slowed wins on conflict).
 Positions far from any methylation (distance ≥ `baseline_min_dist_to_meth`,
 default = K = 11) → CATEGORY_BASELINE candidate, capped per kmer at
-`n_baseline_per_kmer` via end-of-stream uniform subsample.
+`n_baseline_per_kmer` via streaming reservoir sampling.
 
-**Refine pipeline:** ONE pass — `slowed_split_v4`. Pools the IPD of all
-CATEGORY_BASELINE samples, computes the `secondary_percentile`-th
-percentile (default 95) as the lower threshold, drops CATEGORY_SLOWED
-samples below the threshold (FP motifs whose expected slowing did not
-occur). CATEGORY_BASELINE and CATEGORY_NEAR_METH pass through
-unchanged. NO GMM step in v4.
+**Refine** runs a single pass — `slowed_split`. Builds the per-kmer
+baseline IPD mean for every kmer with at least 5 baseline rows; takes
+the `secondary_percentile`-th percentile (default 95) of the per-kmer
+mean distribution as the threshold; drops CATEGORY_SLOWED rows whose
+IPD < threshold (motif false positives). BASELINE and NEAR_METH pass
+through unchanged.
 
-**The v3 35-col layout is preserved for backward compatibility** (calling
-`kinsim extract` without `--v4` emits the legacy format). It is no longer
-required for any v4 step. The `--refined-pkl PATH` flag still exists as
-an opt-in oracle (uses a trusted master_clean from a previous run as
-confirmation source instead of motif-match); almost no one needs it.
+Per-kmer mean (rather than per-sample) avoids the natural per-sample
+Poisson tail of polymerase pauses on unmodified DNA — under CLT the
+per-kmer mean is much tighter, so weak signals (m4C, m5C) survive.
 
 ---
 
@@ -72,14 +80,13 @@ confirmation source instead of motif-match); almost no one needs it.
 ```
 KinSim/
 ├── pyproject.toml                  entry points: kinsim + kinsim-prep
-├── requirements.txt
 │
-├── kinsim/                         ML pipeline package (v0.4.0, MLP-only)
+├── kinsim/                         ML pipeline package (v0.4.0)
 │   ├── __init__.py
-│   ├── __main__.py                 CLI router (v0.4.0)
+│   ├── __main__.py                 CLI router
 │   │
 │   ├── extract.py                  BAM extraction + shard merging (motif-based, manifest-driven)
-│   ├── refine.py                   v3: GMM only. v4: p95 filter on slowed only
+│   ├── refine.py                   slowed_split: per-kmer baseline mean p95 filter
 │   ├── train.py                    supervised training loop (ConvPredictor/MLPPredictor)
 │   ├── generate.py                 BAM generation with trained model
 │   ├── evaluate.py                 calibration report + per-kmer distribution plots
@@ -163,10 +170,9 @@ KinSim/
     │   └── run.sh
     │
     ├── ml/                         ML pipeline — generic across Vega/Sequel/Strepto
-    │   ├── 00_extract.slurm        kinsim extract — legacy v3 (35-col)
-    │   ├── 00b_extract_v4.slurm    kinsim extract --v4 — recommended (36-col CATEGORY)
-    │   ├── 01_merge.slurm          kinsim merge shards → master.pkl
-    │   ├── 02_refine.slurm         kinsim refine — v3 (GMM only) / v4 (p95 on slowed)
+    │   ├── 00_extract.slurm        kinsim extract per manifest row (array job)
+    │   ├── 01_merge.slurm          kinsim merge shards/ → master.pkl
+    │   ├── 02_refine.slurm         kinsim refine master.pkl → master_clean.pkl
     │   ├── 03_train.slurm          kinsim train (1 GPU)
     │   ├── 04_generate.slurm       kinsim generate on PBSIM3 reads (array)
     │   ├── 05_evaluate.slurm       kinsim evaluate
@@ -267,20 +273,15 @@ meth_context:    { left: 7, right: 3 }    # asymmetric kmer / FiLM window
 kinetic_profile: { start: 0, end: 8 }     # downstream profile stored per sample
 
 refine:
-  default_strategy: "gmm_signature"
-  gmm_signature:
-    k_max: 3
-    chi2_threshold: 9.21
-    min_signature_ratio: 1.3
-    min_pi: 0.05
-    min_samples_for_gmm: 5
-  slowed_split:                    # v4 pass-2 (operates on v4 36-col input)
-    n_baseline_per_kmer: 50
-    secondary_percentile: 95
+  slowed_split:
+    secondary_percentile: 95   # p95 of per-kmer baseline mean
 
-extract:                           # v4 extract knobs
-  n_baseline_per_kmer:        50   # per-kmer baseline cap
-  baseline_min_dist_to_meth:  11   # bases (>= K so meth_context stays clean)
+extract:
+  n_baseline_per_kmer:        50   # per-kmer baseline cap (reservoir)
+  baseline_min_dist_to_meth:  11   # >= K so meth_context never overlaps a meth
+  baseline_sample_rate:       0.10 # front-end skip rate before reservoir
+  near_meth_max_dist:         7    # 1..K-1; positions p+k for k in this range
+                                   # are NEAR_METH unless k in signature_offsets[T]
 ```
 
 Strain-specific signatures (e.g. m6A at +8 instead of +5 for some
@@ -297,65 +298,76 @@ discover_pbsim3_layout(directory) -> list[dict]     # auto-detect flat vs subdir
 ```
 
 ### `kinsim/utils/sample_layout.py`
-Per-sample column layout, format detection, category inference. Pure
-Python (no pysam) so refine/dataset/tests can import it without the
+Per-sample column layout, category enum, slice helpers. Pure Python
+(no pysam) so refine/dataset/tests can import it without the
 extract/BAM dependency.
 
 ```python
-SAMPLE_NCOLS_V3 = 35    # legacy v3 layout
-SAMPLE_NCOLS    = 36    # v4 layout (= V3 + 1 CATEGORY column)
-COL_CATEGORY    = 35    # last col on v4
+SAMPLE_NCOLS = 38
+COL_IPD            = 0
+COL_PW             = 1
+COL_FRACTION       = 2
+COL_METH_CTX_*     = 3..14    # mc_0..mc_10 (offsets [-7..+3])
+COL_PROFILE_IPD    = 14..23   # IPD profile at downstream offsets 0..+8
+COL_PROFILE_PW     = 23..32   # PW  profile at downstream offsets 0..+8
+COL_REV_METH       = 32..35   # complementary-strand meth at offsets [-1, 0, +1]
+COL_CATEGORY       = 35
+COL_PARENT_METH    = 36       # meth_id of the parent meth (0 for baseline)
+COL_PARENT_OFFSET  = 37       # row_pos − parent_meth_pos (small int, [0, 7])
+
 CATEGORY_BASELINE  = 0
 CATEGORY_SLOWED    = 1   # at a signature offset (incl. meth itself if 0 ∈ sig)
 CATEGORY_NEAR_METH = 2   # close to meth but not at signature offset
 
-is_v4_format(arr)    -> bool   # True iff arr.shape[1] >= 36
-get_categories(arr, signature_offsets_by_meth=None,
-               near_meth_max_dist=7) -> int8 ndarray
-    # v4: arr[:, COL_CATEGORY]
-    # v3: inferred from meth_context using sig offsets + proximity window
+get_categories(arr) -> int8 ndarray  # arr[:, COL_CATEGORY]
 
 slice_meth_context(meth_status, center) -> list[11]
 slice_rev_meth(meth_status_complement, center) -> list[3]
 slice_kinetic_profile(ipds, pws, center) -> list[18]
 ```
 
+**`PARENT_METH` (col 36)** is written by extract at emission time —
+analyze reads it directly to bucket rows per (category, parent meth)
+without inferring from the meth_context window. This both fixes the
+overlapping-motif ambiguity of mc-based attribution and lets analyze
+vectorise per-bucket accumulators (~75 min → seconds on master pkls).
+
 ### `kinsim/data/dataset.py`
 Dataset class and signal transforms. Never import transforms from model files.
 
 ```python
-log_transform(x: Tensor) -> Tensor      # log1p -- raw [0,255] -> training space
-inv_log_transform(x: Tensor) -> Tensor  # expm1 clamped to [0,255] -- inference
+log_transform(x: Tensor) -> Tensor      # log1p — raw [0,255] -> training space
+inv_log_transform(x: Tensor) -> Tensor  # expm1 clamped to [0,255] — inference
 
 class MLPSignalDataset(Dataset):
-    # Auto-detects v3 (tuple keys, per-bucket cap) vs v4 (int kmer keys,
-    # no resampling — extract has already capped baseline).
-    # Returns (kmer_id, meth_probs, log_signal, meth_id) tuples.
-    # For v4, meth_id at center is read from mc[KMER_PRED_IDX] (col 10).
+    # Iterates int-keyed kmers, derives meth_id at centre from
+    # mc[KMER_PRED_IDX], pre-flattens all rows into contiguous arrays
+    # so every sample is seen once per epoch.
+    # Returns (kmer_id, meth_full, log_signal, meth_id) tuples.
 ```
 
 ### `kinsim/extract.py`
-The data preparation pipeline. **Motif-based extraction only** (GFF mode was
-removed in v3; the model now learns kinetic signatures from the per-position
-methylation context fed to FiLM, so a separate aligned-BAM path is unnecessary).
+The data preparation pipeline. **Motif-based extraction only**: the
+model learns kinetic signatures from the per-position methylation
+context fed to FiLM, so no aligned-BAM path is needed.
 
 ```python
 validate_bam_kinetics(bam_path, n_check=10)
+    # Returns "fi" (unaligned) or "ip" (aligned) — used to route the
+    # forward extraction; reverse-strand pass gated by read.has_tag("ri").
 
-# v3 legacy path (no --v4 flag): emits dict[(kmer, meth_id)] -> 35-col
-extract_samples_from_bam(bam_path, motif_string, ...)
+# Single-pass extract emits dict[kmer_id (int)] -> ndarray(N, 36).
+# Per row: IPD, PW, fraction, mc_0..10, profile_IPD/PW_0..+8, rev_meth_-1/0/+1,
+# CATEGORY (col 35 — see kinsim.utils.sample_layout).
+extract_samples_from_bam(bam_path, motif_string,
+                         n_baseline_per_kmer=50,
+                         baseline_min_dist_to_meth=K,
+                         baseline_sample_rate=0.10,
+                         near_meth_max_dist=7, ...)
 extract_from_manifest_task(manifest_path, task_index, output_dir, ...)
 
-# v4 default standalone path (--v4 flag): emits dict[kmer_id] -> 36-col with CATEGORY
-# refined_pkl_path is OPTIONAL; without it, every motif-match is a candidate
-# methylation and `kinsim refine` GMM filters FP downstream.
-extract_samples_v4_from_bam(bam, motif_string, refined_pkl_path=None,
-                             n_baseline_per_kmer=50,
-                             baseline_min_dist_to_meth=K, ...)
-extract_v4_from_manifest_task(..., refined_pkl_path=None)
-
-# Auto-detects v3 vs v4 shards, rejects mixing both
 merge_shards(input_dir, output_file, max_samples_per_key=50000)
+    # Concatenates per-sample shards (matching int-keyed kmer dicts).
 ```
 
 **Supported BAM formats:**
@@ -509,21 +521,19 @@ Real PacBio BAMs (raw HiFi or bystrandified — never aligned post-pbmm2)
       |
       v  manifest.csv  [sample_id, bam_path, motifs]
       |
-      |  ---- v4 EXTRACT (single pass, no bootstrap) ----
-      v  kinsim extract --v4 --manifest manifest.csv --task $TASK --output-dir shards_v4/
-strain1_shard_v4.pkl  strain2_shard_v4.pkl  ...
-      |   (v4: 36 cols + CATEGORY column, key=kmer_id only)
-      |   Each row tagged 0=baseline / 1=meth / 2=slowed
+      v  kinsim extract --manifest manifest.csv --task $TASK --output-dir shards/
+strain1_shard.pkl  strain2_shard.pkl  ...
+      |   (36 cols, key=kmer_id only, CATEGORY at col 35)
+      |   Each row tagged 0=baseline / 1=slowed / 2=near_meth
       |
-      v  kinsim merge shards_v4/ master_v4.pkl
+      v  kinsim merge shards/ master.pkl
       |
-      v  kinsim refine master_v4.pkl master_v4_clean.pkl
-      |   (auto-detects v4 format)
-      |   p95 filter on CATEGORY_SLOWED only — drops slowed samples
-      |   whose IPD < p95(baseline). Baseline + near_meth pass through.
-master_v4_clean.pkl
+      v  kinsim refine master.pkl master_clean.pkl
+      |   p95 of per-kmer baseline mean drops motif-FP slowed samples;
+      |   baseline + near_meth pass through unchanged.
+master_clean.pkl
       |
-      v  kinsim train master_v4_clean.pkl checkpoints/
+      v  kinsim train master_clean.pkl checkpoints/
       v
 checkpoint_epoch50.pt + model_config.json
       |
@@ -535,14 +545,6 @@ species_mlp.bam
       v  kinsim verify-generate <ref.bam> <gen.bam> <motifs> <report.tsv>
       v  (per-(kmer, meth) mean/sd comparison — Pearson r + MAE summary)
 verify_report.tsv
-```
-
-Legacy v3 chain (still works for backward compat):
-```
-  kinsim extract                      (no --v4)             → shard.pkl
-  kinsim merge shards/ master.pkl
-  kinsim refine master.pkl master_clean.pkl                 → v3 GMM only
-  kinsim train master_clean.pkl checkpoints/
 ```
 
 ---
@@ -565,7 +567,7 @@ Legacy v3 chain (still works for backward compat):
 # kinsim -- ML pipeline --------------------------------------------------
 kinsim extract                -> kinsim/extract.py
 kinsim merge                  -> kinsim/extract.py
-kinsim refine                 -> kinsim/refine.py           (auto v3=GMM only / v4=GMM+p95)
+kinsim refine                 -> kinsim/refine.py           (per-kmer baseline mean p95 filter)
 kinsim train                  -> kinsim/train.py
 kinsim generate               -> kinsim/generate.py
 kinsim evaluate               -> kinsim/evaluate.py
@@ -700,10 +702,11 @@ torch.save({
 
 ### Signal Space
 - **Training**: always in log1p space (`log_transform` applied by `MLPSignalDataset`).
-- **Inference**: model outputs in log1p space -> `inv_log_transform` -> uint8 [0, 255].
-- **Storage (.pkl)**: raw values (not transformed) + stoichiometric fraction column.
-  Format: `np.ndarray(N, 3)` with columns [IPD, PW, fraction]. Legacy 2-col supported.
-- **Metadata**: every .pkl has a `"__meta__"` string key with provenance. Dataset classes skip it.
+- **Inference**: model outputs in log1p space → `inv_log_transform` → uint8 [0, 255].
+- **Storage (.pkl)**: raw values (not transformed). 36-col layout from
+  `kinsim.utils.sample_layout`; see col reference there.
+- **Metadata**: every .pkl has a `"__meta__"` string key with provenance.
+  Dataset classes skip it.
 
 ### SLURM Scripts
 - Array jobs for per-species tasks (`#SBATCH --array=1-N`).
@@ -747,10 +750,8 @@ torch.save({
 | Total possible k-mers | 4,194,304 (4^11) | `kinsim/utils/encoding.py` |
 | Methylation states | 4 (none/m6A/m4C/m5C) | `kinsim/utils/encoding.py` |
 | MID (flanking bases) | 5 | `kinsim/utils/io.py` |
-| Reservoir cap (extract) | 10,000 per (kmer, meth) | `kinsim/extract.py` |
-| Reservoir cap (merge) | 50,000 per (kmer, meth) | `kinsim/extract.py` |
-| MLPSignalDataset cap (unmeth) | 20 per key | `kinsim/data/dataset.py` |
-| MLPSignalDataset cap (meth) | 100 per key | `kinsim/data/dataset.py` |
+| Reservoir cap (extract baseline) | 50 per kmer | `kinsim/extract.py` |
+| Reservoir cap (merge) | 50,000 per kmer | `kinsim/extract.py` |
 | BAM signal range | [0, 255] uint8 | `kinsim/generate.py` |
 | N-context default signal | 1 (not 0) | `kinsim/generate.py` |
 | log_sigma clamp range | [-6, 3] | `kinsim/models/predictor.py` |
@@ -763,18 +764,19 @@ torch.save({
 
 ---
 
-## Future Work / v4 Roadmap
+## Future Work
 
-### Complementary-strand methylation channel
-**Problem:** for palindromic methylation sites (Type II R-M systems), both strands carry an m6A. The polymerase generating one strand's read physically contacts both strands of the duplex (~12 bp footprint), so the methylation on the OPPOSITE strand also affects IPD/PW. Currently only forward-strand methylation is encoded in the FiLM input — the model has no signal about the complementary-strand methylation at the same genomic position.
+### Feed `rev_meth` into FiLM
+The 36-col layout already stores `rev_meth_-1, rev_meth_0, rev_meth_+1`
+(complementary-strand meth_id at the active-site footprint, cols 32-34).
+For palindromic methylation sites (Type II R-M systems) both strands
+carry an m6A; the polymerase contacts both strands of the duplex
+(~12 bp footprint) so the opposite-strand methylation also shifts
+IPD/PW. On bc2033 (HMB-10) the m6A profile shows a strong IPD spike
+at +8 in addition to the expected peak at +0 — the kinetic footprint
+of the bilateral methylation (reverse-strand m6A sits 8 bp downstream
+of the forward m6A on the same palindrome).
 
-**Observation:** on bc2033 (HMB-10), the m6A profile shows a strong IPD spike at +8 in addition to the expected peak at +0. This is the kinetic footprint of the bilateral methylation: the reverse strand's m6A sits 8 bp downstream of the forward m6A on the same site, and its steric effect on the polymerase is what produces the +8 spike.
-
-**Proposed addition:**
-- Extract: store rev_meth[-1], rev_meth[0], rev_meth[+1] per sample (3 extra columns) — meth_id of the complementary strand at the prediction position and its immediate neighbours.
-- Dataset / model: feed those into FiLM alongside the forward meth context.
-- Generate: build two reference meth maps (forward, reverse) and look up both at each prediction position.
-
-**Cost:** ~+3 columns in the .pkl, ~100 lines of code modified, retraining required.
-
-**Benefit:** the model learns bilateral methylation patterns explicitly. Predictions on palindromic sites reproduce the double IPD peak seen in real data (e.g. bc2033's +0/+8 signature). Also captures hemimethylation asymmetries (relevant for cell-cycle studies).
+**TODO:** route `rev_meth` into the FiLM conditioning vector alongside
+the forward meth context. ``generate.py`` will need a reverse meth
+map at inference time. ~100 lines of code, retraining required.

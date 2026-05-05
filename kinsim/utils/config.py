@@ -55,7 +55,6 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -71,8 +70,8 @@ class SampleEntry:
     """One BAM + motif pair from a manifest CSV."""
 
     sample_id: str
-    bam_path:  str
-    motifs:    str   # KinSim motif string or path (resolved later by load_motif_string)
+    bam_path: str
+    motifs: str  # KinSim motif string or path (resolved later by load_motif_string)
 
 
 def load_manifest(manifest_path: str) -> list[SampleEntry]:
@@ -116,7 +115,7 @@ def load_manifest(manifest_path: str) -> list[SampleEntry]:
 
         for row_num, row in enumerate(reader, start=2):
             # Skip comment rows
-            raw_first = list(row.values())[0].strip()
+            raw_first = next(iter(row.values())).strip()
             if raw_first.startswith("#"):
                 continue
             # Skip entirely empty rows
@@ -124,21 +123,23 @@ def load_manifest(manifest_path: str) -> list[SampleEntry]:
                 continue
 
             sample_id = row["sample_id"].strip()
-            bam_path  = row["bam_path"].strip()
-            motifs    = row["motifs"].strip()
+            bam_path = row["bam_path"].strip()
+            motifs = row["motifs"].strip()
 
             if not sample_id:
                 raise ValueError(f"Empty 'sample_id' at row {row_num} in {manifest_path}")
             if not bam_path:
                 raise ValueError(f"Empty 'bam_path'  at row {row_num} in {manifest_path}")
             if not motifs:
-                raise ValueError(
-                    f"Empty 'motifs' at row {row_num} in {manifest_path}."
-                )
+                raise ValueError(f"Empty 'motifs' at row {row_num} in {manifest_path}.")
 
-            entries.append(SampleEntry(
-                sample_id=sample_id, bam_path=bam_path, motifs=motifs,
-            ))
+            entries.append(
+                SampleEntry(
+                    sample_id=sample_id,
+                    bam_path=bam_path,
+                    motifs=motifs,
+                )
+            )
 
     if not entries:
         raise ValueError(f"Manifest is empty (no data rows): {manifest_path}")
@@ -148,7 +149,7 @@ def load_manifest(manifest_path: str) -> list[SampleEntry]:
 
 
 def validate_manifest(
-    entries: "list[SampleEntry]",
+    entries: list[SampleEntry],
     check_files: bool = True,
 ) -> list[str]:
     """Validate a loaded manifest and return a list of error strings.
@@ -185,8 +186,7 @@ def validate_manifest(
             # 2. BAM existence
             if not Path(entry.bam_path).exists():
                 errors.append(
-                    f"Row {idx} ({entry.sample_id}): "
-                    f"bam_path does not exist: {entry.bam_path}"
+                    f"Row {idx} ({entry.sample_id}): bam_path does not exist: {entry.bam_path}"
                 )
             # 3. Motif file existence (only when field looks like a path)
             motif_looks_like_path = (
@@ -197,8 +197,7 @@ def validate_manifest(
             )
             if motif_looks_like_path and not Path(entry.motifs).expanduser().exists():
                 errors.append(
-                    f"Row {idx} ({entry.sample_id}): "
-                    f"motifs file does not exist: {entry.motifs}"
+                    f"Row {idx} ({entry.sample_id}): motifs file does not exist: {entry.motifs}"
                 )
 
     return errors
@@ -207,6 +206,7 @@ def validate_manifest(
 # ---------------------------------------------------------------------------
 # YAML training config
 # ---------------------------------------------------------------------------
+
 
 def load_yaml_config(path: str) -> dict:
     """Load a YAML training config and return it as a plain dict.
@@ -264,22 +264,20 @@ _DEFAULT_KINSIM_CONFIG = {
         "m4C": {"signal_offsets": [0]},
         "m5C": {"signal_offsets": [2, 6]},
     },
-    "meth_context":     {"left": 7, "right": 3},
-    "kinetic_profile":  {"start": 0, "end": 8},
+    "meth_context": {"left": 7, "right": 3},
+    "kinetic_profile": {"start": 0, "end": 8},
+    "extract": {
+        "n_baseline_per_kmer": 50,
+        "baseline_min_dist_to_meth": 11,
+        "baseline_sample_rate": 0.10,
+        "near_meth_max_dist": 7,
+    },
     "refine": {
-        "default_strategy": "gmm_signature",
-        "gmm_signature": {
-            "k_max": 3,
-            "chi2_threshold": 9.21,
-            "min_signature_ratio": 1.3,
-            "min_pi": 0.05,
-            "min_samples_for_gmm": 5,
-            "min_samples_low": 1,
-        },
+        "slowed_split": {"secondary_percentile": 95},
     },
 }
 
-_CACHED_KINSIM_CONFIG: Optional[dict] = None
+_CACHED_KINSIM_CONFIG: dict | None = None
 
 
 def load_kinsim_config(explicit_path: str | None = None) -> dict:
@@ -332,6 +330,7 @@ def get_signature_offsets(meth_name: str) -> list[int]:
 # ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
+
 
 def setup_logging(verbose: bool = False) -> None:
     """Configure root logger for KinSim CLI runs.

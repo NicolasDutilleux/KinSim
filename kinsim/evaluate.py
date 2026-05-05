@@ -60,9 +60,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .data.dataset import MLPSignalDataset, inv_log_transform, log_transform
-from .utils.encoding import METH_IDS, encode_kmer
+from .data.dataset import MLPSignalDataset
 from .models.predictor import MLPPredictor, create_from_config
+from .utils.encoding import METH_IDS, encode_kmer
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +72,7 @@ _SIGMA_CLAMP = (-6.0, 3.0)
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
+
 
 def _load_model(checkpoint_dir: str | Path, device: torch.device) -> torch.nn.Module:
     """Load model from a checkpoint directory (supports conv and mlp)."""
@@ -98,14 +99,19 @@ def _load_model(checkpoint_dir: str | Path, device: torch.device) -> torch.nn.Mo
 
     arch = cfg.get("architecture", "mlp")
     n_params = sum(p.numel() for p in model.parameters())
-    log.info("Model loaded: architecture=%s  params=%s  checkpoint=%s",
-             arch, f"{n_params:,}", ckpt_path.name)
+    log.info(
+        "Model loaded: architecture=%s  params=%s  checkpoint=%s",
+        arch,
+        f"{n_params:,}",
+        ckpt_path.name,
+    )
     return model
 
 
 # ---------------------------------------------------------------------------
 # Full calibration report
 # ---------------------------------------------------------------------------
+
 
 @torch.no_grad()
 def evaluate(
@@ -134,35 +140,35 @@ def evaluate(
         Dictionary of metric names → float values.
     """
     dataset = MLPSignalDataset(str(pkl_path))
-    loader  = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
-    all_mu       = []
-    all_sigma    = []
-    all_true     = []
+    all_mu = []
+    all_sigma = []
+    all_true = []
     all_meth_ids = []
 
     for kmer_ids, meth_probs, signals, meth_ids in loader:
-        kmer_ids   = kmer_ids.to(device)
+        kmer_ids = kmer_ids.to(device)
         meth_probs = meth_probs.to(device)
 
-        params  = model(kmer_ids, meth_probs)
-        mu      = params[:, :2]
+        params = model(kmer_ids, meth_probs)
+        mu = params[:, :2]
         log_sig = torch.clamp(params[:, 2:], *_SIGMA_CLAMP)
-        sigma   = torch.exp(log_sig)
+        sigma = torch.exp(log_sig)
 
         all_mu.append(mu.cpu().numpy())
         all_sigma.append(sigma.cpu().numpy())
         all_true.append(signals.numpy())
         all_meth_ids.append(meth_ids.numpy())
 
-    mu       = np.concatenate(all_mu,       axis=0)   # (N, 2) log1p space
-    sigma    = np.concatenate(all_sigma,    axis=0)   # (N, 2) log1p space
-    true     = np.concatenate(all_true,     axis=0)   # (N, 2) log1p space
-    meth_ids = np.concatenate(all_meth_ids, axis=0)   # (N,)
+    mu = np.concatenate(all_mu, axis=0)  # (N, 2) log1p space
+    sigma = np.concatenate(all_sigma, axis=0)  # (N, 2) log1p space
+    true = np.concatenate(all_true, axis=0)  # (N, 2) log1p space
+    meth_ids = np.concatenate(all_meth_ids, axis=0)  # (N,)
 
     diff = mu - true
-    mse  = (diff ** 2).mean(axis=0)
-    mae  = np.abs(diff).mean(axis=0)
+    mse = (diff**2).mean(axis=0)
+    mae = np.abs(diff).mean(axis=0)
 
     _METH_NAMES = {v: k for k, v in METH_IDS.items()}
 
@@ -181,11 +187,11 @@ def evaluate(
     # r_oracle = Var(μ) / (Var(μ) + E[σ²])
     # Even a *perfect* model cannot exceed this because σ² is irreducible noise.
     var_mu_ipd = np.var(mu[:, 0])
-    var_mu_pw  = np.var(mu[:, 1])
+    var_mu_pw = np.var(mu[:, 1])
     e_sig2_ipd = np.mean(sigma[:, 0] ** 2)
-    e_sig2_pw  = np.mean(sigma[:, 1] ** 2)
+    e_sig2_pw = np.mean(sigma[:, 1] ** 2)
     oracle_ipd = var_mu_ipd / (var_mu_ipd + e_sig2_ipd) if (var_mu_ipd + e_sig2_ipd) > 0 else 0.0
-    oracle_pw  = var_mu_pw  / (var_mu_pw  + e_sig2_pw)  if (var_mu_pw  + e_sig2_pw)  > 0 else 0.0
+    oracle_pw = var_mu_pw / (var_mu_pw + e_sig2_pw) if (var_mu_pw + e_sig2_pw) > 0 else 0.0
 
     # ── Random-from-distribution baseline ─────────────────────────────────
     # Sample z ~ N(μ, σ²) and compute Pearson(z, true).
@@ -195,7 +201,7 @@ def evaluate(
     rng = np.random.default_rng(42)
     z_random = mu + sigma * rng.standard_normal(mu.shape).astype(np.float32)
     rand_pearson_ipd = _pearson(z_random[:, 0], true[:, 0])
-    rand_pearson_pw  = _pearson(z_random[:, 1], true[:, 1])
+    rand_pearson_pw = _pearson(z_random[:, 1], true[:, 1])
 
     # ── Per-meth-type breakdown ───────────────────────────────────────────
     by_type = {}
@@ -210,47 +216,47 @@ def evaluate(
         c2 = (np.abs(diff_m) <= 2.0 * sig_m).mean(axis=0)
         c3 = (np.abs(diff_m) <= 3.0 * sig_m).mean(axis=0)
         by_type[name] = {
-            "n":            int(mask.sum()),
-            "pearson_ipd":  _pearson(mu_m[:, 0], true_m[:, 0]),
-            "pearson_pw":   _pearson(mu_m[:, 1], true_m[:, 1]),
-            "mae_ipd":      float(np.abs(diff_m[:, 0]).mean()),
-            "mae_pw":       float(np.abs(diff_m[:, 1]).mean()),
-            "calib_1s":     float((c1[0] + c1[1]) / 2),
-            "calib_2s":     float((c2[0] + c2[1]) / 2),
-            "calib_3s":     float((c3[0] + c3[1]) / 2),
+            "n": int(mask.sum()),
+            "pearson_ipd": _pearson(mu_m[:, 0], true_m[:, 0]),
+            "pearson_pw": _pearson(mu_m[:, 1], true_m[:, 1]),
+            "mae_ipd": float(np.abs(diff_m[:, 0]).mean()),
+            "mae_pw": float(np.abs(diff_m[:, 1]).mean()),
+            "calib_1s": float((c1[0] + c1[1]) / 2),
+            "calib_2s": float((c2[0] + c2[1]) / 2),
+            "calib_3s": float((c3[0] + c3[1]) / 2),
             "mean_sigma_ipd": float(sig_m[:, 0].mean()),
-            "mean_sigma_pw":  float(sig_m[:, 1].mean()),
+            "mean_sigma_pw": float(sig_m[:, 1].mean()),
         }
 
     return {
         # Mean / spread quality
-        "mse_ipd":        float(mse[0]),
-        "mse_pw":         float(mse[1]),
-        "mae_ipd":        float(mae[0]),
-        "mae_pw":         float(mae[1]),
-        "pearson_ipd":    _pearson(mu[:, 0], true[:, 0]),
-        "pearson_pw":     _pearson(mu[:, 1], true[:, 1]),
+        "mse_ipd": float(mse[0]),
+        "mse_pw": float(mse[1]),
+        "mae_ipd": float(mae[0]),
+        "mae_pw": float(mae[1]),
+        "pearson_ipd": _pearson(mu[:, 0], true[:, 0]),
+        "pearson_pw": _pearson(mu[:, 1], true[:, 1]),
         # Pearson oracle (theoretical ceiling)
-        "oracle_ipd":     float(oracle_ipd),
-        "oracle_pw":      float(oracle_pw),
+        "oracle_ipd": float(oracle_ipd),
+        "oracle_pw": float(oracle_pw),
         # Random-from-distribution baseline (noise floor)
         "rand_pearson_ipd": rand_pearson_ipd,
-        "rand_pearson_pw":  rand_pearson_pw,
+        "rand_pearson_pw": rand_pearson_pw,
         # Calibration coverage
-        "calib_1s_ipd":   float(calib_1s[0]),
-        "calib_1s_pw":    float(calib_1s[1]),
-        "calib_2s_ipd":   float(calib_2s[0]),
-        "calib_2s_pw":    float(calib_2s[1]),
-        "calib_3s_ipd":   float(calib_3s[0]),
-        "calib_3s_pw":    float(calib_3s[1]),
+        "calib_1s_ipd": float(calib_1s[0]),
+        "calib_1s_pw": float(calib_1s[1]),
+        "calib_2s_ipd": float(calib_2s[0]),
+        "calib_2s_pw": float(calib_2s[1]),
+        "calib_3s_ipd": float(calib_3s[0]),
+        "calib_3s_pw": float(calib_3s[1]),
         # Heteroscedasticity check — σ spread
         "mean_sigma_ipd": float(sigma[:, 0].mean()),
-        "mean_sigma_pw":  float(sigma[:, 1].mean()),
+        "mean_sigma_pw": float(sigma[:, 1].mean()),
         "median_sigma_ipd": float(np.median(sigma[:, 0])),
-        "median_sigma_pw":  float(np.median(sigma[:, 1])),
+        "median_sigma_pw": float(np.median(sigma[:, 1])),
         # Per-type breakdown
-        "by_type":        by_type,
-        "n_contexts":     len(mu),
+        "by_type": by_type,
+        "n_contexts": len(mu),
     }
 
 
@@ -282,12 +288,14 @@ def print_report(metrics: dict) -> str:
 
     # Efficiency ratio: how close model is to oracle vs random
     for signal in ("ipd", "pw"):
-        r_model  = metrics[f"pearson_{signal}"]
+        r_model = metrics[f"pearson_{signal}"]
         r_oracle = metrics[f"oracle_{signal}"]
         r_random = metrics[f"rand_pearson_{signal}"]
         if r_oracle - r_random > 1e-6:
             efficiency = (r_model - r_random) / (r_oracle - r_random)
-            lines.append(f"  Efficiency {signal.upper():>3s}     {efficiency*100:.1f}% of oracle gap captured")
+            lines.append(
+                f"  Efficiency {signal.upper():>3s}     {efficiency * 100:.1f}% of oracle gap captured"
+            )
         else:
             lines.append(f"  Efficiency {signal.upper():>3s}     N/A (oracle ≈ random)")
 
@@ -295,9 +303,9 @@ def print_report(metrics: dict) -> str:
         "",
         "  ── Calibration coverage (% within nσ of μ) ──────────────────",
         "  Coverage     IPD     PW    Expected",
-        f"  1σ (68%)  {metrics['calib_1s_ipd']*100:6.1f}%  {metrics['calib_1s_pw']*100:6.1f}%    68.3%",
-        f"  2σ (95%)  {metrics['calib_2s_ipd']*100:6.1f}%  {metrics['calib_2s_pw']*100:6.1f}%    95.4%",
-        f"  3σ (99%)  {metrics['calib_3s_ipd']*100:6.1f}%  {metrics['calib_3s_pw']*100:6.1f}%    99.7%",
+        f"  1σ (68%)  {metrics['calib_1s_ipd'] * 100:6.1f}%  {metrics['calib_1s_pw'] * 100:6.1f}%    68.3%",
+        f"  2σ (95%)  {metrics['calib_2s_ipd'] * 100:6.1f}%  {metrics['calib_2s_pw'] * 100:6.1f}%    95.4%",
+        f"  3σ (99%)  {metrics['calib_3s_ipd'] * 100:6.1f}%  {metrics['calib_3s_pw'] * 100:6.1f}%    99.7%",
         "",
         "  Interpretation: 2σ ≈ 95% = well-calibrated.",
         "    > 98%: σ too large (underconfident). < 90%: σ too small (overconfident).",
@@ -322,7 +330,7 @@ def print_report(metrics: dict) -> str:
             lines.append(
                 f"  {name:<8} {t['n']:>8}  {t['pearson_ipd']:>6.3f} {t['pearson_pw']:>6.3f}"
                 f"  {t['mae_ipd']:>6.4f} {t['mae_pw']:>6.4f}"
-                f"  {t['calib_2s']*100:>4.1f}%"
+                f"  {t['calib_2s'] * 100:>4.1f}%"
                 f"  {t['mean_sigma_ipd']:>6.4f} {t['mean_sigma_pw']:>6.4f}"
             )
         lines += [
@@ -338,6 +346,7 @@ def print_report(metrics: dict) -> str:
 # ---------------------------------------------------------------------------
 # K-mer distribution plot
 # ---------------------------------------------------------------------------
+
 
 @torch.no_grad()
 def plot_kmer_distribution(
@@ -369,8 +378,10 @@ def plot_kmer_distribution(
     """
     try:
         import matplotlib.pyplot as plt
-    except ImportError:
-        raise ImportError("matplotlib is required for plotting. Install with: pip install matplotlib")
+    except ImportError as exc:
+        raise ImportError(
+            "matplotlib is required for plotting. Install with: pip install matplotlib"
+        ) from exc
 
     if len(kmer_str) != 11:
         raise ValueError(f"kmer_str must be exactly 11 bases, got {len(kmer_str)}")
@@ -379,19 +390,19 @@ def plot_kmer_distribution(
 
     kmer_id = encode_kmer(kmer_str)
     meth_id = METH_IDS[meth_name]
-    key     = (kmer_id, meth_id)
+    key = (kmer_id, meth_id)
 
     if key not in data:
         raise KeyError(
             f"Context '{kmer_str}' / '{meth_name}' not found in dataset.\n"
             f"Available meth states for this k-mer: "
-            + str([m for m_name, m_id in METH_IDS.items() if (kmer_id, m_id) in data])
+            + str([m_name for m_name, m_id in METH_IDS.items() if (kmer_id, m_id) in data])
         )
 
     # Actual data: raw uint8 → log1p (use only IPD/PW columns)
-    samples    = data[key].astype(np.float32)
-    actual_raw = samples[:, :2]                     # (N, 2) [IPD, PW]
-    actual_log = np.log1p(actual_raw)               # (N, 2) log1p space
+    samples = data[key].astype(np.float32)
+    actual_raw = samples[:, :2]  # (N, 2) [IPD, PW]
+    actual_log = np.log1p(actual_raw)  # (N, 2) log1p space
 
     # Build stoichiometric meth_probs from stored fraction (3rd column)
     # For legacy 2-column data, default to 1.0 for methylated.
@@ -401,31 +412,36 @@ def plot_kmer_distribution(
         fraction = 1.0 if meth_id > 0 else 0.0
 
     kmer_tensor = torch.tensor([kmer_id], dtype=torch.long, device=device)
-    meth_probs  = torch.zeros(1, 4, device=device)
+    meth_probs = torch.zeros(1, 4, device=device)
     if meth_id > 0:
         meth_probs[0, meth_id] = fraction
 
-    params  = model(kmer_tensor, meth_probs)       # (1, 4)
-    mu_log  = params[0, :2].cpu().numpy()          # [μ_ipd, μ_pw] log1p
+    params = model(kmer_tensor, meth_probs)  # (1, 4)
+    mu_log = params[0, :2].cpu().numpy()  # [μ_ipd, μ_pw] log1p
     log_sig = np.clip(params[0, 2:].cpu().numpy(), *_SIGMA_CLAMP)
-    sigma   = np.exp(log_sig)                      # [σ_ipd, σ_pw] log1p
+    sigma = np.exp(log_sig)  # [σ_ipd, σ_pw] log1p
 
     # Gaussian PDF (pure numpy, no scipy dependency)
     def _gauss_pdf(x, mu, sig):
         return (1.0 / (sig * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((x - mu) / sig) ** 2)
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-    labels    = ["IPD", "PW"]
+    labels = ["IPD", "PW"]
 
-    for i, (ax, label) in enumerate(zip(axes, labels)):
-        col   = actual_log[:, i]
-        mu_i  = mu_log[i]
+    for i, (ax, label) in enumerate(zip(axes, labels, strict=False)):
+        col = actual_log[:, i]
+        mu_i = mu_log[i]
         sig_i = sigma[i]
 
         # Histogram of actual data
         ax.hist(
-            col, bins=50, density=True, alpha=0.55,
-            color="steelblue", edgecolor="white", linewidth=0.4,
+            col,
+            bins=50,
+            density=True,
+            alpha=0.55,
+            color="steelblue",
+            edgecolor="white",
+            linewidth=0.4,
             label=f"Actual  (n={len(col):,})",
         )
 
@@ -436,27 +452,37 @@ def plot_kmer_distribution(
             500,
         )
         ax.plot(
-            x_range, _gauss_pdf(x_range, mu_i, sig_i),
-            "r-", lw=2.5,
+            x_range,
+            _gauss_pdf(x_range, mu_i, sig_i),
+            "r-",
+            lw=2.5,
             label=f"Predicted  μ={mu_i:.3f}  σ={sig_i:.3f}",
         )
 
         # μ ± 2σ shaded region
         x_fill = np.linspace(mu_i - 2 * sig_i, mu_i + 2 * sig_i, 300)
         ax.fill_between(
-            x_fill, _gauss_pdf(x_fill, mu_i, sig_i),
-            alpha=0.18, color="orange", label="μ ± 2σ  (~95.4%)",
+            x_fill,
+            _gauss_pdf(x_fill, mu_i, sig_i),
+            alpha=0.18,
+            color="orange",
+            label="μ ± 2σ  (~95.4%)",
         )
         ax.axvline(mu_i - 2 * sig_i, color="orange", ls="--", lw=1.4)
         ax.axvline(mu_i + 2 * sig_i, color="orange", ls="--", lw=1.4)
-        ax.axvline(mu_i,             color="red",    ls="-",  lw=1.2, alpha=0.7)
+        ax.axvline(mu_i, color="red", ls="-", lw=1.2, alpha=0.7)
 
         # Calibration annotation
         in_2s = float(np.mean(np.abs(col - mu_i) <= 2 * sig_i))
         ax.text(
-            0.97, 0.95, f"2σ coverage: {in_2s*100:.1f}%\n(expected 95.4%)",
-            transform=ax.transAxes, ha="right", va="top",
-            fontsize=9, color="darkorange",
+            0.97,
+            0.95,
+            f"2σ coverage: {in_2s * 100:.1f}%\n(expected 95.4%)",
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=9,
+            color="darkorange",
             bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
         )
 
@@ -472,7 +498,8 @@ def plot_kmer_distribution(
     fig.suptitle(
         f"KinSim MLP — Predicted distribution vs actual data\n"
         f"μ_IPD ≈ {mu_linear[0]:.1f}   μ_PW ≈ {mu_linear[1]:.1f}  (linear scale)",
-        fontsize=12, fontweight="bold",
+        fontsize=12,
+        fontweight="bold",
     )
     plt.tight_layout()
 
@@ -488,8 +515,12 @@ def plot_kmer_distribution(
 # Baseline comparison
 # ---------------------------------------------------------------------------
 
+
 def _evaluate_predictions(
-    mu: np.ndarray, sigma: np.ndarray, true: np.ndarray, meth_ids: np.ndarray,
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    true: np.ndarray,
+    meth_ids: np.ndarray,
 ) -> dict:
     """Compute metrics from pre-computed predictions (shared by main + baselines).
 
@@ -501,8 +532,8 @@ def _evaluate_predictions(
         return float(np.corrcoef(a, b)[0, 1]) if a.std() > 1e-9 and b.std() > 1e-9 else 0.0
 
     diff = mu - true
-    mse  = (diff ** 2).mean(axis=0)
-    mae  = np.abs(diff).mean(axis=0)
+    (diff**2).mean(axis=0)
+    mae = np.abs(diff).mean(axis=0)
 
     def _calib(n_sigma):
         return (np.abs(diff) <= n_sigma * sigma).mean(axis=0)
@@ -510,12 +541,12 @@ def _evaluate_predictions(
     calib_2s = _calib(2)
 
     return {
-        "mae_ipd":     float(mae[0]),
-        "mae_pw":      float(mae[1]),
+        "mae_ipd": float(mae[0]),
+        "mae_pw": float(mae[1]),
         "pearson_ipd": _pearson(mu[:, 0], true[:, 0]),
-        "pearson_pw":  _pearson(mu[:, 1], true[:, 1]),
+        "pearson_pw": _pearson(mu[:, 1], true[:, 1]),
         "calib_2s_ipd": float(calib_2s[0]),
-        "calib_2s_pw":  float(calib_2s[1]),
+        "calib_2s_pw": float(calib_2s[1]),
     }
 
 
@@ -533,7 +564,6 @@ def evaluate_baselines(
     Returns dict mapping baseline name -> metrics dict.
     """
     import sys
-    import os
 
     baselines_dir = Path(baselines_dir)
     results = {}
@@ -567,7 +597,7 @@ def evaluate_baselines(
     true_log = np.array(true_log_list, dtype=np.float32)
     kmer_arr = np.array(kmer_list, dtype=np.int64)
     meth_arr = np.array(meth_list, dtype=np.int64)
-    frac_arr = np.array(frac_list, dtype=np.float32)
+    np.array(frac_list, dtype=np.float32)
     n = len(true_log)
 
     # ── Baseline 1: Global Gaussian ──────────────────────────────────────
@@ -733,7 +763,7 @@ def print_comparison(main_metrics: dict, baseline_metrics: dict[str, dict]) -> s
     lines.append(
         f"  {'Trained model':<22} {m['pearson_ipd']:>7.4f} {m['pearson_pw']:>7.4f}"
         f"  {m['mae_ipd']:>7.4f} {m['mae_pw']:>7.4f}"
-        f"  {m['calib_2s_ipd']*100:>6.1f}% {m['calib_2s_pw']*100:>6.1f}%"
+        f"  {m['calib_2s_ipd'] * 100:>6.1f}% {m['calib_2s_pw'] * 100:>6.1f}%"
     )
 
     # Baselines
@@ -741,7 +771,7 @@ def print_comparison(main_metrics: dict, baseline_metrics: dict[str, dict]) -> s
         lines.append(
             f"  {name:<22} {bm['pearson_ipd']:>7.4f} {bm['pearson_pw']:>7.4f}"
             f"  {bm['mae_ipd']:>7.4f} {bm['mae_pw']:>7.4f}"
-            f"  {bm['calib_2s_ipd']*100:>6.1f}% {bm['calib_2s_pw']*100:>6.1f}%"
+            f"  {bm['calib_2s_ipd'] * 100:>6.1f}% {bm['calib_2s_pw'] * 100:>6.1f}%"
         )
 
     # Oracle / random for context
@@ -760,8 +790,10 @@ def print_comparison(main_metrics: dict, baseline_metrics: dict[str, dict]) -> s
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def main(argv=None) -> None:
     import argparse
+
     from .utils.config import setup_logging
 
     parser = argparse.ArgumentParser(
@@ -776,21 +808,35 @@ def main(argv=None) -> None:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("checkpoint_dir",
-                        help="Directory with model_config.json and checkpoint_epoch*.pt")
-    parser.add_argument("pkl",
-                        help="Merged master .pkl file (from kinsim merge)")
-    parser.add_argument("--kmer",   default=None,
-                        help="11-mer string to inspect (e.g. GGATCCTGCAT)")
-    parser.add_argument("--meth",   default="none",
-                        choices=list(METH_IDS),
-                        help="Methylation state for the k-mer plot (default: none)")
-    parser.add_argument("--plot",   default=None, metavar="FILE",
-                        help="Save distribution plot to FILE instead of displaying it")
-    parser.add_argument("--output", default=None, metavar="TXT",
-                        help="Save full report to FILE (default: <checkpoint_dir>/evaluation_report.txt)")
-    parser.add_argument("--baselines-dir", default=None, metavar="DIR",
-                        help="Directory with baseline subdirs (global_gaussian/, kmer_gaussian/, conv_no_film/)")
+    parser.add_argument(
+        "checkpoint_dir", help="Directory with model_config.json and checkpoint_epoch*.pt"
+    )
+    parser.add_argument("pkl", help="Merged master .pkl file (from kinsim merge)")
+    parser.add_argument("--kmer", default=None, help="11-mer string to inspect (e.g. GGATCCTGCAT)")
+    parser.add_argument(
+        "--meth",
+        default="none",
+        choices=list(METH_IDS),
+        help="Methylation state for the k-mer plot (default: none)",
+    )
+    parser.add_argument(
+        "--plot",
+        default=None,
+        metavar="FILE",
+        help="Save distribution plot to FILE instead of displaying it",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        metavar="TXT",
+        help="Save full report to FILE (default: <checkpoint_dir>/evaluation_report.txt)",
+    )
+    parser.add_argument(
+        "--baselines-dir",
+        default=None,
+        metavar="DIR",
+        help="Directory with baseline subdirs (global_gaussian/, kmer_gaussian/, conv_no_film/)",
+    )
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--verbose", "-v", action="store_true")
@@ -799,7 +845,7 @@ def main(argv=None) -> None:
     setup_logging(verbose=args.verbose)
 
     device_str = args.device if torch.cuda.is_available() else "cpu"
-    device     = torch.device(device_str)
+    device = torch.device(device_str)
     log.info("Device: %s", device)
 
     model = _load_model(args.checkpoint_dir, device)
@@ -809,13 +855,15 @@ def main(argv=None) -> None:
         log.info("Loading data for k-mer plot: %s", args.pkl)
         with open(args.pkl, "rb") as f:
             import pickle
+
             raw_data = pickle.load(f)
 
         # Remove non-tuple keys (__meta__, etc.)
         data = {k: v for k, v in raw_data.items() if isinstance(k, tuple)}
 
         plot_kmer_distribution(
-            model, data,
+            model,
+            data,
             kmer_str=args.kmer,
             meth_name=args.meth,
             device=device,
@@ -826,7 +874,7 @@ def main(argv=None) -> None:
         # ── Full calibration report ──────────────────────────────────────────
         log.info("Running full evaluation on: %s", args.pkl)
         metrics = evaluate(model, args.pkl, device, batch_size=args.batch_size)
-        report  = print_report(metrics)
+        report = print_report(metrics)
 
         # ── Baseline comparison (if available) ───────────────────────────────
         if args.baselines_dir:

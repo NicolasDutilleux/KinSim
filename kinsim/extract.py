@@ -32,10 +32,23 @@ from pathlib import Path
 import numpy as np
 import pysam
 
-from .utils.encoding import BASE_MAP, K, KMER_MASK, METH_IDS, get_meth_ids, kmer_mask
-from .utils.motifs import (filter_motif_string_by_types, load_motif_string,
-                           parse_meth_types_arg, parse_motifs,
-                           reverse_complement, scan_sequence)
+from .utils.encoding import KMER_LEFT_PAD, K, get_meth_ids
+from .utils.motifs import (
+    filter_motif_string_by_types,
+    load_motif_string,
+    parse_meth_types_arg,
+    parse_motifs,
+    reverse_complement,
+    scan_sequence,
+)
+from .utils.sample_layout import (
+    METH_CTX_LEFT,
+    METH_CTX_LEN,
+    PROFILE_LEN,
+    PROFILE_START,
+    REV_METH_OFFSETS,
+    SAMPLE_NCOLS,
+)
 
 try:
     from . import __version__ as _KINSIM_VERSION
@@ -51,6 +64,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Fail-fast BAM validation
 # ---------------------------------------------------------------------------
+
 
 def validate_bam_kinetics(bam_path: str, n_check: int = 10) -> str:
     """Raise ValueError if the BAM has no kinetic tags, return which pair it has.
@@ -101,6 +115,7 @@ def validate_bam_kinetics(bam_path: str, n_check: int = 10) -> str:
 # Fraction lookup from motif string
 # ---------------------------------------------------------------------------
 
+
 def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
     """Parse the motif string to build a meth_id → fraction lookup.
 
@@ -116,15 +131,13 @@ def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
     Returns:
         dict mapping meth_id → float fraction.  Always includes {0: 0.0}.
     """
-    from .utils.encoding import METH_IDS
-
     fracs: dict[int, float] = {0: 0.0}
     if not motif_string:
         return fracs
-    for entry in motif_string.split(';'):
-        if not entry or ',' not in entry:
+    for entry in motif_string.split(";"):
+        if not entry or "," not in entry:
             continue
-        parts = entry.split(',')
+        parts = entry.split(",")
         if len(parts) < 3:
             continue
         m_id = get_meth_ids().get(parts[0], 0)
@@ -139,37 +152,23 @@ def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
 
 # Per-sample column layout (constants + pure-Python slicing helpers) lives in
 # kinsim/utils/sample_layout.py so it is importable without pysam (refine and
-# tests rely on it). Re-export the symbols here so the existing names used
-# elsewhere in extract.py still resolve.
-from .utils.encoding import KMER_LEFT_PAD, KMER_RIGHT_PAD, KMER_PRED_IDX, K
-from .utils.sample_layout import (
-    METH_CTX_LEFT, METH_CTX_RIGHT, METH_CTX_LEN,
-    PROFILE_START, PROFILE_END, PROFILE_LEN,
-    REV_METH_OFFSETS, REV_METH_LEN,
-    SAMPLE_NCOLS,
-    slice_meth_context as _slice_meth_context,
-    slice_rev_meth     as _slice_rev_meth,
-    slice_kinetic_profile as _slice_kinetic_profile,
-)
-
-
-
-
+# tests rely on it). The names used elsewhere in this module are re-exported
+# at the top of the file.
 
 
 def extract_samples_from_bam(
-    bam_path:                  str,
-    motif_string:              str,
-    n_baseline_per_kmer:       int  = 50,
-    baseline_min_dist_to_meth: int  = K,
-    near_meth_max_dist:        int  = 7,
-    baseline_sample_rate:      float = 0.10,
-    revcomp:                   bool = True,
-    use_reverse_strand:        bool = True,
-    max_reads:                 int  = 0,
-    kmer_size:                 int  = K,
-    meth_types:                set | None = None,
-    seed:                      int  = 42,
+    bam_path: str,
+    motif_string: str,
+    n_baseline_per_kmer: int = 50,
+    baseline_min_dist_to_meth: int = K,
+    near_meth_max_dist: int = 7,
+    baseline_sample_rate: float = 0.10,
+    revcomp: bool = True,
+    use_reverse_strand: bool = True,
+    max_reads: int = 0,
+    kmer_size: int = K,
+    meth_types: set | None = None,
+    seed: int = 42,
 ) -> dict:
     """Extract training samples from a BAM in a single pass.
 
@@ -201,13 +200,18 @@ def extract_samples_from_bam(
         for column semantics.
     """
     from .utils.sample_layout import (
-        SAMPLE_NCOLS, COL_CATEGORY,
-        CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH,
+        CATEGORY_BASELINE,
+        CATEGORY_NEAR_METH,
+        CATEGORY_SLOWED,
+        COL_CATEGORY,
+        COL_PARENT_METH,
+        COL_PARENT_OFFSET,
     )
+
     rng = np.random.default_rng(seed)
     kinetic_tag = validate_bam_kinetics(bam_path)
     ipd_tag = kinetic_tag
-    pw_tag  = "fp" if kinetic_tag == "fi" else "pw"
+    pw_tag = "fp" if kinetic_tag == "fi" else "pw"
     log.info("extract — kinetic tags: %s/%s", ipd_tag, pw_tag)
 
     if meth_types is not None:
@@ -217,6 +221,7 @@ def extract_samples_from_bam(
     # match is a candidate methylation; the refine step downstream
     # drops false positives via a baseline IPD threshold.
     from .utils.config import load_kinsim_config
+
     cfg = load_kinsim_config()
     sig_offsets_by_name: dict = {}
     for mname, scfg in (cfg.get("kinetic_signatures") or {}).items():
@@ -229,25 +234,38 @@ def extract_samples_from_bam(
         sig_offsets_by_name[mname] = offs
     log.info("extract — signature offsets: %s", sig_offsets_by_name)
 
-    motifs       = parse_motifs(motif_string, revcomp=revcomp)
-    frac_lookup  = _build_fraction_lookup(motif_string)
-    meth_ids     = get_meth_ids()
-    name_by_mid  = {v: k for k, v in meth_ids.items()}
+    motifs = parse_motifs(motif_string, revcomp=revcomp)
+    frac_lookup = _build_fraction_lookup(motif_string)
+    meth_ids = get_meth_ids()
+    name_by_mid = {v: k for k, v in meth_ids.items()}
 
     # Log v4 knobs + motif breakdown so the run is fully traceable.
-    log.info("extract — knobs: n_baseline_per_kmer=%d  baseline_min_dist=%d  "
-             "near_meth_max_dist=%d  baseline_sample_rate=%.2f  kmer_size=%d  seed=%d",
-             n_baseline_per_kmer, baseline_min_dist_to_meth,
-             near_meth_max_dist, baseline_sample_rate, kmer_size, seed)
+    log.info(
+        "extract — knobs: n_baseline_per_kmer=%d  baseline_min_dist=%d  "
+        "near_meth_max_dist=%d  baseline_sample_rate=%.2f  kmer_size=%d  seed=%d",
+        n_baseline_per_kmer,
+        baseline_min_dist_to_meth,
+        near_meth_max_dist,
+        baseline_sample_rate,
+        kmer_size,
+        seed,
+    )
     motifs_by_type: dict = defaultdict(int)
     for m in motifs:
-        motifs_by_type[name_by_mid.get(int(m['id']), f"meth{m['id']}")] += 1
-    log.info("extract — motifs parsed: %d total (%s)",
-             len(motifs),
-             ", ".join(f"{name}={cnt}" for name, cnt in sorted(motifs_by_type.items())))
-    log.info("extract — fraction_lookup: %s",
-             {name_by_mid.get(mid, f"meth{mid}"): f"{frac:.3f}"
-              for mid, frac in frac_lookup.items() if mid > 0})
+        motifs_by_type[name_by_mid.get(int(m["id"]), f"meth{m['id']}")] += 1
+    log.info(
+        "extract — motifs parsed: %d total (%s)",
+        len(motifs),
+        ", ".join(f"{name}={cnt}" for name, cnt in sorted(motifs_by_type.items())),
+    )
+    log.info(
+        "extract — fraction_lookup: %s",
+        {
+            name_by_mid.get(mid, f"meth{mid}"): f"{frac:.3f}"
+            for mid, frac in frac_lookup.items()
+            if mid > 0
+        },
+    )
 
     # samples: slowed + near_meth rows go here, no per-kmer cap (the
     # genomic distribution is what we want to see).
@@ -255,29 +273,18 @@ def extract_samples_from_bam(
     # streaming reservoir sampling per kmer so memory stays bounded at
     # n_baseline_per_kmer * (# kmers seen) regardless of how many
     # baseline candidates pass through.
-    samples:         dict = defaultdict(list)
+    samples: dict = defaultdict(list)
     baseline_buffer: dict = defaultdict(list)
     baseline_seen_per_kmer: dict = defaultdict(int)
     n_slowed = n_near = n_baseline_seen = 0
     slowed_offset_dist: dict = defaultdict(int)
-    near_offset_dist:   dict = defaultdict(int)
-    n_reads_processed    = 0
+    near_offset_dist: dict = defaultdict(int)
+    n_reads_processed = 0
     n_reads_with_reverse = 0
-    PROGRESS_EVERY       = 10_000
+    PROGRESS_EVERY = 10_000
 
     log.info("extract from: %s", bam_path)
     log.info("Motifs: %s  |  reverse_strand=%s", motif_string, use_reverse_strand)
-
-    def _build_row(ipd_v, pw_v, frac_v, mc, profile, rev_meth, category):
-        row = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
-        row[0] = ipd_v
-        row[1] = pw_v
-        row[2] = frac_v
-        row[3:14]  = mc
-        row[14:32] = profile
-        row[32:35] = rev_meth
-        row[COL_CATEGORY] = category
-        return row
 
     # Per-type signature- and near-offset arrays — pre-computed once so the
     # per-read tagging loop below stays a few cheap numpy ops per type.
@@ -289,8 +296,9 @@ def extract_samples_from_bam(
             continue
         sig_set = {int(o) for o in offs}
         sig_offsets_arr_by_mid[int(T_id)] = np.array(sorted(sig_set), dtype=np.int32)
-        near = np.array(sorted(k for k in range(0, near_meth_max_dist + 1)
-                               if k not in sig_set), dtype=np.int32)
+        near = np.array(
+            sorted(k for k in range(0, near_meth_max_dist + 1) if k not in sig_set), dtype=np.int32
+        )
         near_offsets_arr_by_mid[int(T_id)] = near
 
     def _vec_kmers(seq_str: str) -> tuple:
@@ -303,30 +311,30 @@ def extract_samples_from_bam(
         """
         n = len(seq_str)
         kmer_ids = np.zeros(n, dtype=np.uint32)
-        valid    = np.zeros(n, dtype=bool)
+        valid = np.zeros(n, dtype=bool)
         if n < kmer_size:
             return kmer_ids, valid
         # Encode bases via ord & 6 trick: A=65 -> 0, C=67 -> 1, G=71 -> 3, T=84 -> 2 (incorrect)
         # Use explicit table to be safe.
         seq_bytes = np.frombuffer(seq_str.encode("ascii", errors="replace"), dtype=np.uint8)
         base = np.zeros(n, dtype=np.uint32)
-        base[seq_bytes == ord('A')] = 0
-        base[seq_bytes == ord('C')] = 1
-        base[seq_bytes == ord('G')] = 2
-        base[seq_bytes == ord('T')] = 3
+        base[seq_bytes == ord("A")] = 0
+        base[seq_bytes == ord("C")] = 1
+        base[seq_bytes == ord("G")] = 2
+        base[seq_bytes == ord("T")] = 3
         # Sliding rolling hash via stride tricks
         from numpy.lib.stride_tricks import sliding_window_view
-        windows = sliding_window_view(base, kmer_size)        # (n-K+1, K)
-        weights = (np.uint32(4) ** np.arange(kmer_size - 1, -1, -1).astype(np.uint32))
+
+        windows = sliding_window_view(base, kmer_size)  # (n-K+1, K)
+        weights = np.uint32(4) ** np.arange(kmer_size - 1, -1, -1).astype(np.uint32)
         kmers_at_start = windows.astype(np.uint32) @ weights  # (n-K+1,)
         # start s -> center s + KMER_LEFT_PAD; valid centers [KMER_LEFT_PAD, n-K+KMER_LEFT_PAD]
         n_starts = n - kmer_size + 1
-        kmer_ids[KMER_LEFT_PAD:KMER_LEFT_PAD + n_starts] = kmers_at_start
-        valid[KMER_LEFT_PAD:KMER_LEFT_PAD + n_starts] = True
+        kmer_ids[KMER_LEFT_PAD : KMER_LEFT_PAD + n_starts] = kmers_at_start
+        valid[KMER_LEFT_PAD : KMER_LEFT_PAD + n_starts] = True
         return kmer_ids, valid
 
-    def _process_strand(seq_str, ipd_arr, pw_arr,
-                        meth_status_arr, meth_status_complement_arr):
+    def _process_strand(seq_str, ipd_arr, pw_arr, meth_status_arr, meth_status_complement_arr):
         """Extract all samples from one strand of one read into the global
         accumulators (samples / baseline_buffer).
 
@@ -351,16 +359,23 @@ def extract_samples_from_bam(
         meth_status_arr = np.asarray(meth_status_arr[:n], dtype=np.int32)
         meth_status_complement_arr = np.asarray(meth_status_complement_arr[:n], dtype=np.int32)
         ipd_arr = np.asarray(ipd_arr[:n], dtype=np.float32)
-        pw_arr  = np.asarray(pw_arr[:n],  dtype=np.float32)
+        pw_arr = np.asarray(pw_arr[:n], dtype=np.float32)
 
         # ---- 1. Kmer encoding (vectorised) ----
         kmer_ids, kmer_valid = _vec_kmers(seq_str[:n])
 
         # ---- 2. Phase 1: tag slowed and near positions (vectorised) ----
-        # slowed[c] = parent meth_id if c is at signature offset of some meth, else 0
-        # near[c]   = parent meth_id if c is in proximity window (non-sig) and not slowed
+        # slowed[c]            = parent meth_id if c is at a signature offset of some meth, else 0
+        # near[c]              = parent meth_id if c is in proximity window (non-sig) and not slowed
+        # slowed_parent_off[c] = the offset k that c sits at (last writer wins, matches `slowed`)
+        # near_parent_off[c]   = same, for near (first writer wins)
+        # The parent meth's genomic position is (c − parent_off); ``parent_off`` lets
+        # analyze split slowed_by_T into sig-offset sub-buckets without re-inferring
+        # from meth_context. int8 is plenty: |k| ≤ near_meth_max_dist ≤ 7.
         slowed = np.zeros(n, dtype=np.int8)
-        near   = np.zeros(n, dtype=np.int8)
+        near = np.zeros(n, dtype=np.int8)
+        slowed_parent_off = np.zeros(n, dtype=np.int8)
+        near_parent_off = np.zeros(n, dtype=np.int8)
         # Find motif positions (sparse, ~tens to hundreds per read)
         motif_mask = (meth_status_arr > 0) & kmer_valid
         motif_centers = np.where(motif_mask)[0]
@@ -372,12 +387,14 @@ def extract_samples_from_bam(
             if len(centers_T) == 0:
                 continue
             mname = name_by_mid.get(T_id, f"meth{T_id}")
-            # SLOWED: positions p+k for each k in sig_off (k incl. 0)
+            # SLOWED: positions p+k for each k in sig_off (k incl. 0).
+            # Last writer wins on conflict (matches the existing behaviour).
             for k in sig_off.tolist():
                 tgt = centers_T + k
                 in_range = (tgt >= 0) & (tgt < n)
                 tgt_in = tgt[in_range]
                 slowed[tgt_in] = T_id
+                slowed_parent_off[tgt_in] = int(k)
                 slowed_offset_dist[(mname, int(k))] += int(in_range.sum())
             # NEAR: positions p+k for k in [0, near_max] not in sig, only
             # if not already slowed and meth_status[c]==0 for that target.
@@ -390,6 +407,7 @@ def extract_samples_from_bam(
                 writeable = (slowed[tgt_in] == 0) & (near[tgt_in] == 0)
                 writeable_idx = tgt_in[writeable]
                 near[writeable_idx] = T_id
+                near_parent_off[writeable_idx] = int(k)
                 near_offset_dist[(mname, int(k))] += int(writeable.sum())
 
         # ---- 3. baseline_eligible mask ----
@@ -399,33 +417,33 @@ def extract_samples_from_bam(
         flagged = (meth_status_arr > 0) | (slowed > 0) | (near > 0)
         if flagged.any():
             f_int = flagged.astype(np.int32)
-            cs = np.concatenate(([0], np.cumsum(f_int)))   # length n+1
+            cs = np.concatenate(([0], np.cumsum(f_int)))  # length n+1
             d = baseline_min_dist_to_meth
-            lo = np.clip(np.arange(n) - d,         0, n)
-            hi = np.clip(np.arange(n) + d + 1,     0, n)
+            lo = np.clip(np.arange(n) - d, 0, n)
+            hi = np.clip(np.arange(n) + d + 1, 0, n)
             in_zone = (cs[hi] - cs[lo]) > 0
         else:
             in_zone = np.zeros(n, dtype=bool)
 
         # ---- 4. Materialise index arrays per category ----
         slowed_mask = (slowed > 0) & kmer_valid
-        near_mask   = (near   > 0) & kmer_valid & ~slowed_mask
+        near_mask = (near > 0) & kmer_valid & ~slowed_mask
         baseline_mask = ~in_zone & kmer_valid & ~slowed_mask & ~near_mask
         # Front-end subsample for baseline:
         if baseline_sample_rate < 1.0 and baseline_mask.any():
             r = rng.random(n).astype(np.float32)
-            baseline_mask &= (r < baseline_sample_rate)
+            baseline_mask &= r < baseline_sample_rate
 
-        slowed_idx   = np.where(slowed_mask)[0]
-        near_idx     = np.where(near_mask)[0]
+        slowed_idx = np.where(slowed_mask)[0]
+        near_idx = np.where(near_mask)[0]
         baseline_idx = np.where(baseline_mask)[0]
 
         n_slowed += len(slowed_idx)
-        n_near   += len(near_idx)
+        n_near += len(near_idx)
         n_baseline_seen += len(baseline_idx)
 
         # ---- 5. Build rows in batch via numpy fancy indexing ----
-        def _batch_rows(idx, cat, frac_arr=None):
+        def _batch_rows(idx, cat, frac_arr=None, parent_meth_arr=None, parent_off_arr=None):
             if len(idx) == 0:
                 return np.empty((0, SAMPLE_NCOLS), dtype=np.float32)
             m = len(idx)
@@ -444,13 +462,18 @@ def extract_samples_from_bam(
                 tgt = idx + (PROFILE_START + k)
                 in_r = (tgt >= 0) & (tgt < n)
                 rows[in_r, 14 + k] = ipd_arr[tgt[in_r]]
-                rows[in_r, 23 + k] = pw_arr [tgt[in_r]]
+                rows[in_r, 23 + k] = pw_arr[tgt[in_r]]
             # rev_meth cols 32..34
             for k, off in enumerate(REV_METH_OFFSETS):
                 tgt = idx + off
                 in_r = (tgt >= 0) & (tgt < n)
                 rows[in_r, 32 + k] = meth_status_complement_arr[tgt[in_r]]
             rows[:, COL_CATEGORY] = cat
+            # cols 36/37 — parent meth attribution. Default 0 (baseline).
+            if parent_meth_arr is not None:
+                rows[:, COL_PARENT_METH] = parent_meth_arr
+            if parent_off_arr is not None:
+                rows[:, COL_PARENT_OFFSET] = parent_off_arr
             return rows
 
         # Slowed rows: frac_v from frac_lookup of meth at center
@@ -460,7 +483,13 @@ def extract_samples_from_bam(
                 [frac_lookup.get(int(m), 0.0) for m in slowed_meth_at_center],
                 dtype=np.float32,
             )
-            slowed_rows = _batch_rows(slowed_idx, CATEGORY_SLOWED, slowed_fracs)
+            slowed_rows = _batch_rows(
+                slowed_idx,
+                CATEGORY_SLOWED,
+                slowed_fracs,
+                parent_meth_arr=slowed[slowed_idx],
+                parent_off_arr=slowed_parent_off[slowed_idx],
+            )
             slowed_kmers = kmer_ids[slowed_idx]
             for i in range(len(slowed_idx)):
                 samples[int(slowed_kmers[i])].append(slowed_rows[i])
@@ -471,7 +500,13 @@ def extract_samples_from_bam(
                 [frac_lookup.get(int(m), 0.0) for m in near_meth_at_center],
                 dtype=np.float32,
             )
-            near_rows = _batch_rows(near_idx, CATEGORY_NEAR_METH, near_fracs)
+            near_rows = _batch_rows(
+                near_idx,
+                CATEGORY_NEAR_METH,
+                near_fracs,
+                parent_meth_arr=near[near_idx],
+                parent_off_arr=near_parent_off[near_idx],
+            )
             near_kmers = kmer_ids[near_idx]
             for i in range(len(near_idx)):
                 samples[int(near_kmers[i])].append(near_rows[i])
@@ -501,16 +536,17 @@ def extract_samples_from_bam(
                 continue
 
             ipds = read.get_tag(ipd_tag)
-            pws  = read.get_tag(pw_tag)
+            pws = read.get_tag(pw_tag)
             min_len = min(len(seq), len(ipds), len(pws))
 
             meth_status = scan_sequence(seq[:min_len], motifs)
             rc_seq_full = reverse_complement(seq[:min_len])
             meth_status_rc = scan_sequence(rc_seq_full, motifs)
-            meth_complement = meth_status_rc[::-1]   # this read's coords
+            meth_complement = meth_status_rc[::-1]  # this read's coords
 
-            _process_strand(seq[:min_len], ipds[:min_len], pws[:min_len],
-                            meth_status, meth_complement)
+            _process_strand(
+                seq[:min_len], ipds[:min_len], pws[:min_len], meth_status, meth_complement
+            )
 
             if use_reverse_strand and read.has_tag("ri") and read.has_tag("rp"):
                 ri = read.get_tag("ri")
@@ -526,8 +562,7 @@ def extract_samples_from_bam(
                     rp_rc = list(reversed(list(rp[:min_rev_len])))
                     # Complement-of-complement = forward strand meth, in rc coords
                     fwd_in_rc = list(reversed(list(meth_status[:min_rev_len])))
-                    _process_strand(rc_seq, ri_rc, rp_rc,
-                                    rc_meth_status, fwd_in_rc)
+                    _process_strand(rc_seq, ri_rc, rp_rc, rc_meth_status, fwd_in_rc)
 
             n_reads_processed += 1
             if n_reads_processed % PROGRESS_EVERY == 0:
@@ -536,6 +571,7 @@ def extract_samples_from_bam(
                 n_buf = sum(len(v) for v in baseline_buffer.values())
                 n_smp = sum(len(v) for v in samples.values())
                 mem_mb = int((n_buf + n_smp) * 250 / 1e6)
+
                 # Running IPD stats per category from a sample of the buffer.
                 # Sampling: peek at the first 5 rows of the first 200 kmer
                 # buffers to keep this O(1) regardless of buffer size.
@@ -547,6 +583,7 @@ def extract_samples_from_bam(
                         for r in rows[:max_per]:
                             vals.append(float(r[0]))
                     return vals
+
                 slow_pw = _peek_ipd({k: v for k, v in samples.items()})
                 base_pw = _peek_ipd(baseline_buffer)
                 slow_med = float(np.median(slow_pw)) if slow_pw else 0.0
@@ -555,9 +592,15 @@ def extract_samples_from_bam(
                     "  progress: %d reads | slowed=%d near=%d baseline_seen=%d "
                     "kept=%d | buf_kmers=%d mem~%dMB | "
                     "running IPD median: samples=%.1f baseline_buf=%.1f",
-                    n_reads_processed, n_slowed, n_near, n_baseline_seen,
-                    n_buf, len(baseline_buffer), mem_mb,
-                    slow_med, base_med,
+                    n_reads_processed,
+                    n_slowed,
+                    n_near,
+                    n_baseline_seen,
+                    n_buf,
+                    len(baseline_buffer),
+                    mem_mb,
+                    slow_med,
+                    base_med,
                 )
 
     # Baseline buffer is already capped at n_baseline_per_kmer per kmer
@@ -574,62 +617,65 @@ def extract_samples_from_bam(
         result[int(kmer_id)] = np.array(rows, dtype=np.float32)
 
     n_total = n_slowed + n_near + n_baseline_kept
-    log.info("extract done: reads=%d (rev=%d)  slowed=%d  near_meth=%d  "
-             "baseline_seen=%d  baseline_kept=%d  total=%d",
-             n_reads_processed, n_reads_with_reverse,
-             n_slowed, n_near, n_baseline_seen, n_baseline_kept, n_total)
+    log.info(
+        "extract done: reads=%d (rev=%d)  slowed=%d  near_meth=%d  "
+        "baseline_seen=%d  baseline_kept=%d  total=%d",
+        n_reads_processed,
+        n_reads_with_reverse,
+        n_slowed,
+        n_near,
+        n_baseline_seen,
+        n_baseline_kept,
+        n_total,
+    )
     log.info("extract: %d unique kmers in output", len(result))
     if slowed_offset_dist:
         log.info("Slowed-offset distribution:")
-        for (mname, k), n in sorted(slowed_offset_dist.items(),
-                                    key=lambda x: (-x[1], x[0])):
+        for (mname, k), n in sorted(slowed_offset_dist.items(), key=lambda x: (-x[1], x[0])):
             log.info("  %s @ +%d: %d", mname, k, n)
     if near_offset_dist:
         log.info("Near-meth-offset distribution:")
-        for (mname, k), n in sorted(near_offset_dist.items(),
-                                    key=lambda x: (-x[1], x[0])):
+        for (mname, k), n in sorted(near_offset_dist.items(), key=lambda x: (-x[1], x[0])):
             log.info("  %s @ +%d: %d", mname, k, n)
 
     result["__meta__"] = {
-        "kinsim_version":            _KINSIM_VERSION,
-        "source_bam":                str(bam_path),
-        "motifs":                    motif_string,
-        "meth_types":                sorted(meth_types) if meth_types else None,
-        "kmer_size":                 kmer_size,
-        "n_baseline_per_kmer":       n_baseline_per_kmer,
+        "kinsim_version": _KINSIM_VERSION,
+        "source_bam": str(bam_path),
+        "motifs": motif_string,
+        "meth_types": sorted(meth_types) if meth_types else None,
+        "kmer_size": kmer_size,
+        "n_baseline_per_kmer": n_baseline_per_kmer,
         "baseline_min_dist_to_meth": baseline_min_dist_to_meth,
-        "near_meth_max_dist":        near_meth_max_dist,
-        "use_reverse_strand":        use_reverse_strand,
-        "n_reads_processed":         n_reads_processed,
-        "n_reads_with_reverse":      n_reads_with_reverse,
-        "n_slowed":                  n_slowed,
-        "n_near_meth":               n_near,
-        "n_baseline_seen":           n_baseline_seen,
-        "n_baseline_kept":           n_baseline_kept,
-        "slowed_offset_distribution":
-            {f"{m}+{k}": n for (m, k), n in slowed_offset_dist.items()},
-        "near_offset_distribution":
-            {f"{m}+{k}": n for (m, k), n in near_offset_dist.items()},
-        "n_unique_kmers":            len(result),
-        "n_total_samples":           n_total,
-        "created":                   datetime.datetime.now().isoformat(timespec="seconds"),
+        "near_meth_max_dist": near_meth_max_dist,
+        "use_reverse_strand": use_reverse_strand,
+        "n_reads_processed": n_reads_processed,
+        "n_reads_with_reverse": n_reads_with_reverse,
+        "n_slowed": n_slowed,
+        "n_near_meth": n_near,
+        "n_baseline_seen": n_baseline_seen,
+        "n_baseline_kept": n_baseline_kept,
+        "slowed_offset_distribution": {f"{m}+{k}": n for (m, k), n in slowed_offset_dist.items()},
+        "near_offset_distribution": {f"{m}+{k}": n for (m, k), n in near_offset_dist.items()},
+        "n_unique_kmers": len(result),
+        "n_total_samples": n_total,
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
     }
     return result
 
 
 def extract_from_manifest_task(
-    manifest_path:             str,
-    task_index:                int,
-    output_dir:                str,
-    n_baseline_per_kmer:       int  = 50,
-    baseline_min_dist_to_meth: int  = K,
-    near_meth_max_dist:        int  = 7,
-    baseline_sample_rate:      float = 0.10,
-    revcomp:                   bool = True,
-    use_reverse_strand:        bool = True,
-    max_reads:                 int  = 0,
-    kmer_size:                 int  = K,
-    meth_types:                set | None = None,
+    manifest_path: str,
+    task_index: int,
+    output_dir: str,
+    n_baseline_per_kmer: int = 50,
+    baseline_min_dist_to_meth: int = K,
+    near_meth_max_dist: int = 7,
+    baseline_sample_rate: float = 0.10,
+    revcomp: bool = True,
+    use_reverse_strand: bool = True,
+    max_reads: int = 0,
+    kmer_size: int = K,
+    meth_types: set | None = None,
 ) -> None:
     """Manifest-mode wrapper for ``extract_samples_from_bam``.
 
@@ -642,8 +688,7 @@ def extract_from_manifest_task(
 
     entries = load_manifest(manifest_path)
     if task_index < 1 or task_index > len(entries):
-        log.error("Task index %d out of range (manifest has %d entries).",
-                  task_index, len(entries))
+        log.error("Task index %d out of range (manifest has %d entries).", task_index, len(entries))
         sys.exit(1)
     entry = entries[task_index - 1]
     log.info("task %d/%d: %s", task_index, len(entries), entry.sample_id)
@@ -658,7 +703,8 @@ def extract_from_manifest_task(
         return
 
     result = extract_samples_from_bam(
-        entry.bam_path, motif_string,
+        entry.bam_path,
+        motif_string,
         n_baseline_per_kmer=n_baseline_per_kmer,
         baseline_min_dist_to_meth=baseline_min_dist_to_meth,
         near_meth_max_dist=near_meth_max_dist,
@@ -673,16 +719,19 @@ def extract_from_manifest_task(
     with open(output_pkl, "wb") as f:
         pickle.dump(result, f)
     meta = result.get("__meta__", {})
-    log.info("shard saved: %s  slowed=%d near_meth=%d baseline=%d",
-             output_pkl,
-             meta.get("n_slowed", 0),
-             meta.get("n_near_meth", 0),
-             meta.get("n_baseline_kept", 0))
+    log.info(
+        "shard saved: %s  slowed=%d near_meth=%d baseline=%d",
+        output_pkl,
+        meta.get("n_slowed", 0),
+        meta.get("n_near_meth", 0),
+        meta.get("n_baseline_kept", 0),
+    )
 
 
 # ---------------------------------------------------------------------------
 # Merge: combine shards from multiple BAMs
 # ---------------------------------------------------------------------------
+
 
 def merge_shards(
     input_dir: str,
@@ -702,8 +751,7 @@ def merge_shards(
         files = _glob.glob(os.path.join(input_dir, "*_shard.pkl"))
         if not files:
             files = _glob.glob(os.path.join(input_dir, "*.pkl"))
-            files = [f for f in files
-                     if os.path.abspath(f) != os.path.abspath(output_file)]
+            files = [f for f in files if os.path.abspath(f) != os.path.abspath(output_file)]
     else:
         files = _glob.glob(os.path.join(input_dir, glob_pattern))
 
@@ -741,41 +789,51 @@ def merge_shards(
     # Consolidate meth_types across shards — all shards must agree on the
     # active alphabet otherwise training labels are inconsistent.
     shard_meth_types = [
-        tuple(m["meth_types"]) if m.get("meth_types") else None
-        for m in shard_metas
+        tuple(m["meth_types"]) if m.get("meth_types") else None for m in shard_metas
     ]
     if len(set(shard_meth_types)) > 1:
-        log.warning("Shards were extracted with different --meth-types — "
-                    "merged dataset will mix alphabets.")
-    merged_meth_types = (sorted(shard_meth_types[0]) if shard_meth_types and
-                         shard_meth_types[0] is not None else None)
+        log.warning(
+            "Shards were extracted with different --meth-types — merged dataset will mix alphabets."
+        )
+    merged_meth_types = (
+        sorted(shard_meth_types[0])
+        if shard_meth_types and shard_meth_types[0] is not None
+        else None
+    )
 
     result["__meta__"] = {
-        "kinsim_version":      _KINSIM_VERSION,
-        "merged_from":         [m.get("source_bam", "?") for m in shard_metas],
-        "meth_types":          merged_meth_types,
-        "n_shards":            len(files),
+        "kinsim_version": _KINSIM_VERSION,
+        "merged_from": [m.get("source_bam", "?") for m in shard_metas],
+        "meth_types": merged_meth_types,
+        "n_shards": len(files),
         "max_samples_per_key": max_samples_per_key,
-        "created":             datetime.datetime.now().isoformat(timespec="seconds"),
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
     }
 
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
     with open(output_file, "wb") as f:
         pickle.dump(result, f)
 
-    total_keys    = len(result) - 1
+    total_keys = len(result) - 1
     total_samples = sum(len(v) for k, v in result.items() if k != "__meta__")
-    log.info("Master saved: %s  %d kmers  %d samples  (%d kmers capped at %d)",
-             output_file, total_keys, total_samples, n_subsampled, max_samples_per_key)
-
+    log.info(
+        "Master saved: %s  %d kmers  %d samples  (%d kmers capped at %d)",
+        output_file,
+        total_keys,
+        total_samples,
+        n_subsampled,
+        max_samples_per_key,
+    )
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def main(argv=None) -> None:
     import argparse
+
     from .utils.config import setup_logging
 
     parser = argparse.ArgumentParser(
@@ -786,15 +844,14 @@ def main(argv=None) -> None:
             "The output is consumed by:\n"
             "  kinsim train --model mlp  master_data.pkl  checkpoints_mlp/\n\n"
             "Single-BAM extract (simple/testing):\n"
-            "  kinsim extract reads.bam \"m6A,GATC,1\" shard.pkl\n\n"
+            '  kinsim extract reads.bam "m6A,GATC,1" shard.pkl\n\n'
             "Manifest-based extract (recommended for SLURM array jobs):\n"
             "  kinsim extract --manifest manifest.csv --task $SLURM_ARRAY_TASK_ID \\\n"
             "                 --output-dir shards/"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Enable DEBUG-level logging")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG-level logging")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # -- extract subcommand --
@@ -809,60 +866,112 @@ def main(argv=None) -> None:
         ),
     )
     # Single-BAM positional args (optional — not required when --manifest is used)
-    p_extract.add_argument("bam",    nargs="?", default=None,
-                           help="Input BAM file with fi/fp kinetic tags")
-    p_extract.add_argument("motifs", nargs="?", default=None,
-                           help="Motif source: KinSim string ('m6A,GATC,1'), "
-                                "PacBio motifs.csv, or REBASE file (auto-detected)")
-    p_extract.add_argument("output", nargs="?", default=None,
-                           help="Output .pkl shard file (single-BAM mode)")
+    p_extract.add_argument(
+        "bam", nargs="?", default=None, help="Input BAM file with fi/fp kinetic tags"
+    )
+    p_extract.add_argument(
+        "motifs",
+        nargs="?",
+        default=None,
+        help="Motif source: KinSim string ('m6A,GATC,1'), "
+        "PacBio motifs.csv, or REBASE file (auto-detected)",
+    )
+    p_extract.add_argument(
+        "output", nargs="?", default=None, help="Output .pkl shard file (single-BAM mode)"
+    )
 
     # Manifest mode args
-    p_extract.add_argument("--manifest",   default=None,
-                           help="Manifest CSV with columns: sample_id, bam_path, motifs")
-    p_extract.add_argument("--task",       type=int, default=None,
-                           help="1-based row index from the manifest (= SLURM_ARRAY_TASK_ID)")
-    p_extract.add_argument("--output-dir", default=None,
-                           help="Output directory for shard .pkl files (manifest mode)")
+    p_extract.add_argument(
+        "--manifest", default=None, help="Manifest CSV with columns: sample_id, bam_path, motifs"
+    )
+    p_extract.add_argument(
+        "--task",
+        type=int,
+        default=None,
+        help="1-based row index from the manifest (= SLURM_ARRAY_TASK_ID)",
+    )
+    p_extract.add_argument(
+        "--output-dir", default=None, help="Output directory for shard .pkl files (manifest mode)"
+    )
 
-    p_extract.add_argument("--no-revcomp", action="store_true",
-                           help="Do not scan reverse complement strand for motifs")
-    p_extract.add_argument("--no-reverse-strand", action="store_true",
-                           help="Do not extract ri/rp complementary-strand kinetics. "
-                                "By default both forward and reverse strands are "
-                                "extracted, doubling training data and making the "
-                                "model strand-invariant.")
-    p_extract.add_argument("--min-fraction", type=float, default=0.40,
-                           help="Minimum fraction threshold for PacBio CSV (default: 0.40)")
-    p_extract.add_argument("--min-detected", type=int, default=20,
-                           help="Minimum nDetected threshold for PacBio CSV (default: 20)")
-    p_extract.add_argument("--kmer-size", type=int, default=None,
-                           help="K-mer window size (default: K=11 from encoding.py). "
-                                "Must match the value used during training.")
-    p_extract.add_argument("--max-reads", type=int, default=0,
-                           help="Stop after N reads (0 = no limit). Smoke-test only.")
-    p_extract.add_argument("--meth-types", default=None,
-                           help="Comma-separated list of methylation types to include "
-                                "(e.g. 'm6A,m4C'). 'all' (default) accepts every type.")
-    p_extract.add_argument("--verbose", "-v", action="store_true",
-                           help="Enable DEBUG-level logging")
+    p_extract.add_argument(
+        "--no-revcomp", action="store_true", help="Do not scan reverse complement strand for motifs"
+    )
+    p_extract.add_argument(
+        "--no-reverse-strand",
+        action="store_true",
+        help="Do not extract ri/rp complementary-strand kinetics. "
+        "By default both forward and reverse strands are "
+        "extracted, doubling training data and making the "
+        "model strand-invariant.",
+    )
+    p_extract.add_argument(
+        "--min-fraction",
+        type=float,
+        default=0.40,
+        help="Minimum fraction threshold for PacBio CSV (default: 0.40)",
+    )
+    p_extract.add_argument(
+        "--min-detected",
+        type=int,
+        default=20,
+        help="Minimum nDetected threshold for PacBio CSV (default: 20)",
+    )
+    p_extract.add_argument(
+        "--kmer-size",
+        type=int,
+        default=None,
+        help="K-mer window size (default: K=11 from encoding.py). "
+        "Must match the value used during training.",
+    )
+    p_extract.add_argument(
+        "--max-reads",
+        type=int,
+        default=0,
+        help="Stop after N reads (0 = no limit). Smoke-test only.",
+    )
+    p_extract.add_argument(
+        "--meth-types",
+        default=None,
+        help="Comma-separated list of methylation types to include "
+        "(e.g. 'm6A,m4C'). 'all' (default) accepts every type.",
+    )
+    p_extract.add_argument(
+        "--verbose", "-v", action="store_true", help="Enable DEBUG-level logging"
+    )
 
-    p_extract.add_argument("--n-baseline-per-kmer", type=int, default=None,
-                           help="Cap on baseline samples kept per kmer. "
-                                "Overrides extract.n_baseline_per_kmer in YAML.")
-    p_extract.add_argument("--baseline-min-dist", type=int, default=None,
-                           help="Minimum distance (bases) a baseline candidate must "
-                                "keep from any meth or slowed position. Overrides "
-                                "extract.baseline_min_dist_to_meth in YAML.")
-    p_extract.add_argument("--near-meth-max-dist", type=int, default=None,
-                           help="Max downstream distance for CATEGORY_NEAR_METH "
-                                "samples (proximity window around each methylation). "
-                                "Defaults to YAML extract.near_meth_max_dist (typically 7).")
-    p_extract.add_argument("--baseline-sample-rate", type=float, default=None,
-                           help="Front-end subsample rate for baseline candidates "
-                                "(0..1). Defaults to YAML extract.baseline_sample_rate "
-                                "(typically 0.10). Lower = faster + less memory but "
-                                "fewer baselines for rare kmers.")
+    p_extract.add_argument(
+        "--n-baseline-per-kmer",
+        type=int,
+        default=None,
+        help="Cap on baseline samples kept per kmer. "
+        "Overrides extract.n_baseline_per_kmer in YAML.",
+    )
+    p_extract.add_argument(
+        "--baseline-min-dist",
+        type=int,
+        default=None,
+        help="Minimum distance (bases) a baseline candidate must "
+        "keep from any meth or slowed position. Overrides "
+        "extract.baseline_min_dist_to_meth in YAML.",
+    )
+    p_extract.add_argument(
+        "--near-meth-max-dist",
+        type=int,
+        default=None,
+        help="Max downstream distance for CATEGORY_NEAR_METH "
+        "samples (proximity window around each methylation). "
+        "Defaults to YAML extract.near_meth_max_dist (typically 7).",
+    )
+    p_extract.add_argument(
+        "--baseline-sample-rate",
+        type=float,
+        default=None,
+        help="Front-end subsample rate for baseline candidates "
+        "(0..1). Defaults to YAML extract.baseline_sample_rate "
+        "(typically 0.10). Lower = faster + less memory but "
+        "fewer baselines for rare kmers.",
+    )
 
     # -- merge subcommand --
     p_merge = sub.add_parser(
@@ -874,11 +983,19 @@ def main(argv=None) -> None:
         ),
     )
     p_merge.add_argument("input_dir", help="Directory containing shard .pkl files")
-    p_merge.add_argument("output",    help="Output master training set .pkl file")
-    p_merge.add_argument("--max-samples", type=int, default=50_000,
-                         help="Max samples per kmer after merging (default: 50000)")
-    p_merge.add_argument("--glob", default="auto", dest="glob_pattern",
-                         help="Glob pattern for shard files (default: auto-detect)")
+    p_merge.add_argument("output", help="Output master training set .pkl file")
+    p_merge.add_argument(
+        "--max-samples",
+        type=int,
+        default=50_000,
+        help="Max samples per kmer after merging (default: 50000)",
+    )
+    p_merge.add_argument(
+        "--glob",
+        default="auto",
+        dest="glob_pattern",
+        help="Glob pattern for shard files (default: auto-detect)",
+    )
     p_merge.add_argument("--verbose", "-v", action="store_true")
 
     args = parser.parse_args(argv)
@@ -886,7 +1003,8 @@ def main(argv=None) -> None:
 
     if args.command == "merge":
         merge_shards(
-            args.input_dir, args.output,
+            args.input_dir,
+            args.output,
             max_samples_per_key=args.max_samples,
             glob_pattern=args.glob_pattern,
         )
@@ -897,20 +1015,29 @@ def main(argv=None) -> None:
 
     # Resolve v4 knobs (CLI overrides YAML).
     from .utils.config import load_kinsim_config
+
     cfg = load_kinsim_config()
-    ext = (cfg.get("extract") or {})
-    n_baseline_per_kmer       = (args.n_baseline_per_kmer
-                                 if args.n_baseline_per_kmer is not None
-                                 else int(ext.get("n_baseline_per_kmer", 50)))
-    baseline_min_dist_to_meth = (args.baseline_min_dist
-                                 if args.baseline_min_dist is not None
-                                 else int(ext.get("baseline_min_dist_to_meth", K)))
-    near_meth_max_dist        = (args.near_meth_max_dist
-                                 if args.near_meth_max_dist is not None
-                                 else int(ext.get("near_meth_max_dist", 7)))
-    baseline_sample_rate      = (args.baseline_sample_rate
-                                 if args.baseline_sample_rate is not None
-                                 else float(ext.get("baseline_sample_rate", 0.10)))
+    ext = cfg.get("extract") or {}
+    n_baseline_per_kmer = (
+        args.n_baseline_per_kmer
+        if args.n_baseline_per_kmer is not None
+        else int(ext.get("n_baseline_per_kmer", 50))
+    )
+    baseline_min_dist_to_meth = (
+        args.baseline_min_dist
+        if args.baseline_min_dist is not None
+        else int(ext.get("baseline_min_dist_to_meth", K))
+    )
+    near_meth_max_dist = (
+        args.near_meth_max_dist
+        if args.near_meth_max_dist is not None
+        else int(ext.get("near_meth_max_dist", 7))
+    )
+    baseline_sample_rate = (
+        args.baseline_sample_rate
+        if args.baseline_sample_rate is not None
+        else float(ext.get("baseline_sample_rate", 0.10))
+    )
 
     if args.manifest:
         if args.task is None:
@@ -921,17 +1048,17 @@ def main(argv=None) -> None:
             sys.exit(1)
         extract_from_manifest_task(
             args.manifest,
-            task_index               = args.task,
-            output_dir               = args.output_dir,
-            n_baseline_per_kmer      = n_baseline_per_kmer,
-            baseline_min_dist_to_meth= baseline_min_dist_to_meth,
-            near_meth_max_dist       = near_meth_max_dist,
-            baseline_sample_rate     = baseline_sample_rate,
-            revcomp                  = not args.no_revcomp,
-            use_reverse_strand       = not args.no_reverse_strand,
-            max_reads                = args.max_reads,
-            kmer_size                = args.kmer_size or K,
-            meth_types               = meth_types,
+            task_index=args.task,
+            output_dir=args.output_dir,
+            n_baseline_per_kmer=n_baseline_per_kmer,
+            baseline_min_dist_to_meth=baseline_min_dist_to_meth,
+            near_meth_max_dist=near_meth_max_dist,
+            baseline_sample_rate=baseline_sample_rate,
+            revcomp=not args.no_revcomp,
+            use_reverse_strand=not args.no_reverse_strand,
+            max_reads=args.max_reads,
+            kmer_size=args.kmer_size or K,
+            meth_types=meth_types,
         )
         return
 
@@ -957,16 +1084,17 @@ def main(argv=None) -> None:
     if meth_types is not None:
         log.info("Meth types filter: %s", sorted(meth_types))
     result = extract_samples_from_bam(
-        args.bam, motif_string,
-        n_baseline_per_kmer       = n_baseline_per_kmer,
-        baseline_min_dist_to_meth = baseline_min_dist_to_meth,
-        near_meth_max_dist        = near_meth_max_dist,
-        baseline_sample_rate      = baseline_sample_rate,
-        revcomp                   = not args.no_revcomp,
-        use_reverse_strand        = not args.no_reverse_strand,
-        max_reads                 = args.max_reads,
-        kmer_size                 = args.kmer_size or K,
-        meth_types                = meth_types,
+        args.bam,
+        motif_string,
+        n_baseline_per_kmer=n_baseline_per_kmer,
+        baseline_min_dist_to_meth=baseline_min_dist_to_meth,
+        near_meth_max_dist=near_meth_max_dist,
+        baseline_sample_rate=baseline_sample_rate,
+        revcomp=not args.no_revcomp,
+        use_reverse_strand=not args.no_reverse_strand,
+        max_reads=args.max_reads,
+        kmer_size=args.kmer_size or K,
+        meth_types=meth_types,
     )
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)

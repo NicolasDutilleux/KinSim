@@ -1,32 +1,26 @@
-"""Comprehensive analysis of a KinSim training .pkl file.
+"""Analyse a KinSim training .pkl produced by ``extract`` + ``merge`` (+ ``refine``).
 
-Data format (produced by ``kinsim extract`` / ``kinsim merge``):
+Storage format (v4, ``kinsim.utils.sample_layout``):
 
-    {(kmer_id, meth_id): np.ndarray(N, 2/3/14)}
-        columns: [IPD, PW]              (legacy 2-col)
-                 [IPD, PW, fraction]    (legacy 3-col)
-                 [IPD, PW, fraction, mc_0..mc_10]  (current 14-col, K=11)
+    dict[kmer_id (int)] -> np.ndarray(N, 36)
 
-Auto-detects:
-  - K-mer size           (from __meta__["kmer_size"] or inferred from key range)
-  - Methylation types    (whatever is present in the file — no hardcoded list)
+with col 35 carrying the CATEGORY enum (0=baseline, 1=slowed, 2=near_meth).
 
-Generates:
-  - <basename>_report.txt   — text report printed to stdout AND written to file
-  - <basename>_report.html  — interactive Plotly visualisations (requires plotly)
+Outputs (to ``--output-dir`` or the input's directory by default):
 
-Analysis sections:
-  1. Overview            — file size, format, kmer size, key/sample counts
-  2. Per-type coverage   — unique kmers, %, sample count distributions,
-                           methylation fraction distributions (incl. breakdown)
-  3. Signal statistics   — IPD/PW mean and sigma per meth type
-  4. Low-coverage keys   — keys with n < 5 / 10 / 50 samples
-  5. Neighbor sensitivity — how a single base change in the k-mer context
-                            affects expected IPD/PW; per-position breakdown
+    <basename>_report.txt   text report (also printed to stdout)
+    <basename>_report.html  Plotly figures + report header
 
-CLI usage:
-    kinsim analyze bc2033_shard.pkl
-    kinsim analyze master_data.pkl --output-dir reports/ --no-html
+The HTML report is a focused 4-figure verification dashboard:
+    1. IPD distribution per category (with refine threshold)
+    2. Per-kmer baseline-mean distribution (showing where the threshold sits)
+    3. Kinetic signature profiles (offsets 0..+8) per bucket
+    4. Sample counts per bucket
+
+CLI:
+
+    kinsim analyze master_clean.pkl
+    kinsim analyze master_clean.pkl --output-dir reports/ --no-html
 """
 
 from __future__ import annotations
@@ -34,7 +28,6 @@ from __future__ import annotations
 import dataclasses
 import io
 import logging
-import os
 import pickle
 import time
 from pathlib import Path
@@ -45,25 +38,30 @@ from .utils.encoding import METH_IDS
 
 log = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
-# Lookups and helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 _ID_TO_NAME = {v: k for k, v in METH_IDS.items()}
 
-# Colour palette — cycles for any number of meth types
+# Plotly palette — cycles for any number of meth types.
 _COLORS = [
-    '#636EFA', '#EF553B', '#00CC96', '#AB63FA',
-    '#FFA15A', '#19D3F3', '#FF6692', '#B6E880',
-    '#FF97FF', '#FECB52',
+    "#636EFA",
+    "#EF553B",
+    "#00CC96",
+    "#AB63FA",
+    "#FFA15A",
+    "#19D3F3",
+    "#FF6692",
+    "#B6E880",
+    "#FF97FF",
+    "#FECB52",
 ]
-
-_VIOLIN_SUBSAMPLE = 100_000  # Plotly KDE slows above ~100K points per trace
 
 
 def _meth_name(meth_id: int) -> str:
-    """Human-readable name for a methylation state id."""
-    return _ID_TO_NAME.get(meth_id, f'meth_id={meth_id}')
+    return _ID_TO_NAME.get(meth_id, f"meth_id={meth_id}")
 
 
 def _meth_color(meth_id: int) -> str:
@@ -71,140 +69,119 @@ def _meth_color(meth_id: int) -> str:
 
 
 def _darken_hex(hex_color: str, factor: float) -> str:
-    """Darken a hex color by factor (0=black, 1=original)."""
-    h = hex_color.lstrip('#')
-    r, g, b = (int(h[i:i+2], 16) for i in (0, 2, 4))
-    return f'rgb({int(r*factor)},{int(g*factor)},{int(b*factor)})'
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i : i + 2], 16) for i in (0, 2, 4))
+    return f"rgb({int(r * factor)},{int(g * factor)},{int(b * factor)})"
 
 
 def _pct(val, total) -> str:
-    return f'{100.0 * val / total:.2f}%' if total else 'n/a'
+    return f"{100.0 * val / total:.2f}%" if total else "n/a"
 
 
 # ---------------------------------------------------------------------------
-# Data structures
+# Dataclasses
 # ---------------------------------------------------------------------------
+
 
 @dataclasses.dataclass
 class MethGroupStats:
-    """Statistics collected for one methylation state."""
+    """Per-meth-type aggregate stats (one row per kmer)."""
+
     meth_id: int
-    name: str                     # e.g. "none", "m6A", "m4C", "m5C", "meth_id=5"
+    name: str
     n_entries: int
-    sample_counts: np.ndarray     # (n_entries,)  — samples per key
-    ipd_means: np.ndarray         # (n_entries,)  — per-key IPD mean
-    ipd_sigmas: np.ndarray        # (n_entries,)  — per-key IPD std
-    pw_means: np.ndarray          # (n_entries,)  — per-key PW mean
-    pw_sigmas: np.ndarray         # (n_entries,)  — per-key PW std
-    fraction_means: np.ndarray    # (n_entries,)  — per-key mean frac (NaN if absent)
-    kmer_ids: np.ndarray          # (n_entries,)  int64 — used for neighbor lookup
+    sample_counts: np.ndarray
+    ipd_means: np.ndarray
+    ipd_sigmas: np.ndarray
+    pw_means: np.ndarray
+    pw_sigmas: np.ndarray
+    fraction_means: np.ndarray
+    kmer_ids: np.ndarray
 
 
 @dataclasses.dataclass
 class DictStats:
-    """All statistics collected from one .pkl file."""
+    """Top-level stats for one .pkl."""
+
     pkl_path: str
     kmer_size: int
-    total_possible_kmers: int     # 4 ** kmer_size
+    total_possible_kmers: int
     total_entries: int
     total_samples: int
-    groups: dict                  # meth_id -> MethGroupStats
+    groups: dict
     file_size_mb: float
-    meta: dict                    # __meta__ contents (empty dict if absent)
-
-
-@dataclasses.dataclass
-class NeighborSensitivity:
-    """1-base substitution sensitivity results for one category."""
-    delta_ipd: np.ndarray         # |delta mean_ipd| per neighbor pair found
-    delta_pw: np.ndarray          # |delta mean_pw|  per neighbor pair found
-    positions: np.ndarray         # int8 — which position (0…K-1) was mutated
-    n_source_entries: int
-    n_pairs_found: int
+    meta: dict
 
 
 # ---------------------------------------------------------------------------
-# K-mer size auto-detection
+# Format check
 # ---------------------------------------------------------------------------
+
+
+def _check_v4_input(data: dict) -> None:
+    """Fail fast on inputs that are not in the current v4 layout."""
+    for k, v in data.items():
+        if k == "__meta__":
+            continue
+        if not isinstance(k, (int, np.integer)):
+            raise ValueError(
+                f"Input is not in the current 36-col layout: got key type "
+                f"{type(k).__name__}, expected int kmer_id. Re-run "
+                f"`kinsim extract` + `kinsim merge`."
+            )
+        if not isinstance(v, np.ndarray) or v.ndim != 2:
+            raise ValueError(f"Input value for kmer {k!r} is not a 2D ndarray.")
+        return  # one probe is enough
+
 
 def _detect_kmer_size(data: dict, meta: dict) -> int:
-    """Infer kmer size from __meta__ or from the range of kmer_ids in the data.
-
-    Supports v3 (tuple keys) and v4 (int kmer keys).
-    """
-    if meta and 'kmer_size' in meta:
-        return int(meta['kmer_size'])
+    """Infer kmer size from __meta__ or from the largest int key."""
+    if meta and "kmer_size" in meta:
+        return int(meta["kmer_size"])
     max_kmer = 0
     for k in data:
         if k == "__meta__":
             continue
-        kid = None
-        if isinstance(k, tuple) and len(k) >= 1:
-            kid = k[0]
-        elif isinstance(k, (int, np.integer)):
-            kid = int(k)
-        if kid is not None and kid > max_kmer:
-            max_kmer = kid
+        if isinstance(k, (int, np.integer)) and int(k) > max_kmer:
+            max_kmer = int(k)
     if max_kmer == 0:
         return 11
     bits = int(max_kmer).bit_length()
     return max(1, (bits + 1) // 2)
 
 
-# ---------------------------------------------------------------------------
-# Per-key stat extractors (one per format)
-# ---------------------------------------------------------------------------
-
 def _key_stats_samples(arr: np.ndarray):
-    """Extract (n, mu_ipd, sig_ipd, mu_pw, sig_pw, frac) from a raw-sample array."""
+    """Return ``(n, mu_ipd, sig_ipd, mu_pw, sig_pw, mean_frac)`` for one kmer."""
     n = len(arr)
-    mu_ipd  = float(np.mean(arr[:, 0]))
-    sig_ipd = float(np.std(arr[:, 0]))
-    mu_pw   = float(np.mean(arr[:, 1]))
-    sig_pw  = float(np.std(arr[:, 1]))
-    frac    = float(np.mean(arr[:, 2])) if arr.shape[1] >= 3 else float('nan')
+    mu_ipd = float(arr[:, 0].mean())
+    sig_ipd = float(arr[:, 0].std())
+    mu_pw = float(arr[:, 1].mean())
+    sig_pw = float(arr[:, 1].std())
+    frac = float(arr[:, 2].mean()) if arr.shape[1] >= 3 else float("nan")
     return n, mu_ipd, sig_ipd, mu_pw, sig_pw, frac
 
 
-def _detect_format_a(data: dict) -> str:
-    """Return 'v3' or 'v4' based on the first non-meta key type."""
-    for k in data:
-        if k == "__meta__":
-            continue
-        if isinstance(k, tuple):
-            return "v3"
-        if isinstance(k, (int, np.integer)):
-            return "v4"
-    return "unknown"
+# ---------------------------------------------------------------------------
+# Per-category IPD/PW distribution
+# ---------------------------------------------------------------------------
 
 
 def compute_category_distributions(data: dict) -> dict:
-    """Per-category IPD/PW distribution stats for the v4 layout.
+    """Per-category IPD/PW distribution stats.
 
-    Returns dict[category_name] -> {
-        'n':           int,
-        'ipd_mean':    float, 'ipd_std': float,
-        'ipd_quantiles': dict {p: value} for p in [5, 25, 50, 75, 90, 95, 99],
-        'ipd_max':     float,
-        'pw_mean':     float, 'pw_std': float,
-        'pw_quantiles': same shape,
-        'ipd_hist':    np.array — counts in fixed bins for ASCII histogram,
-        'ipd_hist_edges': bin edges,
-    }
-
-    Returns {} if input is not v4. The caller (render_txt_report) adds
-    this section to the report only when present.
+    Returns ``dict[category_name] -> {n, ipd_mean, ipd_std, ipd_quantiles,
+    ipd_max, pw_mean, pw_std, pw_quantiles, ipd_hist, ipd_hist_edges}``.
     """
     from .utils.sample_layout import (
-        COL_CATEGORY, COL_IPD, COL_PW,
-        CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH,
+        CATEGORY_BASELINE,
         CATEGORY_NAMES,
+        CATEGORY_NEAR_METH,
+        CATEGORY_SLOWED,
+        COL_CATEGORY,
+        COL_IPD,
+        COL_PW,
     )
-    fmt = _detect_format_a(data)
-    if fmt != "v4":
-        return {}
 
-    # Gather (ipd, pw) per category.
     by_cat: dict[int, list] = {0: [], 1: [], 2: []}
     for kid, arr in data.items():
         if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
@@ -213,575 +190,285 @@ def compute_category_distributions(data: dict) -> dict:
             continue
         cats = arr[:, COL_CATEGORY].astype(np.int8)
         for cat_id in (CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH):
-            m = (cats == cat_id)
-            if m.any():
-                by_cat[cat_id].append(arr[m][:, [COL_IPD, COL_PW]])
+            mask = cats == cat_id
+            if mask.any():
+                by_cat[cat_id].append(arr[mask][:, [COL_IPD, COL_PW]])
 
-    # Histogram bins for IPD (uint8 [0, 255]).
     bins = np.array([0, 16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 256], dtype=np.float32)
-
+    qs = (5, 25, 50, 75, 90, 95, 99)
     out: dict = {}
-    qs = [5, 25, 50, 75, 90, 95, 99]
     for cat_id, chunks in by_cat.items():
         if not chunks:
             continue
         pooled = np.concatenate(chunks, axis=0)
         ipd = pooled[:, 0].astype(np.float32)
-        pw  = pooled[:, 1].astype(np.float32)
+        pw = pooled[:, 1].astype(np.float32)
         h, _ = np.histogram(ipd, bins=bins)
         out[CATEGORY_NAMES[cat_id]] = {
-            "n":             int(len(ipd)),
-            "ipd_mean":      float(ipd.mean()),
-            "ipd_std":       float(ipd.std()),
+            "n": len(ipd),
+            "ipd_mean": float(ipd.mean()),
+            "ipd_std": float(ipd.std()),
             "ipd_quantiles": {p: float(np.percentile(ipd, p)) for p in qs},
-            "ipd_max":       float(ipd.max()),
-            "pw_mean":       float(pw.mean()),
-            "pw_std":        float(pw.std()),
-            "pw_quantiles":  {p: float(np.percentile(pw, p)) for p in qs},
-            "ipd_hist":      h.astype(np.int64),
+            "ipd_max": float(ipd.max()),
+            "pw_mean": float(pw.mean()),
+            "pw_std": float(pw.std()),
+            "pw_quantiles": {p: float(np.percentile(pw, p)) for p in qs},
+            "ipd_hist": h.astype(np.int64),
             "ipd_hist_edges": bins,
         }
     return out
 
 
+# ---------------------------------------------------------------------------
+# Kinetic signature profiles (per bucket)
+# ---------------------------------------------------------------------------
+
+
 def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
-    """Aggregate the kinetic profile per meth type across all keys.
+    """Aggregate the kinetic profile per bucket.
 
-    Returns dict[meth_name] -> {'profile_ipd': np.ndarray(PROFILE_LEN,),
-                                'profile_pw':  np.ndarray(PROFILE_LEN,),
-                                'n_samples':   int,
-                                'sig_offsets': list[int]}
+    Buckets: ``baseline``, ``slowed_by_<T>``, ``near_meth_by_<T>`` for each
+    methylation type T declared in ``kinsim_config.yaml``.
 
-    Auto-detects v3 (tuple keys) vs v4 (int kmer keys + col 35 CATEGORY).
-    For v4, the bucket assignment is read directly from the CATEGORY column;
-    for v3, it is inferred from meth_context as before.
+    Parent attribution is read directly from ``COL_PARENT_METH`` (written
+    at extract time) — no inference from the meth_context window. This is
+    fully vectorised: per kmer, one boolean mask per (category, parent)
+    pair, then ``profile[mask].sum(axis=0)`` accumulators.
+
+    Returns ``dict[bucket] -> {profile_ipd, profile_pw, n_samples, sig_offsets}``.
     """
-    from .utils.sample_layout import (
-        METH_CTX_LEN, PROFILE_LEN, COL_CATEGORY,
-        CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH,
-    )
     from .utils.config import load_kinsim_config
-    from .utils.encoding import KMER_PRED_IDX, get_meth_ids
+    from .utils.encoding import get_meth_ids
+    from .utils.sample_layout import (
+        CATEGORY_BASELINE,
+        CATEGORY_NEAR_METH,
+        CATEGORY_SLOWED,
+        COL_CATEGORY,
+        COL_PARENT_METH,
+        METH_CTX_LEN,
+        PROFILE_LEN,
+    )
 
     cfg = load_kinsim_config()
     profile_start_col = 3 + METH_CTX_LEN
-    pw_start_col      = profile_start_col + PROFILE_LEN
-    needed_cols       = pw_start_col + PROFILE_LEN  # = 32
-    meth_ids          = get_meth_ids()
+    pw_start_col = profile_start_col + PROFILE_LEN
+    needed_cols = pw_start_col + PROFILE_LEN  # = 32
 
-    # Per-meth signature offset sets and proximity offsets, used to attribute
-    # SLOWED / NEAR_METH samples to a parent meth type. Probe order: check
-    # mc[KMER_PRED_IDX] first (meth at center), then upstream mc indices.
+    meth_ids = get_meth_ids()
+    name_by_mid = {v: k for k, v in meth_ids.items()}
+
     sig_set_by_name: dict[str, set] = {}
     for mod_name, sig_cfg in (cfg.get("kinetic_signatures") or {}).items():
-        sig_set_by_name[mod_name] = {int(k) for k in sig_cfg.get("signal_offsets", [])
-                                     if isinstance(k, (int, float))}
-
-    fmt = _detect_format_a(data)
-    out: dict = {}
-
-    if fmt == "v4":
-        name_by_mid = {v: k for k, v in meth_ids.items()}
-
-        baseline_acc = [np.zeros(PROFILE_LEN, dtype=np.float64),
-                        np.zeros(PROFILE_LEN, dtype=np.float64), 0]
-        slowed_acc:  dict[str, list] = {}     # by parent meth name
-        near_acc:    dict[str, list] = {}     # by parent meth name
-
-        def _attribute_parent(mc_row, default_kind):
-            """For a SLOWED or NEAR_METH sample, return the parent meth name
-            by inspecting its meth_context. Probe at center first, then
-            upstream offsets."""
-            # 1. center
-            mid = int(mc_row[KMER_PRED_IDX])
-            if mid > 0:
-                return name_by_mid.get(mid)
-            # 2. upstream offsets — for the right "kind" use the right window
-            for k in range(1, KMER_PRED_IDX + 1):
-                idx = KMER_PRED_IDX - k
-                if not (0 <= idx < METH_CTX_LEN):
-                    continue
-                mid = int(mc_row[idx])
-                if mid <= 0:
-                    continue
-                mname = name_by_mid.get(mid)
-                if not mname:
-                    continue
-                sig = sig_set_by_name.get(mname, set())
-                if default_kind == "slowed" and k in sig:
-                    return mname
-                if default_kind == "near"   and k not in sig:
-                    return mname
-            return None
-
-        for kid, v in data.items():
-            if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
-                continue
-            if v.shape[1] < needed_cols:
-                continue
-            if v.shape[1] <= COL_CATEGORY:
-                continue
-            cats = v[:, COL_CATEGORY].astype(np.int8)
-            ipd_prof = v[:, profile_start_col:pw_start_col]
-            pw_prof  = v[:, pw_start_col:needed_cols]
-            mc       = v[:, 3:3 + METH_CTX_LEN].astype(np.int32)
-
-            # Baseline
-            base_m = (cats == CATEGORY_BASELINE)
-            if base_m.any():
-                baseline_acc[0] += ipd_prof[base_m].sum(axis=0)
-                baseline_acc[1] += pw_prof [base_m].sum(axis=0)
-                baseline_acc[2] += int(base_m.sum())
-
-            # Slowed — attribute to a meth type by parent
-            slow_m = (cats == CATEGORY_SLOWED)
-            if slow_m.any():
-                idx_all = np.where(slow_m)[0]
-                for r in idx_all:
-                    mname = _attribute_parent(mc[r], "slowed")
-                    if not mname:
-                        continue
-                    if mname not in slowed_acc:
-                        slowed_acc[mname] = [np.zeros(PROFILE_LEN, dtype=np.float64),
-                                             np.zeros(PROFILE_LEN, dtype=np.float64), 0]
-                    slowed_acc[mname][0] += ipd_prof[r]
-                    slowed_acc[mname][1] += pw_prof [r]
-                    slowed_acc[mname][2] += 1
-
-            # Near_meth — attribute by parent
-            near_m = (cats == CATEGORY_NEAR_METH)
-            if near_m.any():
-                idx_all = np.where(near_m)[0]
-                for r in idx_all:
-                    mname = _attribute_parent(mc[r], "near")
-                    if not mname:
-                        continue
-                    if mname not in near_acc:
-                        near_acc[mname] = [np.zeros(PROFILE_LEN, dtype=np.float64),
-                                           np.zeros(PROFILE_LEN, dtype=np.float64), 0]
-                    near_acc[mname][0] += ipd_prof[r]
-                    near_acc[mname][1] += pw_prof [r]
-                    near_acc[mname][2] += 1
-
-        # Pack accumulators
-        if baseline_acc[2] > 0:
-            out["baseline"] = {
-                "profile_ipd": (baseline_acc[0] / baseline_acc[2]).astype(np.float32),
-                "profile_pw":  (baseline_acc[1] / baseline_acc[2]).astype(np.float32),
-                "n_samples":   baseline_acc[2],
-                "sig_offsets": [],
-            }
-        for mname, (s_i, s_p, n) in slowed_acc.items():
-            sig_offsets = list(sig_set_by_name.get(mname, []))
-            out[f"slowed_by_{mname}"] = {
-                "profile_ipd": (s_i / max(n, 1)).astype(np.float32),
-                "profile_pw":  (s_p / max(n, 1)).astype(np.float32),
-                "n_samples":   n,
-                "sig_offsets": sig_offsets,
-            }
-        for mname, (s_i, s_p, n) in near_acc.items():
-            sig_offsets = list(sig_set_by_name.get(mname, []))
-            out[f"near_meth_by_{mname}"] = {
-                "profile_ipd": (s_i / max(n, 1)).astype(np.float32),
-                "profile_pw":  (s_p / max(n, 1)).astype(np.float32),
-                "n_samples":   n,
-                "sig_offsets": sig_offsets,
-            }
-        return out
-
-    # ---- v3 legacy path: v3 keys (kmer, meth_id) — original behaviour ----
-    upstream_targets: list[tuple[int, int, str, int]] = []
-    for mod_name, sig_cfg in (cfg.get("kinetic_signatures") or {}).items():
-        mid = meth_ids.get(mod_name)
-        if not mid:
-            continue
-        for k in sig_cfg.get("signal_offsets", []):
-            try:
-                k = int(k)
-            except (TypeError, ValueError):
-                continue
-            if k <= 0:
-                continue
-            mc_idx = KMER_PRED_IDX - k
-            if 0 <= mc_idx < METH_CTX_LEN:
-                upstream_targets.append((mc_idx, mid, mod_name, k))
-
-    # v3 path (tuple keys) — original logic preserved below.
-    present_ids = sorted({int(k[1]) for k in data.keys()
-                          if isinstance(k, tuple) and len(k) == 2})
-
-    # ---- Standard per-type aggregate (existing behaviour) ----
-    for meth_id_int in present_ids:
-        name = _meth_name(meth_id_int)
-        sums_ipd = np.zeros(PROFILE_LEN, dtype=np.float64)
-        sums_pw  = np.zeros(PROFILE_LEN, dtype=np.float64)
-        n_total  = 0
-        for k, v in data.items():
-            if not (isinstance(k, tuple) and len(k) == 2 and isinstance(v, np.ndarray)):
-                continue
-            kmer_id, meth_id = k
-            if int(meth_id) != meth_id_int:
-                continue
-            if v.shape[1] < needed_cols:
-                continue  # old-format pkl, no profile stored
-            sums_ipd += v[:, profile_start_col:pw_start_col].sum(axis=0)
-            sums_pw  += v[:, pw_start_col:needed_cols].sum(axis=0)
-            n_total  += len(v)
-        if n_total == 0:
-            continue
-        sig_offsets = list(cfg.get("kinetic_signatures", {})
-                              .get(name, {}).get("signal_offsets", []))
-        out[name] = {
-            "profile_ipd": (sums_ipd / n_total).astype(np.float32),
-            "profile_pw":  (sums_pw  / n_total).astype(np.float32),
-            "n_samples":   n_total,
-            "sig_offsets": sig_offsets,
+        sig_set_by_name[mod_name] = {
+            int(k) for k in sig_cfg.get("signal_offsets", []) if isinstance(k, (int, float))
         }
 
-    # ---- v4: split the (kmer, 0) bucket into baseline + slowed-by-T ----
-    # Verifies pass-2: the slowed-by-T sub-profile should peak at the same
-    # offsets as type T's signature; the baseline sub-profile should be flat.
-    if upstream_targets:
-        baseline_sum_ipd = np.zeros(PROFILE_LEN, dtype=np.float64)
-        baseline_sum_pw  = np.zeros(PROFILE_LEN, dtype=np.float64)
-        baseline_n       = 0
-        slowed_sums_ipd: dict[str, np.ndarray] = {}
-        slowed_sums_pw:  dict[str, np.ndarray] = {}
-        slowed_ns:       dict[str, int]        = {}
-        # Pre-group targets by mod_name for assignment
-        targets_by_name: dict[str, list[tuple[int, int]]] = {}
-        for mc_idx, mid, mname, k in upstream_targets:
-            targets_by_name.setdefault(mname, []).append((mc_idx, mid))
+    # Per-meth-type accumulators initialised lazily as types are first seen.
+    def _new_acc():
+        return [
+            np.zeros(PROFILE_LEN, dtype=np.float64),
+            np.zeros(PROFILE_LEN, dtype=np.float64),
+            0,
+        ]
 
-        for k, v in data.items():
-            if not (isinstance(k, tuple) and len(k) == 2 and isinstance(v, np.ndarray)):
-                continue
-            if int(k[1]) != 0:
-                continue
-            if v.shape[1] < needed_cols:
-                continue
-            mc = v[:, 3:3 + METH_CTX_LEN].astype(np.int32)
+    baseline_acc = _new_acc()
+    slowed_acc: dict[int, list] = {}
+    near_acc: dict[int, list] = {}
 
-            # First-match-wins assignment: a sample tagged by multiple types
-            # (rare) is attributed to the first listed type in the YAML.
-            assigned = np.zeros(len(v), dtype=np.int8)   # 0 = baseline, idx+1 = slowed_by mname[idx]
-            mod_names_order = list(targets_by_name.keys())
-            for idx, mname in enumerate(mod_names_order, start=1):
-                still_baseline = (assigned == 0)
-                hit = np.zeros(len(v), dtype=bool)
-                for mc_idx, mid in targets_by_name[mname]:
-                    hit |= (mc[:, mc_idx] == mid)
-                assigned[still_baseline & hit] = idx
+    for kid, v in data.items():
+        if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
+            continue
+        if v.shape[1] <= COL_PARENT_METH:
+            continue
+        cats = v[:, COL_CATEGORY].astype(np.int8)
+        parent = v[:, COL_PARENT_METH].astype(np.int8)
+        ipd_prof = v[:, profile_start_col:pw_start_col]
+        pw_prof = v[:, pw_start_col:needed_cols]
 
-            ipd_prof = v[:, profile_start_col:pw_start_col]
-            pw_prof  = v[:, pw_start_col:needed_cols]
+        base_m = cats == CATEGORY_BASELINE
+        if base_m.any():
+            baseline_acc[0] += ipd_prof[base_m].sum(axis=0)
+            baseline_acc[1] += pw_prof[base_m].sum(axis=0)
+            baseline_acc[2] += int(base_m.sum())
 
-            base_mask = (assigned == 0)
-            if base_mask.any():
-                baseline_sum_ipd += ipd_prof[base_mask].sum(axis=0)
-                baseline_sum_pw  += pw_prof[base_mask].sum(axis=0)
-                baseline_n       += int(base_mask.sum())
-            for idx, mname in enumerate(mod_names_order, start=1):
-                m = (assigned == idx)
-                if not m.any():
+        slow_m = cats == CATEGORY_SLOWED
+        if slow_m.any():
+            for T_id in np.unique(parent[slow_m]):
+                if T_id == 0:
+                    continue  # untagged slowed (shouldn't happen with new extract)
+                mask = slow_m & (parent == T_id)
+                acc = slowed_acc.setdefault(int(T_id), _new_acc())
+                acc[0] += ipd_prof[mask].sum(axis=0)
+                acc[1] += pw_prof[mask].sum(axis=0)
+                acc[2] += int(mask.sum())
+
+        near_m = cats == CATEGORY_NEAR_METH
+        if near_m.any():
+            for T_id in np.unique(parent[near_m]):
+                if T_id == 0:
                     continue
-                slowed_sums_ipd.setdefault(mname, np.zeros(PROFILE_LEN, dtype=np.float64))
-                slowed_sums_pw .setdefault(mname, np.zeros(PROFILE_LEN, dtype=np.float64))
-                slowed_sums_ipd[mname] += ipd_prof[m].sum(axis=0)
-                slowed_sums_pw [mname] += pw_prof [m].sum(axis=0)
-                slowed_ns[mname] = slowed_ns.get(mname, 0) + int(m.sum())
+                mask = near_m & (parent == T_id)
+                acc = near_acc.setdefault(int(T_id), _new_acc())
+                acc[0] += ipd_prof[mask].sum(axis=0)
+                acc[1] += pw_prof[mask].sum(axis=0)
+                acc[2] += int(mask.sum())
 
-        if baseline_n > 0:
-            out["none/baseline"] = {
-                "profile_ipd": (baseline_sum_ipd / baseline_n).astype(np.float32),
-                "profile_pw":  (baseline_sum_pw  / baseline_n).astype(np.float32),
-                "n_samples":   baseline_n,
-                "sig_offsets": [],
-            }
-        for mname, n in slowed_ns.items():
-            if n == 0:
-                continue
-            sig_offsets = list(cfg.get("kinetic_signatures", {})
-                                  .get(mname, {}).get("signal_offsets", []))
-            out[f"none/slowed_by_{mname}"] = {
-                "profile_ipd": (slowed_sums_ipd[mname] / n).astype(np.float32),
-                "profile_pw":  (slowed_sums_pw [mname] / n).astype(np.float32),
-                "n_samples":   n,
-                "sig_offsets": sig_offsets,
-            }
-
+    out: dict = {}
+    if baseline_acc[2] > 0:
+        out["baseline"] = {
+            "profile_ipd": (baseline_acc[0] / baseline_acc[2]).astype(np.float32),
+            "profile_pw": (baseline_acc[1] / baseline_acc[2]).astype(np.float32),
+            "n_samples": baseline_acc[2],
+            "sig_offsets": [],
+        }
+    for T_id, (s_i, s_p, n) in slowed_acc.items():
+        mname = name_by_mid.get(T_id, f"meth{T_id}")
+        out[f"slowed_by_{mname}"] = {
+            "profile_ipd": (s_i / max(n, 1)).astype(np.float32),
+            "profile_pw": (s_p / max(n, 1)).astype(np.float32),
+            "n_samples": n,
+            "sig_offsets": sorted(sig_set_by_name.get(mname, [])),
+        }
+    for T_id, (s_i, s_p, n) in near_acc.items():
+        mname = name_by_mid.get(T_id, f"meth{T_id}")
+        out[f"near_meth_by_{mname}"] = {
+            "profile_ipd": (s_i / max(n, 1)).astype(np.float32),
+            "profile_pw": (s_p / max(n, 1)).astype(np.float32),
+            "n_samples": n,
+            "sig_offsets": sorted(sig_set_by_name.get(mname, [])),
+        }
     return out
 
 
 # ---------------------------------------------------------------------------
-# Methylation-context distribution per bucket (v4 verification)
+# Methylation-context distribution per bucket
 # ---------------------------------------------------------------------------
 
 
 def compute_meth_context_distribution(data: dict) -> dict:
-    """For each labelled bucket, count the meth_id at each meth_context offset.
+    """For each bucket, count meth_id occurrences at each meth_context offset.
 
-    Returns dict[bucket_name] -> {
-        'counts':   np.ndarray(METH_CTX_LEN, num_meth_ids)  raw counts,
-        'fractions': same shape, normalised per row,
-        'n_samples': int,
-        'meth_ids': list[int],          # column order in counts/fractions
-        'meth_names': list[str],        # display names
-    }
+    Parent attribution is read directly from ``COL_PARENT_METH`` and the
+    inner accumulation is fully vectorised (one boolean mask per meth_id
+    over all rows of the bucket).
 
-    Buckets reported:
-      * One per (kmer, meth_id>0) family — the standard meth buckets.
-      * 'none' if (kmer, 0) buckets exist.
-      * 'none/baseline' and 'none/slowed_by_<T>' splits if upstream signature
-        targets are configured (same logic as compute_signature_profiles).
-
-    The counts answer "for samples in bucket X, how often does meth_id Y
-    appear at meth_context position P [-7..+3]". Useful for verifying that
-    e.g. m6A samples have m6A at center (position +0 ≡ mc_idx 7), and that
-    palindromic R-M sites show a co-occurring m6A at some specific offset.
+    Returns ``dict[bucket] -> {counts, fractions, n_samples, meth_ids, meth_names}``.
     """
-    from .utils.sample_layout import METH_CTX_LEN
-    from .utils.config import load_kinsim_config
-    from .utils.encoding import KMER_PRED_IDX, get_meth_ids
+    from .utils.encoding import get_meth_ids
+    from .utils.sample_layout import (
+        CATEGORY_BASELINE,
+        CATEGORY_NEAR_METH,
+        CATEGORY_SLOWED,
+        COL_CATEGORY,
+        COL_PARENT_METH,
+        METH_CTX_LEN,
+    )
 
-    cfg = load_kinsim_config()
     meth_ids = get_meth_ids()
-    meth_id_list  = sorted(set(meth_ids.values()))               # [0, 1, 2, 3, ...]
-    meth_id_index = {mid: i for i, mid in enumerate(meth_id_list)}
-    name_by_mid   = {v: k for k, v in meth_ids.items()}
-    NMID = len(meth_id_list)
-
-    # Per-meth signature offset sets (used for v4 attribution + v3 inference).
-    sig_set_by_name: dict[str, set] = {}
-    for mod_name, sig_cfg in (cfg.get("kinetic_signatures") or {}).items():
-        sig_set_by_name[mod_name] = {int(k) for k in sig_cfg.get("signal_offsets", [])
-                                     if isinstance(k, (int, float))}
-
-    upstream_targets: list[tuple[int, int, str, int]] = []
-    for mod_name, sig_cfg in (cfg.get("kinetic_signatures") or {}).items():
-        mid = meth_ids.get(mod_name)
-        if not mid:
-            continue
-        for k in sig_cfg.get("signal_offsets", []):
-            try:
-                k = int(k)
-            except (TypeError, ValueError):
-                continue
-            if k <= 0:
-                continue
-            mc_idx = KMER_PRED_IDX - k
-            if 0 <= mc_idx < METH_CTX_LEN:
-                upstream_targets.append((mc_idx, mid, mod_name, k))
-
-    targets_by_name: dict[str, list[tuple[int, int]]] = {}
-    for mc_idx, mid, mname, k in upstream_targets:
-        targets_by_name.setdefault(mname, []).append((mc_idx, mid))
-
-    out: dict = {}
+    meth_id_list = sorted(set(meth_ids.values()))
+    name_by_mid = {v: k for k, v in meth_ids.items()}
+    nmid = len(meth_id_list)
 
     def _empty():
         return {
-            "counts":     np.zeros((METH_CTX_LEN, NMID), dtype=np.int64),
-            "n_samples":  0,
+            "counts": np.zeros((METH_CTX_LEN, nmid), dtype=np.int64),
+            "n_samples": 0,
         }
 
-    def _accumulate(bucket: dict, mc_arr: np.ndarray) -> None:
-        # mc_arr shape (n, METH_CTX_LEN), values in meth_id_list.
-        for col_pos in range(METH_CTX_LEN):
-            col = mc_arr[:, col_pos]
-            for mid in meth_id_list:
-                bucket["counts"][col_pos, meth_id_index[mid]] += int((col == mid).sum())
-        bucket["n_samples"] += len(mc_arr)
+    def _accumulate(bkt: dict, mc_arr: np.ndarray) -> None:
+        """Vectorised per-position meth_id counts.
 
-    fmt = _detect_format_a(data)
+        For a (n, METH_CTX_LEN) mc_arr, ``(mc_arr == mid).sum(axis=0)``
+        is the per-position count of meth_id ``mid`` — one numpy reduction
+        per meth_id, NMID total (~4). No Python row loop.
+        """
+        if len(mc_arr) == 0:
+            return
+        for i, mid in enumerate(meth_id_list):
+            bkt["counts"][:, i] += (mc_arr == mid).sum(axis=0).astype(np.int64)
+        bkt["n_samples"] += len(mc_arr)
 
-    # ── Standard buckets ────────────────────────────────────────────────
-    standard_buckets: dict[str, dict] = {}
-    if fmt == "v3":
-        for k, v in data.items():
-            if not (isinstance(k, tuple) and len(k) == 2 and isinstance(v, np.ndarray)):
-                continue
-            if v.shape[1] < 14:
-                continue
-            meth_id = int(k[1])
-            name = name_by_mid.get(meth_id, f"meth{meth_id}")
-            bkt  = standard_buckets.setdefault(name, _empty())
-            mc   = v[:, 3:14].astype(np.int32)
-            _accumulate(bkt, mc)
-    elif fmt == "v4":
-        # v4 has only 3 categories — no separate per-meth-type bucket here.
-        # The slowed/near_meth split below produces the per-type breakdown.
-        pass
+    baseline_b: dict = _empty()
+    slowed_buckets: dict[int, dict] = {}
+    near_buckets: dict[int, dict] = {}
 
-    # ── Slowed / baseline split ─────────────────────────────────────────
-    # v3: infer from meth_context using upstream signature targets (legacy).
-    # v4: read CATEGORY column directly; attribute slowed/near via mc lookup.
-    # Run for v4 always (independent of upstream_targets, which may be empty
-    # if all signatures are at offset 0). Run for v3 only when upstream targets
-    # exist (v3 inference depends on them).
-    split_buckets: dict[str, dict] = {}
-    if upstream_targets or fmt == "v4":
-        baseline_b = _empty()
-        slowed_buckets: dict[str, dict] = {}
-        mod_names_order = list(targets_by_name.keys())
+    for kid, v in data.items():
+        if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
+            continue
+        if v.shape[1] <= COL_PARENT_METH:
+            continue
+        cats = v[:, COL_CATEGORY].astype(np.int8)
+        parent = v[:, COL_PARENT_METH].astype(np.int8)
+        mc = v[:, 3 : 3 + METH_CTX_LEN].astype(np.int32)
 
-        if fmt == "v3":
-            for k, v in data.items():
-                if not (isinstance(k, tuple) and len(k) == 2 and isinstance(v, np.ndarray)):
+        base_mask = cats == CATEGORY_BASELINE
+        if base_mask.any():
+            _accumulate(baseline_b, mc[base_mask])
+
+        slow_mask = cats == CATEGORY_SLOWED
+        if slow_mask.any():
+            for T_id in np.unique(parent[slow_mask]):
+                if T_id == 0:
                     continue
-                if v.shape[1] < 14 or int(k[1]) != 0:
+                mask = slow_mask & (parent == T_id)
+                _accumulate(slowed_buckets.setdefault(int(T_id), _empty()), mc[mask])
+
+        near_mask = cats == CATEGORY_NEAR_METH
+        if near_mask.any():
+            for T_id in np.unique(parent[near_mask]):
+                if T_id == 0:
                     continue
-                mc = v[:, 3:14].astype(np.int32)
-                assigned = np.zeros(len(v), dtype=np.int8)
-                for idx, mname in enumerate(mod_names_order, start=1):
-                    still_baseline = (assigned == 0)
-                    hit = np.zeros(len(v), dtype=bool)
-                    for mc_idx, mid in targets_by_name[mname]:
-                        hit |= (mc[:, mc_idx] == mid)
-                    assigned[still_baseline & hit] = idx
-                base_mask = (assigned == 0)
-                if base_mask.any():
-                    _accumulate(baseline_b, mc[base_mask])
-                for idx, mname in enumerate(mod_names_order, start=1):
-                    m = (assigned == idx)
-                    if not m.any():
-                        continue
-                    bkt = slowed_buckets.setdefault(mname, _empty())
-                    _accumulate(bkt, mc[m])
+                mask = near_mask & (parent == T_id)
+                _accumulate(near_buckets.setdefault(int(T_id), _empty()), mc[mask])
 
-        elif fmt == "v4":
-            from .utils.sample_layout import (
-                COL_CATEGORY, CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH,
-            )
-            near_buckets: dict[str, dict] = {}
+    final: dict = {}
 
-            def _v4_attribute_to_meth(mc_row, kind):
-                """For a SLOWED or NEAR_METH sample, return the parent meth
-                name. Probe at center first (the meth's own position when
-                0 ∈ sig for slowed, or 0 ∉ sig for near_meth), then upstream."""
-                mid = int(mc_row[KMER_PRED_IDX])
-                if mid > 0:
-                    return name_by_mid.get(mid)
-                for k in range(1, KMER_PRED_IDX + 1):
-                    idx = KMER_PRED_IDX - k
-                    if not (0 <= idx < METH_CTX_LEN):
-                        continue
-                    mid = int(mc_row[idx])
-                    if mid <= 0:
-                        continue
-                    nm = name_by_mid.get(mid)
-                    if not nm:
-                        continue
-                    sig = sig_set_by_name.get(nm, set())
-                    if kind == "slowed" and k in sig:
-                        return nm
-                    if kind == "near"   and k not in sig:
-                        return nm
-                return None
-
-            for kid, v in data.items():
-                if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
-                    continue
-                if v.shape[1] <= COL_CATEGORY:
-                    continue
-                cats = v[:, COL_CATEGORY].astype(np.int8)
-                mc   = v[:, 3:14].astype(np.int32)
-
-                base_mask = (cats == CATEGORY_BASELINE)
-                if base_mask.any():
-                    _accumulate(baseline_b, mc[base_mask])
-
-                slow_mask = (cats == CATEGORY_SLOWED)
-                for r in np.where(slow_mask)[0]:
-                    nm = _v4_attribute_to_meth(mc[r], "slowed")
-                    if not nm:
-                        continue
-                    bkt = slowed_buckets.setdefault(nm, _empty())
-                    _accumulate(bkt, mc[r:r+1])
-
-                near_mask = (cats == CATEGORY_NEAR_METH)
-                for r in np.where(near_mask)[0]:
-                    nm = _v4_attribute_to_meth(mc[r], "near")
-                    if not nm:
-                        continue
-                    bkt = near_buckets.setdefault(nm, _empty())
-                    _accumulate(bkt, mc[r:r+1])
-
-        if baseline_b["n_samples"] > 0:
-            split_buckets["baseline"] = baseline_b
-        for mname, bkt in slowed_buckets.items():
-            if bkt["n_samples"] > 0:
-                split_buckets[f"slowed_by_{mname}"] = bkt
-        if fmt == "v4":
-            for mname, bkt in near_buckets.items():
-                if bkt["n_samples"] > 0:
-                    split_buckets[f"near_meth_by_{mname}"] = bkt
-
-    # ── Finalise: add fractions, names ──────────────────────────────────
     def _finalise(bkt: dict) -> dict:
-        n = bkt["n_samples"]
-        counts = bkt["counts"]
-        # Normalise per row (each row = METH_CTX position) — sum along axis=1
-        # is n_samples (every sample contributes one meth_id per position).
-        denom = max(n, 1)
-        bkt["fractions"]  = counts / denom
-        bkt["meth_ids"]   = meth_id_list
+        bkt["fractions"] = bkt["counts"] / max(bkt["n_samples"], 1)
+        bkt["meth_ids"] = meth_id_list
         bkt["meth_names"] = [name_by_mid.get(m, f"meth{m}") for m in meth_id_list]
         return bkt
 
-    final: dict = {}
-    for name, bkt in standard_buckets.items():
+    if baseline_b["n_samples"] > 0:
+        final["baseline"] = _finalise(baseline_b)
+    for T_id, bkt in slowed_buckets.items():
         if bkt["n_samples"] > 0:
-            final[name] = _finalise(bkt)
-    for name, bkt in split_buckets.items():
+            mname = name_by_mid.get(T_id, f"meth{T_id}")
+            final[f"slowed_by_{mname}"] = _finalise(bkt)
+    for T_id, bkt in near_buckets.items():
         if bkt["n_samples"] > 0:
-            final[name] = _finalise(bkt)
-
+            mname = name_by_mid.get(T_id, f"meth{T_id}")
+            final[f"near_meth_by_{mname}"] = _finalise(bkt)
     return final
 
 
 # ---------------------------------------------------------------------------
-# Stats collection (single pass)
+# Top-level stats collection
 # ---------------------------------------------------------------------------
 
-def collect_stats(data: dict, pkl_path: str) -> DictStats:
-    """One-pass collection of all per-key statistics from a .pkl file.
 
-    Auto-detects v3 (tuple keys, 35-col arrays) vs v4 (int kmer keys, 36-col
-    arrays with CATEGORY at col 35). For v4, samples are partitioned by the
-    meth_id at center (mc[KMER_PRED_IDX]), reproducing the v3 grouping for
-    downstream stats.
-    """
-    meta = data.get('__meta__', {})
+def collect_stats(data: dict, pkl_path: str) -> DictStats:
+    """One-pass per-key statistics, partitioned by meth_id at the centre."""
+    from .utils.encoding import KMER_PRED_IDX
+
+    meta = data.get("__meta__", {})
     if not isinstance(meta, dict):
         meta = {}
 
     kmer_size = _detect_kmer_size(data, meta)
-    total_possible = 4 ** kmer_size
+    total_possible = 4**kmer_size
 
-    fmt = _detect_format_a(data)
-
-    # Group items by meth_id (v3: from key; v4: from mc[KMER_PRED_IDX]).
+    # Partition rows of every kmer by meth_id at centre (mc[KMER_PRED_IDX]).
     partitions: dict[int, list] = {}
-    if fmt == "v3":
-        for k, v in data.items():
-            if not (isinstance(k, tuple) and len(k) == 2 and isinstance(v, np.ndarray)):
-                continue
-            kmer_id, meth_id = k
-            partitions.setdefault(meth_id, []).append((kmer_id, v))
-    elif fmt == "v4":
-        from .utils.encoding import KMER_PRED_IDX
-        for kid, v in data.items():
-            if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
-                continue
-            if v.shape[1] < 14:
-                continue
-            mc = v[:, 3:14].astype(np.int32)
-            center = mc[:, KMER_PRED_IDX]
-            for mid in np.unique(center):
-                rows = (center == mid)
-                if not rows.any():
-                    continue
+    for kid, v in data.items():
+        if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
+            continue
+        if v.shape[1] < 14:
+            continue
+        center = v[:, 3:14].astype(np.int32)[:, KMER_PRED_IDX]
+        for mid in np.unique(center):
+            rows = center == mid
+            if rows.any():
                 partitions.setdefault(int(mid), []).append((int(kid), v[rows]))
 
     groups: dict[int, MethGroupStats] = {}
@@ -789,24 +476,24 @@ def collect_stats(data: dict, pkl_path: str) -> DictStats:
 
     for meth_id, items in partitions.items():
         n = len(items)
-        sample_counts  = np.empty(n, dtype=np.float64)
-        ipd_means      = np.empty(n, dtype=np.float64)
-        ipd_sigmas     = np.empty(n, dtype=np.float64)
-        pw_means       = np.empty(n, dtype=np.float64)
-        pw_sigmas      = np.empty(n, dtype=np.float64)
-        fraction_means = np.full(n, float('nan'), dtype=np.float64)
-        kmer_ids       = np.empty(n, dtype=np.int64)
+        sample_counts = np.empty(n, dtype=np.float64)
+        ipd_means = np.empty(n, dtype=np.float64)
+        ipd_sigmas = np.empty(n, dtype=np.float64)
+        pw_means = np.empty(n, dtype=np.float64)
+        pw_sigmas = np.empty(n, dtype=np.float64)
+        fraction_means = np.full(n, float("nan"), dtype=np.float64)
+        kmer_ids = np.empty(n, dtype=np.int64)
 
         for i, (kmer_id, arr) in enumerate(items):
             cnt, mu_ipd, sig_ipd, mu_pw, sig_pw, frac = _key_stats_samples(arr)
-            sample_counts[i]  = cnt
-            ipd_means[i]      = mu_ipd
-            ipd_sigmas[i]     = sig_ipd
-            pw_means[i]       = mu_pw
-            pw_sigmas[i]      = sig_pw
+            sample_counts[i] = cnt
+            ipd_means[i] = mu_ipd
+            ipd_sigmas[i] = sig_ipd
+            pw_means[i] = mu_pw
+            pw_sigmas[i] = sig_pw
             fraction_means[i] = frac
-            kmer_ids[i]       = kmer_id
-            total_samples    += cnt
+            kmer_ids[i] = kmer_id
+            total_samples += cnt
 
         groups[meth_id] = MethGroupStats(
             meth_id=meth_id,
@@ -837,376 +524,222 @@ def collect_stats(data: dict, pkl_path: str) -> DictStats:
 
 
 # ---------------------------------------------------------------------------
-# Neighbor sensitivity  O(n × K × 3)
-# ---------------------------------------------------------------------------
-
-def compute_neighbor_sensitivity(
-    data: dict,
-    stats: DictStats,
-    max_entries: int = 200_000,
-) -> dict:
-    """Compute 1-base substitution sensitivity for methylated and unmethylated kmers.
-
-    For each source kmer, generates all K×3 single-base substitutions and
-    records |delta mean_ipd|, |delta mean_pw|, and the mutated position for every
-    neighbor found in the dictionary.
-
-    Returns dict with keys 'unmethylated' and 'methylated'.
-    """
-    rng = np.random.default_rng(42)
-    K   = stats.kmer_size
-
-    # Build fast mean lookup: (kmer_id, meth_id) -> (mu_ipd, mu_pw)
-    mean_lookup: dict = {}
-    for k, v in data.items():
-        if not (isinstance(k, tuple) and len(k) == 2 and isinstance(v, np.ndarray)):
-            continue
-        mean_lookup[k] = (float(np.mean(v[:, 0])), float(np.mean(v[:, 1])))
-
-    categories = [
-        ('unmethylated', [0]),
-        ('methylated',   [mid for mid in stats.groups if mid != 0]),
-    ]
-
-    results = {}
-    for category, meth_ids in categories:
-        # Collect source entries for this category
-        source = []
-        for mid in meth_ids:
-            g = stats.groups.get(mid)
-            if g is None:
-                continue
-            for i in range(g.n_entries):
-                key = (int(g.kmer_ids[i]), mid)
-                if key in mean_lookup:
-                    source.append((int(g.kmer_ids[i]), mid,
-                                   mean_lookup[key][0], mean_lookup[key][1]))
-
-        if not source:
-            results[category] = NeighborSensitivity(
-                delta_ipd=np.array([], dtype=np.float32),
-                delta_pw=np.array([], dtype=np.float32),
-                positions=np.array([], dtype=np.int8),
-                n_source_entries=0, n_pairs_found=0,
-            )
-            continue
-
-        # Subsample large groups
-        if max_entries > 0 and len(source) > max_entries:
-            idx = rng.choice(len(source), max_entries, replace=False)
-            source = [source[i] for i in idx]
-
-        delta_ipd_list: list = []
-        delta_pw_list:  list = []
-        pos_list:       list = []
-
-        for kmer_int, meth_id, ipd_mean, pw_mean in source:
-            for pos in range(K):
-                bit_pos   = (K - 1 - pos) * 2       # MSB-first encoding
-                orig_base = (kmer_int >> bit_pos) & 0x3
-                mask_bits = ~(0x3 << bit_pos)
-                for new_base in range(4):
-                    if new_base == orig_base:
-                        continue
-                    neighbor = (kmer_int & mask_bits) | (new_base << bit_pos)
-                    nb = mean_lookup.get((neighbor, meth_id))
-                    if nb is None:
-                        continue
-                    delta_ipd_list.append(abs(ipd_mean - nb[0]))
-                    delta_pw_list.append(abs(pw_mean  - nb[1]))
-                    pos_list.append(pos)
-
-        results[category] = NeighborSensitivity(
-            delta_ipd=np.array(delta_ipd_list, dtype=np.float32),
-            delta_pw=np.array(delta_pw_list,   dtype=np.float32),
-            positions=np.array(pos_list,        dtype=np.int8),
-            n_source_entries=len(source),
-            n_pairs_found=len(delta_ipd_list),
-        )
-
-    return results
-
-
-# ---------------------------------------------------------------------------
 # TXT report
 # ---------------------------------------------------------------------------
 
-def render_txt_report(stats: DictStats, sensitivity: dict, output_path: str,
-                       signature_profiles: dict | None = None,
-                       context_distribution: dict | None = None,
-                       category_distributions: dict | None = None,
-                       refine_meta: dict | None = None) -> None:
-    """Print TXT report to stdout and write to *output_path*."""
+
+def _bucket_order_key(name: str) -> tuple:
+    """Display order: baseline, then slowed_by_*, then near_meth_by_*."""
+    if name == "baseline":
+        return (0, name)
+    if name.startswith("slowed_by_"):
+        return (1, name)
+    if name.startswith("near_meth_by_"):
+        return (2, name)
+    return (3, name)
+
+
+def render_txt_report(
+    stats: DictStats,
+    output_path: str,
+    signature_profiles: dict | None = None,
+    context_distribution: dict | None = None,
+    category_distributions: dict | None = None,
+    refine_meta: dict | None = None,
+) -> None:
+    """Write a plain-text analysis report to *output_path* and stdout."""
     buf = io.StringIO()
     K = stats.kmer_size
 
-    def p(line: str = '') -> None:
+    def p(line: str = "") -> None:
         print(line)
-        buf.write(line + '\n')
+        buf.write(line + "\n")
 
     W = 72
 
-    # ── 1. Overview ──────────────────────────────────────────────────────
-    p('=' * W)
-    p('KinSim  —  Training Data Analysis Report')
-    p('=' * W)
+    # ── 1. Overview ─────────────────────────────────────────────────────
+    p("=" * W)
+    p("KinSim — Training Data Analysis Report")
+    p("=" * W)
     p(f"File          : {stats.pkl_path}")
     p(f"K-mer size    : {K}  (4^{K} = {stats.total_possible_kmers:,} possible)")
     p(f"File size     : {stats.file_size_mb:.1f} MB")
     p(f"Total keys    : {stats.total_entries:,}")
     p(f"Total samples : {stats.total_samples:,}")
-    p(f"Possible kmers: {stats.total_possible_kmers:,}  (4^{K})")
-    p(f"Overall cov.  : {_pct(stats.total_entries, stats.total_possible_kmers)}")
+    p(f"Coverage      : {_pct(stats.total_entries, stats.total_possible_kmers)}")
     if stats.meta:
-        if 'created' in stats.meta:
+        if "created" in stats.meta:
             p(f"Created       : {stats.meta['created']}")
-        src = stats.meta.get('source_bam', stats.meta.get('merged_from', ''))
+        src = stats.meta.get("source_bam", stats.meta.get("merged_from", ""))
         if src:
-            s = src if isinstance(src, str) else ', '.join(src[:3]) + ('...' if len(src) > 3 else '')
+            s = (
+                src
+                if isinstance(src, str)
+                else ", ".join(src[:3]) + ("..." if len(src) > 3 else "")
+            )
             p(f"Source        : {s}")
     p()
 
-    # ── 2. Per-meth coverage ─────────────────────────────────────────────
-    p('-' * W)
-    p('Per-methylation-state coverage')
-    p('-' * W)
+    # ── 2. Per-meth coverage ────────────────────────────────────────────
+    p("-" * W)
+    p("Per-methylation-state coverage  (partitioned by meth_id at centre)")
+    p("-" * W)
     for meth_id in sorted(stats.groups.keys()):
         g = stats.groups[meth_id]
-        label = 'Unmethylated' if meth_id == 0 else f'Methylated ({g.name})'
+        label = "Unmethylated" if meth_id == 0 else f"Methylated ({g.name})"
         c = g.sample_counts
-        p(f'\n  {label}:')
-        p(f'    Unique {K}-mers : {g.n_entries:,} / {stats.total_possible_kmers:,}'
-          f'  ({_pct(g.n_entries, stats.total_possible_kmers)})')
-        p(f'    Total samples  : {np.sum(c):,.0f}')
-        p(f'    Samples/key    :'
-          f' mean={np.mean(c):.1f}  median={np.median(c):.1f}'
-          f'  p5={np.percentile(c, 5):.0f}  p25={np.percentile(c, 25):.0f}'
-          f'  p75={np.percentile(c, 75):.0f}  p95={np.percentile(c, 95):.0f}')
-        p(f'                     min={np.min(c):.0f}  max={np.max(c):.0f}')
-        # Methylation fraction (only for methylated, only if available)
+        p(f"\n  {label}:")
+        p(
+            f"    Unique {K}-mers : {g.n_entries:,} / {stats.total_possible_kmers:,}"
+            f"  ({_pct(g.n_entries, stats.total_possible_kmers)})"
+        )
+        p(f"    Total samples  : {np.sum(c):,.0f}")
+        p(
+            f"    Samples/key    :"
+            f" mean={np.mean(c):.1f}  median={np.median(c):.1f}"
+            f"  p5={np.percentile(c, 5):.0f}  p25={np.percentile(c, 25):.0f}"
+            f"  p75={np.percentile(c, 75):.0f}  p95={np.percentile(c, 95):.0f}"
+        )
+        p(f"                     min={np.min(c):.0f}  max={np.max(c):.0f}")
         if meth_id != 0:
             valid = g.fraction_means[~np.isnan(g.fraction_means)]
             if len(valid) > 0:
-                p(f'    Meth fraction  :'
-                  f' mean={np.mean(valid):.3f}  median={np.median(valid):.3f}'
-                  f'  p5={np.percentile(valid, 5):.3f}'
-                  f'  p95={np.percentile(valid, 95):.3f}')
-                # Fraction breakdown: how many keys at 100%, 0%, in-between
-                n_full   = int(np.sum(valid >= 0.999))
-                n_zero   = int(np.sum(valid <= 0.001))
-                n_mixed  = len(valid) - n_full - n_zero
-                p(f'    Fraction split  :'
-                  f' frac=1.0: {n_full:,} ({_pct(n_full, len(valid))})'
-                  f'  frac=0.0: {n_zero:,} ({_pct(n_zero, len(valid))})'
-                  f'  mixed: {n_mixed:,} ({_pct(n_mixed, len(valid))})')
+                p(
+                    f"    Meth fraction  :"
+                    f" mean={np.mean(valid):.3f}  median={np.median(valid):.3f}"
+                    f"  p5={np.percentile(valid, 5):.3f}"
+                    f"  p95={np.percentile(valid, 95):.3f}"
+                )
     p()
 
-    # ── 3. Signal statistics ──────────────────────────────────────────────
-    p('-' * W)
-    p('Signal statistics  (distribution of per-key means and sigmas)')
-    p('-' * W)
+    # ── 3. Signal statistics ────────────────────────────────────────────
+    p("-" * W)
+    p("Signal statistics  (distribution of per-key means and sigmas)")
+    p("-" * W)
     for meth_id in sorted(stats.groups.keys()):
         g = stats.groups[meth_id]
-        label = 'Unmethylated' if meth_id == 0 else f'Methylated ({g.name})'
-        p(f'\n  {label}:')
+        label = "Unmethylated" if meth_id == 0 else f"Methylated ({g.name})"
+        p(f"\n  {label}:")
         for sig_name, means, sigmas in [
-            ('IPD', g.ipd_means, g.ipd_sigmas),
-            ('PW',  g.pw_means,  g.pw_sigmas),
+            ("IPD", g.ipd_means, g.ipd_sigmas),
+            ("PW", g.pw_means, g.pw_sigmas),
         ]:
-            p(f'    {sig_name} mean   :'
-              f' mean={np.mean(means):.3f}  std={np.std(means):.3f}'
-              f'  median={np.median(means):.3f}'
-              f'  p5={np.percentile(means, 5):.3f}'
-              f'  p95={np.percentile(means, 95):.3f}')
-            p(f'    {sig_name} sigma  :'
-              f' mean={np.mean(sigmas):.3f}  std={np.std(sigmas):.3f}'
-              f'  median={np.median(sigmas):.3f}'
-              f'  p5={np.percentile(sigmas, 5):.3f}'
-              f'  p95={np.percentile(sigmas, 95):.3f}')
+            p(
+                f"    {sig_name} mean   :"
+                f" mean={np.mean(means):.3f}  std={np.std(means):.3f}"
+                f"  median={np.median(means):.3f}"
+                f"  p5={np.percentile(means, 5):.3f}"
+                f"  p95={np.percentile(means, 95):.3f}"
+            )
+            p(
+                f"    {sig_name} sigma  :"
+                f" mean={np.mean(sigmas):.3f}  std={np.std(sigmas):.3f}"
+                f"  median={np.median(sigmas):.3f}"
+            )
     p()
 
-    # ── 3.5 Kinetic signature profile per meth type ──────────────────────
+    # ── 4. Kinetic signature profiles ───────────────────────────────────
     if signature_profiles:
-        p('-' * W)
-        p('Kinetic signature profiles  (mean IPD/PW at offsets 0..+8 from prediction pos)')
-        p('-' * W)
-        p('Each row averages over all samples in the named bucket. The signature')
-        p('offsets (***) are where the polymerase-slowing signal of that type is')
-        p('expected. A high IPD at signature offsets and low elsewhere indicates')
-        p('a clean, real methylation signature.')
+        p("-" * W)
+        p("Kinetic signature profiles  (mean IPD/PW at offsets 0..+8)")
+        p("-" * W)
+        p("Each row is the mean profile across all samples of that bucket. The")
+        p("signature offsets (***) are where the polymerase-slowing signal of")
+        p("that meth type is biophysically expected. A clean signal shows high")
+        p("IPD at signature offsets relative to baseline.")
 
-        # Display order: confirmed meth types first, then none/baseline, then
-        # none/slowed_by_*, finally the legacy combined `none` if present.
-        def _order_key(name: str) -> tuple:
-            if name == 'none':                       return (3, name)
-            if name == 'none/baseline':              return (1, name)
-            if name.startswith('none/slowed_by_'):   return (2, name)
-            return (0, name)
-        ordered = sorted(signature_profiles.keys(), key=_order_key)
-
-        # Locate the matching meth-type signature row for slowed buckets so
-        # we can also report a "vs baseline" and "vs confirmed meth" delta.
-        meth_profile_by_type = {n: signature_profiles[n]
-                                for n in signature_profiles if '/' not in n
-                                and n != 'none'}
-        baseline_profile = signature_profiles.get('none/baseline')
-
-        for name in ordered:
+        baseline_profile = signature_profiles.get("baseline")
+        for name in sorted(signature_profiles.keys(), key=_bucket_order_key):
             sp = signature_profiles[name]
-            offsets_str = '  '.join(f'+{i}' for i in range(len(sp['profile_ipd'])))
-            ipd_str = '  '.join(f'{v:5.1f}' for v in sp['profile_ipd'])
-            pw_str  = '  '.join(f'{v:5.1f}' for v in sp['profile_pw'])
-            sig = sp.get('sig_offsets', [])
-            sig_marker = '  '.join('***' if i in sig else '   '
-                                    for i in range(len(sp['profile_ipd'])))
-            tag = ''
-            if name == 'none/baseline':
-                tag = '  [v4: TRUE baseline — should be FLAT]'
-            elif name.startswith('none/slowed_by_'):
-                t = name.split('none/slowed_by_')[-1]
-                tag = f'  [v4: slowed-by-{t} — should peak at signature offsets]'
-            elif name == 'none':
-                tag = '  [combined none bucket; on a v4 pkl this is empty / unused]'
+            offsets_str = "  ".join(f"+{i}" for i in range(len(sp["profile_ipd"])))
+            ipd_str = "  ".join(f"{v:5.1f}" for v in sp["profile_ipd"])
+            pw_str = "  ".join(f"{v:5.1f}" for v in sp["profile_pw"])
+            sig = sp.get("sig_offsets", [])
+            sig_marker = "  ".join(
+                "***" if i in sig else "   " for i in range(len(sp["profile_ipd"]))
+            )
+            tag = ""
+            if name == "baseline":
+                tag = "  [should be FLAT]"
+            elif name.startswith("slowed_by_"):
+                tag = f"  [should peak at {sig}]"
+            elif name.startswith("near_meth_by_"):
+                tag = "  [should look baseline-like — meth in mc but no slowing]"
             p(f"\n  {name}{tag}  (n={sp['n_samples']:,} samples, signature at {sig})")
             p(f"    Offset      :  {offsets_str}")
             p(f"    Signature   :  {sig_marker}")
             p(f"    IPD profile :  {ipd_str}")
             p(f"    PW  profile :  {pw_str}")
-            if sig:
-                ipd_arr = sp['profile_ipd']
-                sig_idx     = [i for i in sig if 0 <= i < len(ipd_arr)]
-                nonsig_idx  = [i for i in range(len(ipd_arr)) if i not in sig_idx]
-                if sig_idx and nonsig_idx:
-                    sig_mean    = float(ipd_arr[sig_idx].mean())
-                    nonsig_mean = float(ipd_arr[nonsig_idx].mean())
-                    ratio       = sig_mean / max(nonsig_mean, 1.0)
-                    p(f"    Sig/non-sig IPD ratio : {ratio:.3f}  "
-                      f"(>1.3 expected for real signal)")
-            # Extra v4 deltas for slowed buckets
-            if name.startswith('none/slowed_by_') and baseline_profile and sig:
-                slowed_ipd = sp['profile_ipd']
-                base_ipd   = baseline_profile['profile_ipd']
-                t = name.split('none/slowed_by_')[-1]
-                meth_sp = meth_profile_by_type.get(t)
-                lines = []
-                for off in sig:
-                    if not (0 <= off < len(slowed_ipd)):
-                        continue
-                    parts = [f"+{off}: slowed={slowed_ipd[off]:5.1f}",
-                             f"baseline={base_ipd[off]:5.1f}",
-                             f"delta={slowed_ipd[off]-base_ipd[off]:+5.1f}"]
-                    if meth_sp is not None:
-                        m_ipd = meth_sp['profile_ipd'][off]
-                        recovery = (slowed_ipd[off] - base_ipd[off]) / \
-                                   max(m_ipd - base_ipd[off], 1e-6) * 100.0
-                        parts.append(f"meth={m_ipd:5.1f}")
-                        parts.append(f"recovery={recovery:5.1f}% of meth elevation")
-                    lines.append("  ".join(parts))
-                if lines:
-                    p(f"    vs baseline at signature offsets:")
-                    for ln in lines:
-                        p(f"      {ln}")
-            # For confirmed meth buckets, also report separation vs baseline
-            elif (name in meth_profile_by_type and baseline_profile
-                  and sig):
-                m_ipd = sp['profile_ipd']
-                b_ipd = baseline_profile['profile_ipd']
+
+            # vs baseline at signature offsets
+            if sig and baseline_profile is not None and name != "baseline":
+                m_ipd = sp["profile_ipd"]
+                b_ipd = baseline_profile["profile_ipd"]
                 lines = []
                 for off in sig:
                     if not (0 <= off < len(m_ipd)):
                         continue
                     delta = m_ipd[off] - b_ipd[off]
-                    rat   = m_ipd[off] / max(b_ipd[off], 1.0)
-                    lines.append(f"+{off}: meth={m_ipd[off]:5.1f}  "
-                                 f"baseline={b_ipd[off]:5.1f}  "
-                                 f"delta={delta:+5.1f}  ratio={rat:5.2f}x")
+                    rat = m_ipd[off] / max(b_ipd[off], 1.0)
+                    lines.append(
+                        f"+{off}: bucket={m_ipd[off]:5.1f}  "
+                        f"baseline={b_ipd[off]:5.1f}  "
+                        f"delta={delta:+5.1f}  ratio={rat:5.2f}x"
+                    )
                 if lines:
-                    p(f"    vs baseline at signature offsets:")
+                    p("    vs baseline at signature offsets:")
                     for ln in lines:
                         p(f"      {ln}")
         p()
 
-        # ── v4 verification summary table ───────────────────────────────
-        if any(n.startswith('none/slowed_by_') for n in signature_profiles):
-            p('-' * W)
-            p('v4 split verification  (slowed-by-T should look like meth-T, not baseline)')
-            p('-' * W)
-            p('At each signature offset of every meth type, compare:')
-            p('  meth-T peak  : kinetic signature in the confirmed-meth bucket')
-            p('  slowed peak  : kinetic signature recovered from (kmer, 0) by pass-2')
-            p('  baseline     : true unmethylated kinetic level')
-            p('  recovery %   : (slowed - baseline) / (meth - baseline) — closer to')
-            p('                 100 % means pass-2 captured the same signal as pass-1.')
-            p()
-            for t in sorted(meth_profile_by_type):
-                slowed = signature_profiles.get(f'none/slowed_by_{t}')
-                if slowed is None:
-                    p(f"  {t}: no slowed-by-{t} bucket (no pass-2 hits) — either")
-                    p(f"       no upstream signature offsets > 0 for {t}, or refine")
-                    p(f"       pass-2 was disabled at refine time.")
-                    continue
-                meth = meth_profile_by_type[t]
-                base = baseline_profile
-                sig = slowed.get('sig_offsets', [])
-                if not sig:
-                    continue
-                p(f"  {t}  (slowed n={slowed['n_samples']:,}, "
-                  f"meth n={meth['n_samples']:,}"
-                  f"{', baseline n=' + format(base['n_samples'], ',') if base else ''})")
-                hdr = f"    {'offset':>8s} {'meth':>8s} {'slowed':>8s} {'baseline':>10s}  {'recovery':>9s}"
-                p(hdr)
-                for off in sig:
-                    if not (0 <= off < len(meth['profile_ipd'])):
-                        continue
-                    m_v = float(meth['profile_ipd'][off])
-                    s_v = float(slowed['profile_ipd'][off])
-                    b_v = float(base['profile_ipd'][off]) if base else 0.0
-                    span = max(m_v - b_v, 1e-6)
-                    recovery = (s_v - b_v) / span * 100.0
-                    p(f"    +{off:<7d} {m_v:8.2f} {s_v:8.2f} {b_v:10.2f}  {recovery:8.1f}%")
-            p()
-
-    # ── 3.55 IPD distribution per category + p95 threshold check ────────
+    # ── 5. IPD distribution per category + refine threshold check ──────
     if category_distributions:
-        p('-' * W)
-        p('IPD distribution per category  (raw uint8 from PacBio fi/fp tags)')
-        p('-' * W)
-        # Threshold info from refine
+        p("-" * W)
+        p("IPD distribution per category  (raw uint8 from PacBio fi/fp tags)")
+        p("-" * W)
         threshold = None
         if refine_meta:
-            stats_ref = refine_meta.get('stats') or {}
-            threshold = stats_ref.get('threshold')
-            sec_pct   = stats_ref.get('secondary_percentile')
+            stats_ref = refine_meta.get("stats") or {}
+            threshold = stats_ref.get("threshold")
+            sec_pct = stats_ref.get("secondary_percentile")
             if threshold is not None:
-                p(f'Refine v4 secondary filter: p{sec_pct:g}(baseline) = {threshold:.2f}')
-                ni = stats_ref.get('n_slowed_in', 0)
-                nk = stats_ref.get('n_slowed_kept', 0)
-                nd = stats_ref.get('n_slowed_dropped', 0)
+                p(
+                    f"Refine secondary filter: p{sec_pct:g}(per-kmer baseline mean) "
+                    f"= {threshold:.2f}"
+                )
+                ni = stats_ref.get("n_slowed_in", 0)
+                nk = stats_ref.get("n_slowed_kept", 0)
+                nd = stats_ref.get("n_slowed_dropped", 0)
                 if ni:
-                    p(f'  slowed survival: {nk:,}/{ni:,} = {100.0*nk/ni:.1f}% '
-                      f'(dropped {nd:,} below threshold)')
+                    p(
+                        f"  slowed survival: {nk:,}/{ni:,} = {100.0 * nk / ni:.1f}% "
+                        f"(dropped {nd:,} below threshold)"
+                    )
             p()
 
-        # Per-category quantile table
-        p(f"  {'category':<12s} {'n':>12s} {'mean':>7s} {'std':>7s} "
-          f"{'p5':>5s} {'p25':>5s} {'p50':>5s} {'p75':>5s} {'p90':>5s} {'p95':>5s} "
-          f"{'p99':>5s} {'max':>5s}")
-        for cat_name in ('baseline', 'slowed', 'near_meth'):
+        p(
+            f"  {'category':<12s} {'n':>12s} {'mean':>7s} {'std':>7s} "
+            f"{'p5':>5s} {'p25':>5s} {'p50':>5s} {'p75':>5s} {'p90':>5s} {'p95':>5s} "
+            f"{'p99':>5s} {'max':>5s}"
+        )
+        for cat_name in ("baseline", "slowed", "near_meth"):
             d = category_distributions.get(cat_name)
             if d is None:
                 continue
-            q = d['ipd_quantiles']
-            p(f"  {cat_name:<12s} {d['n']:>12,d} {d['ipd_mean']:>7.2f} "
-              f"{d['ipd_std']:>7.2f} {q[5]:>5.0f} {q[25]:>5.0f} {q[50]:>5.0f} "
-              f"{q[75]:>5.0f} {q[90]:>5.0f} {q[95]:>5.0f} {q[99]:>5.0f} {d['ipd_max']:>5.0f}")
+            q = d["ipd_quantiles"]
+            p(
+                f"  {cat_name:<12s} {d['n']:>12,d} {d['ipd_mean']:>7.2f} "
+                f"{d['ipd_std']:>7.2f} {q[5]:>5.0f} {q[25]:>5.0f} {q[50]:>5.0f} "
+                f"{q[75]:>5.0f} {q[90]:>5.0f} {q[95]:>5.0f} {q[99]:>5.0f} "
+                f"{d['ipd_max']:>5.0f}"
+            )
         p()
 
-        # ASCII histogram of baseline + threshold marker
-        bd = category_distributions.get('baseline')
-        if bd is not None and bd['n'] > 0:
-            p('  Baseline IPD histogram  (where the threshold sits in the distribution)')
-            edges = bd['ipd_hist_edges']
-            counts = bd['ipd_hist']
+        bd = category_distributions.get("baseline")
+        if bd is not None and bd["n"] > 0:
+            p("  Baseline IPD histogram  (where the threshold sits)")
+            edges = bd["ipd_hist_edges"]
+            counts = bd["ipd_hist"]
             total = float(counts.sum()) or 1.0
             max_bar = 50
             max_pct = float(counts.max() / total * 100.0)
@@ -1214,97 +747,82 @@ def render_txt_report(stats: DictStats, sensitivity: dict, output_path: str,
                 lo, hi = float(edges[i]), float(edges[i + 1])
                 pct = float(counts[i]) / total * 100.0
                 bar_len = int((pct / max_pct) * max_bar)
-                bar = '#' * bar_len
-                marker = ''
+                bar = "#" * bar_len
+                marker = ""
                 if threshold is not None and lo <= threshold < hi:
-                    marker = f'   <-- p95 threshold = {threshold:.0f}'
-                p(f"    [{lo:5.0f}-{hi:5.0f})  {bar:<{max_bar}s}  {pct:5.2f}% "
-                  f"({int(counts[i]):>10,d}){marker}")
+                    marker = f"   <-- p{sec_pct:g} threshold = {threshold:.0f}"
+                p(
+                    f"    [{lo:5.0f}-{hi:5.0f})  {bar:<{max_bar}s}  {pct:5.2f}% "
+                    f"({int(counts[i]):>10,d}){marker}"
+                )
             p()
 
-        # PW distribution (compact)
-        p('  PW distribution per category (mean / median / p95):')
-        for cat_name in ('baseline', 'slowed', 'near_meth'):
+        p("  PW distribution per category (mean / median / p95):")
+        for cat_name in ("baseline", "slowed", "near_meth"):
             d = category_distributions.get(cat_name)
             if d is None:
                 continue
-            q = d['pw_quantiles']
-            p(f"    {cat_name:<12s} mean={d['pw_mean']:5.1f}  median={q[50]:5.1f}  "
-              f"p95={q[95]:5.1f}  std={d['pw_std']:5.2f}")
+            q = d["pw_quantiles"]
+            p(
+                f"    {cat_name:<12s} mean={d['pw_mean']:5.1f}  "
+                f"median={q[50]:5.1f}  p95={q[95]:5.1f}  std={d['pw_std']:5.2f}"
+            )
         p()
 
-        # Sanity check vs threshold
-        if threshold is not None and 'slowed' in category_distributions:
-            s = category_distributions['slowed']
-            min_kept = s['ipd_quantiles'][5]
+        if threshold is not None and "slowed" in category_distributions:
+            s = category_distributions["slowed"]
+            min_kept = s["ipd_quantiles"][5]
             if min_kept < threshold:
-                p(f'  WARNING: some kept slowed samples have IPD < threshold? '
-                  f'(p5={min_kept:.1f} < {threshold:.1f})')
+                p(
+                    f"  WARNING: kept slowed has IPD < threshold "
+                    f"(p5={min_kept:.1f} < {threshold:.1f})"
+                )
             else:
-                p(f'  Sanity OK: all kept slowed samples have IPD >= threshold '
-                  f'({threshold:.1f}) — minimum kept p5 = {min_kept:.1f}')
-            if 'near_meth' in category_distributions:
-                n = category_distributions['near_meth']
-                near_above = sum(1 for q in [n['ipd_quantiles'][p] for p in (50, 75, 90)] if q > threshold)
-                p(f'  Sanity: near_meth median={n["ipd_quantiles"][50]:.1f} (should look like baseline)')
+                p(
+                    f"  Sanity OK: all kept slowed have IPD >= threshold "
+                    f"({threshold:.1f}); minimum kept p5 = {min_kept:.1f}"
+                )
+            if "near_meth" in category_distributions:
+                n = category_distributions["near_meth"]
+                p(f"  near_meth median = {n['ipd_quantiles'][50]:.1f} (should look like baseline)")
         p()
 
-    # ── 3.6 Methylation-context distribution per bucket ─────────────────
+    # ── 6. Methylation-context distribution per bucket ──────────────────
     if context_distribution:
         from .utils.encoding import KMER_PRED_IDX
-        from .utils.sample_layout import METH_CTX_LEN, METH_CTX_LEFT
-        p('-' * W)
-        p('Methylation context distribution  (which meth_id sits at each offset')
-        p('around the prediction position, per bucket)')
-        p('-' * W)
-        p(f"Position labels are offsets from the prediction position. The center")
-        p(f"position [C] is at index {KMER_PRED_IDX} (offset 0). Negative offsets are")
-        p(f"upstream of the prediction position (already-read by polymerase),")
-        p(f"positive offsets are downstream.")
+        from .utils.sample_layout import METH_CTX_LEFT, METH_CTX_LEN
+
+        p("-" * W)
+        p("Methylation context distribution  (which meth_id sits at each offset")
+        p("around the prediction position, per bucket)")
+        p("-" * W)
+        p(f"Centre [C] sits at meth_context index {KMER_PRED_IDX} (offset 0).")
         p()
-        # Position labels: -7..+3
         pos_labels = []
         for i in range(METH_CTX_LEN):
             off = i - METH_CTX_LEFT
-            tag = '[C]' if off == 0 else ''
+            tag = "[C]" if off == 0 else ""
             pos_labels.append(f"{off:+d}{tag}")
 
-        def _order_key(name: str) -> tuple:
-            if name == 'none':                       return (3, name)
-            if name == 'none/baseline':              return (1, name)
-            if name.startswith('none/slowed_by_'):   return (2, name)
-            return (0, name)
-        ordered = sorted(context_distribution.keys(), key=_order_key)
-
-        for name in ordered:
+        for name in sorted(context_distribution.keys(), key=_bucket_order_key):
             cd = context_distribution[name]
-            n = cd['n_samples']
-            fractions = cd['fractions']            # (METH_CTX_LEN, NMID)
-            mids = cd['meth_ids']
-            mnames = cd['meth_names']
-            tag = ''
-            if name == 'none/baseline':
-                tag = '  [pass-2 baseline — should be ~100 % none everywhere]'
-            elif name.startswith('none/slowed_by_'):
-                t = name.split('none/slowed_by_')[-1]
-                tag = f'  [pass-2 slowed-by-{t} — expect {t} at the matching upstream offset]'
-            p(f"  {name}{tag}  (n={n:,} samples)")
+            n = cd["n_samples"]
+            fractions = cd["fractions"]
+            mids = cd["meth_ids"]
+            mnames = cd["meth_names"]
+            p(f"  {name}  (n={n:,} samples)")
 
-            # Header row: positions
-            hdr = '    {:8s}'.format('mc_pos')
+            hdr = "    {:8s}".format("mc_pos")
             for lbl in pos_labels:
-                hdr += f'{lbl:>7s}'
+                hdr += f"{lbl:>7s}"
             p(hdr)
 
-            # One row per meth_id, percentage at each position
-            for col_idx, (mid, mn) in enumerate(zip(mids, mnames)):
-                # Skip rows that are zero across all positions to keep the
-                # report compact.
+            for col_idx, (mid, mn) in enumerate(zip(mids, mnames, strict=False)):
                 row = fractions[:, col_idx]
                 if not np.any(row > 0.0005):
                     continue
                 row_label = f"{mn} (id={mid})"
-                line = f'    {row_label:8s}'
+                line = f"    {row_label:8s}"
                 for v in row:
                     pct = v * 100.0
                     if pct >= 99.95:
@@ -1316,117 +834,70 @@ def render_txt_report(stats: DictStats, sensitivity: dict, output_path: str,
                 p(line)
             p()
 
-    # ── 4. Low-coverage warnings ──────────────────────────────────────────
-    p('-' * W)
-    p('Low-coverage keys  (keys with few samples — less reliable signals)')
-    p('-' * W)
+    # ── 7. Low-coverage warnings ────────────────────────────────────────
+    p("-" * W)
+    p("Low-coverage keys  (keys with few samples — less reliable signals)")
+    p("-" * W)
     for meth_id in sorted(stats.groups.keys()):
         g = stats.groups[meth_id]
-        label = 'Unmethylated' if meth_id == 0 else f'Methylated ({g.name})'
-        ne  = g.n_entries
-        n5  = int(np.sum(g.sample_counts < 5))
+        label = "Unmethylated" if meth_id == 0 else f"Methylated ({g.name})"
+        ne = g.n_entries
+        n5 = int(np.sum(g.sample_counts < 5))
         n10 = int(np.sum(g.sample_counts < 10))
         n50 = int(np.sum(g.sample_counts < 50))
-        p(f'  {label:30s}'
-          f'  n<5: {n5:,} ({_pct(n5, ne)})'
-          f'   n<10: {n10:,} ({_pct(n10, ne)})'
-          f'   n<50: {n50:,} ({_pct(n50, ne)})')
+        p(
+            f"  {label:30s}"
+            f"  n<5: {n5:,} ({_pct(n5, ne)})"
+            f"   n<10: {n10:,} ({_pct(n10, ne)})"
+            f"   n<50: {n50:,} ({_pct(n50, ne)})"
+        )
     p()
+    p("=" * W)
 
-    # ── 5. Neighbor sensitivity ───────────────────────────────────────────
-    p('-' * W)
-    p('1-base neighbor sensitivity analysis')
-    p('-' * W)
-    from .utils.encoding import KMER_PRED_IDX
-    center = KMER_PRED_IDX
-    p(f'  How much does a single base change in the {K}-mer context affect')
-    p(f'  the expected (mean) IPD / PW?  '
-      f'(pos {center}[C] = prediction position / modified base)')
-    p()
-    for category in ['unmethylated', 'methylated']:
-        ns = sensitivity.get(category)
-        if ns is None or ns.n_pairs_found == 0:
-            p(f'  {category.capitalize()}: no neighbor pairs found (skipping)')
-            continue
-        p(f'  {category.capitalize()} '
-          f'({ns.n_source_entries:,} source kmers, '
-          f'{ns.n_pairs_found:,} neighbor pairs):')
-        p(f'    |delta IPD mean|  :'
-          f' mean={np.mean(ns.delta_ipd):.4f}'
-          f'  median={np.median(ns.delta_ipd):.4f}'
-          f'  p75={np.percentile(ns.delta_ipd, 75):.4f}'
-          f'  p95={np.percentile(ns.delta_ipd, 95):.4f}')
-        p(f'    |delta PW  mean|  :'
-          f' mean={np.mean(ns.delta_pw):.4f}'
-          f'  median={np.median(ns.delta_pw):.4f}'
-          f'  p75={np.percentile(ns.delta_pw, 75):.4f}'
-          f'  p95={np.percentile(ns.delta_pw, 95):.4f}')
-        ipd_by_pos, pw_by_pos = [], []
-        for pos in range(K):
-            mask = ns.positions == pos
-            tag  = '[C]' if pos == center else ''
-            ipd_by_pos.append(
-                f'{pos}{tag}:{np.mean(ns.delta_ipd[mask]):.3f}' if np.any(mask) else f'{pos}:n/a')
-            pw_by_pos.append(
-                f'{pos}{tag}:{np.mean(ns.delta_pw[mask]):.3f}' if np.any(mask) else f'{pos}:n/a')
-        p(f'    Per-pos |delta IPD|:')
-        p(f'      {", ".join(ipd_by_pos)}')
-        p(f'    Per-pos |delta PW|:')
-        p(f'      {", ".join(pw_by_pos)}')
-        p()
-
-    p('=' * W)
-
-    with open(output_path, 'w', encoding='utf-8') as fh:
+    with open(output_path, "w", encoding="utf-8") as fh:
         fh.write(buf.getvalue())
-    print(f'\nTXT report saved: {output_path}')
+    print(f"\nTXT report saved: {output_path}")
 
 
 # ---------------------------------------------------------------------------
 # HTML report (Plotly)
 # ---------------------------------------------------------------------------
 
-def _build_v4_html_figures(data, category_distributions, signature_profiles, refine_meta):
-    """Five focused Plotly figures for v4 verification.
 
-    The goal is to answer a single question at a glance: does the
-    extract + refine pipeline produce a clean separation between
-    baseline / slowed / near_meth, and is the m6A/m4C/m5C signature
-    visible at the configured offsets ?
-
-    Figures returned (in order):
-      1. IPD distribution per category (overlay histogram)
-      2. Per-kmer baseline mean distribution + threshold marker
-      3. Kinetic signature profiles (offset 0..+8) per bucket
-      4. Sample counts per bucket (bar chart)
-      5. Meth-context distribution (heatmap per bucket)
-    """
+def _build_html_figures(
+    data: dict,
+    category_distributions: dict,
+    signature_profiles: dict,
+    refine_meta: dict | None,
+) -> list[tuple[str, object]]:
+    """Build the four verification figures as ``(title, plotly.Figure)``."""
     import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
+
     from .utils.sample_layout import (
-        COL_IPD, COL_CATEGORY,
-        CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH,
+        CATEGORY_BASELINE,
+        CATEGORY_NEAR_METH,
+        CATEGORY_SLOWED,
+        COL_CATEGORY,
+        COL_IPD,
     )
 
     figures: list[tuple[str, object]] = []
     cat_palette = {
-        'baseline':  '#1f77b4',   # blue
-        'slowed':    '#d62728',   # red
-        'near_meth': '#2ca02c',   # green
+        "baseline": "#1f77b4",
+        "slowed": "#d62728",
+        "near_meth": "#2ca02c",
     }
 
     threshold = None
     if refine_meta:
-        threshold = (refine_meta.get('stats') or {}).get('threshold')
+        threshold = (refine_meta.get("stats") or {}).get("threshold")
 
-    # ── Fig 1: IPD distribution per category (overlay histogram) ─────────
+    # ── Fig 1: IPD distribution per category ────────────────────────────
     fig1 = go.Figure()
-    for cat_name in ('baseline', 'slowed', 'near_meth'):
+    for cat_name in ("baseline", "slowed", "near_meth"):
         d = category_distributions.get(cat_name)
         if d is None:
             continue
-        # Re-extract IPD values from data for this category to plot the
-        # full histogram (not just the coarse bins from the table).
         ipds = []
         for kid, arr in data.items():
             if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
@@ -1434,39 +905,48 @@ def _build_v4_html_figures(data, category_distributions, signature_profiles, ref
             if arr.shape[1] <= COL_CATEGORY:
                 continue
             cats = arr[:, COL_CATEGORY].astype(np.int8)
-            target = {'baseline': CATEGORY_BASELINE,
-                      'slowed':   CATEGORY_SLOWED,
-                      'near_meth': CATEGORY_NEAR_METH}[cat_name]
-            mask = (cats == target)
+            target = {
+                "baseline": CATEGORY_BASELINE,
+                "slowed": CATEGORY_SLOWED,
+                "near_meth": CATEGORY_NEAR_METH,
+            }[cat_name]
+            mask = cats == target
             if mask.any():
                 ipds.append(arr[mask, COL_IPD])
         if not ipds:
             continue
         ipds_pool = np.concatenate(ipds)
-        # Sub-sample for plot performance
         if len(ipds_pool) > 200_000:
             idx = np.random.default_rng(0).choice(len(ipds_pool), 200_000, replace=False)
             ipds_pool = ipds_pool[idx]
-        fig1.add_trace(go.Histogram(
-            x=ipds_pool, name=f'{cat_name} (n={d["n"]:,})',
-            marker_color=cat_palette[cat_name], opacity=0.55,
-            xbins=dict(start=0, end=256, size=4),
-            histnorm='probability density',
-        ))
+        fig1.add_trace(
+            go.Histogram(
+                x=ipds_pool,
+                name=f"{cat_name} (n={d['n']:,})",
+                marker_color=cat_palette[cat_name],
+                opacity=0.55,
+                xbins=dict(start=0, end=256, size=4),
+                histnorm="probability density",
+            )
+        )
     if threshold is not None:
-        fig1.add_vline(x=threshold, line_color='black', line_dash='dash',
-                       annotation_text=f'threshold = {threshold:.1f}',
-                       annotation_position='top right')
+        fig1.add_vline(
+            x=threshold,
+            line_color="black",
+            line_dash="dash",
+            annotation_text=f"threshold = {threshold:.1f}",
+            annotation_position="top right",
+        )
     fig1.update_layout(
-        title='IPD distribution per category  '
-              '(slowed should be right-shifted; near_meth should overlap baseline)',
-        xaxis_title='IPD (uint8 [0, 255])',
-        yaxis_title='Probability density',
-        barmode='overlay',
+        title="IPD distribution per category  "
+        "(slowed should be right-shifted; near_meth should overlap baseline)",
+        xaxis_title="IPD (uint8 [0, 255])",
+        yaxis_title="Probability density",
+        barmode="overlay",
     )
-    figures.append(('IPD distribution per category', fig1))
+    figures.append(("IPD distribution per category", fig1))
 
-    # ── Fig 2: Per-kmer baseline mean distribution + threshold ───────────
+    # ── Fig 2: Per-kmer baseline mean distribution + threshold ──────────
     kmer_means = []
     for kid, arr in data.items():
         if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
@@ -1474,121 +954,143 @@ def _build_v4_html_figures(data, category_distributions, signature_profiles, ref
         if arr.shape[1] <= COL_CATEGORY:
             continue
         cats = arr[:, COL_CATEGORY].astype(np.int8)
-        m = (cats == CATEGORY_BASELINE)
+        m = cats == CATEGORY_BASELINE
         if int(m.sum()) >= 5:
             kmer_means.append(float(arr[m, COL_IPD].mean()))
-    fig2 = go.Figure()
     if kmer_means:
+        fig2 = go.Figure()
         kmer_means_arr = np.array(kmer_means, dtype=np.float32)
-        fig2.add_trace(go.Histogram(
-            x=kmer_means_arr, name=f'per-kmer baseline mean (n={len(kmer_means_arr):,})',
-            marker_color='#1f77b4', xbins=dict(start=0, end=256, size=2),
-        ))
-        if threshold is not None:
-            fig2.add_vline(x=threshold, line_color='black', line_dash='dash',
-                           annotation_text=f'p95 threshold = {threshold:.1f}',
-                           annotation_position='top right')
-        fig2.update_layout(
-            title='Per-kmer baseline mean IPD  '
-                  '(threshold for slowed survival is the p95 of this)',
-            xaxis_title='Mean baseline IPD per kmer',
-            yaxis_title='Number of kmers',
+        fig2.add_trace(
+            go.Histogram(
+                x=kmer_means_arr,
+                name=f"per-kmer baseline mean (n={len(kmer_means_arr):,})",
+                marker_color="#1f77b4",
+                xbins=dict(start=0, end=256, size=2),
+            )
         )
-        figures.append(('Per-kmer baseline mean distribution', fig2))
+        if threshold is not None:
+            fig2.add_vline(
+                x=threshold,
+                line_color="black",
+                line_dash="dash",
+                annotation_text=f"p95 threshold = {threshold:.1f}",
+                annotation_position="top right",
+            )
+        fig2.update_layout(
+            title="Per-kmer baseline mean IPD  (threshold for slowed survival is the p95 of this)",
+            xaxis_title="Mean baseline IPD per kmer",
+            yaxis_title="Number of kmers",
+        )
+        figures.append(("Per-kmer baseline mean distribution", fig2))
 
-    # ── Fig 3: Kinetic signature profiles per bucket (line plot) ─────────
+    # ── Fig 3: Kinetic signature profiles ───────────────────────────────
     if signature_profiles:
         fig3 = go.Figure()
-        offsets = list(range(9))   # 0..+8
-        # Order: baseline first (ref), then slowed_by_T, then near_meth_by_T
-        ordered = (
-            ['baseline'] +
-            sorted(n for n in signature_profiles if n.startswith('slowed_by_')) +
-            sorted(n for n in signature_profiles if n.startswith('near_meth_by_'))
-        )
-        palette_idx = 0
-        palette = ['#1f77b4', '#d62728', '#ff7f0e', '#9467bd', '#8c564b',
-                   '#2ca02c', '#17becf', '#bcbd22']
-        for name in ordered:
+        ordered = [
+            "baseline",
+            *sorted(n for n in signature_profiles if n.startswith("slowed_by_")),
+            *sorted(n for n in signature_profiles if n.startswith("near_meth_by_")),
+        ]
+        palette = [
+            "#1f77b4",
+            "#d62728",
+            "#ff7f0e",
+            "#9467bd",
+            "#8c564b",
+            "#2ca02c",
+            "#17becf",
+            "#bcbd22",
+        ]
+        offsets = list(range(9))
+        for i, name in enumerate(ordered):
             sp = signature_profiles.get(name)
             if sp is None:
                 continue
-            color = palette[palette_idx % len(palette)]
-            palette_idx += 1
-            sig_offs = sp.get('sig_offsets', [])
-            line_dash = 'dash' if name.startswith('near_meth_by_') else 'solid'
-            fig3.add_trace(go.Scatter(
-                x=offsets, y=sp['profile_ipd'],
-                mode='lines+markers',
-                name=f'{name} (n={sp["n_samples"]:,})',
-                line=dict(color=color, width=2, dash=line_dash),
-                marker=dict(size=8),
-            ))
-            # Mark signature offsets with diamonds
+            color = palette[i % len(palette)]
+            sig_offs = sp.get("sig_offsets", [])
+            line_dash = "dash" if name.startswith("near_meth_by_") else "solid"
+            fig3.add_trace(
+                go.Scatter(
+                    x=offsets,
+                    y=sp["profile_ipd"],
+                    mode="lines+markers",
+                    name=f"{name} (n={sp['n_samples']:,})",
+                    line=dict(color=color, width=2, dash=line_dash),
+                    marker=dict(size=8),
+                )
+            )
             if sig_offs:
-                fig3.add_trace(go.Scatter(
-                    x=sig_offs,
-                    y=[sp['profile_ipd'][o] for o in sig_offs if 0 <= o < 9],
-                    mode='markers', showlegend=False,
-                    marker=dict(symbol='diamond', size=14, color=color,
-                                line=dict(color='black', width=1)),
-                ))
+                fig3.add_trace(
+                    go.Scatter(
+                        x=sig_offs,
+                        y=[sp["profile_ipd"][o] for o in sig_offs if 0 <= o < 9],
+                        mode="markers",
+                        showlegend=False,
+                        marker=dict(
+                            symbol="diamond",
+                            size=14,
+                            color=color,
+                            line=dict(color="black", width=1),
+                        ),
+                    )
+                )
         fig3.update_layout(
-            title='Kinetic signature profiles  '
-                  '(diamonds = signature offsets per type — that\'s where IPD should peak)',
-            xaxis=dict(title='Offset from prediction position', dtick=1),
-            yaxis_title='Mean IPD',
+            title="Kinetic signature profiles  "
+            "(diamonds = signature offsets — IPD should peak there)",
+            xaxis=dict(title="Offset from prediction position", dtick=1),
+            yaxis_title="Mean IPD",
         )
-        figures.append(('Kinetic signature profiles', fig3))
+        figures.append(("Kinetic signature profiles", fig3))
 
-    # ── Fig 4: Sample counts per bucket ──────────────────────────────────
+    # ── Fig 4: Sample counts per bucket ─────────────────────────────────
     if signature_profiles:
-        names = sorted(signature_profiles.keys(),
-                       key=lambda n: (0 if n == 'baseline' else
-                                      (1 if n.startswith('slowed_by_') else 2),
-                                      n))
-        counts = [signature_profiles[n]['n_samples'] for n in names]
-        colors = ['#1f77b4' if n == 'baseline' else
-                  '#d62728' if n.startswith('slowed_by_') else
-                  '#2ca02c' for n in names]
-        fig4 = go.Figure(go.Bar(
-            x=names, y=counts, marker_color=colors,
-            text=[f'{c:,}' for c in counts], textposition='auto',
-        ))
-        fig4.update_layout(
-            title='Sample counts per bucket',
-            yaxis_title='# samples', yaxis_type='log',
+        names = sorted(signature_profiles.keys(), key=_bucket_order_key)
+        counts = [signature_profiles[n]["n_samples"] for n in names]
+        colors = [
+            "#1f77b4" if n == "baseline" else "#d62728" if n.startswith("slowed_by_") else "#2ca02c"
+            for n in names
+        ]
+        fig4 = go.Figure(
+            go.Bar(
+                x=names,
+                y=counts,
+                marker_color=colors,
+                text=[f"{c:,}" for c in counts],
+                textposition="auto",
+            )
         )
-        figures.append(('Sample counts per bucket', fig4))
+        fig4.update_layout(
+            title="Sample counts per bucket",
+            yaxis_title="# samples",
+            yaxis_type="log",
+        )
+        figures.append(("Sample counts per bucket", fig4))
 
     return figures
 
 
-def _write_html_report(figures, stats, output_path: str, meth_summary: str) -> None:
-    """Render a list of (title, plotly Figure) into a self-contained HTML file
-    with header cards, a nav, and one section per figure. Also exports
-    each figure as a standalone .html (and .png if kaleido is installed)
-    in a sibling 'figures/' directory."""
+def _write_html_report(figures, stats: DictStats, output_path: str, meth_summary: str) -> None:
+    """Render figures into a self-contained HTML file with a small dashboard."""
     import plotly.io as pio
+
     K = stats.kmer_size
     cards = [
-        ('K-mer size',     f'K={K}'),
-        ('Total keys',     f'{stats.total_entries:,}'),
-        ('Total samples',  f'{stats.total_samples:,}'),
-        ('Coverage',       _pct(stats.total_entries, stats.total_possible_kmers)),
-        ('Meth types',     str(len(stats.groups))),
-        ('File size',      f'{stats.file_size_mb:.1f} MB'),
+        ("K-mer size", f"K={K}"),
+        ("Total keys", f"{stats.total_entries:,}"),
+        ("Total samples", f"{stats.total_samples:,}"),
+        ("Coverage", _pct(stats.total_entries, stats.total_possible_kmers)),
+        ("Meth types", str(len(stats.groups))),
+        ("File size", f"{stats.file_size_mb:.1f} MB"),
     ]
-    card_html = '\n'.join(
-        f'<div class="stat-card"><div class="val">{v}</div>'
-        f'<div class="lbl">{k}</div></div>'
+    card_html = "\n".join(
+        f'<div class="stat-card"><div class="val">{v}</div><div class="lbl">{k}</div></div>'
         for k, v in cards
     )
-    nav_links = '\n'.join(
-        f'<a href="#section-{i}">{title}</a>'
-        for i, (title, _) in enumerate(figures)
+    nav_links = "\n".join(
+        f'<a href="#section-{i}">{title}</a>' for i, (title, _) in enumerate(figures)
     )
-    html_parts = [f"""<!DOCTYPE html>
+    html_parts = [
+        f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1624,7 +1126,8 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
 <div class="nav"><span>Jump to:</span>
 {nav_links}
 </div>
-"""]
+"""
+    ]
     for i, (title, fig) in enumerate(figures):
         plot_json = pio.to_json(fig)
         html_parts.append(f"""
@@ -1642,12 +1145,12 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
     html_parts.append("""
 <div class="footer">Generated by KinSim &mdash; kinsim analyze</div>
 </div></body></html>""")
-    with open(output_path, 'w', encoding='utf-8') as fh:
-        fh.write('\n'.join(html_parts))
+    with open(output_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(html_parts))
     log.info("HTML report saved: %s", output_path)
 
     # Standalone per-figure exports.
-    export_dir = Path(output_path).parent / 'figures'
+    export_dir = Path(output_path).parent / "figures"
     export_dir.mkdir(parents=True, exist_ok=True)
     has_kaleido = True
     try:
@@ -1655,12 +1158,12 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
     except ImportError:
         has_kaleido = False
     for i, (title, fig) in enumerate(figures):
-        slug = title.lower().replace(' ', '_').replace('/', '_')
-        slug = ''.join(c for c in slug if c.isalnum() or c == '_')
-        fig_path = export_dir / f'{i:02d}_{slug}.html'
-        pio.write_html(fig, str(fig_path), include_plotlyjs='cdn')
+        slug = title.lower().replace(" ", "_").replace("/", "_")
+        slug = "".join(c for c in slug if c.isalnum() or c == "_")
+        fig_path = export_dir / f"{i:02d}_{slug}.html"
+        pio.write_html(fig, str(fig_path), include_plotlyjs="cdn")
         if has_kaleido:
-            png_path = export_dir / f'{i:02d}_{slug}.png'
+            png_path = export_dir / f"{i:02d}_{slug}.png"
             try:
                 fig.write_image(str(png_path), scale=3)
             except Exception:
@@ -1670,434 +1173,26 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
 
 def render_html_report(
     stats: DictStats,
-    sensitivity: dict,
     output_path: str,
-    max_scatter: int = 10_000,
-    min_ipd_m6a: float = 0.0,
+    data: dict,
     signature_profiles: dict | None = None,
     category_distributions: dict | None = None,
     refine_meta: dict | None = None,
-    data: dict | None = None,
 ) -> None:
-    """Generate a self-contained interactive HTML report using Plotly.
-
-    For v4 inputs (when `data`+`category_distributions` are provided),
-    the report focuses on 4 verification figures: IPD distribution per
-    category, per-kmer baseline mean distribution with threshold marker,
-    kinetic signature profiles, and sample counts per bucket. Skips the
-    legacy v3 plots which are not meaningful in the v4 layout.
-
-    For v3 inputs the original plots are kept.
-    """
+    """Generate the verification dashboard (4 focused figures)."""
     try:
-        import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
-        import plotly.io as pio
+        import plotly.graph_objects  # noqa: F401
     except ImportError:
-        log.warning(
-            'plotly not installed — skipping HTML report.  '
-            'Install with: pip install plotly'
-        )
+        log.warning("plotly not installed — skipping HTML report. Install with: pip install plotly")
         return
 
-    rng = np.random.default_rng(0)
-    K   = stats.kmer_size
-    figures: list[tuple[str, object]] = []
-    meth_ids_sorted = sorted(stats.groups.keys())
-
-    def lbl(mid: int) -> str:
-        return 'Unmethylated' if mid == 0 else stats.groups[mid].name
-
-    def clr(mid: int) -> str:
-        return _meth_color(mid)
-
-    # v4 path: focused report with 4 figures only.
-    if category_distributions and data is not None:
-        figures = _build_v4_html_figures(
-            data, category_distributions,
-            signature_profiles or {}, refine_meta,
-        )
-        # v4 done — write the focused report and return.
-        meth_summary = (f'baseline / slowed / near_meth — '
-                        f'{stats.total_samples:,} samples')
-        _write_html_report(figures, stats, output_path, meth_summary)
-        return
-
-    # ── Fig 1: Coverage bar chart ─────────────────────────────────────────
-    fig = go.Figure(go.Bar(
-        x=[lbl(m) for m in meth_ids_sorted],
-        y=[stats.groups[m].n_entries for m in meth_ids_sorted],
-        marker_color=[clr(m) for m in meth_ids_sorted],
-        text=[_pct(stats.groups[m].n_entries, stats.total_possible_kmers)
-              for m in meth_ids_sorted],
-        textposition='auto',
-        hovertemplate='%{x}<br>Unique keys: %{y:,}<extra></extra>',
-    ))
-    fig.update_layout(
-        title=f'{K}-mer Coverage per Methylation State  '
-              f'(total possible: {stats.total_possible_kmers:,})',
-        yaxis_title=f'Unique {K}-mers',
+    figures = _build_html_figures(
+        data,
+        category_distributions or {},
+        signature_profiles or {},
+        refine_meta,
     )
-    figures.append(('Coverage', fig))
-
-    # ── Fig 2: Sample count distribution ─────────────────────────────────
-    fig = go.Figure()
-    for m in meth_ids_sorted:
-        g = stats.groups[m]
-        fig.add_trace(go.Histogram(
-            x=g.sample_counts, name=lbl(m),
-            marker_color=clr(m), opacity=0.70, nbinsx=80,
-            hovertemplate='n: %{x}<br>Keys: %{y}<extra></extra>',
-        ))
-    fig.update_layout(
-        title='Sample Count Distribution per Key  (log-scale x)',
-        xaxis_title='Samples per key', yaxis_title='Number of keys',
-        barmode='overlay', xaxis_type='log',
-    )
-    figures.append(('Sample count distribution', fig))
-
-    # ── Fig 3: IPD mean violin ────────────────────────────────────────────
-    fig = go.Figure()
-    for m in meth_ids_sorted:
-        g = stats.groups[m]
-        vals = g.ipd_means
-        if len(vals) > _VIOLIN_SUBSAMPLE:
-            vals = rng.choice(vals, _VIOLIN_SUBSAMPLE, replace=False)
-        fig.add_trace(go.Violin(
-            y=vals, name=lbl(m), line_color=clr(m),
-            box_visible=True, meanline_visible=True, points=False,
-        ))
-    fig.update_layout(
-        title=f'IPD Mean Distribution per Methylation State',
-        yaxis_title=f'Mean IPD per {K}-mer context', violinmode='overlay',
-    )
-    figures.append(('IPD mean distribution', fig))
-
-    # ── Fig 4: PW mean violin ─────────────────────────────────────────────
-    fig = go.Figure()
-    for m in meth_ids_sorted:
-        g = stats.groups[m]
-        vals = g.pw_means
-        if len(vals) > _VIOLIN_SUBSAMPLE:
-            vals = rng.choice(vals, _VIOLIN_SUBSAMPLE, replace=False)
-        fig.add_trace(go.Violin(
-            y=vals, name=lbl(m), line_color=clr(m),
-            box_visible=True, meanline_visible=True, points=False,
-        ))
-    fig.update_layout(
-        title='PW Mean Distribution per Methylation State',
-        yaxis_title=f'Mean PW per {K}-mer context', violinmode='overlay',
-    )
-    figures.append(('PW mean distribution', fig))
-
-    # ── Fig 5: Sigma distributions ────────────────────────────────────────
-    fig = make_subplots(rows=1, cols=2,
-                        subplot_titles=['IPD sigma  (within-context variability)',
-                                        'PW sigma   (within-context variability)'])
-    for m in meth_ids_sorted:
-        g = stats.groups[m]
-        l, c = lbl(m), clr(m)
-        fig.add_trace(go.Histogram(
-            x=g.ipd_sigmas, name=l, legendgroup=l,
-            marker_color=c, opacity=0.65, nbinsx=60,
-        ), row=1, col=1)
-        fig.add_trace(go.Histogram(
-            x=g.pw_sigmas, name=l, legendgroup=l, showlegend=False,
-            marker_color=c, opacity=0.65, nbinsx=60,
-        ), row=1, col=2)
-    fig.update_layout(title='Within-context Signal Variability (sigma)', barmode='overlay')
-    fig.update_xaxes(title_text='σ IPD', row=1, col=1)
-    fig.update_xaxes(title_text='σ PW',  row=1, col=2)
-    figures.append(('Signal variability (sigma)', fig))
-
-    # ── Fig 6: IPD vs PW scatter ──────────────────────────────────────────
-    fig = go.Figure()
-    for m in meth_ids_sorted:
-        g = stats.groups[m]
-        n = g.n_entries
-        if n > max_scatter:
-            idx    = rng.choice(n, max_scatter, replace=False)
-            x_vals = g.ipd_means[idx]
-            y_vals = g.pw_means[idx]
-        else:
-            x_vals = g.ipd_means
-            y_vals = g.pw_means
-        fig.add_trace(go.Scattergl(
-            x=x_vals, y=y_vals, mode='markers', name=lbl(m),
-            marker=dict(color=clr(m), size=3, opacity=0.4),
-            hovertemplate='IPD: %{x:.2f}<br>PW: %{y:.2f}<extra></extra>',
-        ))
-    suffix = (f' (subsampled to {max_scatter:,}/group)'
-              if any(stats.groups[m].n_entries > max_scatter for m in meth_ids_sorted)
-              else '')
-    fig.update_layout(
-        title=f'IPD Mean vs PW Mean per Key{suffix}',
-        xaxis_title='Mean IPD', yaxis_title='Mean PW',
-    )
-    figures.append(('IPD vs PW correlation', fig))
-
-    # ── Fig 7: Methylation fraction distribution ──────────────────────────
-    any_frac = any(
-        not np.all(np.isnan(stats.groups[m].fraction_means))
-        for m in meth_ids_sorted if m != 0
-    )
-    if any_frac:
-        fig = go.Figure()
-        for m in meth_ids_sorted:
-            if m == 0:
-                continue
-            g    = stats.groups[m]
-            vals = g.fraction_means[~np.isnan(g.fraction_means)]
-            if len(vals) == 0:
-                continue
-            fig.add_trace(go.Histogram(
-                x=vals, name=lbl(m), marker_color=clr(m),
-                opacity=0.70, nbinsx=60,
-                hovertemplate='Fraction: %{x:.2f}<br>Keys: %{y}<extra></extra>',
-            ))
-        fig.update_layout(
-            title='Methylation Fraction Distribution per Key  (methylated types only)',
-            xaxis_title='Mean methylation fraction per key',
-            yaxis_title='Number of keys',
-            barmode='overlay',
-        )
-        figures.append(('Methylation fraction', fig))
-
-    # ── Figs 8–9: Neighbor sensitivity histograms ─────────────────────────
-    for sig_name, delta_attr, title_sig in [
-        ('IPD', 'delta_ipd', '|delta IPD mean|'),
-        ('PW',  'delta_pw',  '|delta PW mean|'),
-    ]:
-        unmeth_ns = sensitivity.get('unmethylated')
-        meth_ns   = sensitivity.get('methylated')
-        has_u = unmeth_ns is not None and unmeth_ns.n_pairs_found > 0
-        has_m = meth_ns   is not None and meth_ns.n_pairs_found > 0
-        if not has_u and not has_m:
-            continue
-        fig = make_subplots(rows=1, cols=2,
-                            subplot_titles=[f'Unmethylated: {title_sig}',
-                                            f'Methylated:   {title_sig}'])
-        for ns, rc, name, color in [
-            (unmeth_ns, (1, 1), 'Unmethylated', _meth_color(0)),
-            (meth_ns,   (1, 2), 'Methylated',   '#EF553B'),
-        ]:
-            if ns is None or ns.n_pairs_found == 0:
-                continue
-            d = getattr(ns, delta_attr)
-            fig.add_trace(go.Histogram(
-                x=d, name=name, marker_color=color, opacity=0.75, nbinsx=80,
-            ), row=rc[0], col=rc[1])
-            fig.add_vline(
-                x=float(np.mean(d)), line_dash='dash', line_color='black',
-                row=rc[0], col=rc[1],
-                annotation_text=f'mean={np.mean(d):.3f}',
-                annotation_position='top right',
-            )
-        fig.update_layout(title=f'1-Base Neighbor Sensitivity: {title_sig}  (dashed = mean)')
-        figures.append((f'Neighbor sensitivity ({sig_name})', fig))
-
-    # ── Fig 10: Per-position sensitivity ─────────────────────────────────
-    has_any_pos = any(
-        sensitivity.get(c) is not None and sensitivity[c].n_pairs_found > 0
-        for c in ('unmethylated', 'methylated')
-    )
-    if has_any_pos:
-        from .utils.encoding import KMER_PRED_IDX
-        center     = KMER_PRED_IDX
-        positions  = list(range(K))
-        pos_labels = [f'{p}[C]' if p == center else str(p) for p in positions]
-        fig = make_subplots(rows=1, cols=2,
-                            subplot_titles=['Mean |delta IPD| per position',
-                                            'Mean |delta PW|  per position'])
-        for col_i, (delta_attr, ylabel) in enumerate(
-                [('delta_ipd', '|delta IPD|'), ('delta_pw', '|delta PW|')], start=1):
-            for cat, color, name in [
-                ('unmethylated', _meth_color(0), 'Unmethylated'),
-                ('methylated',   '#EF553B',       'Methylated'),
-            ]:
-                ns = sensitivity.get(cat)
-                if ns is None or ns.n_pairs_found == 0:
-                    continue
-                d     = getattr(ns, delta_attr)
-                y_pos = []
-                for pos in positions:
-                    mask = ns.positions == pos
-                    y_pos.append(float(np.mean(d[mask])) if np.any(mask) else 0.0)
-                fig.add_trace(go.Bar(
-                    x=pos_labels, y=y_pos, name=name,
-                    legendgroup=name, showlegend=(col_i == 1),
-                    marker_color=color, opacity=0.8,
-                ), row=1, col=col_i)
-        fig.update_layout(
-            title=f'Per-Position Sensitivity  '
-                  f'(pos {center}[C] = center / modified base)',
-            barmode='group',
-        )
-        figures.append(('Per-position sensitivity', fig))
-
-    # ── Fig 11: Meth vs unmeth sensitivity box ────────────────────────────
-    has_both = (
-        sensitivity.get('unmethylated') is not None
-        and sensitivity['unmethylated'].n_pairs_found > 0
-        and sensitivity.get('methylated') is not None
-        and sensitivity['methylated'].n_pairs_found > 0
-    )
-    if has_both:
-        fig = make_subplots(rows=1, cols=2,
-                            subplot_titles=['|delta IPD|: meth vs unmeth',
-                                            '|delta PW|:  meth vs unmeth'])
-        for col_i, delta_attr in enumerate(['delta_ipd', 'delta_pw'], start=1):
-            for ns, name, color in [
-                (sensitivity['unmethylated'], 'Unmethylated', _meth_color(0)),
-                (sensitivity['methylated'],   'Methylated',   '#EF553B'),
-            ]:
-                fig.add_trace(go.Box(
-                    y=getattr(ns, delta_attr), name=name,
-                    marker_color=color, boxmean='sd',
-                    legendgroup=name, showlegend=(col_i == 1),
-                ), row=1, col=col_i)
-        fig.update_layout(
-            title='Meth vs Unmeth: Neighbor Sensitivity Comparison',
-            boxmode='group',
-        )
-        figures.append(('Sensitivity comparison', fig))
-
-    # ── Fig: 3D Density Surface (IPD × PW × density per meth type) ─────
-    try:
-        from scipy.stats import gaussian_kde
-        _HAS_SCIPY = True
-    except ImportError:
-        _HAS_SCIPY = False
-        log.warning("scipy not installed — skipping 3D density surface.")
-
-    if _HAS_SCIPY:
-        # Build a shared grid in raw signal space
-        all_ipd_vals = np.concatenate([
-            stats.groups[m].ipd_means for m in meth_ids_sorted
-        ])
-        all_pw_vals = np.concatenate([
-            stats.groups[m].pw_means for m in meth_ids_sorted
-        ])
-        ipd_lo = 0.0
-        ipd_hi = max(float(np.percentile(all_ipd_vals, 99.5)), 150.0)
-        pw_lo  = 0.0
-        pw_hi  = max(float(np.percentile(all_pw_vals, 99.5)), 80.0)
-        grid_n = 80
-        ipd_grid = np.linspace(ipd_lo, ipd_hi, grid_n)
-        pw_grid  = np.linspace(pw_lo, pw_hi, grid_n)
-        ipd_mesh, pw_mesh = np.meshgrid(ipd_grid, pw_grid)
-        grid_pts = np.vstack([ipd_mesh.ravel(), pw_mesh.ravel()])
-
-        fig = go.Figure()
-        for m in meth_ids_sorted:
-            g = stats.groups[m]
-            ipd_vals = g.ipd_means
-            pw_vals  = g.pw_means
-
-            # Apply m6A IPD cutoff if requested
-            if m == 1 and min_ipd_m6a > 0:
-                mask = ipd_vals >= min_ipd_m6a
-                ipd_vals = ipd_vals[mask]
-                pw_vals  = pw_vals[mask]
-                log.info("3D plot: m6A filtered to IPD >= %.0f (%d -> %d keys)",
-                         min_ipd_m6a, g.n_entries, len(ipd_vals))
-
-            n = len(ipd_vals)
-            if n < 50:
-                continue
-            # Subsample for KDE performance
-            max_kde = 50_000
-            if n > max_kde:
-                idx = rng.choice(n, max_kde, replace=False)
-                ipd_s = ipd_vals[idx]
-                pw_s  = pw_vals[idx]
-            else:
-                ipd_s = ipd_vals
-                pw_s  = pw_vals
-            try:
-                kde = gaussian_kde(np.vstack([ipd_s, pw_s]), bw_method=0.15)
-                z   = kde(grid_pts).reshape(grid_n, grid_n)
-            except np.linalg.LinAlgError:
-                continue
-            # Normalize to [0, 1] for consistent visual height
-            z_max = z.max()
-            if z_max > 0:
-                z = z / z_max
-            color = clr(m)
-            fig.add_trace(go.Surface(
-                x=ipd_grid, y=pw_grid, z=z,
-                name=f'{lbl(m)} (n={n:,})', showscale=False,
-                opacity=1.0,
-                colorscale=[
-                    [0.0, _darken_hex(color, 0.3)],
-                    [0.3, _darken_hex(color, 0.6)],
-                    [1.0, color],
-                ],
-                showlegend=True,
-                contours=dict(
-                    z=dict(show=True, usecolormap=True, project_z=False,
-                           highlightcolor='white', highlightwidth=1),
-                ),
-            ))
-        title_text = '3D Density Surface: IPD × PW per Methylation Type'
-        if min_ipd_m6a > 0:
-            title_text += f'<br><sub>m6A filtered: IPD >= {min_ipd_m6a:.0f}</sub>'
-        fig.update_layout(
-            title=dict(text=title_text, x=0.5),
-            scene=dict(
-                xaxis_title='Mean IPD',
-                yaxis_title='Mean PW',
-                zaxis_title='Normalized Density',
-                camera=dict(eye=dict(x=1.8, y=-1.5, z=1.0)),
-                bgcolor='rgb(240, 240, 240)',
-            ),
-            legend=dict(
-                x=0.01, y=0.99,
-                bgcolor='rgba(255,255,255,0.85)',
-                bordercolor='rgba(0,0,0,0.3)',
-                borderwidth=1,
-            ),
-        )
-        figures.append(('3D density surface (per type)', fig))
-
-        # ── Combined surface with height-based colormap ───────────────────
-        # KDE on ALL data points together, single surface colored by Z
-        max_kde_all = 100_000
-        total = len(all_ipd_vals)
-        if total > max_kde_all:
-            idx_all = rng.choice(total, max_kde_all, replace=False)
-            ipd_all_s = all_ipd_vals[idx_all]
-            pw_all_s  = all_pw_vals[idx_all]
-        else:
-            ipd_all_s = all_ipd_vals
-            pw_all_s  = all_pw_vals
-        try:
-            kde_all = gaussian_kde(np.vstack([ipd_all_s, pw_all_s]), bw_method=0.15)
-            z_all   = kde_all(grid_pts).reshape(grid_n, grid_n)
-
-            fig2 = go.Figure(go.Surface(
-                x=ipd_grid, y=pw_grid, z=z_all,
-                colorscale='Jet',
-                colorbar=dict(title='Density'),
-                opacity=0.95,
-            ))
-            fig2.update_layout(
-                title='3D Density Surface: Combined IPD × PW (all methylation types)',
-                scene=dict(
-                    xaxis_title='Mean IPD',
-                    yaxis_title='Mean PW',
-                    zaxis_title='Density',
-                    camera=dict(eye=dict(x=1.5, y=-1.5, z=1.2)),
-                ),
-            )
-            figures.append(('3D density surface (combined)', fig2))
-        except np.linalg.LinAlgError:
-            log.warning("KDE failed for combined surface — skipping.")
-
-    # v3 path — write the report using the shared HTML helper.
-    meth_summary = ', '.join(
-        f'{lbl(m)}: {stats.groups[m].n_entries:,}' for m in meth_ids_sorted
-    )
+    meth_summary = f"baseline / slowed / near_meth — {stats.total_samples:,} samples"
     _write_html_report(figures, stats, output_path, meth_summary)
 
 
@@ -2105,15 +1200,13 @@ def render_html_report(
 # Orchestrator
 # ---------------------------------------------------------------------------
 
+
 def analyze_pkl(
     pkl_path: str,
     output_dir: str | None = None,
     no_html: bool = False,
-    max_scatter: int = 10_000,
-    max_neighbor_entries: int = 200_000,
-    min_ipd_m6a: float = 0.0,
 ) -> None:
-    """Load a .pkl file, compute statistics, write TXT + HTML reports."""
+    """Load a .pkl, compute statistics, write TXT + HTML reports."""
     t0 = time.time()
     pkl_path = str(Path(pkl_path).resolve())
 
@@ -2121,58 +1214,45 @@ def analyze_pkl(
         output_dir = str(Path(pkl_path).parent)
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    base      = Path(pkl_path).stem
-    txt_path  = str(Path(output_dir) / f'{base}_report.txt')
-    html_path = str(Path(output_dir) / f'{base}_report.html')
+    base = Path(pkl_path).stem
+    txt_path = str(Path(output_dir) / f"{base}_report.txt")
+    html_path = str(Path(output_dir) / f"{base}_report.html")
 
     log.info("Loading: %s", pkl_path)
-    with open(pkl_path, 'rb') as fh:
+    with open(pkl_path, "rb") as fh:
         data = pickle.load(fh)
 
     if not data:
         log.error("File is empty: %s", pkl_path)
         return
 
-    log.info("Collecting statistics...")
+    _check_v4_input(data)
+
+    log.info("Collecting statistics ...")
     stats = collect_stats(data, pkl_path)
     log.info(
         "kmer_size: %d  keys: %d  samples: %d  types: %s",
         stats.kmer_size,
-        stats.total_entries, stats.total_samples,
+        stats.total_entries,
+        stats.total_samples,
         [stats.groups[m].name for m in sorted(stats.groups)],
     )
 
-    sensitivity: dict = {}
-    if max_neighbor_entries != 0:
-        log.info(
-            "Computing neighbor sensitivity (cap=%d per category)...",
-            max_neighbor_entries,
-        )
-        sensitivity = compute_neighbor_sensitivity(
-            data, stats, max_entries=max_neighbor_entries,
-        )
-        for cat, ns in sensitivity.items():
-            log.info(
-                "  %s: %d source kmers, %d neighbor pairs",
-                cat, ns.n_source_entries, ns.n_pairs_found,
-            )
-    else:
-        log.info("Skipping neighbor sensitivity (--max-neighbor-entries 0)")
-
-    log.info("Computing kinetic signature profiles per meth type...")
+    log.info("Computing kinetic signature profiles ...")
     sig_profiles = compute_signature_profiles(data, kmer_size=stats.kmer_size)
 
-    log.info("Computing meth-context distribution per bucket...")
+    log.info("Computing meth-context distribution per bucket ...")
     ctx_dist = compute_meth_context_distribution(data)
 
-    log.info("Computing per-category IPD distribution...")
+    log.info("Computing per-category IPD distribution ...")
     cat_dist = compute_category_distributions(data)
 
-    refine_meta = data.get('__meta__') if isinstance(data.get('__meta__'), dict) else None
+    refine_meta = data.get("__meta__") if isinstance(data.get("__meta__"), dict) else None
 
     print()
     render_txt_report(
-        stats, sensitivity, txt_path,
+        stats,
+        txt_path,
         signature_profiles=sig_profiles,
         context_distribution=ctx_dist,
         category_distributions=cat_dist,
@@ -2180,14 +1260,14 @@ def analyze_pkl(
     )
 
     if not no_html:
-        log.info("Generating HTML report...")
+        log.info("Generating HTML report ...")
         render_html_report(
-            stats, sensitivity, html_path,
-            max_scatter=max_scatter, min_ipd_m6a=min_ipd_m6a,
+            stats,
+            html_path,
+            data=data,
             signature_profiles=sig_profiles,
             category_distributions=cat_dist,
             refine_meta=refine_meta,
-            data=data,
         )
 
     log.info("Analysis complete in %.1fs", time.time() - t0)
@@ -2197,47 +1277,26 @@ def analyze_pkl(
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def main(argv=None) -> None:
     import argparse
+
     from .utils.config import setup_logging
 
     parser = argparse.ArgumentParser(
-        prog='kinsim analyze',
+        prog="kinsim analyze",
         description=(
-            'Comprehensive analysis of a KinSim training .pkl file.\n\n'
-            'Auto-detects kmer size and all methylation types present.\n'
-            'Works on:\n'
-            '  · kinsim extract shards  (*_shard.pkl)\n'
-            '  · kinsim merge output    (master_data.pkl)\n'
-            '  · kinsim-prep filter output  (training_data.pkl)\n\n'
-            'Outputs:\n'
-            '  <basename>_report.txt   — text report (stdout + file)\n'
-            '  <basename>_report.html  — interactive Plotly charts\n'
-            '                           (requires: pip install plotly)\n\n'
-            'Analysis sections:\n'
-            '  · Per-type coverage and sample count distributions\n'
-            '  · IPD/PW signal mean and sigma distributions\n'
-            '  · Methylation fraction distributions\n'
-            '  · Low-coverage key counts (n < 5/10/50)\n'
-            '  · 1-base neighbor sensitivity + per-position profile\n'
+            "Analyse a KinSim training .pkl (extract + merge + refine output).\n"
+            "Writes a text report and an interactive Plotly HTML dashboard.\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument('pkl',
-                        help='Path to .pkl shard, merged dict, or balanced dict')
-    parser.add_argument('-o', '--output-dir', default=None,
-                        help='Output directory (default: same dir as pkl)')
-    parser.add_argument('--no-html', action='store_true',
-                        help='Skip HTML report (text only, no plotly needed)')
-    parser.add_argument('--max-scatter', type=int, default=10_000, metavar='N',
-                        help='Max points per group in IPD-vs-PW scatter (default: 10000)')
-    parser.add_argument('--max-neighbor-entries', type=int, default=200_000, metavar='N',
-                        help='Max kmers per category for neighbor sensitivity '
-                             '(default: 200000; 0 = skip)')
-    parser.add_argument('--min-ipd-m6a', type=float, default=0.0, metavar='X',
-                        help='Min mean IPD for m6A keys in 3D plot (default: 0 = no filter)')
-    parser.add_argument('--verbose', '-v', action='store_true',
-                        help='Enable DEBUG-level logging')
+    parser.add_argument("pkl", help="Path to the master / master_clean .pkl")
+    parser.add_argument(
+        "-o", "--output-dir", default=None, help="Output directory (default: same dir as pkl)"
+    )
+    parser.add_argument("--no-html", action="store_true", help="Skip HTML report (text only)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG-level logging")
     args = parser.parse_args(argv)
     setup_logging(verbose=args.verbose)
 
@@ -2245,11 +1304,8 @@ def main(argv=None) -> None:
         pkl_path=args.pkl,
         output_dir=args.output_dir,
         no_html=args.no_html,
-        max_scatter=args.max_scatter,
-        max_neighbor_entries=args.max_neighbor_entries,
-        min_ipd_m6a=args.min_ipd_m6a,
     )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

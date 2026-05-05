@@ -24,6 +24,7 @@ import csv
 import logging
 
 from kinsim.utils.encoding import METH_IDS
+
 from .base import BaseOutputParser
 from .registry import register
 
@@ -31,13 +32,13 @@ log = logging.getLogger(__name__)
 
 # Map user's mod_type names to KinSim mod types
 _COMBINED_MOD_MAP = {
-    '5mC': 'm5C',
-    'm5C': 'm5C',
-    '6mA': 'm6A',
-    'm6A': 'm6A',
-    '4mC': 'm4C',
-    'm4C': 'm4C',
-    '5hmC': 'm5C',  # hydroxymethylcytosine -> treat as m5C
+    "5mC": "m5C",
+    "m5C": "m5C",
+    "6mA": "m6A",
+    "m6A": "m6A",
+    "4mC": "m4C",
+    "m4C": "m4C",
+    "5hmC": "m5C",  # hydroxymethylcytosine -> treat as m5C
 }
 
 
@@ -59,51 +60,53 @@ class CombinedParser(BaseOutputParser):
         with open(filepath) as f:
             reader = csv.DictReader(f)
             if reader.fieldnames is None:
-                log.warning("Combined CSV: empty or headerless file '%s'",
-                            filepath)
+                log.warning("Combined CSV: empty or headerless file '%s'", filepath)
                 return ""
 
             for lineno, row in enumerate(reader, 2):
                 # -- mod_type (required) --
-                raw_mod = row.get('mod_type', '').strip()
+                raw_mod = row.get("mod_type", "").strip()
                 mod_type = _COMBINED_MOD_MAP.get(raw_mod)
                 if mod_type is None:
-                    log.warning("Combined CSV line %d: unknown mod_type '%s' "
-                                "-- skipped", lineno, raw_mod)
+                    log.warning(
+                        "Combined CSV line %d: unknown mod_type '%s' -- skipped", lineno, raw_mod
+                    )
                     continue
 
                 # -- motif (required) --
-                motif_seq = row.get('motif', '').strip()
+                motif_seq = row.get("motif", "").strip()
                 if not motif_seq:
-                    log.warning("Combined CSV line %d: missing motif -- skipped",
-                                lineno)
+                    log.warning("Combined CSV line %d: missing motif -- skipped", lineno)
                     continue
 
                 # -- offset (required) --
-                offset_str = row.get('offset', '').strip()
+                offset_str = row.get("offset", "").strip()
                 try:
                     offset = int(offset_str)
                 except ValueError:
-                    log.warning("Combined CSV line %d: invalid offset '%s' "
-                                "-- skipped", lineno, offset_str)
+                    log.warning(
+                        "Combined CSV line %d: invalid offset '%s' -- skipped", lineno, offset_str
+                    )
                     continue
 
                 # -- frac_mod (optional, default 1.0) --
-                frac_str = row.get('frac_mod', '').strip()
+                frac_str = row.get("frac_mod", "").strip()
                 try:
                     fraction = float(frac_str) if frac_str else 1.0
                 except ValueError:
-                    log.warning("Combined CSV line %d: invalid frac_mod '%s' "
-                                "-- using 1.0", lineno, frac_str)
+                    log.warning(
+                        "Combined CSV line %d: invalid frac_mod '%s' -- using 1.0", lineno, frac_str
+                    )
                     fraction = 1.0
 
                 # -- n_sites (optional, default 0) --
-                ns_str = row.get('n_sites', '').strip()
+                ns_str = row.get("n_sites", "").strip()
                 try:
                     n_sites = int(ns_str) if ns_str else 0
                 except ValueError:
-                    log.warning("Combined CSV line %d: invalid n_sites '%s' "
-                                "-- using 0", lineno, ns_str)
+                    log.warning(
+                        "Combined CSV line %d: invalid n_sites '%s' -- using 0", lineno, ns_str
+                    )
                     n_sites = 0
 
                 # -- Apply thresholds --
@@ -111,23 +114,24 @@ class CombinedParser(BaseOutputParser):
                     continue
 
                 if mod_type not in METH_IDS:
-                    log.warning("Combined CSV line %d: mod_type '%s' not in "
-                                "METH_IDS -- skipped", lineno, mod_type)
+                    log.warning(
+                        "Combined CSV line %d: mod_type '%s' not in METH_IDS -- skipped",
+                        lineno,
+                        mod_type,
+                    )
                     continue
 
-                entries.append(
-                    f"{mod_type},{motif_seq},{offset},{n_sites},{fraction:.6g}"
-                )
+                entries.append(f"{mod_type},{motif_seq},{offset},{n_sites},{fraction:.6g}")
 
         return ";".join(entries)
 
     def is_file_for_this_parser(self, filepath: str) -> bool:
         """Match .csv files with mod_type and frac_mod in the header."""
-        if not filepath.lower().endswith('.csv'):
+        if not filepath.lower().endswith(".csv"):
             return False
         try:
             with open(filepath) as f:
                 header = f.readline().lower()
-                return 'mod_type' in header and 'frac_mod' in header
+                return "mod_type" in header and "frac_mod" in header
         except OSError:
             return False

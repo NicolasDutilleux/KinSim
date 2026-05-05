@@ -96,39 +96,9 @@ extract:
 
 # Refinement parameters
 refine:
-  # Strategy applied per-type. All currently use the same algorithm
-  # (GMM + signature validation), parameterised by the offsets above.
-  default_strategy: "gmm_signature"
-
-  gmm_signature:
-    # Maximum K to try in the GMM. BIC selects best K in [1, k_max].
-    k_max: 3
-
-    # Mahalanobis threshold against None for component centroid validation.
-    # 9.21 = chi2_{2dof, 0.99} = "1% chance of being None".
-    chi2_threshold: 9.21
-
-    # Minimum profile signal ratio at signature offsets vs baseline.
-    # A component must have mean(IPD at signature_offsets) >= ratio * baseline_IPD.
-    # baseline_IPD is the mean at non-signature positions of the profile.
-    min_signature_ratio: 1.3
-
-    # Minimum mixing weight (pi) for a component to be considered.
-    min_pi: 0.05
-
-    # Below this sample count, skip GMM and use direct Mahalanobis filter.
-    min_samples_for_gmm: 5
-
-    # Below this sample count, the bucket is too small even for Mahalanobis;
-    # keep all samples without refinement (single-Gaussian fit on the data).
-    min_samples_low: 1
-
-  # ---------- v4: secondary p95 filter on slowed samples ----------
-  # The v4 extract emits CATEGORY_SLOWED at every motif-match center +
-  # signature offsets. Some of these are FP (motif scan can be noisy or
-  # the methylation at p might not actually be active). The p95 filter
-  # drops slowed samples whose IPD is below the p95 of the BASELINE
-  # distribution — those are samples whose expected slowing did not
-  # actually occur, so they're FP for our purposes.
+  # Single pass: drop CATEGORY_SLOWED samples whose IPD falls below the
+  # `secondary_percentile`-th percentile of the per-kmer baseline mean.
+  # Per-kmer mean (not per-sample) avoids the per-sample Poisson tail and
+  # keeps weak signals (m4C/m5C) from being wiped by noise.
   slowed_split:
     secondary_percentile: 95

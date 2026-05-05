@@ -76,12 +76,11 @@ except ImportError:
         from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
     except ImportError as exc:
         raise ImportError(
-            "PyTorch Lightning is required for MLP training.\n"
-            "Install with: pip install lightning"
+            "PyTorch Lightning is required for MLP training.\nInstall with: pip install lightning"
         ) from exc
 
 from .data.dataset import MLPSignalDataset
-from .models.predictor import MLPPredictor, ConvPredictor, create_from_config
+from .models.predictor import ConvPredictor, MLPPredictor
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +89,7 @@ log = logging.getLogger(__name__)
 # Loss functions
 # ---------------------------------------------------------------------------
 
+
 def _gaussian_nll_loss(params: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """Gaussian NLL for (IPD, PW) jointly.
 
@@ -97,9 +97,9 @@ def _gaussian_nll_loss(params: torch.Tensor, targets: torch.Tensor) -> torch.Ten
         params:  Model output (batch, 4) — [μ_ipd, μ_pw, log_σ_ipd, log_σ_pw].
         targets: Ground-truth signals (batch, 2) — [IPD, PW] in log1p space.
     """
-    mu      = params[:, :2]
+    mu = params[:, :2]
     log_sig = torch.clamp(params[:, 2:], -6.0, 3.0)
-    var     = torch.exp(2.0 * log_sig)
+    var = torch.exp(2.0 * log_sig)
     return (0.5 * (log_sig * 2.0 + (targets - mu) ** 2 / var)).mean()
 
 
@@ -114,8 +114,8 @@ def _huber_loss(params: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
 
 
 _LOSS_FUNCTIONS = {
-    "gnll":  _gaussian_nll_loss,
-    "mse":   _mse_loss,
+    "gnll": _gaussian_nll_loss,
+    "mse": _mse_loss,
     "huber": _huber_loss,
 }
 
@@ -142,25 +142,27 @@ def _compute_metrics(
     result: dict = {}
 
     # Overall metrics
-    mse     = (diff ** 2).mean(axis=0)
-    mae     = np.abs(diff).mean(axis=0)
+    mse = (diff**2).mean(axis=0)
+    mae = np.abs(diff).mean(axis=0)
     in_1sig = (np.abs(diff) <= 1.0 * all_sigma).mean(axis=0)
     in_2sig = (np.abs(diff) <= 2.0 * all_sigma).mean(axis=0)
     in_3sig = (np.abs(diff) <= 3.0 * all_sigma).mean(axis=0)
-    result.update({
-        f"{prefix}_mse_ipd":      float(mse[0]),
-        f"{prefix}_mse_pw":       float(mse[1]),
-        f"{prefix}_mae_ipd":      float(mae[0]),
-        f"{prefix}_mae_pw":       float(mae[1]),
-        f"{prefix}_pearson_ipd":  _pearson(all_mu[:, 0], all_true[:, 0]),
-        f"{prefix}_pearson_pw":   _pearson(all_mu[:, 1], all_true[:, 1]),
-        f"{prefix}_calib_1sig_ipd": float(in_1sig[0]),
-        f"{prefix}_calib_1sig_pw":  float(in_1sig[1]),
-        f"{prefix}_calib_2sig_ipd": float(in_2sig[0]),
-        f"{prefix}_calib_2sig_pw":  float(in_2sig[1]),
-        f"{prefix}_calib_3sig_ipd": float(in_3sig[0]),
-        f"{prefix}_calib_3sig_pw":  float(in_3sig[1]),
-    })
+    result.update(
+        {
+            f"{prefix}_mse_ipd": float(mse[0]),
+            f"{prefix}_mse_pw": float(mse[1]),
+            f"{prefix}_mae_ipd": float(mae[0]),
+            f"{prefix}_mae_pw": float(mae[1]),
+            f"{prefix}_pearson_ipd": _pearson(all_mu[:, 0], all_true[:, 0]),
+            f"{prefix}_pearson_pw": _pearson(all_mu[:, 1], all_true[:, 1]),
+            f"{prefix}_calib_1sig_ipd": float(in_1sig[0]),
+            f"{prefix}_calib_1sig_pw": float(in_1sig[1]),
+            f"{prefix}_calib_2sig_ipd": float(in_2sig[0]),
+            f"{prefix}_calib_2sig_pw": float(in_2sig[1]),
+            f"{prefix}_calib_3sig_ipd": float(in_3sig[0]),
+            f"{prefix}_calib_3sig_pw": float(in_3sig[1]),
+        }
+    )
 
     # Per-meth-type breakdown
     by_type: dict = {}
@@ -168,38 +170,38 @@ def _compute_metrics(
         mask = all_meth_ids == meth_id
         if mask.sum() < 2:
             continue
-        mu_m    = all_mu[mask]
-        sig_m   = all_sigma[mask]
-        true_m  = all_true[mask]
-        diff_m  = mu_m - true_m
-        name    = _METH_NAMES.get(int(meth_id), f"meth{meth_id}")
+        mu_m = all_mu[mask]
+        sig_m = all_sigma[mask]
+        true_m = all_true[mask]
+        diff_m = mu_m - true_m
+        name = _METH_NAMES.get(int(meth_id), f"meth{meth_id}")
         by_type[name] = {
-            "n":          int(mask.sum()),
+            "n": int(mask.sum()),
             "pearson_ipd": _pearson(mu_m[:, 0], true_m[:, 0]),
-            "pearson_pw":  _pearson(mu_m[:, 1], true_m[:, 1]),
-            "mae_ipd":     float(np.abs(diff_m[:, 0]).mean()),
-            "mae_pw":      float(np.abs(diff_m[:, 1]).mean()),
-            "calib_1sig":  float((np.abs(diff_m) <= 1.0 * sig_m).mean()),
-            "calib_2sig":  float((np.abs(diff_m) <= 2.0 * sig_m).mean()),
-            "calib_3sig":  float((np.abs(diff_m) <= 3.0 * sig_m).mean()),
+            "pearson_pw": _pearson(mu_m[:, 1], true_m[:, 1]),
+            "mae_ipd": float(np.abs(diff_m[:, 0]).mean()),
+            "mae_pw": float(np.abs(diff_m[:, 1]).mean()),
+            "calib_1sig": float((np.abs(diff_m) <= 1.0 * sig_m).mean()),
+            "calib_2sig": float((np.abs(diff_m) <= 2.0 * sig_m).mean()),
+            "calib_3sig": float((np.abs(diff_m) <= 3.0 * sig_m).mean()),
         }
         # Also log per-type scalars for CSV/TensorBoard
         result[f"{prefix}_pearson_ipd_{name}"] = by_type[name]["pearson_ipd"]
-        result[f"{prefix}_pearson_pw_{name}"]  = by_type[name]["pearson_pw"]
-        result[f"{prefix}_calib_2sig_{name}"]  = by_type[name]["calib_2sig"]
+        result[f"{prefix}_pearson_pw_{name}"] = by_type[name]["pearson_pw"]
+        result[f"{prefix}_calib_2sig_{name}"] = by_type[name]["calib_2sig"]
 
-    result["_by_type"] = by_type   # human-readable, not logged as scalar
+    result["_by_type"] = by_type  # human-readable, not logged as scalar
 
     # ── Pearson oracle: theoretical ceiling for a perfect distributional model ─
     # r_oracle = Var(μ) / (Var(μ) + E[σ²])
     var_mu_ipd = np.var(all_mu[:, 0])
-    var_mu_pw  = np.var(all_mu[:, 1])
+    var_mu_pw = np.var(all_mu[:, 1])
     e_sig2_ipd = np.mean(all_sigma[:, 0] ** 2)
-    e_sig2_pw  = np.mean(all_sigma[:, 1] ** 2)
+    e_sig2_pw = np.mean(all_sigma[:, 1] ** 2)
     oracle_ipd = var_mu_ipd / (var_mu_ipd + e_sig2_ipd) if (var_mu_ipd + e_sig2_ipd) > 0 else 0.0
-    oracle_pw  = var_mu_pw  / (var_mu_pw  + e_sig2_pw)  if (var_mu_pw  + e_sig2_pw)  > 0 else 0.0
+    oracle_pw = var_mu_pw / (var_mu_pw + e_sig2_pw) if (var_mu_pw + e_sig2_pw) > 0 else 0.0
     result[f"{prefix}_oracle_ipd"] = float(oracle_ipd)
-    result[f"{prefix}_oracle_pw"]  = float(oracle_pw)
+    result[f"{prefix}_oracle_pw"] = float(oracle_pw)
 
     # ── Distribution samples: 10 random per meth type ─────────────────────────
     dist_samples: dict = {}
@@ -211,14 +213,14 @@ def _compute_metrics(
             continue
         n_pick = min(10, n_avail)
         idx = rng.choice(n_avail, n_pick, replace=False)
-        mu_sel  = all_mu[mask][idx]     # (n_pick, 2)
+        mu_sel = all_mu[mask][idx]  # (n_pick, 2)
         sig_sel = all_sigma[mask][idx]  # (n_pick, 2)
         name = _METH_NAMES.get(int(meth_id), f"meth{meth_id}")
         dist_samples[name] = {
-            "mu_ipd":    mu_sel[:, 0],
-            "mu_pw":     mu_sel[:, 1],
+            "mu_ipd": mu_sel[:, 0],
+            "mu_pw": mu_sel[:, 1],
             "sigma_ipd": sig_sel[:, 0],
-            "sigma_pw":  sig_sel[:, 1],
+            "sigma_pw": sig_sel[:, 1],
         }
     result["_dist_samples"] = dist_samples
 
@@ -228,12 +230,16 @@ def _compute_metrics(
 def _grade(value: float, good: float, ok: float, higher_is_better: bool = True) -> str:
     """Return GOOD / OK / POOR based on thresholds."""
     if higher_is_better:
-        if value >= good:  return "GOOD"
-        if value >= ok:    return "OK  "
+        if value >= good:
+            return "GOOD"
+        if value >= ok:
+            return "OK  "
         return "POOR"
     else:
-        if value <= good:  return "GOOD"
-        if value <= ok:    return "OK  "
+        if value <= good:
+            return "GOOD"
+        if value <= ok:
+            return "OK  "
         return "POOR"
 
 
@@ -254,15 +260,15 @@ def _log_metrics(metrics: dict, prefix: str) -> None:
     log.info("─" * W)
 
     p_ipd = metrics.get(f"{prefix}_pearson_ipd", 0.0)
-    p_pw  = metrics.get(f"{prefix}_pearson_pw",  0.0)
+    p_pw = metrics.get(f"{prefix}_pearson_pw", 0.0)
     m_ipd = metrics.get(f"{prefix}_mae_ipd", 0.0)
-    m_pw  = metrics.get(f"{prefix}_mae_pw",  0.0)
-    c1i   = metrics.get(f"{prefix}_calib_1sig_ipd", 0.0) * 100
-    c2i   = metrics.get(f"{prefix}_calib_2sig_ipd", 0.0) * 100
-    c3i   = metrics.get(f"{prefix}_calib_3sig_ipd", 0.0) * 100
-    c1p   = metrics.get(f"{prefix}_calib_1sig_pw",  0.0) * 100
-    c2p   = metrics.get(f"{prefix}_calib_2sig_pw",  0.0) * 100
-    c3p   = metrics.get(f"{prefix}_calib_3sig_pw",  0.0) * 100
+    m_pw = metrics.get(f"{prefix}_mae_pw", 0.0)
+    c1i = metrics.get(f"{prefix}_calib_1sig_ipd", 0.0) * 100
+    c2i = metrics.get(f"{prefix}_calib_2sig_ipd", 0.0) * 100
+    c3i = metrics.get(f"{prefix}_calib_3sig_ipd", 0.0) * 100
+    c1p = metrics.get(f"{prefix}_calib_1sig_pw", 0.0) * 100
+    c2p = metrics.get(f"{prefix}_calib_2sig_pw", 0.0) * 100
+    c3p = metrics.get(f"{prefix}_calib_3sig_pw", 0.0) * 100
 
     # Calibration grade: ideally near 95.4% for 2σ
     calib_grade = _grade(c2i, 90.0, 80.0, higher_is_better=True)
@@ -270,30 +276,38 @@ def _log_metrics(metrics: dict, prefix: str) -> None:
         calib_grade = "POOR"  # underconfident
 
     o_ipd = metrics.get(f"{prefix}_oracle_ipd", 0.0)
-    o_pw  = metrics.get(f"{prefix}_oracle_pw",  0.0)
+    o_pw = metrics.get(f"{prefix}_oracle_pw", 0.0)
     log.info(
         "  Pearson  IPD=%.3f [%s ≥0.70]   PW=%.3f [%s ≥0.60]",
-        p_ipd, _grade(p_ipd, 0.70, 0.50), p_pw, _grade(p_pw, 0.60, 0.40),
+        p_ipd,
+        _grade(p_ipd, 0.70, 0.50),
+        p_pw,
+        _grade(p_pw, 0.60, 0.40),
     )
     log.info(
         "  Oracle   IPD=%.3f              PW=%.3f  (theoretical ceiling)",
-        o_ipd, o_pw,
+        o_ipd,
+        o_pw,
     )
     log.info(
         "  MAE      IPD=%.4f               PW=%.4f  (log1p space)",
-        m_ipd, m_pw,
+        m_ipd,
+        m_pw,
     )
     log.info(
         "  Calib    IPD: 1σ=%.1f%%  2σ=%.1f%% [%s 90-99%%]  3σ=%.1f%%",
-        c1i, c2i, calib_grade, c3i,
+        c1i,
+        c2i,
+        calib_grade,
+        c3i,
     )
     log.info(
         "           PW:  1σ=%.1f%%  2σ=%.1f%%               3σ=%.1f%%",
-        c1p, c2p, c3p,
+        c1p,
+        c2p,
+        c3p,
     )
-    log.info(
-        "  (ideal calibration: 1σ=68%%  2σ=95.4%%  3σ=99.7%%)"
-    )
+    log.info("  (ideal calibration: 1σ=68%%  2σ=95.4%%  3σ=99.7%%)")
 
     by_type = metrics.get("_by_type", {})
     if by_type:
@@ -303,25 +317,33 @@ def _log_metrics(metrics: dict, prefix: str) -> None:
             if t["calib_2sig"] * 100 > 99.0:
                 cg = "POOR"
             log.info(
-                "    %-6s  n=%-7d  pearson=(IPD %.3f [%s] PW %.3f [%s])  "
-                "2σ=%.1f%% [%s]",
-                name, t["n"],
-                t["pearson_ipd"], _grade(t["pearson_ipd"], 0.70, 0.50),
-                t["pearson_pw"],  _grade(t["pearson_pw"],  0.60, 0.40),
-                t["calib_2sig"] * 100, cg,
+                "    %-6s  n=%-7d  pearson=(IPD %.3f [%s] PW %.3f [%s])  2σ=%.1f%% [%s]",
+                name,
+                t["n"],
+                t["pearson_ipd"],
+                _grade(t["pearson_ipd"], 0.70, 0.50),
+                t["pearson_pw"],
+                _grade(t["pearson_pw"], 0.60, 0.40),
+                t["calib_2sig"] * 100,
+                cg,
             )
     # ── Distribution samples (10 per meth type) ─────────────────────────────
     dist_samples = metrics.get("_dist_samples", {})
     if dist_samples:
         log.info("  Distribution samples (predicted μ ± σ in log1p space):")
         for name, s in dist_samples.items():
-            mu_ipd_mean  = float(np.mean(s["mu_ipd"]))
-            mu_pw_mean   = float(np.mean(s["mu_pw"]))
+            mu_ipd_mean = float(np.mean(s["mu_ipd"]))
+            mu_pw_mean = float(np.mean(s["mu_pw"]))
             sig_ipd_mean = float(np.mean(s["sigma_ipd"]))
-            sig_pw_mean  = float(np.mean(s["sigma_pw"]))
+            sig_pw_mean = float(np.mean(s["sigma_pw"]))
             log.info(
                 "    %-6s  IPD: μ=%.3f ± σ=%.3f   PW: μ=%.3f ± σ=%.3f  (avg of %d samples)",
-                name, mu_ipd_mean, sig_ipd_mean, mu_pw_mean, sig_pw_mean, len(s["mu_ipd"]),
+                name,
+                mu_ipd_mean,
+                sig_ipd_mean,
+                mu_pw_mean,
+                sig_pw_mean,
+                len(s["mu_ipd"]),
             )
     log.info("─" * W)
 
@@ -329,6 +351,7 @@ def _log_metrics(metrics: dict, prefix: str) -> None:
 # ---------------------------------------------------------------------------
 # KineticDataModule
 # ---------------------------------------------------------------------------
+
 
 class KineticDataModule(L.LightningDataModule):
     """LightningDataModule for KinSim kinetic .pkl files.
@@ -353,24 +376,24 @@ class KineticDataModule(L.LightningDataModule):
         seed: int = 42,
     ) -> None:
         super().__init__()
-        self.pkl_path     = pkl_path
-        self.test_pkl     = test_pkl
+        self.pkl_path = pkl_path
+        self.test_pkl = test_pkl
         self.val_fraction = val_fraction
-        self.batch_size   = batch_size
-        self.seed         = seed
+        self.batch_size = batch_size
+        self.seed = seed
         self._train_subset = None
-        self._val_subset   = None
+        self._val_subset = None
         self._test_dataset = None
 
     def setup(self, stage: str | None = None) -> None:
         if stage in ("fit", None):
             dataset = MLPSignalDataset(self.pkl_path)
-            n_val   = max(1, int(len(dataset) * self.val_fraction))
+            n_val = max(1, int(len(dataset) * self.val_fraction))
             n_train = len(dataset) - n_val
-            rng     = torch.Generator().manual_seed(self.seed)
+            rng = torch.Generator().manual_seed(self.seed)
             indices = torch.randperm(len(dataset), generator=rng).tolist()
             self._train_subset = Subset(dataset, indices[:n_train])
-            self._val_subset   = Subset(dataset, indices[n_train:])
+            self._val_subset = Subset(dataset, indices[n_train:])
             log.info("Data split — train: %d samples, val: %d samples", n_train, n_val)
         if stage in ("test", None) and self.test_pkl:
             self._test_dataset = MLPSignalDataset(self.test_pkl)
@@ -410,6 +433,7 @@ class KineticDataModule(L.LightningDataModule):
 # KineticPredictor (LightningModule)
 # ---------------------------------------------------------------------------
 
+
 class KineticPredictor(L.LightningModule):
     """Lightning module wrapping MLPPredictor.
 
@@ -436,17 +460,17 @@ class KineticPredictor(L.LightningModule):
         loss_name: str = "gnll",
     ) -> None:
         super().__init__()
-        self.model    = model
-        self.lr       = lr
+        self.model = model
+        self.lr = lr
         self._loss_fn = _LOSS_FUNCTIONS[loss_name]
         # Accumulate per-batch predictions for epoch-level metrics
-        self._val_mu:       list[torch.Tensor] = []
-        self._val_sigma:    list[torch.Tensor] = []
-        self._val_true:     list[torch.Tensor] = []
+        self._val_mu: list[torch.Tensor] = []
+        self._val_sigma: list[torch.Tensor] = []
+        self._val_true: list[torch.Tensor] = []
         self._val_meth_ids: list[torch.Tensor] = []
-        self._test_mu:      list[torch.Tensor] = []
-        self._test_sigma:   list[torch.Tensor] = []
-        self._test_true:    list[torch.Tensor] = []
+        self._test_mu: list[torch.Tensor] = []
+        self._test_sigma: list[torch.Tensor] = []
+        self._test_true: list[torch.Tensor] = []
         self._test_meth_ids: list[torch.Tensor] = []
 
     def forward(self, kmer_ids: torch.Tensor, meth_probs: torch.Tensor) -> torch.Tensor:
@@ -460,12 +484,12 @@ class KineticPredictor(L.LightningModule):
 
     def validation_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
         kmer_ids, meth_probs, signals, meth_ids = batch
-        params  = self.model(kmer_ids, meth_probs)
-        loss    = self._loss_fn(params, signals)
+        params = self.model(kmer_ids, meth_probs)
+        loss = self._loss_fn(params, signals)
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-        mu      = params[:, :2]
+        mu = params[:, :2]
         log_sig = torch.clamp(params[:, 2:], -6.0, 3.0)
-        sigma   = torch.exp(log_sig)
+        sigma = torch.exp(log_sig)
         self._val_mu.append(mu.detach().cpu())
         self._val_sigma.append(sigma.detach().cpu())
         self._val_true.append(signals.detach().cpu())
@@ -475,16 +499,18 @@ class KineticPredictor(L.LightningModule):
     def on_validation_epoch_end(self) -> None:
         if not self._val_mu:
             return
-        all_mu       = torch.cat(self._val_mu).numpy()        # (N, 2)
-        all_sigma    = torch.cat(self._val_sigma).numpy()     # (N, 2)
-        all_true     = torch.cat(self._val_true).numpy()      # (N, 2)
+        all_mu = torch.cat(self._val_mu).numpy()  # (N, 2)
+        all_sigma = torch.cat(self._val_sigma).numpy()  # (N, 2)
+        all_true = torch.cat(self._val_true).numpy()  # (N, 2)
         all_meth_ids = torch.cat(self._val_meth_ids).numpy()  # (N,)
 
         val_loss = self.trainer.callback_metrics.get("val_loss", float("nan"))
         gnll_grade = _grade(float(val_loss), 1.0, 1.5, higher_is_better=False)
         log.info(
             "Epoch %d  val_loss(GNLL)=%.4f [%s ≤1.0]",
-            self.current_epoch, float(val_loss), gnll_grade,
+            self.current_epoch,
+            float(val_loss),
+            gnll_grade,
         )
         metrics = _compute_metrics(all_mu, all_sigma, all_true, all_meth_ids, prefix="val")
         self.log_dict(
@@ -500,10 +526,10 @@ class KineticPredictor(L.LightningModule):
 
     def test_step(self, batch: tuple, batch_idx: int) -> None:
         kmer_ids, meth_probs, signals, meth_ids = batch
-        params  = self.model(kmer_ids, meth_probs)
-        mu      = params[:, :2]
+        params = self.model(kmer_ids, meth_probs)
+        mu = params[:, :2]
         log_sig = torch.clamp(params[:, 2:], -6.0, 3.0)
-        sigma   = torch.exp(log_sig)
+        sigma = torch.exp(log_sig)
         self._test_mu.append(mu.detach().cpu())
         self._test_sigma.append(sigma.detach().cpu())
         self._test_true.append(signals.detach().cpu())
@@ -512,9 +538,9 @@ class KineticPredictor(L.LightningModule):
     def on_test_epoch_end(self) -> None:
         if not self._test_mu:
             return
-        all_mu       = torch.cat(self._test_mu).numpy()
-        all_sigma    = torch.cat(self._test_sigma).numpy()
-        all_true     = torch.cat(self._test_true).numpy()
+        all_mu = torch.cat(self._test_mu).numpy()
+        all_sigma = torch.cat(self._test_sigma).numpy()
+        all_true = torch.cat(self._test_true).numpy()
         all_meth_ids = torch.cat(self._test_meth_ids).numpy()
 
         metrics = _compute_metrics(all_mu, all_sigma, all_true, all_meth_ids, prefix="test")
@@ -537,7 +563,7 @@ class KineticPredictor(L.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor":   "val_loss",
+                "monitor": "val_loss",
                 "frequency": 1,
             },
         }
@@ -551,6 +577,7 @@ class KineticPredictor(L.LightningModule):
 # ---------------------------------------------------------------------------
 # LegacyCheckpointCallback
 # ---------------------------------------------------------------------------
+
 
 class LegacyCheckpointCallback(Callback):
     """Write checkpoint_epoch{N}.pt in the legacy format.
@@ -576,13 +603,13 @@ class LegacyCheckpointCallback(Callback):
     """
 
     def __init__(self, output_dir: Path, checkpoint_every: int = 10) -> None:
-        self.output_dir       = Path(output_dir)
+        self.output_dir = Path(output_dir)
         self.checkpoint_every = checkpoint_every
 
     def _save(
         self,
-        trainer: "L.Trainer",
-        pl_module: "KineticPredictor",
+        trainer: L.Trainer,
+        pl_module: KineticPredictor,
         epoch: int,
     ) -> None:
         state: dict = {
@@ -598,8 +625,8 @@ class LegacyCheckpointCallback(Callback):
 
     def on_train_epoch_end(
         self,
-        trainer: "L.Trainer",
-        pl_module: "KineticPredictor",
+        trainer: L.Trainer,
+        pl_module: KineticPredictor,
     ) -> None:
         # trainer.current_epoch is 0-indexed during on_train_epoch_end
         epoch = trainer.current_epoch + 1
@@ -608,13 +635,13 @@ class LegacyCheckpointCallback(Callback):
 
     def on_train_end(
         self,
-        trainer: "L.Trainer",
-        pl_module: "KineticPredictor",
+        trainer: L.Trainer,
+        pl_module: KineticPredictor,
     ) -> None:
         """Save the final epoch — handles early stopping stopping mid-interval."""
         # After the last on_train_epoch_end, current_epoch is incremented by Lightning.
         # So at on_train_end, current_epoch == number of completed epochs (1-indexed).
-        epoch     = trainer.current_epoch
+        epoch = trainer.current_epoch
         ckpt_path = self.output_dir / f"checkpoint_epoch{epoch}.pt"
         if not ckpt_path.exists():
             self._save(trainer, pl_module, epoch)
@@ -623,6 +650,7 @@ class LegacyCheckpointCallback(Callback):
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
+
 
 def _read_pkl_meta(pkl_path: str) -> dict:
     """Return the ``__meta__`` provenance dict from a training .pkl, or {}.
@@ -661,7 +689,8 @@ def _save_model_config(
     path.write_text(json.dumps(cfg, indent=2))
     log.info(
         "Model config saved: %s  (architecture=%s, meth_types=%s)",
-        path, cfg.get("architecture"),
+        path,
+        cfg.get("architecture"),
         cfg.get("meth_types", "all"),
     )
 
@@ -669,6 +698,7 @@ def _save_model_config(
 # ---------------------------------------------------------------------------
 # Optuna objective
 # ---------------------------------------------------------------------------
+
 
 def objective(
     trial,
@@ -701,14 +731,14 @@ def objective(
     Returns:
         Best val_loss seen during this trial (lower is better).
     """
-    lr      = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
+    lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
     dropout = trial.suggest_float("dropout", 0.0, 0.4)
 
     if architecture == "conv":
         base_embed_dim = trial.suggest_categorical("base_embed_dim", [8, 16])
-        conv_dim       = trial.suggest_categorical("conv_dim", [64, 128])
-        head_dim       = trial.suggest_categorical("head_dim", [64, 128, 256])
-        kernel_size    = trial.suggest_categorical("kernel_size", [3, 5])
+        conv_dim = trial.suggest_categorical("conv_dim", [64, 128])
+        head_dim = trial.suggest_categorical("head_dim", [64, 128, 256])
+        kernel_size = trial.suggest_categorical("kernel_size", [3, 5])
         model = ConvPredictor(
             base_embed_dim=base_embed_dim,
             conv_dim=conv_dim,
@@ -718,7 +748,7 @@ def objective(
         )
     else:
         kmer_embed_dim = trial.suggest_categorical("kmer_embed_dim", [32, 64])
-        hidden_dim     = trial.suggest_categorical("hidden_dim", [128, 256, 512])
+        hidden_dim = trial.suggest_categorical("hidden_dim", [128, 256, 512])
         model = MLPPredictor(
             kmer_embed_dim=kmer_embed_dim,
             hidden_dim=hidden_dim,
@@ -736,6 +766,7 @@ def objective(
     callbacks: list = [EarlyStopping(monitor="val_loss", patience=5, mode="min")]
     try:
         from optuna.integration import PyTorchLightningPruningCallback
+
         callbacks.append(PyTorchLightningPruningCallback(trial, monitor="val_loss"))
     except ImportError:
         pass  # Pruning skipped — optuna.integration not available
@@ -763,6 +794,7 @@ def objective(
 # ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
+
 
 def train_mlp(
     pkl_path: str,
@@ -836,13 +868,14 @@ def train_mlp(
     if run_optuna:
         try:
             import optuna
-        except ImportError:
+        except ImportError as exc:
             raise ImportError(
                 "Optuna is required for HPO. Install with: pip install optuna"
-            )
+            ) from exc
 
-        log.info("Optuna HPO — arch=%s  %d trials × %d epochs",
-                 architecture, n_trials, optuna_epochs)
+        log.info(
+            "Optuna HPO — arch=%s  %d trials × %d epochs", architecture, n_trials, optuna_epochs
+        )
         optuna_dir = output_dir / "optuna"
         optuna_dir.mkdir(exist_ok=True)
 
@@ -869,16 +902,16 @@ def train_mlp(
         best = study.best_params
         log.info("Optuna best — val_loss=%.6f  params=%s", study.best_value, best)
         # Override with Optuna's best hyperparameters
-        lr      = best["lr"]
+        lr = best["lr"]
         dropout = best.get("dropout", dropout)
         if architecture == "conv":
             base_embed_dim = best.get("base_embed_dim", base_embed_dim)
-            conv_dim       = best.get("conv_dim", conv_dim)
-            head_dim       = best.get("head_dim", head_dim)
-            kernel_size    = best.get("kernel_size", kernel_size)
+            conv_dim = best.get("conv_dim", conv_dim)
+            head_dim = best.get("head_dim", head_dim)
+            kernel_size = best.get("kernel_size", kernel_size)
         else:
             kmer_embed_dim = best.get("kmer_embed_dim", kmer_embed_dim)
-            hidden_dim     = best.get("hidden_dim", hidden_dim)
+            hidden_dim = best.get("hidden_dim", hidden_dim)
         (output_dir / "optuna_best_params.json").write_text(
             json.dumps({"best_val_loss": study.best_value, **best}, indent=2)
         )
@@ -890,8 +923,17 @@ def train_mlp(
         log.info(
             "Training — arch=conv  %d epochs  loss=%s  lr=%.2e  base_embed=%d  "
             "conv_dim=%d  n_layers=%d  k=%d  head=%d  meth_proj=%d  dropout=%.2f  accel=%s",
-            epochs, loss_name, lr, base_embed_dim, conv_dim, n_conv_layers,
-            kernel_size, head_dim, meth_proj_dim, dropout, accelerator,
+            epochs,
+            loss_name,
+            lr,
+            base_embed_dim,
+            conv_dim,
+            n_conv_layers,
+            kernel_size,
+            head_dim,
+            meth_proj_dim,
+            dropout,
+            accelerator,
         )
         model = ConvPredictor(
             base_embed_dim=base_embed_dim,
@@ -906,8 +948,14 @@ def train_mlp(
         log.info(
             "Training — arch=mlp  %d epochs  loss=%s  lr=%.2e  embed=%d  hidden=%d  "
             "meth_proj=%d  dropout=%.2f  accel=%s",
-            epochs, loss_name, lr, kmer_embed_dim, hidden_dim, meth_proj_dim,
-            dropout, accelerator,
+            epochs,
+            loss_name,
+            lr,
+            kmer_embed_dim,
+            hidden_dim,
+            meth_proj_dim,
+            dropout,
+            accelerator,
         )
         model = MLPPredictor(
             kmer_embed_dim=kmer_embed_dim,
@@ -924,11 +972,12 @@ def train_mlp(
     meta = _read_pkl_meta(pkl_path)
     pkl_meth_types = meta.get("meth_types")  # list[str] | None
     if pkl_meth_types:
-        log.info("Training alphabet (from %s __meta__): %s",
-                 Path(pkl_path).name, pkl_meth_types)
+        log.info("Training alphabet (from %s __meta__): %s", Path(pkl_path).name, pkl_meth_types)
     else:
-        log.info("Training alphabet: all types in .pkl (no --meth-types filter "
-                 "was applied during extraction)")
+        log.info(
+            "Training alphabet: all types in .pkl (no --meth-types filter "
+            "was applied during extraction)"
+        )
 
     # Save model config BEFORE first epoch — generate.py needs it even if interrupted
     _save_model_config(output_dir, model, meth_types=pkl_meth_types)
@@ -942,7 +991,7 @@ def train_mlp(
         elif "state_dict" in ckpt:
             # Lightning format: strip "model." prefix added by KineticPredictor wrapper
             state_dict = {
-                k[len("model."):]: v
+                k[len("model.") :]: v
                 for k, v in ckpt["state_dict"].items()
                 if k.startswith("model.")
             }
@@ -981,6 +1030,7 @@ def train_mlp(
     loggers: list = [CSVLogger(str(output_dir), name="logs")]
     try:
         from torch.utils.tensorboard import SummaryWriter  # noqa: F401
+
         loggers.append(TensorBoardLogger(str(output_dir), name="runs"))
     except ImportError:
         log.warning("TensorBoard not available — CSV logger only.")
@@ -1010,8 +1060,10 @@ def train_mlp(
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def main(argv: list[str] | None = None) -> None:
     import argparse
+
     from .utils.config import load_yaml_config, setup_logging
 
     parser = argparse.ArgumentParser(
@@ -1030,75 +1082,125 @@ def main(argv: list[str] | None = None) -> None:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("pkl",        nargs="?", default=None,
-                        help="Balanced training data .pkl (from kinsim-prep balance)")
-    parser.add_argument("output_dir", nargs="?", default=None,
-                        help="Directory for checkpoints and logs")
-    parser.add_argument("--test-pkl", default=None,
-                        help="Held-out test .pkl — evaluated once after training "
-                             "(should be balanced the same way as the training set)")
+    parser.add_argument(
+        "pkl",
+        nargs="?",
+        default=None,
+        help="Balanced training data .pkl (from kinsim-prep balance)",
+    )
+    parser.add_argument(
+        "output_dir", nargs="?", default=None, help="Directory for checkpoints and logs"
+    )
+    parser.add_argument(
+        "--test-pkl",
+        default=None,
+        help="Held-out test .pkl — evaluated once after training "
+        "(should be balanced the same way as the training set)",
+    )
 
     # Architecture selection
-    parser.add_argument("--architecture",     default=None,
-                        choices=["conv", "mlp"],
-                        help="Model architecture: conv (default, 1D-conv + FiLM) or mlp (legacy embedding)")
+    parser.add_argument(
+        "--architecture",
+        default=None,
+        choices=["conv", "mlp"],
+        help="Model architecture: conv (default, 1D-conv + FiLM) or mlp (legacy embedding)",
+    )
 
     # Training hyperparameters
-    parser.add_argument("--config",           default=None,
-                        help="YAML config file (all flags can be set here)")
-    parser.add_argument("--epochs",           type=int,   default=None,
-                        help="Training epochs (default: 50)")
-    parser.add_argument("--batch-size",       type=int,   default=None,
-                        help="Batch size (default: 4096)")
-    parser.add_argument("--lr",               type=float, default=None,
-                        help="Learning rate (default: 1e-3)")
+    parser.add_argument(
+        "--config", default=None, help="YAML config file (all flags can be set here)"
+    )
+    parser.add_argument("--epochs", type=int, default=None, help="Training epochs (default: 50)")
+    parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: 4096)")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate (default: 1e-3)")
 
     # Conv architecture params
-    parser.add_argument("--base-embed-dim",   type=int,   default=None,
-                        help="[conv] Per-base embedding dimension (default: 16)")
-    parser.add_argument("--conv-dim",         type=int,   default=None,
-                        help="[conv] Conv channel width (default: 128)")
-    parser.add_argument("--n-conv-layers",    type=int,   default=None,
-                        help="[conv] Number of conv layers (default: 3)")
-    parser.add_argument("--kernel-size",      type=int,   default=None,
-                        help="[conv] Conv kernel size (default: 3)")
-    parser.add_argument("--head-dim",         type=int,   default=None,
-                        help="[conv] Head hidden layer width (default: 128)")
+    parser.add_argument(
+        "--base-embed-dim",
+        type=int,
+        default=None,
+        help="[conv] Per-base embedding dimension (default: 16)",
+    )
+    parser.add_argument(
+        "--conv-dim", type=int, default=None, help="[conv] Conv channel width (default: 128)"
+    )
+    parser.add_argument(
+        "--n-conv-layers", type=int, default=None, help="[conv] Number of conv layers (default: 3)"
+    )
+    parser.add_argument(
+        "--kernel-size", type=int, default=None, help="[conv] Conv kernel size (default: 3)"
+    )
+    parser.add_argument(
+        "--head-dim", type=int, default=None, help="[conv] Head hidden layer width (default: 128)"
+    )
 
     # MLP architecture params (legacy)
-    parser.add_argument("--kmer-embed-dim",   type=int,   default=None,
-                        help="[mlp] 11-mer embedding dimension (default: 64)")
-    parser.add_argument("--hidden-dim",       type=int,   default=None,
-                        help="[mlp] Hidden layer width (default: 128)")
+    parser.add_argument(
+        "--kmer-embed-dim",
+        type=int,
+        default=None,
+        help="[mlp] 11-mer embedding dimension (default: 64)",
+    )
+    parser.add_argument(
+        "--hidden-dim", type=int, default=None, help="[mlp] Hidden layer width (default: 128)"
+    )
 
     # Shared params
-    parser.add_argument("--meth-proj-dim",    type=int,   default=None,
-                        help="Methylation projection output dim (default: 8)")
-    parser.add_argument("--dropout",          type=float, default=None,
-                        help="Dropout probability (default: 0.1 for conv, 0.0 for mlp)")
-    parser.add_argument("--loss",             default=None,
-                        choices=["gnll", "mse", "huber"],
-                        help="Loss function: gnll=Gaussian NLL (default), mse, huber")
-    parser.add_argument("--val-fraction",     type=float, default=None,
-                        help="Fraction for validation split (default: 0.10)")
-    parser.add_argument("--checkpoint-every", type=int,   default=None,
-                        help="Save legacy checkpoint every N epochs (default: 10)")
-    parser.add_argument("--device",           default=None,
-                        choices=["cuda", "cpu"],
-                        help="Device (default: cuda, falls back to cpu automatically)")
-    parser.add_argument("--resume",           dest="resume_ckpt",
-                        help="Resume weights from a checkpoint .pt or .ckpt file")
+    parser.add_argument(
+        "--meth-proj-dim",
+        type=int,
+        default=None,
+        help="Methylation projection output dim (default: 8)",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=None,
+        help="Dropout probability (default: 0.1 for conv, 0.0 for mlp)",
+    )
+    parser.add_argument(
+        "--loss",
+        default=None,
+        choices=["gnll", "mse", "huber"],
+        help="Loss function: gnll=Gaussian NLL (default), mse, huber",
+    )
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=None,
+        help="Fraction for validation split (default: 0.10)",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=None,
+        help="Save legacy checkpoint every N epochs (default: 10)",
+    )
+    parser.add_argument(
+        "--device",
+        default=None,
+        choices=["cuda", "cpu"],
+        help="Device (default: cuda, falls back to cpu automatically)",
+    )
+    parser.add_argument(
+        "--resume", dest="resume_ckpt", help="Resume weights from a checkpoint .pt or .ckpt file"
+    )
 
     # Optuna HPO flags
-    parser.add_argument("--optuna",           action="store_true",
-                        help="Run Optuna HPO before the final training run")
-    parser.add_argument("--n-trials",         type=int,   default=None,
-                        help="Number of Optuna trials (default: 20)")
-    parser.add_argument("--optuna-epochs",    type=int,   default=None,
-                        help="Epochs per Optuna trial (default: 20, shorter than --epochs)")
+    parser.add_argument(
+        "--optuna", action="store_true", help="Run Optuna HPO before the final training run"
+    )
+    parser.add_argument(
+        "--n-trials", type=int, default=None, help="Number of Optuna trials (default: 20)"
+    )
+    parser.add_argument(
+        "--optuna-epochs",
+        type=int,
+        default=None,
+        help="Epochs per Optuna trial (default: 20, shorter than --epochs)",
+    )
 
-    parser.add_argument("--verbose", "-v",    action="store_true",
-                        help="Enable DEBUG-level logging")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG-level logging")
 
     args = parser.parse_args(argv)
     setup_logging(verbose=args.verbose)
@@ -1111,7 +1213,7 @@ def main(argv: list[str] | None = None) -> None:
     def _get(cli_val, key, default):
         return cli_val if cli_val is not None else cfg.get(key, default)
 
-    pkl_path   = args.pkl        or cfg.get("pkl")
+    pkl_path = args.pkl or cfg.get("pkl")
     output_dir = args.output_dir or cfg.get("output_dir")
 
     if not pkl_path:
@@ -1124,33 +1226,33 @@ def main(argv: list[str] | None = None) -> None:
     default_dropout = 0.1 if architecture == "conv" else 0.0
 
     train_mlp(
-        pkl_path         = pkl_path,
-        output_dir       = output_dir,
-        test_pkl         = args.test_pkl or cfg.get("test_pkl"),
-        architecture     = architecture,
-        epochs           = _get(args.epochs,          "epochs",          50),
-        batch_size       = _get(args.batch_size,      "batch_size",      4096),
-        lr               = _get(args.lr,              "lr",              1e-3),
+        pkl_path=pkl_path,
+        output_dir=output_dir,
+        test_pkl=args.test_pkl or cfg.get("test_pkl"),
+        architecture=architecture,
+        epochs=_get(args.epochs, "epochs", 50),
+        batch_size=_get(args.batch_size, "batch_size", 4096),
+        lr=_get(args.lr, "lr", 1e-3),
         # Conv params
-        base_embed_dim   = _get(args.base_embed_dim,  "base_embed_dim",  16),
-        conv_dim         = _get(args.conv_dim,        "conv_dim",        128),
-        n_conv_layers    = _get(args.n_conv_layers,   "n_conv_layers",   3),
-        kernel_size      = _get(args.kernel_size,     "kernel_size",     3),
-        head_dim         = _get(args.head_dim,        "head_dim",        128),
+        base_embed_dim=_get(args.base_embed_dim, "base_embed_dim", 16),
+        conv_dim=_get(args.conv_dim, "conv_dim", 128),
+        n_conv_layers=_get(args.n_conv_layers, "n_conv_layers", 3),
+        kernel_size=_get(args.kernel_size, "kernel_size", 3),
+        head_dim=_get(args.head_dim, "head_dim", 128),
         # MLP params
-        kmer_embed_dim   = _get(args.kmer_embed_dim,  "kmer_embed_dim",  64),
-        hidden_dim       = _get(args.hidden_dim,      "hidden_dim",      128),
+        kmer_embed_dim=_get(args.kmer_embed_dim, "kmer_embed_dim", 64),
+        hidden_dim=_get(args.hidden_dim, "hidden_dim", 128),
         # Shared
-        meth_proj_dim    = _get(args.meth_proj_dim,   "meth_proj_dim",   8),
-        dropout          = _get(args.dropout,         "dropout",         default_dropout),
-        loss_name        = _get(args.loss,            "loss",            "gnll"),
-        val_fraction     = _get(args.val_fraction,    "val_fraction",    0.10),
-        checkpoint_every = _get(args.checkpoint_every,"checkpoint_every",10),
-        device           = _get(args.device,          "device",          "cuda"),
-        resume_ckpt      = args.resume_ckpt or cfg.get("resume"),
-        run_optuna       = args.optuna or cfg.get("optuna", False),
-        n_trials         = _get(args.n_trials,        "n_trials",        20),
-        optuna_epochs    = _get(args.optuna_epochs,   "optuna_epochs",   20),
+        meth_proj_dim=_get(args.meth_proj_dim, "meth_proj_dim", 8),
+        dropout=_get(args.dropout, "dropout", default_dropout),
+        loss_name=_get(args.loss, "loss", "gnll"),
+        val_fraction=_get(args.val_fraction, "val_fraction", 0.10),
+        checkpoint_every=_get(args.checkpoint_every, "checkpoint_every", 10),
+        device=_get(args.device, "device", "cuda"),
+        resume_ckpt=args.resume_ckpt or cfg.get("resume"),
+        run_optuna=args.optuna or cfg.get("optuna", False),
+        n_trials=_get(args.n_trials, "n_trials", 20),
+        optuna_epochs=_get(args.optuna_epochs, "optuna_epochs", 20),
     )
 
 

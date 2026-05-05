@@ -102,8 +102,11 @@ def balance_pkl(
     meta = data.pop("__meta__", None)
 
     # Separate data keys from metadata
-    keyed = {k: v for k, v in data.items()
-             if isinstance(k, tuple) and len(k) == 2 and isinstance(v, np.ndarray)}
+    keyed = {
+        k: v
+        for k, v in data.items()
+        if isinstance(k, tuple) and len(k) == 2 and isinstance(v, np.ndarray)
+    }
 
     keys_in = len(keyed)
     samples_in = sum(len(v) for v in keyed.values())
@@ -115,14 +118,17 @@ def balance_pkl(
         by_meth[meth_id].append(key)
 
     unmeth_keys = by_meth.get(_NONE_ID, [])
-    meth_by_type: dict[int, list] = {
-        mid: keys for mid, keys in by_meth.items() if mid != _NONE_ID
-    }
+    meth_by_type: dict[int, list] = {mid: keys for mid, keys in by_meth.items() if mid != _NONE_ID}
     present_types = sorted(meth_by_type.keys())
     total_meth_keys = sum(len(v) for v in meth_by_type.values())
 
-    log.info("Keys in dict: %d total  (%d unmeth, %d meth across %d types)",
-             keys_in, len(unmeth_keys), total_meth_keys, len(present_types))
+    log.info(
+        "Keys in dict: %d total  (%d unmeth, %d meth across %d types)",
+        keys_in,
+        len(unmeth_keys),
+        total_meth_keys,
+        len(present_types),
+    )
     for mid in present_types:
         log.info("  %s: %d keys", _METH_NAMES.get(mid, mid), len(meth_by_type[mid]))
 
@@ -132,13 +138,13 @@ def balance_pkl(
         # actually achieved: total = meth_keys / meth_fraction
         # e.g. 6K meth keys at 50% → 12K total → 6K unmeth kept, 2M dropped
         if total_meth_keys > 0 and 0 < meth_fraction < 1:
-            total_available = min(keys_in, int(round(total_meth_keys / meth_fraction)))
+            total_available = min(keys_in, round(total_meth_keys / meth_fraction))
         else:
             total_available = keys_in
     else:
         total_available = min(max_keys, keys_in)
 
-    n_meth_budget  = min(int(round(total_available * meth_fraction)), total_meth_keys)
+    n_meth_budget = min(round(total_available * meth_fraction), total_meth_keys)
     n_unmeth_budget = total_available - n_meth_budget
 
     # Distribute meth budget evenly across mod types; redistribute leftovers
@@ -167,13 +173,10 @@ def balance_pkl(
     else:
         type_targets = {}
 
-    log.info("Key budget: %d total  (%.0f%% meth target)",
-             total_available, meth_fraction * 100)
+    log.info("Key budget: %d total  (%.0f%% meth target)", total_available, meth_fraction * 100)
     for mid, n in type_targets.items():
-        log.info("  %s: keep %d / %d keys",
-                 _METH_NAMES.get(mid, mid), n, len(meth_by_type[mid]))
-    log.info("  none: keep %d / %d keys",
-             min(n_unmeth_budget, len(unmeth_keys)), len(unmeth_keys))
+        log.info("  %s: keep %d / %d keys", _METH_NAMES.get(mid, mid), n, len(meth_by_type[mid]))
+    log.info("  none: keep %d / %d keys", min(n_unmeth_budget, len(unmeth_keys)), len(unmeth_keys))
 
     # ---- Select keys ----
     def _select_keys(candidates: list, n: int) -> list:
@@ -228,13 +231,13 @@ def balance_pkl(
         "keys_out": keys_out,
         "samples_in": samples_in,
         "samples_out": samples_out,
-        "keys_by_type_in":  {_METH_NAMES.get(m, str(m)): len(k)
-                              for m, k in by_meth.items()},
+        "keys_by_type_in": {_METH_NAMES.get(m, str(m)): len(k) for m, k in by_meth.items()},
         "keys_by_type_out": keys_by_type_out,
     }
 
-    log.info("Balanced: %d -> %d keys,  %d -> %d samples",
-             keys_in, keys_out, samples_in, samples_out)
+    log.info(
+        "Balanced: %d -> %d keys,  %d -> %d samples", keys_in, keys_out, samples_in, samples_out
+    )
     log.info("Output: %s", output_path)
     return stats
 
@@ -259,24 +262,29 @@ def main(argv=None) -> None:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("input",  help="Merged dictionary .pkl file")
+    parser.add_argument("input", help="Merged dictionary .pkl file")
     parser.add_argument("output", help="Output balanced dictionary .pkl file")
     parser.add_argument(
-        "--meth-fraction", type=float, default=0.5,
+        "--meth-fraction",
+        type=float,
+        default=0.5,
         help="Target fraction of kept keys that are methylated (default: 0.5). "
-             "Methylated budget is split evenly across all mod types present.",
+        "Methylated budget is split evenly across all mod types present.",
     )
     parser.add_argument(
-        "--max-keys", type=int, default=0,
+        "--max-keys",
+        type=int,
+        default=0,
         help="Total key budget (default: 0 = keep all keys, only rebalance types).",
     )
     parser.add_argument(
-        "--samples-per-key", type=int, default=0,
+        "--samples-per-key",
+        type=int,
+        default=0,
         help="Subsample each key to this many samples using IPD-quantile diversity "
-             "selection (default: 0 = keep all samples). Recommended: 200.",
+        "selection (default: 0 = keep all samples). Recommended: 200.",
     )
-    parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Enable DEBUG-level logging")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG-level logging")
 
     args = parser.parse_args(argv)
     setup_logging(verbose=args.verbose)

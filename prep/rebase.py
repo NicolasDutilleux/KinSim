@@ -25,7 +25,6 @@ REBASE Format #19 MS field uses position(type) where type is 6mA, N4mC, or 5mC.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import sys
 
@@ -34,28 +33,29 @@ from kinsim.utils.encoding import METH_IDS
 log = logging.getLogger(__name__)
 
 # Regex to validate IUPAC-only recognition sequences
-_IUPAC_RE = re.compile(r'^[ACGTRYSWKMBDHVN]+$')
+_IUPAC_RE = re.compile(r"^[ACGTRYSWKMBDHVN]+$")
 
 # REBASE Y-code -> KinSim mod type (used in simple X(Y) notation)
-_REBASE_CODE_TO_METH = {'6': 'm6A', '5': 'm5C', '4': 'm4C'}
+_REBASE_CODE_TO_METH = {"6": "m6A", "5": "m5C", "4": "m4C"}
 
 # REBASE Format #19 MS type strings -> KinSim mod type
 _REBASE_TYPE_TO_METH = {
-    '6mA': 'm6A',
-    '5mC': 'm5C',
-    'N4mC': 'm4C',
+    "6mA": "m6A",
+    "5mC": "m5C",
+    "N4mC": "m4C",
 }
 
 # Regex for simplified two-column REBASE annotations: "2(6)" or "-1(4)"
-_SITE_RE = re.compile(r'(-?\d+)\((\d)\)')
+_SITE_RE = re.compile(r"(-?\d+)\((\d)\)")
 
 # Regex for Format #19 MS field annotations: "3(6mA)" or "-1(N4mC)"
-_MS_SITE_RE = re.compile(r'(-?\d+)\((\w+)\)')
+_MS_SITE_RE = re.compile(r"(-?\d+)\((\w+)\)")
 
 
 # ---------------------------------------------------------------------------
 # X(Y) notation parser (shared between simple and Format #19)
 # ---------------------------------------------------------------------------
+
 
 def parse_rebase_annotation(recognition_seq, meth_annotation):
     """Parse a REBASE X(Y) methylation annotation into KinSim motif entries.
@@ -89,13 +89,17 @@ def parse_rebase_annotation(recognition_seq, meth_annotation):
             continue
 
         if x > 0:
-            pos_0 = x - 1            # 1-based -> 0-based
+            pos_0 = x - 1  # 1-based -> 0-based
         else:
             pos_0 = seq_len - abs(x)  # from 5' of complementary strand
 
         if not (0 <= pos_0 < seq_len):
-            log.warning("REBASE: position %d out of range for '%s' (len=%d) -- skipped",
-                        x, recognition_seq, seq_len)
+            log.warning(
+                "REBASE: position %d out of range for '%s' (len=%d) -- skipped",
+                x,
+                recognition_seq,
+                seq_len,
+            )
             continue
 
         entries.append(f"{meth_type},{recognition_seq},{pos_0}")
@@ -105,6 +109,7 @@ def parse_rebase_annotation(recognition_seq, meth_annotation):
 # ---------------------------------------------------------------------------
 # Simplified two-column REBASE format
 # ---------------------------------------------------------------------------
+
 
 def parse_rebase_simple(filepath):
     """Parse a simplified two-column REBASE tab-delimited file.
@@ -127,27 +132,30 @@ def parse_rebase_simple(filepath):
     with open(filepath) as f:
         for lineno, line in enumerate(f, 1):
             line = line.strip()
-            if not line or line.startswith('#'):
+            if not line or line.startswith("#"):
                 continue
-            parts = re.split(r'\s+', line, maxsplit=1)
+            parts = re.split(r"\s+", line, maxsplit=1)
             if len(parts) < 2:
-                log.warning("REBASE line %d: expected 2 columns, got %d -- skipped",
-                            lineno, len(parts))
+                log.warning(
+                    "REBASE line %d: expected 2 columns, got %d -- skipped", lineno, len(parts)
+                )
                 continue
             rec_seq = parts[0].upper()
             meth_ann = parts[1]
             if not _IUPAC_RE.match(rec_seq):
-                log.warning("REBASE line %d: invalid IUPAC sequence '%s' -- skipped",
-                            lineno, rec_seq)
+                log.warning(
+                    "REBASE line %d: invalid IUPAC sequence '%s' -- skipped", lineno, rec_seq
+                )
                 continue
             entries = parse_rebase_annotation(rec_seq, meth_ann)
             all_entries.extend(entries)
-    return ';'.join(all_entries)
+    return ";".join(all_entries)
 
 
 # ---------------------------------------------------------------------------
 # REBASE Format #19 (withrefm / allenz-style tagged records)
 # ---------------------------------------------------------------------------
+
 
 def parse_rebase_withrefm(filepath):
     """Parse a REBASE Format #19 file (withrefm or allenz-style).
@@ -177,58 +185,64 @@ def parse_rebase_withrefm(filepath):
     with open(filepath) as f:
         current = {}
         for line in f:
-            line = line.rstrip('\n')
-            if line.startswith('//'):
+            line = line.rstrip("\n")
+            if line.startswith("//"):
                 # End of record: process if we have RS and MS
-                rec_seq = current.get('RS', '').strip()
-                ms_raw  = current.get('MS', '').strip()
+                rec_seq = current.get("RS", "").strip()
+                ms_raw = current.get("MS", "").strip()
 
-                if rec_seq and rec_seq != '?' and ms_raw and ms_raw != '?':
+                if rec_seq and rec_seq != "?" and ms_raw and ms_raw != "?":
                     # Clean recognition sequence: remove cleavage site indicators
-                    rec_clean = re.sub(r'[^ACGTRYMKSWHBVDN]', '', rec_seq.upper())
+                    rec_clean = re.sub(r"[^ACGTRYMKSWHBVDN]", "", rec_seq.upper())
                     if rec_clean and not _IUPAC_RE.match(rec_clean):
-                        log.warning("REBASE: invalid IUPAC in RS '%s' (enzyme %s) -- skipped",
-                                    rec_seq, current.get('ID', '?'))
-                        rec_clean = ''
+                        log.warning(
+                            "REBASE: invalid IUPAC in RS '%s' (enzyme %s) -- skipped",
+                            rec_seq,
+                            current.get("ID", "?"),
+                        )
+                        rec_clean = ""
                 if rec_clean:
-                        for site_match in _MS_SITE_RE.finditer(ms_raw):
-                            x   = int(site_match.group(1))
-                            typ = site_match.group(2)
-                            meth_type = _REBASE_TYPE_TO_METH.get(typ)
-                            if meth_type is None:
-                                log.warning("REBASE: unknown MS type '%s' (enzyme %s) -- skipped",
-                                            typ, current.get('ID', '?'))
-                                continue
+                    for site_match in _MS_SITE_RE.finditer(ms_raw):
+                        x = int(site_match.group(1))
+                        typ = site_match.group(2)
+                        meth_type = _REBASE_TYPE_TO_METH.get(typ)
+                        if meth_type is None:
+                            log.warning(
+                                "REBASE: unknown MS type '%s' (enzyme %s) -- skipped",
+                                typ,
+                                current.get("ID", "?"),
+                            )
+                            continue
 
-                            seq_len = len(rec_clean)
-                            if x > 0:
-                                pos_0 = x - 1
-                            else:
-                                pos_0 = seq_len - abs(x)
+                        seq_len = len(rec_clean)
+                        if x > 0:
+                            pos_0 = x - 1
+                        else:
+                            pos_0 = seq_len - abs(x)
 
-                            if 0 <= pos_0 < seq_len:
-                                all_entries.append(
-                                    f"{meth_type},{rec_clean},{pos_0}")
+                        if 0 <= pos_0 < seq_len:
+                            all_entries.append(f"{meth_type},{rec_clean},{pos_0}")
 
                 current = {}
                 continue
 
             # Tagged-field line: "ID   name" or "RS\tGATC, 2;"
-            m = re.match(r'^(\w{2})\s{2,}(.+)', line)
-            if not m and '\t' in line:
-                m = re.match(r'^(\w{2})\t(.+)', line)
+            m = re.match(r"^(\w{2})\s{2,}(.+)", line)
+            if not m and "\t" in line:
+                m = re.match(r"^(\w{2})\t(.+)", line)
             if m:
                 tag = m.group(1).strip()
                 val = m.group(2).strip()
-                if tag in ('ID', 'RS', 'MS', 'ET'):
+                if tag in ("ID", "RS", "MS", "ET"):
                     current[tag] = val
 
-    return ';'.join(all_entries)
+    return ";".join(all_entries)
 
 
 # ---------------------------------------------------------------------------
 # Auto-detecting REBASE file parser
 # ---------------------------------------------------------------------------
+
 
 def parse_rebase_file(filepath):
     """Auto-detect REBASE format and parse accordingly.
@@ -243,7 +257,7 @@ def parse_rebase_file(filepath):
     """
     with open(filepath) as f:
         for line in f:
-            if line.startswith(('ID   ', 'RS   ', 'MS   ')):
+            if line.startswith(("ID   ", "RS   ", "MS   ")):
                 return parse_rebase_withrefm(filepath)
     return parse_rebase_simple(filepath)
 
@@ -251,6 +265,7 @@ def parse_rebase_file(filepath):
 # ---------------------------------------------------------------------------
 # Fuzznuc pattern file generator
 # ---------------------------------------------------------------------------
+
 
 def write_fuzznuc_pattern_file(motif_string, filepath):
     """Convert a KinSim motif string to a fuzznuc named-pattern file.
@@ -276,13 +291,13 @@ def write_fuzznuc_pattern_file(motif_string, filepath):
     pattern_lookup = {}  # name -> (meth_id, mod_pos)
 
     lines = []
-    for entry in motif_string.split(';'):
-        if not entry or ',' not in entry:
+    for entry in motif_string.split(";"):
+        if not entry or "," not in entry:
             continue
-        parts = entry.split(',')
+        parts = entry.split(",")
         m_type, seq, pos_str = parts[0], parts[1], parts[2]
-        meth_id  = METH_IDS.get(m_type, 0)
-        mod_pos  = int(pos_str)
+        meth_id = METH_IDS.get(m_type, 0)
+        mod_pos = int(pos_str)
 
         # Unique name encodes all fields needed for GFF lookup
         name = f"{m_type}_{seq}_{mod_pos}"
@@ -292,8 +307,8 @@ def write_fuzznuc_pattern_file(motif_string, filepath):
             pattern_lookup[name] = (meth_id, mod_pos)
             lines.append(f">{name}\n{seq}")
 
-    with open(filepath, 'w') as f:
-        f.write('\n'.join(lines) + '\n')
+    with open(filepath, "w") as f:
+        f.write("\n".join(lines) + "\n")
 
     return pattern_lookup
 
@@ -305,12 +320,12 @@ def decode_fuzznuc_pattern_name(name):
 
     Returns (meth_id, mod_pos) or (0, 0) if decoding fails.
     """
-    parts = name.split('_')
+    parts = name.split("_")
     if len(parts) < 3:
         return 0, 0
     try:
         mod_pos = int(parts[-1])
-        m_type  = parts[0]
+        m_type = parts[0]
         meth_id = METH_IDS.get(m_type, 0)
         return meth_id, mod_pos
     except (ValueError, IndexError):
@@ -320,6 +335,7 @@ def decode_fuzznuc_pattern_name(name):
 # ---------------------------------------------------------------------------
 # Isoschizomer mapping (Format #19 only)
 # ---------------------------------------------------------------------------
+
 
 def parse_rebase_isoschizomers(filepath):
     """Parse a REBASE Format #19 file and group enzymes by recognition sequence.
@@ -341,13 +357,13 @@ def parse_rebase_isoschizomers(filepath):
     with open(filepath) as f:
         current: dict[str, str] = {}
         for line in f:
-            line = line.rstrip('\n')
-            if line.startswith('//'):
-                rec_seq = current.get('RS', '').strip()
-                enz_id  = current.get('ID', '').strip()
+            line = line.rstrip("\n")
+            if line.startswith("//"):
+                rec_seq = current.get("RS", "").strip()
+                enz_id = current.get("ID", "").strip()
 
-                if rec_seq and rec_seq != '?' and enz_id:
-                    rec_clean = re.sub(r'[^ACGTRYMKSWHBVDN]', '', rec_seq.upper())
+                if rec_seq and rec_seq != "?" and enz_id:
+                    rec_clean = re.sub(r"[^ACGTRYMKSWHBVDN]", "", rec_seq.upper())
                     if rec_clean and _IUPAC_RE.match(rec_clean):
                         if rec_clean not in iso_map:
                             iso_map[rec_clean] = []
@@ -357,13 +373,13 @@ def parse_rebase_isoschizomers(filepath):
                 current = {}
                 continue
 
-            m = re.match(r'^(\w{2})\s{2,}(.+)', line)
-            if not m and '\t' in line:
-                m = re.match(r'^(\w{2})\t(.+)', line)
+            m = re.match(r"^(\w{2})\s{2,}(.+)", line)
+            if not m and "\t" in line:
+                m = re.match(r"^(\w{2})\t(.+)", line)
             if m:
                 tag = m.group(1).strip()
                 val = m.group(2).strip()
-                if tag in ('ID', 'RS', 'MS', 'ET'):
+                if tag in ("ID", "RS", "MS", "ET"):
                     current[tag] = val
 
     return iso_map
@@ -398,21 +414,30 @@ def parse_rebase_isoschizomers(filepath):
 # These are REBASE's historic colors as of 2024.
 _REBASE_FALLBACK_COLORS: dict[str, str] = {
     # m6A -- blue variants
-    '#1e90ff': 'm6A', '1e90ff': 'm6A',
-    '#0000ff': 'm6A', '0000ff': 'm6A',
-    '#4169e1': 'm6A', '4169e1': 'm6A',
+    "#1e90ff": "m6A",
+    "1e90ff": "m6A",
+    "#0000ff": "m6A",
+    "0000ff": "m6A",
+    "#4169e1": "m6A",
+    "4169e1": "m6A",
     # m5C -- green variants
-    '#008000': 'm5C', '008000': 'm5C',
-    '#228b22': 'm5C', '228b22': 'm5C',
-    '#006400': 'm5C', '006400': 'm5C',
+    "#008000": "m5C",
+    "008000": "m5C",
+    "#228b22": "m5C",
+    "228b22": "m5C",
+    "#006400": "m5C",
+    "006400": "m5C",
     # m4C -- orange variants
-    '#ff8c00': 'm4C', 'ff8c00': 'm4C',
-    '#ffa500': 'm4C', 'ffa500': 'm4C',
-    '#ff7f00': 'm4C', 'ff7f00': 'm4C',
+    "#ff8c00": "m4C",
+    "ff8c00": "m4C",
+    "#ffa500": "m4C",
+    "ffa500": "m4C",
+    "#ff7f00": "m4C",
+    "ff7f00": "m4C",
 }
 
 # IUPAC validation for motif sequences extracted from HTML
-_IUPAC_MOTIF_RE = re.compile(r'^[ACGTNRYSWKMBDHV]+$')
+_IUPAC_MOTIF_RE = re.compile(r"^[ACGTNRYSWKMBDHV]+$")
 
 
 def _fetch_rebase_html(org_num: int) -> str:
@@ -422,29 +447,27 @@ def _fetch_rebase_html(org_num: int) -> str:
 
     Raises RuntimeError on network or HTTP errors.
     """
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     url = f"https://rebase.neb.com/cgi-bin/pacbioget?{org_num}"
     log.info("Fetching REBASE page: %s", url)
     try:
         req = urllib.request.Request(
             url,
-            headers={'User-Agent': 'KinSim/0.3.0 (github.com/NicolasDutilleux/KinSim)'},
+            headers={"User-Agent": "KinSim/0.3.0 (github.com/NicolasDutilleux/KinSim)"},
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
-            html = resp.read().decode('utf-8', errors='replace')
+            html = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
         raise RuntimeError(
             f"REBASE returned HTTP {e.code} for organism {org_num}. "
             "Check that the organism number is valid."
         ) from e
     except Exception as e:
-        raise RuntimeError(
-            f"Failed to fetch REBASE page for organism {org_num}: {e}"
-        ) from e
+        raise RuntimeError(f"Failed to fetch REBASE page for organism {org_num}: {e}") from e
 
-    if 'MTases active in the genome' not in html:
+    if "MTases active in the genome" not in html:
         raise RuntimeError(
             f"REBASE page for organism {org_num} does not contain expected "
             "'MTases active in the genome' section. "
@@ -470,12 +493,12 @@ def _parse_color_legend(html: str) -> dict[str, str]:
     )
     for m in pattern.finditer(snippet):
         color = m.group(1).strip()
-        meth  = m.group(2)
+        meth = m.group(2)
         # Store both with and without leading '#' so lookup is forgiving
         color_to_meth[color.lower()] = meth
-        stripped = color.lower().lstrip('#')
+        stripped = color.lower().lstrip("#")
         color_to_meth[stripped] = meth
-        color_to_meth['#' + stripped] = meth
+        color_to_meth["#" + stripped] = meth
     return color_to_meth
 
 
@@ -485,16 +508,16 @@ def _resolve_color(color: str, color_to_meth: dict[str, str]) -> str | None:
     Tries the color as-is, then lowercased, then with/without '#', then
     falls back to _REBASE_FALLBACK_COLORS.
     """
-    for key in (color, color.lower(), color.lower().lstrip('#'),
-                '#' + color.lower().lstrip('#')):
+    for key in (color, color.lower(), color.lower().lstrip("#"), "#" + color.lower().lstrip("#")):
         result = color_to_meth.get(key) or _REBASE_FALLBACK_COLORS.get(key)
         if result:
             return result
     return None
 
 
-def _parse_motif_cell(cell_html: str,
-                      color_to_meth: dict[str, str]) -> list[tuple[str, int, str, str]]:
+def _parse_motif_cell(
+    cell_html: str, color_to_meth: dict[str, str]
+) -> list[tuple[str, int, str, str]]:
     """Parse a REBASE motif table cell.
 
     REBASE colors bases to indicate methylation:
@@ -508,31 +531,31 @@ def _parse_motif_cell(cell_html: str,
         strand is 'top' (base matches mod type directly) or 'rc' (complement).
         Empty list if nothing parseable.
     """
-    tag_re   = re.compile(r'<[^>]+>')
-    font_re  = re.compile(
+    tag_re = re.compile(r"<[^>]+>")
+    font_re = re.compile(
         r'<font[^>]+color\s*=\s*["\']?([^"\'>\s]+)["\']?[^>]*>([A-Za-z]+)</font>',
         re.IGNORECASE,
     )
 
     # Direct base and complement base for each mod type
-    _DIRECT = {'m6A': 'A', 'm4C': 'C', 'm5C': 'C'}
-    _COMPL  = {'m6A': 'T', 'm4C': 'G', 'm5C': 'G'}
+    _DIRECT = {"m6A": "A", "m4C": "C", "m5C": "C"}
+    _COMPL = {"m6A": "T", "m4C": "G", "m5C": "G"}
 
-    full_motif = tag_re.sub('', cell_html).strip().upper()
+    full_motif = tag_re.sub("", cell_html).strip().upper()
     if not full_motif or not _IUPAC_MOTIF_RE.match(full_motif):
         return []
 
     results: list[tuple[str, int, str, str]] = []
     for m in font_re.finditer(cell_html):
-        color    = m.group(1).strip()
+        color = m.group(1).strip()
         base_str = m.group(2).strip().upper()
         mod_type = _resolve_color(color, color_to_meth)
         if mod_type is None:
             continue
 
-        before_tag  = cell_html[:m.start()]
-        text_before = tag_re.sub('', before_tag).strip()
-        pos         = len(text_before)
+        before_tag = cell_html[: m.start()]
+        text_before = tag_re.sub("", before_tag).strip()
+        pos = len(text_before)
 
         for char_offset, base_char in enumerate(base_str):
             actual_pos = pos + char_offset
@@ -540,9 +563,9 @@ def _parse_motif_cell(cell_html: str,
                 continue
 
             if base_char == _DIRECT.get(mod_type):
-                results.append((full_motif, actual_pos, mod_type, 'top'))
+                results.append((full_motif, actual_pos, mod_type, "top"))
             elif base_char == _COMPL.get(mod_type):
-                results.append((full_motif, actual_pos, mod_type, 'rc'))
+                results.append((full_motif, actual_pos, mod_type, "rc"))
 
     return results
 
@@ -550,19 +573,19 @@ def _parse_motif_cell(cell_html: str,
 def _find_table_end(html: str, table_start: int) -> int:
     """Return the index just past the </table> that closes the <table> at table_start."""
     depth = 0
-    pos   = table_start
-    lo    = html.lower()
+    pos = table_start
+    lo = html.lower()
     while pos < len(lo):
-        next_open  = lo.find('<table',  pos)
-        next_close = lo.find('</table>', pos)
+        next_open = lo.find("<table", pos)
+        next_close = lo.find("</table>", pos)
         if next_close == -1:
             break
         if next_open != -1 and next_open < next_close:
             depth += 1
-            pos = next_open + len('<table')
+            pos = next_open + len("<table")
         else:
             depth -= 1
-            pos = next_close + len('</table>')
+            pos = next_close + len("</table>")
             if depth == 0:
                 return pos
     return len(html)
@@ -571,6 +594,7 @@ def _find_table_end(html: str, table_start: int) -> int:
 def _is_palindromic(motif: str) -> bool:
     """True if the IUPAC motif is its own reverse complement."""
     from kinsim.utils.motifs import reverse_complement
+
     return reverse_complement(motif.upper()) == motif.upper()
 
 
@@ -583,8 +607,7 @@ def _rc_offset(motif: str, offset: int) -> int:
     return len(motif) - 1 - offset
 
 
-def _parse_active_mtases_table(html: str,
-                                color_to_meth: dict[str, str]) -> list[dict]:
+def _parse_active_mtases_table(html: str, color_to_meth: dict[str, str]) -> list[dict]:
     """Parse the 'MTases active in the genome' table and return entry dicts.
 
     For non-palindromic motifs (% Detected shows two values like "86.4/85.0"),
@@ -593,34 +616,35 @@ def _parse_active_mtases_table(html: str,
 
     For palindromic motifs (% Detected shows one value), generates one entry.
     """
-    from .motif_merge import _make_entry
     from kinsim.utils.motifs import reverse_complement
 
-    marker = 'MTases active in the genome'
+    from .motif_merge import _make_entry
+
+    marker = "MTases active in the genome"
     idx = html.find(marker)
     if idx == -1:
         return []
 
     # Walk back to the nearest <table> that contains the marker
-    table_start = html.lower().rfind('<table', 0, idx)
+    table_start = html.lower().rfind("<table", 0, idx)
     if table_start == -1:
         log.warning("REBASE HTML: <table> not found before active MTases section")
         return []
 
-    table_end  = _find_table_end(html, table_start)
+    table_end = _find_table_end(html, table_start)
     table_html = html[table_start:table_end]
 
-    tag_re  = re.compile(r'<[^>]+>')
-    row_re  = re.compile(r'<tr[^>]*>(.*?)</tr>',       re.IGNORECASE | re.DOTALL)
-    cell_re = re.compile(r'<t[dh][^>]*>(.*?)</t[dh]>', re.IGNORECASE | re.DOTALL)
+    tag_re = re.compile(r"<[^>]+>")
+    row_re = re.compile(r"<tr[^>]*>(.*?)</tr>", re.IGNORECASE | re.DOTALL)
+    cell_re = re.compile(r"<t[dh][^>]*>(.*?)</t[dh]>", re.IGNORECASE | re.DOTALL)
 
     entries: list[dict] = []
     header_found = False
 
     # Default column indices (guard against header parsing failure)
-    col_motif    = 5
-    col_count    = 6
-    col_pct      = 9
+    col_motif = 5
+    col_count = 6
+    col_pct = 9
     col_coverage = 10
 
     for row_m in row_re.finditer(table_html):
@@ -629,15 +653,19 @@ def _parse_active_mtases_table(html: str,
         if not cells:
             continue
 
-        texts = [tag_re.sub('', c).strip() for c in cells]
+        texts = [tag_re.sub("", c).strip() for c in cells]
 
         # Identify header row by presence of 'Motif' column
-        if not header_found and 'Motif' in texts:
+        if not header_found and "Motif" in texts:
             for i, t in enumerate(texts):
-                if t == 'Motif':         col_motif    = i
-                elif t == 'Count':       col_count    = i
-                elif 'Detected' in t:    col_pct      = i
-                elif t == 'Coverage':    col_coverage = i
+                if t == "Motif":
+                    col_motif = i
+                elif t == "Count":
+                    col_count = i
+                elif "Detected" in t:
+                    col_pct = i
+                elif t == "Coverage":
+                    col_coverage = i
             header_found = True
             continue
 
@@ -655,20 +683,20 @@ def _parse_active_mtases_table(html: str,
 
         # Use the first hit to get motif_str and mod_type
         motif_str = hits[0][0]
-        mod_type  = hits[0][2]
+        mod_type = hits[0][2]
 
         # Count -> nDetected
-        n_detected: int | str = ''
+        n_detected: int | str = ""
         if col_count < len(cells):
             try:
-                n_detected = int(texts[col_count].replace(',', ''))
+                n_detected = int(texts[col_count].replace(",", ""))
             except (ValueError, AttributeError):
                 pass
 
         # % Detected -> parse top/bottom fractions separately
         pct_parts: list[float] = []
         if col_pct < len(cells):
-            raw = texts[col_pct].split('/')
+            raw = texts[col_pct].split("/")
             try:
                 pct_parts = [float(p.strip()) / 100.0 for p in raw if p.strip()]
             except ValueError:
@@ -677,9 +705,9 @@ def _parse_active_mtases_table(html: str,
         is_palindrome = _is_palindromic(motif_str)
 
         # Coverage -> meanCoverage
-        mean_coverage: float | str = ''
+        mean_coverage: float | str = ""
         if col_coverage < len(cells):
-            cov_parts = texts[col_coverage].split('/')
+            cov_parts = texts[col_coverage].split("/")
             try:
                 mean_coverage = round(
                     sum(float(p.strip()) for p in cov_parts if p.strip()) / len(cov_parts),
@@ -691,32 +719,38 @@ def _parse_active_mtases_table(html: str,
         rc_motif = reverse_complement(motif_str)
 
         # Separate hits by strand
-        top_hits = [h for h in hits if h[3] == 'top']
-        rc_hits  = [h for h in hits if h[3] == 'rc']
+        top_hits = [h for h in hits if h[3] == "top"]
+        rc_hits = [h for h in hits if h[3] == "rc"]
 
         # ---- Top strand entry ----
         if top_hits:
-            center_pos = top_hits[0][1]   # 0-based from HTML
+            center_pos = top_hits[0][1]  # 0-based from HTML
             center_pos_1b = center_pos + 1
-            frac_top = round(pct_parts[0], 7) if pct_parts else ''
-            n_genome_top: int | str = ''
+            frac_top = round(pct_parts[0], 7) if pct_parts else ""
+            n_genome_top: int | str = ""
             if isinstance(n_detected, int) and isinstance(frac_top, float) and frac_top > 0:
                 n_genome_top = round(n_detected / frac_top)
 
-            entries.append(_make_entry(
-                motif_str=motif_str,
-                offset=center_pos_1b,
-                mod_type=mod_type,
-                fraction=frac_top,
-                n_detected=n_detected,
-                n_genome=n_genome_top,
-                mean_coverage=mean_coverage,
-                source='rebase',
-            ))
-            log.info("  [TOP]  %s offset=%d %s  frac=%.3f  palindromic=%s",
-                     motif_str, center_pos_1b, mod_type,
-                     frac_top if isinstance(frac_top, float) else 0,
-                     is_palindrome)
+            entries.append(
+                _make_entry(
+                    motif_str=motif_str,
+                    offset=center_pos_1b,
+                    mod_type=mod_type,
+                    fraction=frac_top,
+                    n_detected=n_detected,
+                    n_genome=n_genome_top,
+                    mean_coverage=mean_coverage,
+                    source="rebase",
+                )
+            )
+            log.info(
+                "  [TOP]  %s offset=%d %s  frac=%.3f  palindromic=%s",
+                motif_str,
+                center_pos_1b,
+                mod_type,
+                frac_top if isinstance(frac_top, float) else 0,
+                is_palindrome,
+            )
 
         # ---- RC strand entry (from complement-colored bases) ----
         if rc_hits and not is_palindrome:
@@ -725,39 +759,48 @@ def _parse_active_mtases_table(html: str,
             # position (len - 1 - P), which IS the correct base (A or C).
             rc_pos_0b = len(motif_str) - 1 - rc_hits[0][1]
             rc_pos_1b = rc_pos_0b + 1
-            frac_bot = round(pct_parts[1], 7) if len(pct_parts) >= 2 else ''
-            n_genome_bot: int | str = ''
+            frac_bot = round(pct_parts[1], 7) if len(pct_parts) >= 2 else ""
+            n_genome_bot: int | str = ""
             if isinstance(n_detected, int) and isinstance(frac_bot, float) and frac_bot > 0:
                 n_genome_bot = round(n_detected / frac_bot)
 
-            entries.append(_make_entry(
-                motif_str=rc_motif,
-                offset=rc_pos_1b,
-                mod_type=mod_type,
-                fraction=frac_bot,
-                n_detected=n_detected,
-                n_genome=n_genome_bot,
-                mean_coverage=mean_coverage,
-                source='rebase',
-            ))
-            log.info("  [RC]   %s offset=%d %s  frac=%.3f  (complement of %s)",
-                     rc_motif, rc_pos_1b, mod_type,
-                     frac_bot if isinstance(frac_bot, float) else 0,
-                     motif_str)
+            entries.append(
+                _make_entry(
+                    motif_str=rc_motif,
+                    offset=rc_pos_1b,
+                    mod_type=mod_type,
+                    fraction=frac_bot,
+                    n_detected=n_detected,
+                    n_genome=n_genome_bot,
+                    mean_coverage=mean_coverage,
+                    source="rebase",
+                )
+            )
+            log.info(
+                "  [RC]   %s offset=%d %s  frac=%.3f  (complement of %s)",
+                rc_motif,
+                rc_pos_1b,
+                mod_type,
+                frac_bot if isinstance(frac_bot, float) else 0,
+                motif_str,
+            )
 
         # ---- Fallback: no top hit but we have a single colored base ----
         # (shouldn't happen normally, but handles edge cases)
         if not top_hits and not rc_hits:
-            log.warning("REBASE HTML: no valid direct or complement hits for '%s'",
-                        motif_plain)
+            log.warning("REBASE HTML: no valid direct or complement hits for '%s'", motif_plain)
 
     # Deduplicate: same (motif, offset, mod_type) from multiple table rows
     seen: dict[tuple, dict] = {}
     for e in entries:
-        key = (e['motif'], e['offset'], e['mod_type'])
+        key = (e["motif"], e["offset"], e["mod_type"])
         if key in seen:
-            log.info("  [DEDUP] duplicate entry %s %s offset=%d -- keeping first",
-                     e['mod_type'], e['motif'], e['offset'])
+            log.info(
+                "  [DEDUP] duplicate entry %s %s offset=%d -- keeping first",
+                e["mod_type"],
+                e["motif"],
+                e["offset"],
+            )
         else:
             seen[key] = e
     entries = list(seen.values())
@@ -783,7 +826,7 @@ def fetch_rebase_org(org_num: int, output_path: str) -> list[dict]:
     """
     from .motif_merge import write_pacbio_motifs_csv
 
-    html          = _fetch_rebase_html(org_num)
+    html = _fetch_rebase_html(org_num)
     color_to_meth = _parse_color_legend(html)
 
     if not color_to_meth:
@@ -791,7 +834,7 @@ def fetch_rebase_org(org_num: int, output_path: str) -> list[dict]:
             "Could not extract color legend from REBASE page -- "
             "using fallback color map.  Colors may be wrong if REBASE changed."
         )
-        color_to_meth = {}   # _resolve_color() will hit the fallback dict
+        color_to_meth = {}  # _resolve_color() will hit the fallback dict
 
     entries = _parse_active_mtases_table(html, color_to_meth)
 
@@ -808,6 +851,7 @@ def fetch_rebase_org(org_num: int, output_path: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 # CLI: kinsim-prep rebase
 # ---------------------------------------------------------------------------
+
 
 def main(argv=None):
     import argparse
@@ -839,10 +883,12 @@ def main(argv=None):
             "        --output final_motifs.csv\n"
         ),
     )
-    p_parse.add_argument("input",
-                         help="REBASE file (simplified two-column or Format #19)")
+    p_parse.add_argument("input", help="REBASE file (simplified two-column or Format #19)")
     p_parse.add_argument(
-        "--output-csv", metavar="FILE", nargs="?", const="rebase_motifs.csv",
+        "--output-csv",
+        metavar="FILE",
+        nargs="?",
+        const="rebase_motifs.csv",
         default=None,
         help=(
             "Write standard PacBio motifs.csv instead of printing to stdout. "
@@ -867,11 +913,15 @@ def main(argv=None):
         ),
     )
     p_fetch.add_argument(
-        "org_num", type=int,
+        "org_num",
+        type=int,
         help="REBASE organism number (the 'Org#' integer on REBASE pages)",
     )
     p_fetch.add_argument(
-        "--output", "-o", metavar="FILE", default="rebase_motifs.csv",
+        "--output",
+        "-o",
+        metavar="FILE",
+        default="rebase_motifs.csv",
         help="Output CSV file (default: rebase_motifs.csv)",
     )
 
@@ -885,20 +935,27 @@ def main(argv=None):
             "The output can be used with: fuzznuc -pattern @<output> ..."
         ),
     )
-    p_patt.add_argument("motifs",
-                        help="Motif source: KinSim string, REBASE file, or PacBio CSV")
-    p_patt.add_argument("output",
-                        help="Output fuzznuc pattern file")
-    p_patt.add_argument("--min-fraction", type=float, default=0.40,
-                        help="Minimum fraction threshold (PacBio CSV only, default: 0.40)")
-    p_patt.add_argument("--min-detected", type=int, default=20,
-                        help="Minimum nDetected threshold (PacBio CSV only, default: 20)")
+    p_patt.add_argument("motifs", help="Motif source: KinSim string, REBASE file, or PacBio CSV")
+    p_patt.add_argument("output", help="Output fuzznuc pattern file")
+    p_patt.add_argument(
+        "--min-fraction",
+        type=float,
+        default=0.40,
+        help="Minimum fraction threshold (PacBio CSV only, default: 0.40)",
+    )
+    p_patt.add_argument(
+        "--min-detected",
+        type=int,
+        default=20,
+        help="Minimum nDetected threshold (PacBio CSV only, default: 20)",
+    )
 
     args = parser.parse_args(argv)
 
     if args.command == "fetch":
         from kinsim.utils.config import setup_logging
-        setup_logging(verbose=getattr(args, 'verbose', False))
+
+        setup_logging(verbose=getattr(args, "verbose", False))
         try:
             entries = fetch_rebase_org(args.org_num, args.output)
         except RuntimeError as e:
@@ -912,14 +969,15 @@ def main(argv=None):
             print("No motifs found in the REBASE file.", file=sys.stderr)
             sys.exit(1)
 
-        if getattr(args, 'output_csv', None) is not None:
+        if getattr(args, "output_csv", None) is not None:
             # Write standard PacBio motifs.csv (rebase_motifs.csv)
-            from .motif_merge import write_pacbio_motifs_csv, _make_entry
+            from .motif_merge import _make_entry, write_pacbio_motifs_csv
+
             entries = []
-            for part in result.split(';'):
+            for part in result.split(";"):
                 if not part:
                     continue
-                fields = part.split(',')
+                fields = part.split(",")
                 if len(fields) < 3:
                     continue
                 mod_type, motif, pos_str = fields[0], fields[1], fields[2]
@@ -927,13 +985,15 @@ def main(argv=None):
                     offset = int(pos_str)
                 except ValueError:
                     continue
-                entries.append(_make_entry(
-                    motif_str=motif,
-                    offset=offset,
-                    mod_type=mod_type,
-                    fraction=1.0,   # Restriction enzymes: 100% methylation
-                    source='rebase',
-                ))
+                entries.append(
+                    _make_entry(
+                        motif_str=motif,
+                        offset=offset,
+                        mod_type=mod_type,
+                        fraction=1.0,  # Restriction enzymes: 100% methylation
+                        source="rebase",
+                    )
+                )
             output_file = args.output_csv
             write_pacbio_motifs_csv(entries, output_file)
             print(f"Wrote {len(entries)} REBASE motifs to {output_file}")
@@ -942,9 +1002,10 @@ def main(argv=None):
 
     elif args.command == "patterns":
         from kinsim.utils.motifs import load_motif_string
-        motif_string = load_motif_string(args.motifs,
-                                         min_fraction=args.min_fraction,
-                                         min_detected=args.min_detected)
+
+        motif_string = load_motif_string(
+            args.motifs, min_fraction=args.min_fraction, min_detected=args.min_detected
+        )
         if not motif_string:
             print("ERROR: no motifs found from the provided source.", file=sys.stderr)
             sys.exit(1)
