@@ -2,18 +2,22 @@
 
 Three categories: baseline / slowed / near_meth. The methylation
 centers themselves land in SLOWED or NEAR_METH depending on whether 0
-is a signature offset for that type. Parent meth attribution is
-written at extract time into ``COL_PARENT_METH`` (col 36).
+is a signature offset for that type. Parent meth + offset attribution
+is written at extract time into ``COL_PARENT_METH`` (col 36) and
+``COL_PARENT_OFFSET`` (col 37). Refine and analyze bucket per
+**(meth_type, parent_offset)** so a noisy offset of one meth type
+never contaminates a clean offset of the same type.
 
 Tests cover:
   1. Storage constants + get_categories on the 38-col layout.
   2. Refine: slowed_split filters CATEGORY_SLOWED below the
      per-kmer-mean baseline percentile; CATEGORY_BASELINE and
      CATEGORY_NEAR_METH pass through untouched.
-  3. Analyze: compute_signature_profiles and
+  3. Refine GMM fits one model per (meth_type, offset) bucket.
+  4. Analyze: compute_signature_profiles and
      compute_meth_context_distribution produce
-     "baseline" / "slowed_by_<T>" / "near_meth_by_<T>" buckets
-     using the COL_PARENT_METH column directly (no mc[] inference).
+     "baseline" / "slowed_by_<T>_at_+<O>" / "near_meth_by_<T>_at_+<O>"
+     buckets using cols 36/37 directly (no mc[] inference).
 """
 
 from __future__ import annotations
@@ -111,10 +115,12 @@ def test_analyze_uses_parent_meth_column_not_meth_context():
     data = {0: np.stack(rows)}
 
     profiles = compute_signature_profiles(data)
-    assert "slowed_by_m6A" in profiles
-    assert "slowed_by_m5C" in profiles
-    assert profiles["slowed_by_m6A"]["n_samples"] == 1
-    assert profiles["slowed_by_m5C"]["n_samples"] == 1
+    # Both rows have COL_PARENT_OFFSET = 0 by default (np.zeros) → bucket
+    # name encodes the offset in the suffix.
+    assert "slowed_by_m6A_at_+0" in profiles
+    assert "slowed_by_m5C_at_+0" in profiles
+    assert profiles["slowed_by_m6A_at_+0"]["n_samples"] == 1
+    assert profiles["slowed_by_m5C_at_+0"]["n_samples"] == 1
 
 
 def test_refine_fails_fast_on_obsolete_layout():
@@ -317,9 +323,9 @@ def test_gmm_k2_separates_clean_two_distributions():
         f"survival {survival:.2%} outside expected 65-85% (kept {n_kept}/{n_in})"
     )
 
-    # Per-type fit stored with reasonable means (lowest ~30, highest ~90).
-    assert stats["method"] == "gmm_per_meth_type"
-    m6a_stats = stats["per_type"]["m6A"]
+    # Per-bucket fit stored with reasonable means (lowest ~30, highest ~90).
+    assert stats["method"] == "gmm_per_meth_offset"
+    m6a_stats = stats["per_bucket"]["m6A@+0"]
     assert not m6a_stats["skipped"]
     # 2D fit: gmm_means is (K, 2) — read the IPD axis only for the assertion.
     ipd_means = sorted(row[0] for row in m6a_stats["gmm_means"])
@@ -366,7 +372,7 @@ def test_gmm_k3_handles_long_tail_baseline():
 
     # K=3 (default) should handle this cleanly.
     _new_data, stats = slowed_split_gmm(data, n_components=3, seed=42)
-    m6a_stats = stats["per_type"]["m6A"]
+    m6a_stats = stats["per_bucket"]["m6A@+0"]
 
     # Validation passes — baseline cleanly captured by the two lower comps.
     assert not m6a_stats["skipped"], (
@@ -411,7 +417,7 @@ def test_gmm_validation_fails_when_meth_indistinguishable_from_baseline():
         data[kid] = np.stack(rows)
 
     _new_data, stats = slowed_split_gmm(data, n_components=3, seed=42)
-    m6a_stats = stats["per_type"]["m6A"]
+    m6a_stats = stats["per_bucket"]["m6A@+0"]
     # Either validation rejects, OR no slowed gets cut because the meth
     # component sits inside the baseline range (P(meth | x) low everywhere).
     survival = stats["n_slowed_kept"] / stats["n_slowed_in"]
@@ -438,7 +444,7 @@ def test_gmm_bic_picks_k2_for_unimodal_baseline():
         seed=11,
     )
     _new_data, stats = slowed_split_gmm(data, n_components=(2, 3), seed=42)
-    m6a = stats["per_type"]["m6A"]
+    m6a = stats["per_bucket"]["m6A@+0"]
     assert not m6a["skipped"]
     assert m6a["n_components_used"] == 2, (
         f"BIC should pick K=2 for unimodal baseline; picked K={m6a['n_components_used']} "
@@ -472,7 +478,7 @@ def test_gmm_bic_picks_k3_for_long_tail_baseline():
         data[kid] = np.stack(rows)
 
     _new_data, stats = slowed_split_gmm(data, n_components=(2, 3), seed=42)
-    m6a = stats["per_type"]["m6A"]
+    m6a = stats["per_bucket"]["m6A@+0"]
     assert m6a["n_components_used"] == 3, (
         f"BIC should pick K=3 for long-tail baseline + clean meth signal; "
         f"picked K={m6a['n_components_used']} (BICs: {m6a['bic_per_k']})"
@@ -489,10 +495,81 @@ def test_gmm_too_few_slowed_keeps_all():
         seed=2,
     )
     _new_data, stats = slowed_split_gmm(data, min_samples_for_gmm=200, seed=42)
-    m6a_stats = stats["per_type"]["m6A"]
+    m6a_stats = stats["per_bucket"]["m6A@+0"]
     assert m6a_stats["skipped"] is True
     assert m6a_stats["reason"] == "too_few_samples"
     assert stats["n_slowed_kept"] == stats["n_slowed_in"]
+
+
+def test_gmm_per_offset_isolates_noisy_offset_from_clean_offset():
+    """Two offsets of the same meth type are fit independently.
+
+    Synthetic dataset: m6A@+0 has a clean meth signal at IPD≈100;
+    m6A@+5 is indistinguishable from baseline (the +5 signature
+    doesn't actually exist for this synthetic motif). The new
+    per-(T, offset) refine should:
+      - fit m6A@+0 cleanly and drop the contaminating tail
+      - mark m6A@+5 as defensive (skipped or near-100% survival)
+    so the noisy @+5 bucket cannot poison the @+0 bucket.
+    """
+    rng = np.random.default_rng(101)
+    n_kmers = 80
+    data: dict = {}
+    meth_ids = get_meth_ids()
+    m6a = meth_ids["m6A"]
+    for kid in range(n_kmers):
+        rows = []
+        # Clean baseline at μ=30
+        for _ in range(80):
+            r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
+            _set_ipd_pw(r, rng.normal(30.0, 4.0), rng)
+            r[COL_CATEGORY] = CATEGORY_BASELINE
+            rows.append(r)
+        # m6A@+0 — real meth at μ=100, with 25% baseline contamination
+        for _ in range(40):
+            r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
+            ipd = rng.normal(30.0, 4.0) if rng.random() < 0.25 else rng.normal(100.0, 8.0)
+            _set_ipd_pw(r, ipd, rng)
+            r[COL_CATEGORY] = CATEGORY_SLOWED
+            r[COL_PARENT_METH] = m6a
+            r[COL_PARENT_OFFSET] = 0
+            rows.append(r)
+        # m6A@+5 — pure baseline (no real signature)
+        for _ in range(40):
+            r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
+            _set_ipd_pw(r, rng.normal(30.0, 4.0), rng)
+            r[COL_CATEGORY] = CATEGORY_SLOWED
+            r[COL_PARENT_METH] = m6a
+            r[COL_PARENT_OFFSET] = 5
+            rows.append(r)
+        data[kid] = np.stack(rows)
+
+    _new_data, stats = slowed_split_gmm(data, n_components=(2, 3), seed=42)
+    by_bucket = stats["per_bucket"]
+
+    # Both buckets must be reported separately.
+    assert "m6A@+0" in by_bucket, f"got buckets: {list(by_bucket)}"
+    assert "m6A@+5" in by_bucket, f"got buckets: {list(by_bucket)}"
+
+    b0 = by_bucket["m6A@+0"]
+    b5 = by_bucket["m6A@+5"]
+
+    # m6A@+0 must be a successful fit with most slowed surviving.
+    assert not b0["skipped"], (
+        f"m6A@+0 should fit cleanly (got skipped={b0.get('reason')})"
+    )
+    survival0 = b0["n_kept"] / b0["n_in"]
+    assert 0.55 < survival0 < 0.95, (
+        f"m6A@+0 survival {survival0:.2%} outside expected ~75% range"
+    )
+
+    # m6A@+5 is indistinguishable from baseline → defensive (skipped or
+    # ~100 % kept). Either way, it must NOT have dropped m6A@+0.
+    survival5 = b5["n_kept"] / b5["n_in"]
+    assert b5.get("skipped") or survival5 > 0.95, (
+        f"m6A@+5 should be defensive when meth signal is absent; "
+        f"skipped={b5.get('skipped')} survival={survival5:.2%}"
+    )
 
 
 def test_refine_pkl_writes_output_gmm():
@@ -513,8 +590,8 @@ def test_refine_pkl_writes_output_gmm():
         with open(out, "rb") as f:
             refined = pickle.load(f)
         meta = refined.pop("__meta__")
-        assert meta["method"] == "gmm_per_meth_type"
-        assert "m6A" in meta["stats"]["per_type"]
+        assert meta["method"] == "gmm_per_meth_offset"
+        assert "m6A@+0" in meta["stats"]["per_bucket"]
         # Each kmer has at least baseline rows surviving.
         for kid in range(50):
             assert kid in refined
@@ -594,49 +671,64 @@ def _build_v4_with_signatures(n_kmers: int = 5) -> dict:
 
 
 def test_compute_signature_profiles():
-    """Profiles aggregated by CATEGORY column with per-type attribution."""
+    """Profiles aggregated by CATEGORY × PARENT_METH × PARENT_OFFSET.
+
+    The test fixture plants four parent buckets:
+      - slowed_by_m6A_at_+0  (n=20 per kmer, IPD=200)
+      - slowed_by_m6A_at_+5  (n=15 per kmer, IPD=150)
+      - near_meth_by_m6A_at_+3  (n=10 per kmer, IPD=32)
+      - near_meth_by_m5C_at_+0  (n=8  per kmer, IPD=35)
+    Per-offset buckets keep clean and noisy offsets of the same meth
+    type isolated in the report — m6A@+0 and m6A@+5 are reported
+    separately so a flat +5 cannot mask an active +0.
+    """
     from kinsim.analyze import compute_signature_profiles
 
     data = _build_v4_with_signatures(5)
     profiles = compute_signature_profiles(data)
 
-    # Expected buckets
     assert "baseline" in profiles
-    assert "slowed_by_m6A" in profiles
-    assert "near_meth_by_m6A" in profiles
-    assert "near_meth_by_m5C" in profiles
+    assert "slowed_by_m6A_at_+0" in profiles
+    assert "slowed_by_m6A_at_+5" in profiles
+    assert "near_meth_by_m6A_at_+3" in profiles
+    assert "near_meth_by_m5C_at_+0" in profiles
 
     base = profiles["baseline"]
     assert base["n_samples"] == 5 * 40
     for v in base["profile_ipd"]:
         assert abs(v - 30.0) < 0.1
 
-    slow = profiles["slowed_by_m6A"]
-    # 20 (k=0, IPD@+0=200, IPD@+5=180) + 15 (k=5, IPD@+0=150, IPD@+5=130)
-    assert slow["n_samples"] == 5 * 35
-    # Average IPD at +0 = (20*200 + 15*150) / 35 = (4000+2250)/35 = 178.57
-    assert abs(slow["profile_ipd"][0] - 178.57) < 1.0
+    slow0 = profiles["slowed_by_m6A_at_+0"]
+    assert slow0["n_samples"] == 5 * 20
+    assert abs(slow0["profile_ipd"][0] - 200.0) < 0.5
+    assert slow0["sig_offsets"] == [0]
 
-    near_a = profiles["near_meth_by_m6A"]
+    slow5 = profiles["slowed_by_m6A_at_+5"]
+    assert slow5["n_samples"] == 5 * 15
+    assert abs(slow5["profile_ipd"][0] - 150.0) < 0.5
+    assert slow5["sig_offsets"] == [5]
+
+    near_a = profiles["near_meth_by_m6A_at_+3"]
     assert near_a["n_samples"] == 5 * 10
     assert abs(near_a["profile_ipd"][0] - 32.0) < 0.1
 
-    near_c = profiles["near_meth_by_m5C"]
+    near_c = profiles["near_meth_by_m5C_at_+0"]
     assert near_c["n_samples"] == 5 * 8
     assert abs(near_c["profile_ipd"][0] - 35.0) < 0.1
 
 
 def test_compute_meth_context_distribution():
-    """v4 path: context buckets match the CATEGORY split."""
+    """v4 path: context buckets match the CATEGORY × parent_meth × offset split."""
     from kinsim.analyze import compute_meth_context_distribution
 
     data = _build_v4_with_signatures(5)
     ctx = compute_meth_context_distribution(data)
 
     assert "baseline" in ctx
-    assert "slowed_by_m6A" in ctx
-    assert "near_meth_by_m6A" in ctx
-    assert "near_meth_by_m5C" in ctx
+    assert "slowed_by_m6A_at_+0" in ctx
+    assert "slowed_by_m6A_at_+5" in ctx
+    assert "near_meth_by_m6A_at_+3" in ctx
+    assert "near_meth_by_m5C_at_+0" in ctx
 
     meth_ids = get_meth_ids()
     m5c = meth_ids["m5C"]
@@ -647,10 +739,203 @@ def test_compute_meth_context_distribution():
     for pos in range(11):
         assert abs(base["fractions"][pos, none_col] - 1.0) < 1e-6
 
-    # near_meth_by_m5C: m5C at center
-    near_c = ctx["near_meth_by_m5C"]
+    # near_meth_by_m5C@+0: m5C at center
+    near_c = ctx["near_meth_by_m5C_at_+0"]
     m5c_col = near_c["meth_ids"].index(m5c)
     assert abs(near_c["fractions"][KMER_PRED_IDX, m5c_col] - 1.0) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Sharded refine + dataset + split helpers
+# ---------------------------------------------------------------------------
+
+
+def _write_shard(path: Path, data: dict) -> None:
+    with open(path, "wb") as f:
+        pickle.dump(data, f)
+
+
+# Tests below import kinsim.data.dataset which depends on torch. On
+# environments without torch (Windows dev box, minimal CI), skip cleanly.
+try:
+    import torch  # noqa: F401
+
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+
+def test_shard_sample_id_recovers_id_from_filename():
+    if not HAS_TORCH:
+        print("[skip] torch not installed — skipping shard helper tests")
+        return
+    from kinsim.data.dataset import shard_sample_id
+
+    assert shard_sample_id("/data/run/shards/bc2034_shard.pkl") == "bc2034"
+    assert shard_sample_id("/data/run/shards/bc2034_shard_clean.pkl") == "bc2034"
+    assert shard_sample_id("plain_name.pkl") == "plain_name"
+
+
+def test_split_shards_by_explicit_strain_list():
+    if not HAS_TORCH:
+        return
+    from kinsim.data.dataset import split_shards
+
+    paths = [
+        "/x/bc2034_shard.pkl",
+        "/x/bc2045_shard.pkl",
+        "/x/bc2080_shard.pkl",
+    ]
+    train, test = split_shards(paths, test_strains=["bc2080"])
+    assert len(train) == 2
+    assert len(test) == 1
+    assert "bc2080" in test[0]
+
+
+def test_split_shards_by_random_fraction_is_reproducible():
+    if not HAS_TORCH:
+        return
+    from kinsim.data.dataset import split_shards
+
+    paths = [f"/x/bc{i:04d}_shard.pkl" for i in range(20)]
+    train_a, test_a = split_shards(paths, test_fraction=0.2, seed=42)
+    train_b, test_b = split_shards(paths, test_fraction=0.2, seed=42)
+    assert train_a == train_b
+    assert test_a == test_b
+    assert len(test_a) == 4  # round(20 * 0.2)
+
+
+def test_split_shards_unknown_test_strain_raises():
+    if not HAS_TORCH:
+        return
+    from kinsim.data.dataset import split_shards
+
+    paths = ["/x/bc2034_shard.pkl"]
+    try:
+        split_shards(paths, test_strains=["does_not_exist"])
+    except ValueError as e:
+        assert "no matching shard" in str(e)
+    else:
+        raise AssertionError("expected ValueError on missing test strain")
+
+
+def test_sharded_signal_dataset_iterates_all_rows():
+    """Two synthetic shards → ShardedSignalDataset yields every row exactly once
+    (per epoch). Yields are (kmer_id, meth_full, log_signal, meth_id) tuples."""
+    if not HAS_TORCH:
+        return
+    from kinsim.data.dataset import ShardedSignalDataset
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        # Shard A: 5 baseline rows (kmer_id=0)
+        a = np.zeros((5, SAMPLE_NCOLS), dtype=np.float32)
+        a[:, COL_IPD] = 30.0
+        a[:, COL_PW] = 15.0
+        _write_shard(td / "a_shard.pkl", {0: a})
+        # Shard B: 3 slowed rows (kmer_id=1)
+        b = np.zeros((3, SAMPLE_NCOLS), dtype=np.float32)
+        b[:, COL_IPD] = 100.0
+        b[:, COL_PW] = 50.0
+        b[:, COL_CATEGORY] = CATEGORY_SLOWED
+        b[:, COL_PARENT_METH] = 1
+        _write_shard(td / "b_shard.pkl", {1: b})
+
+        ds = ShardedSignalDataset(
+            [str(td / "a_shard.pkl"), str(td / "b_shard.pkl")],
+            shuffle=False,
+        )
+        items = list(ds)
+        assert len(items) == 8  # 5 + 3
+        # Spot-check first emit shape: kmer_id (Long), meth_full (K, 4),
+        # log_signal (2,), meth_id (Long).
+        kmer_id, meth_full, log_signal, meth_id = items[0]
+        import torch as _torch
+
+        assert isinstance(kmer_id, _torch.Tensor) and kmer_id.dtype == _torch.long
+        assert meth_full.shape == (11, 4)
+        assert log_signal.shape == (2,)
+        assert isinstance(meth_id, _torch.Tensor)
+
+
+def test_sharded_refine_writes_per_shard_clean_pkls():
+    """slowed_split_gmm_shards over 2 synthetic shards produces 2 cleaned shards
+    in the output dir, with __meta__["method"] = 'gmm_per_meth_offset'."""
+    from kinsim.refine import slowed_split_gmm_shards
+
+    meth_ids = get_meth_ids()
+    m6a = meth_ids["m6A"]
+
+    def _build_strain_shard(n_kmers: int, seed: int) -> dict:
+        local = np.random.default_rng(seed)
+        out = {}
+        for kid in range(n_kmers):
+            rows = []
+            # Baseline: μ=30
+            for _ in range(50):
+                r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
+                r[COL_IPD] = float(max(0.0, local.normal(30.0, 4.0)))
+                r[COL_PW] = float(max(0.0, 0.5 * r[COL_IPD] + local.normal(0, 1.5)))
+                r[COL_CATEGORY] = CATEGORY_BASELINE
+                rows.append(r)
+            # Slowed-by-m6A: μ=100, with 30 % contamination at μ=30
+            for _ in range(40):
+                r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
+                ipd = local.normal(30.0, 4.0) if local.random() < 0.3 else local.normal(100.0, 8.0)
+                r[COL_IPD] = float(max(0.0, ipd))
+                r[COL_PW] = float(max(0.0, 0.5 * r[COL_IPD] + local.normal(0, 1.5)))
+                r[COL_CATEGORY] = CATEGORY_SLOWED
+                r[COL_PARENT_METH] = m6a
+                r[COL_PARENT_OFFSET] = 0
+                rows.append(r)
+            out[kid] = np.stack(rows)
+        return out
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        shards_dir = td / "shards"
+        out_dir = td / "refined"
+        shards_dir.mkdir()
+
+        # Two strain shards, 30 kmers each.
+        _write_shard(shards_dir / "bc2034_shard.pkl", _build_strain_shard(30, seed=1))
+        _write_shard(shards_dir / "bc2045_shard.pkl", _build_strain_shard(30, seed=2))
+
+        stats = slowed_split_gmm_shards(shards_dir, out_dir, n_components=(2, 3), seed=42)
+
+        # 2 cleaned shards on disk.
+        cleaned = sorted((out_dir).glob("*_clean.pkl"))
+        assert len(cleaned) == 2
+        # Method recorded.
+        assert stats["method"] == "gmm_per_meth_offset"
+        assert stats["n_shards"] == 2
+        # Each cleaned shard has __meta__ with refine info.
+        for p in cleaned:
+            with open(p, "rb") as f:
+                d = pickle.load(f)
+            assert "__meta__" in d
+            assert d["__meta__"]["method"] == "gmm_per_meth_offset"
+
+
+def test_concat_shards_in_analyze_merges_per_kmer_arrays():
+    """_concat_shards stacks rows of the same kmer across shards."""
+    from kinsim.analyze import _concat_shards
+
+    a = np.zeros((3, SAMPLE_NCOLS), dtype=np.float32)
+    a[:, COL_IPD] = 30.0
+    b = np.zeros((4, SAMPLE_NCOLS), dtype=np.float32)
+    b[:, COL_IPD] = 35.0
+    c = np.zeros((2, SAMPLE_NCOLS), dtype=np.float32)
+    c[:, COL_IPD] = 90.0
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        # Shard 1 has kmer 0; shard 2 has kmer 0 AND kmer 1.
+        _write_shard(td / "x_shard.pkl", {0: a})
+        _write_shard(td / "y_shard.pkl", {0: b, 1: c})
+        merged, _ = _concat_shards(td)
+        assert merged[0].shape[0] == 7  # 3 + 4
+        assert merged[1].shape[0] == 2
 
 
 if __name__ == "__main__":
@@ -678,6 +963,8 @@ if __name__ == "__main__":
     print("[pass] GMM BIC picks K=3 for long-tail baseline")
     test_gmm_too_few_slowed_keeps_all()
     print("[pass] GMM too-few-slowed → keeps all")
+    test_gmm_per_offset_isolates_noisy_offset_from_clean_offset()
+    print("[pass] GMM per-(meth, offset) isolates noisy offsets from clean ones")
     test_refine_pkl_writes_output_gmm()
     print("[pass] refine_pkl (gmm)")
     test_compute_signature_profiles()
@@ -686,4 +973,20 @@ if __name__ == "__main__":
     print("[pass] analyze trusts COL_PARENT_METH over mc[]")
     test_compute_meth_context_distribution()
     print("[pass] compute_meth_context_distribution")
+
+    # ── Sharded paths ─────────────────────────────────────────────────
+    test_shard_sample_id_recovers_id_from_filename()
+    print("[pass] shard_sample_id recovers ID from filename")
+    test_split_shards_by_explicit_strain_list()
+    print("[pass] split_shards by explicit --test-strains list")
+    test_split_shards_by_random_fraction_is_reproducible()
+    print("[pass] split_shards by random fraction is reproducible")
+    test_split_shards_unknown_test_strain_raises()
+    print("[pass] split_shards raises on unknown test strain")
+    test_sharded_signal_dataset_iterates_all_rows()
+    print("[pass] ShardedSignalDataset iterates all rows from all shards")
+    test_sharded_refine_writes_per_shard_clean_pkls()
+    print("[pass] sharded refine writes per-shard *_clean.pkl files")
+    test_concat_shards_in_analyze_merges_per_kmer_arrays()
+    print("[pass] _concat_shards in analyze merges per-kmer arrays")
     print("\nAll tests passed.")

@@ -6,18 +6,20 @@ PARENT_METH and PARENT_OFFSET (see ``kinsim.utils.sample_layout``).
 
 Two methods are supported:
 
-* ``--method gmm`` (default) — for each meth type T present in the
-  ``slowed`` rows, fit one Gaussian Mixture per candidate K (default
-  K∈{2,3}) on the combined ``baseline + slowed_by_T`` IPD pool
-  (baseline subsampled to match ``slowed_by_T`` count). Pick the K with
-  the lowest BIC. Sort components by mean — the highest-mean component
-  is "meth-like", the rest "baseline-like". Validate that ≥
-  ``baseline_validation_min`` fraction of the baseline subsample lands
-  in any of the baseline-like components; if so, keep ``slowed_by_T``
-  rows whose posterior in the meth-like component is ≥
-  ``posterior_threshold``. If validation fails or the type has too few
-  samples, keep all rows of that type (defensive). ``BASELINE`` and
-  ``NEAR_METH`` always pass through unchanged.
+* ``--method gmm`` (default) — for each (meth_type T, parent_offset off)
+  bucket present in the ``slowed`` rows, fit one Gaussian Mixture per
+  candidate K (default K∈{2,3,4}) on the combined ``baseline +
+  slowed_by_T@+off`` (IPD, PW) pool (baseline subsampled to match the
+  bucket count). Pick the K with the lowest BIC. Sort components by
+  mean IPD — the highest-IPD component is "meth-like", the rest
+  "baseline-like". Validate that ≥ ``baseline_validation_min`` fraction
+  of the baseline subsample lands in any of the baseline-like
+  components; if so, keep ``slowed_by_T@+off`` rows whose posterior in
+  the meth-like component is ≥ ``posterior_threshold``. If validation
+  fails or the bucket has too few samples, keep all rows of that exact
+  bucket (defensive — a noisy offset of one meth type never poisons a
+  clean offset of the same type). ``BASELINE`` and ``NEAR_METH`` always
+  pass through unchanged.
 
 * ``--method p95`` (legacy) — single global threshold = the
   ``secondary_percentile``-th percentile of the per-kmer baseline-mean
@@ -30,14 +32,23 @@ The p95 method applies one absolute IPD threshold to every meth type and
 every kmer. That is unfair to (a) low-baseline kmers whose real meth
 slowing produces IPDs below the global threshold, and (b) weak-signal
 meth types (m4C, m5C) whose slowing factor is smaller than m6A's. The
-GMM method fits a per-type model with a per-type model-selected K
-(K=2 for clean unimodal baselines, K=3 for long-tailed ones), lets the
-data decide where the boundary between "baseline-like" and "real meth"
-sits, and self-validates by checking that the baseline subsample really
-does cluster in the baseline-like components before applying the cut.
+GMM method fits a per-(T, offset) model with a model-selected K, lets
+the data decide where the boundary between "baseline-like" and "real
+meth" sits, and self-validates by checking that the baseline subsample
+really does cluster in the baseline-like components before applying
+the cut.
+
+Why per-(T, offset) and not per-T
+---------------------------------
+A single meth type can carry multiple signature offsets (m6A at +0 AND
++5 in some R-M systems). Pooling them under one bucket means a noisy
+offset (e.g. +5 from a Type I R-M motif that only carries the +0 mark)
+contaminates the GMM fit and over-rejects the clean +0 samples. Per-(T,
+offset) buckets isolate the noise: m6A@+5 may fail validation and pass
+through unfiltered while m6A@+0 still gets a clean cut.
 
 Usage:
-    kinsim refine in.pkl out.pkl                              # default GMM, BIC over K∈{2,3}
+    kinsim refine in.pkl out.pkl                              # default GMM, BIC over K∈{2,3,4}
     kinsim refine in.pkl out.pkl --method p95                 # legacy
     kinsim refine in.pkl out.pkl --n-components 3             # force K=3
     kinsim refine in.pkl out.pkl --posterior-threshold 0.7    # stricter cut
@@ -255,99 +266,42 @@ def _gmm_posterior(
     return p / p.sum(axis=1, keepdims=True)
 
 
-def slowed_split_gmm(
+def _harvest_into(
     data: dict,
-    posterior_threshold: float = 0.5,
-    baseline_validation_min: float = 0.85,
-    min_samples_for_gmm: int = 100,
-    n_components: int | tuple[int, ...] = (2, 3, 4),
-    seed: int = 42,
-) -> tuple[dict, dict]:
-    """Per-meth-type 2D GMM filter on ``CATEGORY_SLOWED`` rows with BIC-based K selection.
+    baseline_chunks: list,
+    slowed_chunks_by_TO: dict,
+) -> None:
+    """Append (IPD, PW) pairs from ``data`` into the passed-in containers.
 
-    Methylation slows the polymerase on BOTH the wait-time (IPD) and the
-    incorporation duration (PW), and the two channels are typically
-    correlated. The GMM is therefore fit on the **joint (IPD, PW)
-    feature pair** with full per-component covariance — strictly more
-    discriminative than 1D-IPD alone, especially for weak-signal types.
+    Mutates ``baseline_chunks`` (list of (n, 2) arrays) and
+    ``slowed_chunks_by_TO`` (dict[(T_id, offset)] -> list of (n, 2)
+    arrays). Used by both the single-pkl and sharded pass-1 harvest.
 
-    For each meth type T present in the slowed rows:
-
-    1. Pool ``slowed_by_T`` (IPD, PW) across all kmers; subsample
-       baseline (IPD, PW) to the same count (or all baseline if fewer).
-    2. For each candidate K in ``n_components``, fit
-       ``GaussianMixture(K, covariance_type="full")`` on the combined
-       2D pool and compute its BIC (lower is better — penalises extra
-       parameters that don't improve the likelihood enough). Pick the K
-       with the lowest BIC. Default candidates: ``(2, 3)`` — let BIC
-       choose between baseline+meth (K=2) and baseline-fast +
-       baseline-tail + meth (K=3) per type independently.
-    3. Sort components by **mean IPD**. The highest-IPD-mean component
-       is the "meth-like" cluster; the remaining ``K − 1`` are
-       "baseline-like" (methylation only ever slows, so meth-like
-       always sits above baseline on the IPD axis).
-    4. Validate that ≥ ``baseline_validation_min`` fraction of the
-       baseline subsample is assigned to any of the baseline-like
-       components. If not, the fit cannot be trusted for T — keep all
-       ``slowed_by_T`` rows, log a warning.
-    5. Otherwise, keep ``slowed_by_T`` rows whose posterior in the
-       meth-like component is ≥ ``posterior_threshold`` (default 0.5).
-
-    Pass ``n_components=3`` (or any single int) to force a fixed K and
-    skip the BIC selection. ``CATEGORY_BASELINE`` and
-    ``CATEGORY_NEAR_METH`` always pass through unchanged.
-
-    Returns ``(new_data, stats)``; ``stats["per_type"][T]`` carries the
-    selected K, the per-K BIC scores, and the fitted GMM parameters
-    (means, sigmas, weights, meth_idx, baseline_idxs).
+    Slowed rows are now bucketed per **(parent_meth, parent_offset)**
+    pair rather than per parent_meth alone, so each signature offset
+    of a meth type fits its own GMM independently. This protects the
+    high-confidence offsets (e.g. m6A@+0 from GATC) from contamination
+    by a noisier offset of the same meth type (e.g. m6A@+5 emitted by
+    a Type I R-M motif that doesn't actually carry a +5 signature).
     """
-    try:
-        from sklearn.mixture import GaussianMixture
-    except ImportError as exc:
-        raise ImportError(
-            "sklearn is required for the GMM refine method. Install with: pip install scikit-learn"
-        ) from exc
-
-    from .utils.encoding import get_meth_ids
     from .utils.sample_layout import (
         CATEGORY_BASELINE,
-        CATEGORY_NEAR_METH,
         CATEGORY_SLOWED,
         COL_CATEGORY,
         COL_IPD,
         COL_PARENT_METH,
+        COL_PARENT_OFFSET,
         COL_PW,
     )
-
-    # Normalise n_components to a tuple of candidate Ks.
-    if isinstance(n_components, int):
-        candidate_ks: tuple[int, ...] = (n_components,)
-    else:
-        candidate_ks = tuple(int(k) for k in n_components)
-    if not candidate_ks or any(k < 2 for k in candidate_ks):
-        raise ValueError(f"n_components must be int ≥ 2 or tuple of ints ≥ 2, got {n_components}")
-
-    rng = np.random.default_rng(seed)
-    name_by_mid = {v: k for k, v in get_meth_ids().items()}
-
-    # ── Pass 1: harvest joint (IPD, PW) per (cat, parent_meth) ──
-    # 2D: methylation slows the polymerase on BOTH wait-time (IPD) and
-    # incorporation duration (PW). Fitting jointly captures the (often
-    # correlated) signature on both axes — strictly more discriminative
-    # than 1D-IPD alone, especially for weak-signal types where one axis
-    # dominates the other.
-    log.info("[refine.gmm] pass 1/2: harvesting (IPD, PW) ...")
-    baseline_chunks: list = []
-    slowed_chunks_by_T: dict[int, list] = {}
 
     for kid, arr in data.items():
         if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
             continue
-        if arr.shape[1] <= COL_PARENT_METH:
+        if arr.shape[1] <= COL_PARENT_OFFSET:
             continue
         cats = arr[:, COL_CATEGORY].astype(np.int8)
         parent = arr[:, COL_PARENT_METH].astype(np.int8)
-        # 2D feature column: stack (IPD, PW) per row.
+        offset = arr[:, COL_PARENT_OFFSET].astype(np.int8)
         ipd_pw = arr[:, [COL_IPD, COL_PW]]
 
         base_m = cats == CATEGORY_BASELINE
@@ -360,62 +314,88 @@ def slowed_split_gmm(
                 T_id_int = int(T_id)
                 if T_id_int == 0:
                     continue
-                mask = slow_m & (parent == T_id)
-                slowed_chunks_by_T.setdefault(T_id_int, []).append(ipd_pw[mask].astype(np.float32))
+                m_T = slow_m & (parent == T_id)
+                if not m_T.any():
+                    continue
+                for off in np.unique(offset[m_T]):
+                    O_int = int(off)
+                    mask = m_T & (offset == O_int)
+                    slowed_chunks_by_TO.setdefault((T_id_int, O_int), []).append(
+                        ipd_pw[mask].astype(np.float32)
+                    )
 
-    if not baseline_chunks:
-        log.warning("[refine.gmm] no baseline samples — keeping all slowed (no filter)")
-        return _passthrough(data, method="gmm_no_baseline")
 
-    baseline_pool = np.concatenate(baseline_chunks)  # (N, 2)
-    log.info(
-        "[refine.gmm] baseline pool: n=%d  IPD mean=%.2f std=%.2f  PW mean=%.2f std=%.2f",
-        len(baseline_pool),
-        float(baseline_pool[:, 0].mean()),
-        float(baseline_pool[:, 0].std()),
-        float(baseline_pool[:, 1].mean()),
-        float(baseline_pool[:, 1].std()),
-    )
+def _bucket_label(T_name: str, offset: int) -> str:
+    """Canonical per-(meth, offset) bucket label, e.g. ``m6A@+0`` / ``m5C@+6``."""
+    return f"{T_name}@{offset:+d}"
 
-    # ── Per-type GMM fits ──
-    fit_params_by_T: dict[int, dict] = {}
-    per_type_stats: dict = {}
 
-    for T_id in sorted(slowed_chunks_by_T.keys()):
+def _fit_gmms_per_bucket(
+    baseline_pool: np.ndarray,
+    slowed_chunks_by_TO: dict,
+    posterior_threshold: float,
+    baseline_validation_min: float,
+    min_samples_for_gmm: int,
+    candidate_ks: tuple,
+    seed: int,
+    rng: np.random.Generator,
+) -> tuple[dict, dict]:
+    """Fit per-(meth_type, offset) GMMs (BIC over ``candidate_ks``), validate, return fit params.
+
+    Returns ``(fit_params_by_TO, per_bucket_stats)``. The dict
+    ``fit_params_by_TO`` is keyed by ``(T_id, offset)`` tuple — buckets
+    whose validation fails or whose sample count is below
+    ``min_samples_for_gmm`` are omitted (sentinel: no filter for that
+    bucket — keep all rows of that exact (T, offset) pair) and recorded
+    as ``skipped`` in ``per_bucket_stats`` under the canonical
+    ``"<T_name>@<+offset>"`` label.
+
+    Why per-(T, offset) instead of per-T:
+    one GMM per signature offset isolates noisy offsets from clean ones.
+    If m6A@+5 fails validation (because some Type I R-M motifs don't
+    actually carry a +5 signature), the m6A@+0 bucket is unaffected.
+    """
+    from sklearn.mixture import GaussianMixture
+
+    from .utils.encoding import get_meth_ids
+
+    name_by_mid = {v: k for k, v in get_meth_ids().items()}
+    fit_params_by_TO: dict[tuple[int, int], dict] = {}
+    per_bucket_stats: dict = {}
+
+    bucket_keys = sorted(slowed_chunks_by_TO.keys(), key=lambda k: (name_by_mid.get(k[0], "z"), k[1]))
+    for T_id, off in bucket_keys:
         T_name = name_by_mid.get(T_id, f"meth{T_id}")
-        slowed_T = np.concatenate(slowed_chunks_by_T[T_id])
-        n_T = len(slowed_T)
+        label = _bucket_label(T_name, off)
+        slowed_TO = np.concatenate(slowed_chunks_by_TO[(T_id, off)])
+        n_TO = len(slowed_TO)
 
-        if n_T < min_samples_for_gmm:
+        if n_TO < min_samples_for_gmm:
             log.warning(
-                "[refine.gmm] %s: only %d slowed samples (< %d) — keeping all (no fit attempted)",
-                T_name,
-                n_T,
+                "[refine.gmm] %s: only %d slowed samples (< %d) — keeping all (no fit)",
+                label,
+                n_TO,
                 min_samples_for_gmm,
             )
-            per_type_stats[T_name] = {
-                "n_in": n_T,
-                "n_kept": n_T,
+            per_bucket_stats[label] = {
+                "meth_type": T_name,
+                "offset": off,
+                "n_in": n_TO,
+                "n_kept": n_TO,
                 "n_dropped": 0,
                 "skipped": True,
                 "reason": "too_few_samples",
             }
             continue
 
-        # Equal-count baseline subsample (or all baseline if fewer).
-        n_match = min(n_T, len(baseline_pool))
+        n_match = min(n_TO, len(baseline_pool))
         if n_match == len(baseline_pool):
             base_sample = baseline_pool
         else:
             idx = rng.choice(len(baseline_pool), n_match, replace=False)
             base_sample = baseline_pool[idx]
 
-        # Fit each candidate K, pick the lowest-BIC model. BIC penalises
-        # extra parameters, so an unimodal baseline + meth selects K=2
-        # while a bimodal (long-tailed) baseline + meth selects K=3.
-        # Pool is (n, 2): (IPD, PW). Full covariance per component
-        # captures the IPD↔PW correlation natural to PacBio kinetics.
-        pool = np.concatenate([base_sample, slowed_T])  # (n, 2)
+        pool = np.concatenate([base_sample, slowed_TO])
         bic_per_k: dict[int, float] = {}
         best_gmm = None
         best_k = -1
@@ -437,33 +417,23 @@ def slowed_split_gmm(
         n_components_used = best_k
         if len(candidate_ks) > 1:
             log.info(
-                "[refine.gmm] %s: BIC-selected K=%d  (candidates: %s)",
-                T_name,
+                "[refine.gmm] %s: BIC-selected K=%d  (%s)",
+                label,
                 best_k,
                 "  ".join(f"K={k}:{b:,.0f}" for k, b in bic_per_k.items()),
             )
 
         means = gmm.means_  # (K, 2)
         covariances = gmm.covariances_  # (K, 2, 2)
-        weights = gmm.weights_  # (K,)
+        weights = gmm.weights_
 
-        # Sort components by IPD axis (mean[k, 0]). The HIGHEST-IPD-mean
-        # component is the "meth-like" cluster — methylation slows the
-        # polymerase, so its IPD mean is always above baseline's.
         sort_order = np.argsort(means[:, 0])
         meth_idx = int(sort_order[-1])
         baseline_idxs = [int(i) for i in sort_order[:-1]]
 
-        # Validation: ≥ baseline_validation_min of the baseline subsample
-        # must land in any of the baseline-like components. If baseline
-        # leaks into the meth-like component, the fit is suspect (could
-        # be flipped weights, or the meth signal is genuinely
-        # indistinguishable from baseline noise) — don't filter T.
         base_assignments = gmm.predict(base_sample)
         pct_in_baseline = float(np.isin(base_assignments, baseline_idxs).mean())
 
-        # Pretty-print the GMM components in IPD-ascending order:
-        #   N(μ_ipd ± σ_ipd, μ_pw ± σ_pw, ρ_ipd_pw) · weight
         comp_summary_parts = []
         for i in sort_order:
             mu_i, mu_p = float(means[i, 0]), float(means[i, 1])
@@ -478,27 +448,28 @@ def slowed_split_gmm(
         if pct_in_baseline < baseline_validation_min:
             log.warning(
                 "[refine.gmm] %s: VALIDATION FAILED — only %.1f%% of baseline in the "
-                "%d lower-mean comp(s) (need ≥ %.0f%%). K=%d fit:  %s.  "
-                "Keeping all %d slowed.",
-                T_name,
+                "%d lower-mean comp(s) (need ≥ %.0f%%). K=%d:  %s.  Keeping all %d slowed.",
+                label,
                 pct_in_baseline * 100,
                 len(baseline_idxs),
                 baseline_validation_min * 100,
                 n_components_used,
                 comp_summary,
-                n_T,
+                n_TO,
             )
-            per_type_stats[T_name] = {
-                "n_in": n_T,
-                "n_kept": n_T,
+            per_bucket_stats[label] = {
+                "meth_type": T_name,
+                "offset": off,
+                "n_in": n_TO,
+                "n_kept": n_TO,
                 "n_dropped": 0,
                 "skipped": True,
                 "reason": "baseline_validation_failed",
                 "n_components_used": n_components_used,
                 "n_components_candidates": list(candidate_ks),
                 "bic_per_k": bic_per_k,
-                "gmm_means": means.tolist(),  # (K, 2)
-                "gmm_covariances": covariances.tolist(),  # (K, 2, 2)
+                "gmm_means": means.tolist(),
+                "gmm_covariances": covariances.tolist(),
                 "gmm_weights": weights.tolist(),
                 "meth_idx": meth_idx,
                 "baseline_idxs": baseline_idxs,
@@ -506,66 +477,94 @@ def slowed_split_gmm(
             }
             continue
 
-        # Apply the cut: keep slowed rows whose posterior in the meth-like
-        # component is ≥ posterior_threshold. slowed_T is (n, 2); the
-        # multivariate GMM scores them on both axes jointly.
-        post = _gmm_posterior(slowed_T, means, covariances, weights)
+        post = _gmm_posterior(slowed_TO, means, covariances, weights)
         post_meth = post[:, meth_idx]
         keep_mask = post_meth >= posterior_threshold
         n_kept = int(keep_mask.sum())
-        drop_count = n_T - n_kept
+        drop_count = n_TO - n_kept
 
         log.info(
-            "[refine.gmm] %s: K=%d fit:  %s.  baseline_in_baseline=%.1f%% "
-            "(meth_idx=%d). Kept %d/%d (%.1f%%), dropped %d.",
-            T_name,
+            "[refine.gmm] %s: K=%d:  %s.  baseline_in_baseline=%.1f%% (meth_idx=%d). "
+            "Kept %d/%d (%.1f%%), dropped %d.",
+            label,
             n_components_used,
             comp_summary,
             pct_in_baseline * 100,
             meth_idx,
             n_kept,
-            n_T,
-            100.0 * n_kept / n_T,
+            n_TO,
+            100.0 * n_kept / n_TO,
             drop_count,
         )
 
-        fit_params_by_T[T_id] = {
+        fit_params_by_TO[(T_id, off)] = {
             "means": means.tolist(),
             "covariances": covariances.tolist(),
             "weights": weights.tolist(),
             "meth_idx": meth_idx,
         }
-        per_type_stats[T_name] = {
-            "n_in": n_T,
+        per_bucket_stats[label] = {
+            "meth_type": T_name,
+            "offset": off,
+            "n_in": n_TO,
             "n_kept": n_kept,
             "n_dropped": drop_count,
             "skipped": False,
             "n_components_used": n_components_used,
             "n_components_candidates": list(candidate_ks),
             "bic_per_k": bic_per_k,
-            "gmm_means": means.tolist(),  # (K, 2)
-            "gmm_covariances": covariances.tolist(),  # (K, 2, 2)
+            "gmm_means": means.tolist(),
+            "gmm_covariances": covariances.tolist(),
             "gmm_weights": weights.tolist(),
             "meth_idx": meth_idx,
             "baseline_idxs": baseline_idxs,
             "baseline_in_baseline_pct": pct_in_baseline,
         }
 
-    # ── Pass 2: rebuild the data dict, applying per-type filter to slowed ──
-    log.info("[refine.gmm] pass 2/2: filtering slowed rows ...")
+    return fit_params_by_TO, per_bucket_stats
+
+
+def _apply_gmm_filter_to_data(
+    data: dict,
+    fit_params_by_TO: dict,
+    posterior_threshold: float,
+) -> tuple[dict, dict]:
+    """Apply per-(meth_type, offset) GMM filter to one in-memory data dict.
+
+    Returns ``(new_data, counts)`` where ``new_data`` is a fresh dict with
+    the filtered rows (BASELINE + NEAR_METH pass through; SLOWED filtered
+    by per-(T, offset) GMM posterior) and ``counts`` is a small dict with
+    in/out/dropped counts per category for this slice of data.
+
+    Buckets without a fit (validation failed, too few samples, or
+    unknown T/offset combination) keep all rows of that exact (T,
+    offset) pair — so a noisy offset never poisons a clean offset of
+    the same meth type.
+    """
+    from .utils.sample_layout import (
+        CATEGORY_BASELINE,
+        CATEGORY_NEAR_METH,
+        CATEGORY_SLOWED,
+        COL_CATEGORY,
+        COL_IPD,
+        COL_PARENT_METH,
+        COL_PARENT_OFFSET,
+        COL_PW,
+    )
+
     new_data: dict = {}
     n_baseline_in = n_baseline_out = 0
     n_near_in = n_near_out = 0
-    n_slowed_in = n_slowed_kept = n_slowed_dropped = 0
+    n_slowed_in = n_slowed_kept = 0
 
     for kid, arr in data.items():
         if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
             continue
-        if arr.shape[1] <= COL_PARENT_METH:
+        if arr.shape[1] <= COL_PARENT_OFFSET:
             continue
         cats = arr[:, COL_CATEGORY].astype(np.int8)
         parent = arr[:, COL_PARENT_METH].astype(np.int8)
-        # 2D feature column for scoring: (IPD, PW) per row.
+        offset = arr[:, COL_PARENT_OFFSET].astype(np.int8)
         ipd_pw = arr[:, [COL_IPD, COL_PW]]
 
         base_m = cats == CATEGORY_BASELINE
@@ -575,81 +574,358 @@ def slowed_split_gmm(
         n_near_in += int(near_m.sum())
         n_slowed_in += int(slow_m.sum())
 
-        # Per-type slowed keep mask — vectorised 2D K-component posterior
-        # via stored params. ipd_pw[mask_T] is (n_T_kid, 2).
         slow_keep = np.zeros_like(slow_m)
         if slow_m.any():
             for T_id in np.unique(parent[slow_m]):
                 T_id_int = int(T_id)
                 if T_id_int == 0:
                     continue
-                mask_T = slow_m & (parent == T_id)
-                if not mask_T.any():
+                m_T = slow_m & (parent == T_id)
+                if not m_T.any():
                     continue
-                params = fit_params_by_T.get(T_id_int)
-                if params is None:
-                    # Type was skipped (validation failed or too few) —
-                    # keep all slowed of this type.
-                    slow_keep |= mask_T
-                    continue
-                xs_T = ipd_pw[mask_T]  # (n_T_kid, 2)
-                post = _gmm_posterior(
-                    xs_T,
-                    np.asarray(params["means"]),
-                    np.asarray(params["covariances"]),
-                    np.asarray(params["weights"]),
-                )
-                keep_local = post[:, params["meth_idx"]] >= posterior_threshold
-                # Place keep_local back into the full-row mask.
-                full_idx = np.where(mask_T)[0]
-                tmp = np.zeros_like(mask_T)
-                tmp[full_idx[keep_local]] = True
-                slow_keep |= tmp
+                for off in np.unique(offset[m_T]):
+                    O_int = int(off)
+                    mask_TO = m_T & (offset == O_int)
+                    if not mask_TO.any():
+                        continue
+                    params = fit_params_by_TO.get((T_id_int, O_int))
+                    if params is None:
+                        # Bucket was skipped (validation failed, too few, or
+                        # not seen at fit time) — keep all rows in the bucket.
+                        slow_keep |= mask_TO
+                        continue
+                    xs_TO = ipd_pw[mask_TO]
+                    post = _gmm_posterior(
+                        xs_TO,
+                        np.asarray(params["means"]),
+                        np.asarray(params["covariances"]),
+                        np.asarray(params["weights"]),
+                    )
+                    keep_local = post[:, params["meth_idx"]] >= posterior_threshold
+                    full_idx = np.where(mask_TO)[0]
+                    tmp = np.zeros_like(mask_TO)
+                    tmp[full_idx[keep_local]] = True
+                    slow_keep |= tmp
 
         n_slowed_kept += int(slow_keep.sum())
-        n_slowed_dropped += int(slow_m.sum() - slow_keep.sum())
-
         keep_rows = base_m | near_m | slow_keep
         if keep_rows.any():
             new_data[int(kid)] = arr[keep_rows].copy()
             n_baseline_out += int(base_m.sum())
             n_near_out += int(near_m.sum())
 
-    log.info(
-        "[refine.gmm] baseline:  %d in -> %d kept (pass-through)",
-        n_baseline_in,
-        n_baseline_out,
-    )
-    log.info(
-        "[refine.gmm] near_meth: %d in -> %d kept (pass-through)",
-        n_near_in,
-        n_near_out,
-    )
-    log.info(
-        "[refine.gmm] slowed:    %d in -> %d kept, %d dropped  overall survival = %.2f%%",
-        n_slowed_in,
-        n_slowed_kept,
-        n_slowed_dropped,
-        100.0 * n_slowed_kept / max(n_slowed_in, 1),
-    )
-
-    stats = {
-        "method": "gmm_per_meth_type",
-        "posterior_threshold": posterior_threshold,
-        "baseline_validation_min": baseline_validation_min,
-        "min_samples_for_gmm": min_samples_for_gmm,
-        "seed": seed,
-        "n_baseline_pool": len(baseline_pool),
+    return new_data, {
         "n_baseline_in": n_baseline_in,
         "n_baseline_out": n_baseline_out,
         "n_near_in": n_near_in,
         "n_near_out": n_near_out,
         "n_slowed_in": n_slowed_in,
         "n_slowed_kept": n_slowed_kept,
-        "n_slowed_dropped": n_slowed_dropped,
-        "per_type": per_type_stats,
+        "n_slowed_dropped": n_slowed_in - n_slowed_kept,
+    }
+
+
+def slowed_split_gmm(
+    data: dict,
+    posterior_threshold: float = 0.5,
+    baseline_validation_min: float = 0.85,
+    min_samples_for_gmm: int = 100,
+    n_components: int | tuple[int, ...] = (2, 3, 4),
+    seed: int = 42,
+) -> tuple[dict, dict]:
+    """Per-(meth_type, offset) 2D GMM filter on ``CATEGORY_SLOWED`` rows with BIC-based K selection.
+
+    Methylation slows the polymerase on BOTH the wait-time (IPD) and the
+    incorporation duration (PW), and the two channels are typically
+    correlated. The GMM is therefore fit on the **joint (IPD, PW)
+    feature pair** with full per-component covariance — strictly more
+    discriminative than 1D-IPD alone, especially for weak-signal types.
+
+    For each (meth_type T, parent_offset off) bucket present in the slowed
+    rows (e.g. m6A@+0, m6A@+5, m4C@+0, m5C@+2, m5C@+6):
+
+    1. Pool ``slowed_by_T@+off`` (IPD, PW) across all kmers; subsample
+       baseline (IPD, PW) to the same count (or all baseline if fewer).
+    2. For each candidate K in ``n_components``, fit
+       ``GaussianMixture(K, covariance_type="full")`` on the combined
+       2D pool and compute its BIC (lower is better — penalises extra
+       parameters that don't improve the likelihood enough). Pick the K
+       with the lowest BIC. Default candidates: ``(2, 3, 4)``.
+    3. Sort components by **mean IPD**. The highest-IPD-mean component
+       is the "meth-like" cluster; the remaining ``K − 1`` are
+       "baseline-like" (methylation only ever slows, so meth-like
+       always sits above baseline on the IPD axis).
+    4. Validate that ≥ ``baseline_validation_min`` fraction of the
+       baseline subsample is assigned to any of the baseline-like
+       components. If not, the fit cannot be trusted for THIS bucket —
+       keep all ``slowed_by_T@+off`` rows, log a warning. Other buckets
+       of the same meth type are fit and applied independently.
+    5. Otherwise, keep ``slowed_by_T@+off`` rows whose posterior in the
+       meth-like component is ≥ ``posterior_threshold`` (default 0.5).
+
+    Pass ``n_components=3`` (or any single int) to force a fixed K and
+    skip the BIC selection. ``CATEGORY_BASELINE`` and
+    ``CATEGORY_NEAR_METH`` always pass through unchanged.
+
+    Returns ``(new_data, stats)``; ``stats["per_bucket"]["<T>@+<off>"]``
+    carries the selected K, the per-K BIC scores, and the fitted GMM
+    parameters (means, sigmas, weights, meth_idx, baseline_idxs).
+    """
+    try:
+        import sklearn.mixture  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "sklearn is required for the GMM refine method. Install with: pip install scikit-learn"
+        ) from exc
+
+    # Normalise n_components to a tuple of candidate Ks.
+    if isinstance(n_components, int):
+        candidate_ks: tuple[int, ...] = (n_components,)
+    else:
+        candidate_ks = tuple(int(k) for k in n_components)
+    if not candidate_ks or any(k < 2 for k in candidate_ks):
+        raise ValueError(f"n_components must be int ≥ 2 or tuple of ints ≥ 2, got {n_components}")
+
+    rng = np.random.default_rng(seed)
+
+    # ── Pass 1: harvest joint (IPD, PW) per (cat, parent_meth, offset) ──
+    # 2D: methylation slows the polymerase on BOTH wait-time (IPD) and
+    # incorporation duration (PW). Fitting jointly captures the (often
+    # correlated) signature on both axes — strictly more discriminative
+    # than 1D-IPD alone, especially for weak-signal types where one axis
+    # dominates the other.
+    log.info("[refine.gmm] pass 1/2: harvesting (IPD, PW) per (meth, offset) ...")
+    baseline_chunks: list = []
+    slowed_chunks_by_TO: dict[tuple[int, int], list] = {}
+    _harvest_into(data, baseline_chunks, slowed_chunks_by_TO)
+
+    if not baseline_chunks:
+        log.warning("[refine.gmm] no baseline samples — keeping all slowed (no filter)")
+        return _passthrough(data, method="gmm_no_baseline")
+
+    baseline_pool = np.concatenate(baseline_chunks)  # (N, 2)
+    log.info(
+        "[refine.gmm] baseline pool: n=%d  IPD mean=%.2f std=%.2f  PW mean=%.2f std=%.2f",
+        len(baseline_pool),
+        float(baseline_pool[:, 0].mean()),
+        float(baseline_pool[:, 0].std()),
+        float(baseline_pool[:, 1].mean()),
+        float(baseline_pool[:, 1].std()),
+    )
+
+    fit_params_by_TO, per_bucket_stats = _fit_gmms_per_bucket(
+        baseline_pool,
+        slowed_chunks_by_TO,
+        posterior_threshold=posterior_threshold,
+        baseline_validation_min=baseline_validation_min,
+        min_samples_for_gmm=min_samples_for_gmm,
+        candidate_ks=candidate_ks,
+        seed=seed,
+        rng=rng,
+    )
+
+    log.info("[refine.gmm] pass 2/2: filtering slowed rows ...")
+    new_data, counts = _apply_gmm_filter_to_data(data, fit_params_by_TO, posterior_threshold)
+    log.info(
+        "[refine.gmm] baseline:  %d in -> %d kept (pass-through)",
+        counts["n_baseline_in"],
+        counts["n_baseline_out"],
+    )
+    log.info(
+        "[refine.gmm] near_meth: %d in -> %d kept (pass-through)",
+        counts["n_near_in"],
+        counts["n_near_out"],
+    )
+    log.info(
+        "[refine.gmm] slowed:    %d in -> %d kept, %d dropped  overall survival = %.2f%%",
+        counts["n_slowed_in"],
+        counts["n_slowed_kept"],
+        counts["n_slowed_dropped"],
+        100.0 * counts["n_slowed_kept"] / max(counts["n_slowed_in"], 1),
+    )
+
+    stats = {
+        "method": "gmm_per_meth_offset",
+        "posterior_threshold": posterior_threshold,
+        "baseline_validation_min": baseline_validation_min,
+        "min_samples_for_gmm": min_samples_for_gmm,
+        "seed": seed,
+        "n_baseline_pool": len(baseline_pool),
+        **counts,
+        "per_bucket": per_bucket_stats,
     }
     return new_data, stats
+
+
+def slowed_split_gmm_shards(
+    shards_dir: Path,
+    output_dir: Path,
+    posterior_threshold: float = 0.5,
+    baseline_validation_min: float = 0.85,
+    min_samples_for_gmm: int = 100,
+    n_components: int | tuple[int, ...] = (2, 3, 4),
+    seed: int = 42,
+    shard_glob: str = "*_shard.pkl",
+) -> dict:
+    """Sharded variant of :func:`slowed_split_gmm` — never holds the full corpus in RAM.
+
+    Three-phase, bounded peak memory ≈ one shard's size:
+
+    1. **Phase 1 (harvest pool)** — walk every shard in ``shards_dir``,
+       load it, append its (IPD, PW) chunks into the global baseline /
+       slowed-by-T pools, release the shard. Memory delta per shard is
+       just the (IPD, PW) values, not the full pkl.
+    2. **Phase 2 (fit GMMs globally)** — once, on the pooled data. Same
+       per-meth-type 2D BIC fit + validation as the in-memory path.
+    3. **Phase 3 (apply per-shard, write back)** — walk shards again,
+       load each, score with the stored GMM params, atomically write
+       ``<sample_id>_clean_shard.pkl`` into ``output_dir``. Aggregates
+       per-shard counts into a global stats dict.
+
+    Atomic writes guarantee any partial output from a crash is invisible:
+    the next run resumes by re-reading whatever shards exist.
+
+    Args mirror :func:`slowed_split_gmm` plus ``shard_glob`` for the pkl
+    filename pattern. Returns the aggregate ``stats`` dict.
+    """
+    try:
+        import sklearn.mixture  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "sklearn is required for the GMM refine method. Install with: pip install scikit-learn"
+        ) from exc
+
+    from .utils.io import atomic_write_pickle
+
+    shards_dir = Path(shards_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    shard_paths = sorted(shards_dir.glob(shard_glob))
+    if not shard_paths:
+        log.error("No shards matching %s in %s", shard_glob, shards_dir)
+        sys.exit(1)
+    log.info("[refine.gmm.shards] %d shards under %s", len(shard_paths), shards_dir)
+
+    if isinstance(n_components, int):
+        candidate_ks: tuple[int, ...] = (n_components,)
+    else:
+        candidate_ks = tuple(int(k) for k in n_components)
+    if not candidate_ks or any(k < 2 for k in candidate_ks):
+        raise ValueError(f"n_components must be int ≥ 2 or tuple of ints ≥ 2, got {n_components}")
+    rng = np.random.default_rng(seed)
+
+    # ── Phase 1: harvest (IPD, PW) pool from every shard ──────────────
+    log.info(
+        "[refine.gmm.shards] phase 1/3: harvesting (IPD, PW) from %d shards ...", len(shard_paths)
+    )
+    baseline_chunks: list = []
+    slowed_chunks_by_TO: dict[tuple[int, int], list] = {}
+    for i, shard_path in enumerate(shard_paths, start=1):
+        log.info("[refine.gmm.shards]   harvest %d/%d  %s", i, len(shard_paths), shard_path.name)
+        with open(shard_path, "rb") as f:
+            data = pickle.load(f)
+        _harvest_into(data, baseline_chunks, slowed_chunks_by_TO)
+        del data  # release the shard before loading the next
+
+    if not baseline_chunks:
+        log.warning("[refine.gmm.shards] no baseline samples — passing all shards through")
+        # Copy each shard verbatim with passthrough meta.
+        for shard_path in shard_paths:
+            with open(shard_path, "rb") as f:
+                data = pickle.load(f)
+            data["__meta__"] = {
+                "refined_from": str(shard_path),
+                "method": "gmm_no_baseline",
+                "stats": {"skipped": True},
+                "original_meta": data.get("__meta__"),
+            }
+            out_path = output_dir / f"{shard_path.stem}_clean.pkl"
+            atomic_write_pickle(data, out_path)
+        return {"method": "gmm_no_baseline", "skipped": True, "n_shards": len(shard_paths)}
+
+    baseline_pool = np.concatenate(baseline_chunks)
+    log.info(
+        "[refine.gmm.shards] baseline pool: n=%d  IPD %.2f±%.2f  PW %.2f±%.2f",
+        len(baseline_pool),
+        float(baseline_pool[:, 0].mean()),
+        float(baseline_pool[:, 0].std()),
+        float(baseline_pool[:, 1].mean()),
+        float(baseline_pool[:, 1].std()),
+    )
+
+    # ── Phase 2: fit GMMs globally (once, on the pooled data) ──────────
+    log.info("[refine.gmm.shards] phase 2/3: fitting per-(meth, offset) GMMs ...")
+    fit_params_by_TO, per_bucket_stats = _fit_gmms_per_bucket(
+        baseline_pool,
+        slowed_chunks_by_TO,
+        posterior_threshold=posterior_threshold,
+        baseline_validation_min=baseline_validation_min,
+        min_samples_for_gmm=min_samples_for_gmm,
+        candidate_ks=candidate_ks,
+        seed=seed,
+        rng=rng,
+    )
+    # Free the pool memory before phase 3.
+    del baseline_chunks, slowed_chunks_by_TO, baseline_pool
+
+    # ── Phase 3: apply per-shard, write atomically ─────────────────────
+    log.info("[refine.gmm.shards] phase 3/3: filtering + writing %d shards ...", len(shard_paths))
+    aggregate = {
+        "n_baseline_in": 0,
+        "n_baseline_out": 0,
+        "n_near_in": 0,
+        "n_near_out": 0,
+        "n_slowed_in": 0,
+        "n_slowed_kept": 0,
+        "n_slowed_dropped": 0,
+    }
+    for i, shard_path in enumerate(shard_paths, start=1):
+        log.info("[refine.gmm.shards]   apply %d/%d  %s", i, len(shard_paths), shard_path.name)
+        with open(shard_path, "rb") as f:
+            data = pickle.load(f)
+        orig_meta = data.pop("__meta__", None)
+        int_keyed = {k: v for k, v in data.items() if isinstance(k, (int, np.integer))}
+
+        new_data, counts = _apply_gmm_filter_to_data(
+            int_keyed, fit_params_by_TO, posterior_threshold
+        )
+        for k, v in counts.items():
+            aggregate[k] += v
+
+        new_data["__meta__"] = {
+            "refined_from": str(shard_path),
+            "method": "gmm_per_meth_offset",
+            "stats": {**counts, "per_bucket": per_bucket_stats},
+            "original_meta": orig_meta,
+        }
+        out_path = output_dir / f"{shard_path.stem}_clean.pkl"
+        atomic_write_pickle(new_data, out_path)
+        del data, new_data  # release before next shard
+
+    log.info(
+        "[refine.gmm.shards] DONE  baseline %d→%d  near %d→%d  "
+        "slowed %d→%d kept (%d dropped, %.2f%% survival)",
+        aggregate["n_baseline_in"],
+        aggregate["n_baseline_out"],
+        aggregate["n_near_in"],
+        aggregate["n_near_out"],
+        aggregate["n_slowed_in"],
+        aggregate["n_slowed_kept"],
+        aggregate["n_slowed_dropped"],
+        100.0 * aggregate["n_slowed_kept"] / max(aggregate["n_slowed_in"], 1),
+    )
+
+    return {
+        "method": "gmm_per_meth_offset",
+        "posterior_threshold": posterior_threshold,
+        "baseline_validation_min": baseline_validation_min,
+        "min_samples_for_gmm": min_samples_for_gmm,
+        "seed": seed,
+        "n_shards": len(shard_paths),
+        **aggregate,
+        "per_bucket": per_bucket_stats,
+    }
 
 
 def _passthrough(data: dict, method: str) -> tuple[dict, dict]:
@@ -705,20 +981,78 @@ def refine_pkl(
     posterior_threshold: float = 0.5,
     baseline_validation_min: float = 0.85,
     min_samples_for_gmm: int = 100,
-    n_components: int | tuple[int, ...] = (2, 3),
+    n_components: int | tuple[int, ...] = (2, 3, 4),
     seed: int = 42,
 ) -> dict:
-    """Load a master .pkl, run the chosen refine method, write the refined pkl.
+    """Refine one master .pkl OR a directory of shards (auto-detected).
+
+    If ``in_path`` is a directory, the **sharded** refine path is used:
+    pool harvest across shards → fit GMMs once globally → apply per-shard
+    and write to ``out_path/`` (which must be a directory). Peak RAM is
+    bounded by one shard, not the full corpus — the right path for ≥ 10
+    strains.
+
+    If ``in_path`` is a file, the in-memory ``slowed_split_gmm`` /
+    ``slowed_split`` path is used: load, fit, filter, atomic write.
 
     Args:
-        method: ``"gmm"`` (default, per-meth-type 2-comp Gaussian Mixture)
-            or ``"p95"`` (legacy global per-kmer baseline-mean p95).
-        secondary_percentile: percentile for the ``p95`` method. Defaults
-            to ``refine.slowed_split.secondary_percentile`` in
-            ``kinsim_config.yaml`` (typically 95).
+        method: ``"gmm"`` (default) or ``"p95"`` (legacy).
+        secondary_percentile: percentile for the ``p95`` method.
         posterior_threshold / baseline_validation_min /
-            min_samples_for_gmm: knobs for the ``gmm`` method.
+            min_samples_for_gmm / n_components / seed: knobs for ``gmm``.
     """
+    in_path = Path(in_path)
+    out_path = Path(out_path)
+
+    # ── Sharded mode: in_path is a directory of *_shard.pkl files. ──────
+    if in_path.is_dir():
+        if method != "gmm":
+            log.error("Sharded refine only supports method=gmm (got %r)", method)
+            sys.exit(1)
+        from .utils.sample_layout import SAMPLE_NCOLS
+
+        # Quick layout sanity check on the first shard.
+        first = next(iter(sorted(in_path.glob("*_shard.pkl"))), None)
+        if first is None:
+            log.error("No *_shard.pkl files in %s", in_path)
+            sys.exit(1)
+        with open(first, "rb") as f:
+            probe = pickle.load(f)
+        for k, v in probe.items():
+            if isinstance(k, (int, np.integer)) and isinstance(v, np.ndarray):
+                if v.shape[1] < SAMPLE_NCOLS:
+                    log.error(
+                        "Shard %s uses an obsolete %d-col layout; "
+                        "re-run `kinsim extract` (need %d cols).",
+                        first.name,
+                        v.shape[1],
+                        SAMPLE_NCOLS,
+                    )
+                    sys.exit(1)
+                break
+        del probe
+
+        log.info(
+            "Refine (sharded): in=%s  out=%s  method=gmm  n_components=%s  "
+            "posterior_threshold=%g  baseline_validation_min=%g  min_samples_for_gmm=%d",
+            in_path,
+            out_path,
+            n_components if isinstance(n_components, int) else ",".join(map(str, n_components)),
+            posterior_threshold,
+            baseline_validation_min,
+            min_samples_for_gmm,
+        )
+        return slowed_split_gmm_shards(
+            in_path,
+            out_path,
+            posterior_threshold=posterior_threshold,
+            baseline_validation_min=baseline_validation_min,
+            min_samples_for_gmm=min_samples_for_gmm,
+            n_components=n_components,
+            seed=seed,
+        )
+
+    # ── Single-pkl mode (legacy / small datasets) ──
     log.info("Loading: %s  (%.2f GB)", in_path, in_path.stat().st_size / 1e9)
     with open(in_path, "rb") as f:
         data = pickle.load(f)

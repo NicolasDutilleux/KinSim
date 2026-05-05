@@ -2,20 +2,26 @@
 
 Storage format (v4, ``kinsim.utils.sample_layout``):
 
-    dict[kmer_id (int)] -> np.ndarray(N, 36)
+    dict[kmer_id (int)] -> np.ndarray(N, 38)
 
-with col 35 carrying the CATEGORY enum (0=baseline, 1=slowed, 2=near_meth).
+Cols 35/36/37 carry CATEGORY (0=baseline, 1=slowed, 2=near_meth),
+PARENT_METH (meth_id of the parent methylation), and PARENT_OFFSET
+(this row's distance from the parent meth position). Buckets are
+emitted **per (meth_type, offset)** — e.g. ``slowed_by_m6A_at_+0`` and
+``slowed_by_m6A_at_+5`` are reported separately so a noisy offset of a
+meth type cannot mask a clean offset of the same type in the plots.
 
 Outputs (to ``--output-dir`` or the input's directory by default):
 
     <basename>_report.txt   text report (also printed to stdout)
     <basename>_report.html  Plotly figures + report header
 
-The HTML report is a focused 4-figure verification dashboard:
+The HTML report is a focused 5-figure verification dashboard:
     1. IPD distribution per category (with refine threshold)
     2. Per-kmer baseline-mean distribution (showing where the threshold sits)
-    3. Kinetic signature profiles (offsets 0..+8) per bucket
-    4. Sample counts per bucket
+    3. Kinetic signature profiles (offsets 0..+8) per (meth, signature offset) bucket
+    4. Sample counts per (meth, offset) bucket
+    5. 3D joint (IPD, PW) KDE per bucket
 
 CLI:
 
@@ -214,19 +220,27 @@ def compute_category_distributions(data: dict) -> dict:
 
 
 def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
-    """Aggregate the kinetic profile per bucket.
+    """Aggregate the kinetic profile per (category, parent_meth, parent_offset) bucket.
 
-    Buckets: ``baseline``, ``slowed_by_<T>``, ``near_meth_by_<T>`` for each
-    methylation type T declared in ``kinsim_config.yaml``.
+    Buckets: ``baseline``, ``slowed_by_<T>_at_+<off>``,
+    ``near_meth_by_<T>_at_+<off>`` — one bucket per (meth type T, parent
+    offset off) pair found in the data. Splitting per-offset means a
+    noisy offset (e.g. m6A@+5 from a Type I R-M motif that doesn't
+    actually carry a +5 signature) can be inspected independently from
+    a clean offset of the same meth type (e.g. m6A@+0 from GATC). With
+    a merged ``slowed_by_<T>`` bucket, a flat profile could mean
+    "extraction is broken" OR "one offset is noisy" — splitting makes
+    that distinction visible at a glance.
 
-    Parent attribution is read directly from ``COL_PARENT_METH`` (written
-    at extract time) — no inference from the meth_context window. This is
-    fully vectorised: per kmer, one boolean mask per (category, parent)
-    pair, then ``profile[mask].sum(axis=0)`` accumulators.
+    Parent attribution is read directly from ``COL_PARENT_METH`` /
+    ``COL_PARENT_OFFSET`` (written at extract time) — no inference
+    from the meth_context window.
 
     Returns ``dict[bucket] -> {profile_ipd, profile_pw, n_samples, sig_offsets}``.
+    For per-offset buckets, ``sig_offsets`` is the singleton ``[off]`` so
+    Fig 3 marks exactly the offset where the polymerase-slowing signal
+    is biophysically expected for that bucket.
     """
-    from .utils.config import load_kinsim_config
     from .utils.encoding import get_meth_ids
     from .utils.sample_layout import (
         CATEGORY_BASELINE,
@@ -234,11 +248,11 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
         CATEGORY_SLOWED,
         COL_CATEGORY,
         COL_PARENT_METH,
+        COL_PARENT_OFFSET,
         METH_CTX_LEN,
         PROFILE_LEN,
     )
 
-    cfg = load_kinsim_config()
     profile_start_col = 3 + METH_CTX_LEN
     pw_start_col = profile_start_col + PROFILE_LEN
     needed_cols = pw_start_col + PROFILE_LEN  # = 32
@@ -246,13 +260,6 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
     meth_ids = get_meth_ids()
     name_by_mid = {v: k for k, v in meth_ids.items()}
 
-    sig_set_by_name: dict[str, set] = {}
-    for mod_name, sig_cfg in (cfg.get("kinetic_signatures") or {}).items():
-        sig_set_by_name[mod_name] = {
-            int(k) for k in sig_cfg.get("signal_offsets", []) if isinstance(k, (int, float))
-        }
-
-    # Per-meth-type accumulators initialised lazily as types are first seen.
     def _new_acc():
         return [
             np.zeros(PROFILE_LEN, dtype=np.float64),
@@ -261,16 +268,18 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
         ]
 
     baseline_acc = _new_acc()
-    slowed_acc: dict[int, list] = {}
-    near_acc: dict[int, list] = {}
+    # Keys: (T_id, offset) — one accumulator per (meth, signature offset).
+    slowed_acc: dict[tuple[int, int], list] = {}
+    near_acc: dict[tuple[int, int], list] = {}
 
     for kid, v in data.items():
         if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
             continue
-        if v.shape[1] <= COL_PARENT_METH:
+        if v.shape[1] <= COL_PARENT_OFFSET:
             continue
         cats = v[:, COL_CATEGORY].astype(np.int8)
         parent = v[:, COL_PARENT_METH].astype(np.int8)
+        offset = v[:, COL_PARENT_OFFSET].astype(np.int8)
         ipd_prof = v[:, profile_start_col:pw_start_col]
         pw_prof = v[:, pw_start_col:needed_cols]
 
@@ -280,27 +289,29 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
             baseline_acc[1] += pw_prof[base_m].sum(axis=0)
             baseline_acc[2] += int(base_m.sum())
 
-        slow_m = cats == CATEGORY_SLOWED
-        if slow_m.any():
-            for T_id in np.unique(parent[slow_m]):
-                if T_id == 0:
-                    continue  # untagged slowed (shouldn't happen with new extract)
-                mask = slow_m & (parent == T_id)
-                acc = slowed_acc.setdefault(int(T_id), _new_acc())
-                acc[0] += ipd_prof[mask].sum(axis=0)
-                acc[1] += pw_prof[mask].sum(axis=0)
-                acc[2] += int(mask.sum())
-
-        near_m = cats == CATEGORY_NEAR_METH
-        if near_m.any():
-            for T_id in np.unique(parent[near_m]):
-                if T_id == 0:
+        for cat_id, acc_dict in (
+            (CATEGORY_SLOWED, slowed_acc),
+            (CATEGORY_NEAR_METH, near_acc),
+        ):
+            m_cat = cats == cat_id
+            if not m_cat.any():
+                continue
+            for T_id in np.unique(parent[m_cat]):
+                T_int = int(T_id)
+                if T_int == 0:
                     continue
-                mask = near_m & (parent == T_id)
-                acc = near_acc.setdefault(int(T_id), _new_acc())
-                acc[0] += ipd_prof[mask].sum(axis=0)
-                acc[1] += pw_prof[mask].sum(axis=0)
-                acc[2] += int(mask.sum())
+                m_T = m_cat & (parent == T_int)
+                if not m_T.any():
+                    continue
+                for off in np.unique(offset[m_T]):
+                    O_int = int(off)
+                    mask = m_T & (offset == O_int)
+                    if not mask.any():
+                        continue
+                    acc = acc_dict.setdefault((T_int, O_int), _new_acc())
+                    acc[0] += ipd_prof[mask].sum(axis=0)
+                    acc[1] += pw_prof[mask].sum(axis=0)
+                    acc[2] += int(mask.sum())
 
     out: dict = {}
     if baseline_acc[2] > 0:
@@ -310,21 +321,21 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
             "n_samples": baseline_acc[2],
             "sig_offsets": [],
         }
-    for T_id, (s_i, s_p, n) in slowed_acc.items():
+    for (T_id, off), (s_i, s_p, n) in slowed_acc.items():
         mname = name_by_mid.get(T_id, f"meth{T_id}")
-        out[f"slowed_by_{mname}"] = {
+        out[_bucket_name("slowed_by_", mname, off)] = {
             "profile_ipd": (s_i / max(n, 1)).astype(np.float32),
             "profile_pw": (s_p / max(n, 1)).astype(np.float32),
             "n_samples": n,
-            "sig_offsets": sorted(sig_set_by_name.get(mname, [])),
+            "sig_offsets": [off] if 0 <= off < PROFILE_LEN else [],
         }
-    for T_id, (s_i, s_p, n) in near_acc.items():
+    for (T_id, off), (s_i, s_p, n) in near_acc.items():
         mname = name_by_mid.get(T_id, f"meth{T_id}")
-        out[f"near_meth_by_{mname}"] = {
+        out[_bucket_name("near_meth_by_", mname, off)] = {
             "profile_ipd": (s_i / max(n, 1)).astype(np.float32),
             "profile_pw": (s_p / max(n, 1)).astype(np.float32),
             "n_samples": n,
-            "sig_offsets": sorted(sig_set_by_name.get(mname, [])),
+            "sig_offsets": [off] if 0 <= off < PROFILE_LEN else [],
         }
     return out
 
@@ -335,11 +346,16 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
 
 
 def compute_meth_context_distribution(data: dict) -> dict:
-    """For each bucket, count meth_id occurrences at each meth_context offset.
+    """For each (category, parent_meth, parent_offset) bucket, count
+    meth_id occurrences at each meth_context offset.
 
-    Parent attribution is read directly from ``COL_PARENT_METH`` and the
-    inner accumulation is fully vectorised (one boolean mask per meth_id
-    over all rows of the bucket).
+    Parent attribution is read directly from ``COL_PARENT_METH`` /
+    ``COL_PARENT_OFFSET`` and the inner accumulation is fully
+    vectorised (one boolean mask per meth_id over all rows of the
+    bucket). Splitting per-offset surfaces things like "the m6A flag at
+    +5 sees meth_context A at the wrong column" — a clue that the
+    expected signature offset for that meth type doesn't apply to the
+    motif that produced this row.
 
     Returns ``dict[bucket] -> {counts, fractions, n_samples, meth_ids, meth_names}``.
     """
@@ -350,6 +366,7 @@ def compute_meth_context_distribution(data: dict) -> dict:
         CATEGORY_SLOWED,
         COL_CATEGORY,
         COL_PARENT_METH,
+        COL_PARENT_OFFSET,
         METH_CTX_LEN,
     )
 
@@ -378,37 +395,45 @@ def compute_meth_context_distribution(data: dict) -> dict:
         bkt["n_samples"] += len(mc_arr)
 
     baseline_b: dict = _empty()
-    slowed_buckets: dict[int, dict] = {}
-    near_buckets: dict[int, dict] = {}
+    slowed_buckets: dict[tuple[int, int], dict] = {}
+    near_buckets: dict[tuple[int, int], dict] = {}
 
     for kid, v in data.items():
         if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
             continue
-        if v.shape[1] <= COL_PARENT_METH:
+        if v.shape[1] <= COL_PARENT_OFFSET:
             continue
         cats = v[:, COL_CATEGORY].astype(np.int8)
         parent = v[:, COL_PARENT_METH].astype(np.int8)
+        offset = v[:, COL_PARENT_OFFSET].astype(np.int8)
         mc = v[:, 3 : 3 + METH_CTX_LEN].astype(np.int32)
 
         base_mask = cats == CATEGORY_BASELINE
         if base_mask.any():
             _accumulate(baseline_b, mc[base_mask])
 
-        slow_mask = cats == CATEGORY_SLOWED
-        if slow_mask.any():
-            for T_id in np.unique(parent[slow_mask]):
-                if T_id == 0:
+        for cat_id, bucket_dict in (
+            (CATEGORY_SLOWED, slowed_buckets),
+            (CATEGORY_NEAR_METH, near_buckets),
+        ):
+            m_cat = cats == cat_id
+            if not m_cat.any():
+                continue
+            for T_id in np.unique(parent[m_cat]):
+                T_int = int(T_id)
+                if T_int == 0:
                     continue
-                mask = slow_mask & (parent == T_id)
-                _accumulate(slowed_buckets.setdefault(int(T_id), _empty()), mc[mask])
-
-        near_mask = cats == CATEGORY_NEAR_METH
-        if near_mask.any():
-            for T_id in np.unique(parent[near_mask]):
-                if T_id == 0:
+                m_T = m_cat & (parent == T_int)
+                if not m_T.any():
                     continue
-                mask = near_mask & (parent == T_id)
-                _accumulate(near_buckets.setdefault(int(T_id), _empty()), mc[mask])
+                for off in np.unique(offset[m_T]):
+                    O_int = int(off)
+                    mask = m_T & (offset == O_int)
+                    if not mask.any():
+                        continue
+                    _accumulate(
+                        bucket_dict.setdefault((T_int, O_int), _empty()), mc[mask]
+                    )
 
     final: dict = {}
 
@@ -420,14 +445,14 @@ def compute_meth_context_distribution(data: dict) -> dict:
 
     if baseline_b["n_samples"] > 0:
         final["baseline"] = _finalise(baseline_b)
-    for T_id, bkt in slowed_buckets.items():
+    for (T_id, off), bkt in slowed_buckets.items():
         if bkt["n_samples"] > 0:
             mname = name_by_mid.get(T_id, f"meth{T_id}")
-            final[f"slowed_by_{mname}"] = _finalise(bkt)
-    for T_id, bkt in near_buckets.items():
+            final[_bucket_name("slowed_by_", mname, off)] = _finalise(bkt)
+    for (T_id, off), bkt in near_buckets.items():
         if bkt["n_samples"] > 0:
             mname = name_by_mid.get(T_id, f"meth{T_id}")
-            final[f"near_meth_by_{mname}"] = _finalise(bkt)
+            final[_bucket_name("near_meth_by_", mname, off)] = _finalise(bkt)
     return final
 
 
@@ -540,14 +565,34 @@ def collect_stats(data: dict, pkl_path: str) -> DictStats:
 
 
 def _bucket_order_key(name: str) -> tuple:
-    """Display order: baseline, then slowed_by_*, then near_meth_by_*."""
+    """Display order: baseline, then slowed_by_<T>_at_+<off>, then near_meth_by_<T>_at_+<off>.
+
+    Within each category, sort by meth-type then by offset (numerical,
+    so ``+10`` doesn't sort before ``+2``).
+    """
     if name == "baseline":
-        return (0, name)
+        return (0, "", 0)
     if name.startswith("slowed_by_"):
-        return (1, name)
-    if name.startswith("near_meth_by_"):
-        return (2, name)
-    return (3, name)
+        prefix = 1
+        body = name[len("slowed_by_"):]
+    elif name.startswith("near_meth_by_"):
+        prefix = 2
+        body = name[len("near_meth_by_"):]
+    else:
+        return (3, name, 0)
+    if "_at_" in body:
+        meth_part, off_part = body.rsplit("_at_", 1)
+        try:
+            off_int = int(off_part)
+        except ValueError:
+            off_int = 0
+        return (prefix, meth_part, off_int)
+    return (prefix, body, 0)
+
+
+def _bucket_name(prefix: str, meth_name: str, offset: int) -> str:
+    """Canonical analyze bucket name: ``slowed_by_m6A_at_+0`` etc."""
+    return f"{prefix}{meth_name}_at_{offset:+d}"
 
 
 def render_txt_report(
@@ -998,11 +1043,7 @@ def _build_html_figures(
     # ── Fig 3: Kinetic signature profiles ───────────────────────────────
     if signature_profiles:
         fig3 = go.Figure()
-        ordered = [
-            "baseline",
-            *sorted(n for n in signature_profiles if n.startswith("slowed_by_")),
-            *sorted(n for n in signature_profiles if n.startswith("near_meth_by_")),
-        ]
+        ordered = sorted(signature_profiles.keys(), key=_bucket_order_key)
         palette = [
             "#1f77b4",
             "#d62728",
@@ -1108,24 +1149,27 @@ def _build_ipd_pw_density_figure(data: dict):
         COL_CATEGORY,
         COL_IPD,
         COL_PARENT_METH,
+        COL_PARENT_OFFSET,
         COL_PW,
     )
 
     name_by_mid = {v: k for k, v in get_meth_ids().items()}
     rng = np.random.default_rng(0)
 
-    # Gather (IPD, PW) per bucket. Cap at 50k points per bucket — KDE
-    # is O(n²) on bandwidth selection and slows hard above that, with
-    # negligible visual gain (the surface is already smooth).
+    # Gather (IPD, PW) per (category, meth, offset) bucket. Cap at 50k
+    # points per bucket — KDE is off(n²) on bandwidth selection and slows
+    # hard above that, with negligible visual gain (the surface is
+    # already smooth).
     BUCKET_CAP = 50_000
     buckets: dict[str, list] = {}
     for kid, arr in data.items():
         if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
             continue
-        if arr.shape[1] <= COL_PARENT_METH:
+        if arr.shape[1] <= COL_PARENT_OFFSET:
             continue
         cats = arr[:, COL_CATEGORY].astype(np.int8)
         parent = arr[:, COL_PARENT_METH].astype(np.int8)
+        offset = arr[:, COL_PARENT_OFFSET].astype(np.int8)
         ipd_pw = arr[:, [COL_IPD, COL_PW]]
 
         m_base = cats == CATEGORY_BASELINE
@@ -1143,11 +1187,18 @@ def _build_ipd_pw_density_figure(data: dict):
                 T_id_int = int(T_id)
                 if T_id_int == 0:
                     continue
-                mask = m_cat & (parent == T_id)
-                if not mask.any():
+                m_T = m_cat & (parent == T_id_int)
+                if not m_T.any():
                     continue
                 T_name = name_by_mid.get(T_id_int, f"meth{T_id_int}")
-                buckets.setdefault(prefix + T_name, []).append(ipd_pw[mask])
+                for off in np.unique(offset[m_T]):
+                    O_int = int(off)
+                    mask = m_T & (offset == O_int)
+                    if not mask.any():
+                        continue
+                    buckets.setdefault(_bucket_name(prefix, T_name, O_int), []).append(
+                        ipd_pw[mask]
+                    )
 
     if not buckets:
         return None
@@ -1375,29 +1426,85 @@ def render_html_report(
 # ---------------------------------------------------------------------------
 
 
+def _concat_shards(shards_dir, glob: str = "*_shard*.pkl") -> tuple[dict, dict | None]:
+    """Walk a shards directory and concatenate per-kmer arrays into one dict.
+
+    Memory peak ≈ corpus size at completion, but loads shards sequentially
+    so the working set never exceeds (corpus + one shard) at any moment.
+    Returns ``(merged_data, refine_meta)`` where ``refine_meta`` is taken
+    from the first shard's ``__meta__`` (all shards share the same refine
+    parameters by construction).
+    """
+    shard_paths = sorted(Path(shards_dir).glob(glob))
+    if not shard_paths:
+        raise FileNotFoundError(f"No shards matching {glob} in {shards_dir}")
+
+    log.info(
+        "Sharded analyze: loading + concatenating %d shards from %s", len(shard_paths), shards_dir
+    )
+    merged: dict = {}
+    refine_meta: dict | None = None
+
+    for i, shard_path in enumerate(shard_paths, start=1):
+        log.info("  load %d/%d  %s", i, len(shard_paths), shard_path.name)
+        with open(shard_path, "rb") as f:
+            data = pickle.load(f)
+        meta = data.pop("__meta__", None)
+        if refine_meta is None and isinstance(meta, dict):
+            refine_meta = meta
+        for kid, arr in data.items():
+            if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
+                continue
+            kid_int = int(kid)
+            if kid_int in merged:
+                merged[kid_int] = np.concatenate([merged[kid_int], arr], axis=0)
+            else:
+                merged[kid_int] = arr
+        del data
+    return merged, refine_meta
+
+
 def analyze_pkl(
     pkl_path: str,
     output_dir: str | None = None,
     no_html: bool = False,
 ) -> None:
-    """Load a .pkl, compute statistics, write TXT + HTML reports."""
+    """Load a .pkl OR a shards directory, compute statistics, write TXT + HTML reports.
+
+    If ``pkl_path`` is a directory, all ``*_shard*.pkl`` files are loaded
+    and concatenated per-kmer before running the pipeline. Memory peak
+    is the full corpus — for very large corpora consider splitting the
+    analyze run by meth type or by sample subset.
+
+    If ``pkl_path`` is a file, it's loaded as a single master_clean.pkl.
+    """
     t0 = time.time()
-    pkl_path = str(Path(pkl_path).resolve())
+    in_path = Path(pkl_path).resolve()
 
-    if output_dir is None:
-        output_dir = str(Path(pkl_path).parent)
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    if in_path.is_dir():
+        # Sharded mode
+        if output_dir is None:
+            output_dir = str(in_path)
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        base = in_path.name + "_combined"
+        pkl_path = str(in_path)
+        data, sharded_meta = _concat_shards(in_path)
+    else:
+        pkl_path = str(in_path)
+        if output_dir is None:
+            output_dir = str(in_path.parent)
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        base = in_path.stem
+        log.info("Loading: %s", pkl_path)
+        with open(pkl_path, "rb") as fh:
+            data = pickle.load(fh)
+        sharded_meta = None
 
-    base = Path(pkl_path).stem
     txt_path = str(Path(output_dir) / f"{base}_report.txt")
     html_path = str(Path(output_dir) / f"{base}_report.html")
 
-    log.info("Loading: %s", pkl_path)
-    with open(pkl_path, "rb") as fh:
-        data = pickle.load(fh)
-
     if not data:
-        log.error("File is empty: %s", pkl_path)
+        log.error("Input is empty: %s", pkl_path)
         return
 
     _check_v4_input(data)
@@ -1421,7 +1528,11 @@ def analyze_pkl(
     log.info("Computing per-category IPD distribution ...")
     cat_dist = compute_category_distributions(data)
 
-    refine_meta = data.get("__meta__") if isinstance(data.get("__meta__"), dict) else None
+    refine_meta = (
+        sharded_meta
+        if sharded_meta is not None
+        else (data.get("__meta__") if isinstance(data.get("__meta__"), dict) else None)
+    )
 
     print()
     render_txt_report(
@@ -1465,7 +1576,11 @@ def main(argv=None) -> None:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("pkl", help="Path to the master / master_clean .pkl")
+    parser.add_argument(
+        "pkl",
+        help="Path to a master_clean .pkl (single file) OR a directory of "
+        "refined *_shard.pkl files (sharded mode — concatenates them in-memory).",
+    )
     parser.add_argument(
         "-o", "--output-dir", default=None, help="Output directory (default: same dir as pkl)"
     )

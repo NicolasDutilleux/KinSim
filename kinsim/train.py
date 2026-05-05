@@ -62,7 +62,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, IterableDataset, Subset
 
 try:
     import lightning as L
@@ -79,7 +79,12 @@ except ImportError:
             "PyTorch Lightning is required for MLP training.\nInstall with: pip install lightning"
         ) from exc
 
-from .data.dataset import MLPSignalDataset
+from .data.dataset import (
+    MLPSignalDataset,
+    ShardedSignalDataset,
+    list_shards,
+    split_shards,
+)
 from .models.predictor import ConvPredictor, MLPPredictor
 
 log = logging.getLogger(__name__)
@@ -354,40 +359,69 @@ def _log_metrics(metrics: dict, prefix: str) -> None:
 
 
 class KineticDataModule(L.LightningDataModule):
-    """LightningDataModule for KinSim kinetic .pkl files.
+    """LightningDataModule for KinSim kinetic data — supports both layouts.
 
-    Wraps MLPSignalDataset with a reproducible train/val split and an optional
-    separate held-out test set.
+    Two input modes (auto-detected from ``input_path``):
+
+    * **Single .pkl** — loads :class:`MLPSignalDataset` once into RAM,
+      then random train/val split. Optional separate ``test_pkl`` for a
+      held-out evaluation set. Best for small datasets.
+
+    * **Shards directory** — uses :class:`ShardedSignalDataset` over a
+      list of per-strain shard pkls. The shard list is split:
+
+      - ``test_strains`` (explicit list) OR ``test_fraction`` (random
+        per-shard) carves the held-out **test** set.
+      - The remaining shards are split into train + val by
+        ``val_fraction`` (random per-shard with ``seed``).
+
+      Peak RAM is bounded by ``num_workers × shard_size``, regardless of
+      corpus size — the right path for ≥ 10 strains.
 
     Args:
-        pkl_path:     Path to balanced training .pkl (from kinsim-prep balance).
-        test_pkl:     Path to separate test .pkl (optional).
-        val_fraction: Fraction of training keys held out for validation.
-        batch_size:   Training DataLoader batch size.
-        seed:         Random seed for reproducible train/val split.
+        input_path:    Path to a master .pkl OR a shards directory.
+        test_pkl:      (single-pkl mode) path to a separate held-out test .pkl.
+        test_strains:  (sharded mode) list of sample_ids to hold out as test.
+        test_fraction: (sharded mode) random fraction of shards held out as test.
+        val_fraction:  Fraction held out as validation (after test split).
+        batch_size:    Training DataLoader batch size.
+        seed:          Random seed for reproducible splits + sharded shuffler.
     """
 
     def __init__(
         self,
-        pkl_path: str,
+        input_path: str,
         test_pkl: str | None = None,
+        test_strains: list | None = None,
+        test_fraction: float | None = None,
         val_fraction: float = 0.10,
         batch_size: int = 4096,
         seed: int = 42,
     ) -> None:
         super().__init__()
-        self.pkl_path = pkl_path
+        self.input_path = str(input_path)
         self.test_pkl = test_pkl
+        self.test_strains = list(test_strains) if test_strains else None
+        self.test_fraction = test_fraction
         self.val_fraction = val_fraction
         self.batch_size = batch_size
         self.seed = seed
+        # populated in setup()
         self._train_subset = None
         self._val_subset = None
         self._test_dataset = None
+        self._sharded = Path(self.input_path).is_dir()
 
     def setup(self, stage: str | None = None) -> None:
+        if self._sharded:
+            self._setup_sharded(stage)
+        else:
+            self._setup_monolithic(stage)
+
+    # ── Single-pkl path ────────────────────────────────────────────────
+    def _setup_monolithic(self, stage: str | None) -> None:
         if stage in ("fit", None):
-            dataset = MLPSignalDataset(self.pkl_path)
+            dataset = MLPSignalDataset(self.input_path)
             n_val = max(1, int(len(dataset) * self.val_fraction))
             n_train = len(dataset) - n_val
             rng = torch.Generator().manual_seed(self.seed)
@@ -399,11 +433,62 @@ class KineticDataModule(L.LightningDataModule):
             self._test_dataset = MLPSignalDataset(self.test_pkl)
             log.info("Test set: %d keys from %s", len(self._test_dataset), self.test_pkl)
 
+    # ── Sharded path ───────────────────────────────────────────────────
+    def _setup_sharded(self, stage: str | None) -> None:
+        all_shards = list_shards(self.input_path)
+        if not all_shards:
+            raise FileNotFoundError(f"No *_shard.pkl in {self.input_path}")
+
+        train_shards, test_shards = split_shards(
+            all_shards,
+            test_strains=self.test_strains,
+            test_fraction=self.test_fraction,
+            seed=self.seed,
+        )
+        # Carve a val set out of train_shards (per-shard split, reproducible).
+        rng = np.random.default_rng(self.seed + 1)
+        idx = np.arange(len(train_shards))
+        rng.shuffle(idx)
+        n_val = max(1, round(len(train_shards) * self.val_fraction))
+        val_idx = set(int(i) for i in idx[:n_val])
+        val_shards = [s for i, s in enumerate(train_shards) if i in val_idx]
+        train_only_shards = [s for i, s in enumerate(train_shards) if i not in val_idx]
+
+        log.info(
+            "Sharded split — train: %d shards, val: %d shards, test: %d shards",
+            len(train_only_shards),
+            len(val_shards),
+            len(test_shards),
+        )
+        log.info("  train: %s", [Path(s).stem for s in train_only_shards])
+        log.info("  val:   %s", [Path(s).stem for s in val_shards])
+        log.info("  test:  %s", [Path(s).stem for s in test_shards])
+
+        if stage in ("fit", None):
+            self._train_subset = ShardedSignalDataset(
+                train_only_shards,
+                shuffle=True,
+                seed=self.seed,
+            )
+            self._val_subset = ShardedSignalDataset(
+                val_shards,
+                shuffle=False,
+                seed=self.seed + 100,
+            )
+        if stage in ("test", None) and test_shards:
+            self._test_dataset = ShardedSignalDataset(
+                test_shards,
+                shuffle=False,
+                seed=self.seed + 200,
+            )
+
     def train_dataloader(self) -> DataLoader:
+        # IterableDataset shuffles inside __iter__ — DataLoader must NOT.
+        is_iter = isinstance(self._train_subset, IterableDataset)
         return DataLoader(
             self._train_subset,
             batch_size=self.batch_size,
-            shuffle=True,
+            shuffle=not is_iter,
             num_workers=4,
             pin_memory=True,
         )
@@ -758,7 +843,7 @@ def objective(
 
     lm = KineticPredictor(model, lr=lr, loss_name=loss_name)
     dm = KineticDataModule(
-        pkl_path=pkl_path,
+        input_path=pkl_path,
         val_fraction=val_fraction,
         batch_size=batch_size,
     )
@@ -800,6 +885,9 @@ def train_mlp(
     pkl_path: str,
     output_dir: str,
     test_pkl: str | None = None,
+    test_strains: list | None = None,
+    test_fraction: float | None = None,
+    split_seed: int = 42,
     architecture: str = "conv",
     epochs: int = 50,
     batch_size: int = 4096,
@@ -1005,10 +1093,13 @@ def train_mlp(
 
     lm = KineticPredictor(model, lr=lr, loss_name=loss_name)
     dm = KineticDataModule(
-        pkl_path=pkl_path,
+        input_path=pkl_path,
         test_pkl=test_pkl,
+        test_strains=test_strains,
+        test_fraction=test_fraction,
         val_fraction=val_fraction,
         batch_size=batch_size,
+        seed=split_seed,
     )
 
     # ── Callbacks ─────────────────────────────────────────────────────────
@@ -1086,7 +1177,9 @@ def main(argv: list[str] | None = None) -> None:
         "pkl",
         nargs="?",
         default=None,
-        help="Balanced training data .pkl (from kinsim-prep balance)",
+        help="Training input — either a master_clean.pkl (small datasets, in-memory) "
+        "or a directory of refined *_shard.pkl files (sharded streaming). "
+        "Auto-detected from the path.",
     )
     parser.add_argument(
         "output_dir", nargs="?", default=None, help="Directory for checkpoints and logs"
@@ -1094,8 +1187,26 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--test-pkl",
         default=None,
-        help="Held-out test .pkl — evaluated once after training "
-        "(should be balanced the same way as the training set)",
+        help="(single-pkl mode) held-out test .pkl — evaluated once after training",
+    )
+    parser.add_argument(
+        "--test-strains",
+        default=None,
+        help="(sharded mode) comma-separated sample_ids to hold out as the test set "
+        "(e.g. --test-strains bc2080,bc2081,bc2082). Their shards never enter training.",
+    )
+    parser.add_argument(
+        "--test-fraction",
+        type=float,
+        default=None,
+        help="(sharded mode) random per-shard fraction held out as test "
+        "(default: 0.10 if neither --test-strains nor --test-pkl is given).",
+    )
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=None,
+        help="Seed for the random shard split (sharded mode only).",
     )
 
     # Architecture selection
@@ -1225,10 +1336,22 @@ def main(argv: list[str] | None = None) -> None:
     # Default dropout depends on architecture
     default_dropout = 0.1 if architecture == "conv" else 0.0
 
+    # Parse --test-strains "a,b,c" into a list (sharded mode only).
+    test_strains_arg = args.test_strains or cfg.get("test_strains")
+    if isinstance(test_strains_arg, str):
+        test_strains_list = [s.strip() for s in test_strains_arg.split(",") if s.strip()]
+    elif isinstance(test_strains_arg, list):
+        test_strains_list = list(test_strains_arg)
+    else:
+        test_strains_list = None
+
     train_mlp(
         pkl_path=pkl_path,
         output_dir=output_dir,
         test_pkl=args.test_pkl or cfg.get("test_pkl"),
+        test_strains=test_strains_list,
+        test_fraction=_get(args.test_fraction, "test_fraction", None),
+        split_seed=_get(args.split_seed, "split_seed", 42),
         architecture=architecture,
         epochs=_get(args.epochs, "epochs", 50),
         batch_size=_get(args.batch_size, "batch_size", 4096),

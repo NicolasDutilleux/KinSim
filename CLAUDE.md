@@ -13,6 +13,33 @@ Two CLI tools are installed from the same repository:
 - **`kinsim`**      — ML pipeline: extract, merge, train, generate, evaluate, analyze
 - **`kinsim-prep`** — Data preparation: rebase, merge-motifs, manifest, filter, balance, parse
 
+## Sharded mode (preferred for ≥ 10 strains)
+
+`merge` collapses N shards into a monolithic master.pkl whose RAM footprint
+scales linearly with the corpus. For larger runs the entire pipeline now
+supports a **sharded mode** that never holds the corpus in RAM:
+
+```
+extract  ──► <shards>/sample_id_shard.pkl       (one per strain, parallel via SLURM array)
+refine   ──► <refined>/sample_id_shard_clean.pkl
+            (auto-detected when input is a directory; pool-harvest IPDs across
+             shards → fit GMMs once globally → apply per-shard, atomic write)
+train    ──► reads <refined>/ via ShardedSignalDataset (PyTorch IterableDataset).
+             Worker-aware shard partition; per-epoch shard + row shuffling.
+analyze  ──► concatenates shards in-memory before stats (analyze is run once,
+             can afford full-corpus RAM; refine + train are the hot paths)
+```
+
+Train/test splitting (sharded mode):
+
+- `--test-strains bc2080,bc2081,bc2082` — explicit by-sample-id holdout. Those
+  shards never enter training. Real generalisation metric.
+- `--test-fraction 0.10` — random per-shard split, reproducible via `--split-seed`.
+
+`merge` and the in-memory `MLPSignalDataset` are kept for small datasets.
+Auto-detection on input path: directory → sharded path; file → in-memory path.
+No CLI changes for the small-data case.
+
 ## Training Set
 
 `extract` is a single-pass pipeline that captures **positions of

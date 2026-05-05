@@ -2,28 +2,24 @@
 
 Training data format (produced by ``kinsim extract`` + ``kinsim merge`` + ``refine``):
 
-    dict[kmer_id (int)] -> np.ndarray(N, 36)
+    dict[kmer_id (int)] -> np.ndarray(N, 38)
 
-with the column layout from ``kinsim.utils.sample_layout``:
-
-    cols 0-1   IPD, PW           (raw uint8 from fi/fp BAM tags, [0, 255])
-    col  2     fraction          (stoichiometric methylation fraction)
-    cols 3-13  mc_0..mc_10       (per-position meth_id at offsets [-7..+3])
-    cols 14-31 profile_IPD/PW    (downstream kinetic profile)
-    cols 32-34 rev_meth          (complementary-strand meth at active-site)
-    col  35    CATEGORY          (0=baseline, 1=slowed, 2=near_meth)
+with the column layout from ``kinsim.utils.sample_layout``.
 
 This module provides:
 
-    log_transform(x)     map raw [0, 255] signals into log1p space for training
-    inv_log_transform(x) recover raw uint8 [0, 255] from log1p (inference)
-    MLPSignalDataset     flat-sample dataset returning
-                         (kmer_id, meth_full, log_signal, meth_id) tuples,
-                         with meth_full a Float[K, num_meth_types] tensor
-                         encoding the per-position methylation context.
+    log_transform(x)        map raw [0, 255] signals into log1p space for training
+    inv_log_transform(x)    recover raw uint8 [0, 255] from log1p (inference)
+    MLPSignalDataset        loads a single merged .pkl into RAM (small datasets)
+    ShardedSignalDataset    PyTorch ``IterableDataset`` over a list of shard
+                            pkls. Memory bounded by one shard regardless of
+                            corpus size. Worker-aware (partitions shards across
+                            DataLoader workers) and per-epoch shuffling at
+                            both the shard level and the row level.
 
-The model operates in log1p space during training and calls
-``inv_log_transform`` at inference time to recover uint8 BAM values.
+Both datasets emit identical ``(kmer_id, meth_full, log_signal, meth_id)``
+tuples — the model code is unchanged whether you train on a master.pkl
+or on a shards directory.
 """
 
 from __future__ import annotations
@@ -31,10 +27,11 @@ from __future__ import annotations
 import logging
 import pickle
 from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 
 from ..utils.encoding import K
 
@@ -74,32 +71,115 @@ def inv_log_transform(x: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# PyTorch Dataset — MLP (random-shot, dynamic capping, stoichiometric fractions)
+# Shared helpers (used by both MLPSignalDataset and ShardedSignalDataset)
+# ---------------------------------------------------------------------------
+
+
+def _flatten_data_dict(data_dict: dict, kmer_size: int) -> dict:
+    """Flatten one ``dict[kmer_id] -> ndarray(N, ≥14)`` into per-row ndarrays.
+
+    Returns a small dict with keys: ``kmer_ids`` (int32), ``meth_ids``
+    (int8 — meth at the prediction position), ``signals_log``
+    (float32 (n, 2) tensor pre-log1p-transformed), ``fractions`` (float32),
+    ``meth_ctx`` (uint8 (n, kmer_size)), ``n_keys`` (int),
+    ``meth_counts`` (dict[int, int]).
+    """
+    from ..utils.encoding import KMER_PRED_IDX
+
+    pred_idx = KMER_PRED_IDX
+    kmer_ids_list: list = []
+    meth_ids_list: list = []
+    signals_list: list = []
+    fractions_list: list = []
+    meth_ctx_list: list = []
+    n_keys = 0
+    n_meth_counts: dict[int, int] = defaultdict(int)
+
+    for key, samples in data_dict.items():
+        if key == "__meta__":
+            continue
+        if not isinstance(key, (int, np.integer)):
+            continue
+        if not isinstance(samples, np.ndarray) or samples.ndim != 2:
+            continue
+        if samples.shape[1] < 3 + kmer_size:
+            continue
+        kmer_id = int(key)
+        ctx = samples[:, 3 : 3 + kmer_size].astype(np.uint8)
+        meth_at_center = ctx[:, pred_idx].astype(np.int8)
+        n = len(samples)
+        kmer_ids_list.append(np.full(n, kmer_id, dtype=np.int32))
+        meth_ids_list.append(meth_at_center)
+        signals_list.append(samples[:, :2].astype(np.float32))
+        fractions_list.append(samples[:, 2].astype(np.float32))
+        meth_ctx_list.append(ctx)
+        for mid in np.unique(meth_at_center):
+            n_meth_counts[int(mid)] += int((meth_at_center == mid).sum())
+        n_keys += 1
+
+    if not kmer_ids_list:
+        return {
+            "kmer_ids": np.empty(0, dtype=np.int32),
+            "meth_ids": np.empty(0, dtype=np.int8),
+            "signals_log": torch.empty(0, 2, dtype=torch.float32),
+            "fractions": np.empty(0, dtype=np.float32),
+            "meth_ctx": np.empty((0, kmer_size), dtype=np.uint8),
+            "n_keys": 0,
+            "meth_counts": dict(n_meth_counts),
+        }
+
+    return {
+        "kmer_ids": np.concatenate(kmer_ids_list),
+        "meth_ids": np.concatenate(meth_ids_list),
+        "signals_log": log_transform(
+            torch.from_numpy(np.concatenate(signals_list, axis=0)).float()
+        ),
+        "fractions": np.concatenate(fractions_list),
+        "meth_ctx": np.concatenate(meth_ctx_list),
+        "n_keys": n_keys,
+        "meth_counts": dict(n_meth_counts),
+    }
+
+
+def _build_meth_full(
+    ctx_ids: np.ndarray,
+    frac: float,
+    pred_idx: int,
+    kmer_size: int,
+    num_meth_types: int,
+) -> torch.Tensor:
+    """Build the per-row ``meth_full`` Float[kmer_size, num_meth_types] tensor.
+
+    Encoding:
+      - prediction position with meth_id = m: ``meth_full[pred_idx, m] = frac``
+        (soft label using the stored stoichiometric fraction).
+      - any other position with meth_id = m: ``meth_full[pos, m] = 1.0``
+        (hard upstream/downstream label).
+      - any position with meth_id = 0: row stays all-zero.
+    """
+    meth_full = torch.zeros(kmer_size, num_meth_types, dtype=torch.float32)
+    for pos in range(kmer_size):
+        m = int(ctx_ids[pos])
+        if m > 0:
+            meth_full[pos, m] = frac if pos == pred_idx else 1.0
+    return meth_full
+
+
+# ---------------------------------------------------------------------------
+# In-memory dataset (small datasets — single .pkl)
 # ---------------------------------------------------------------------------
 
 
 class MLPSignalDataset(Dataset):
-    """Flat-sample dataset for KinSim training with per-position methylation context.
+    """Flat-sample dataset for KinSim training, in-memory.
 
-    Loads the merged .pkl, partitions every kmer's rows by ``meth_id`` at the
-    prediction position (``mc[KMER_PRED_IDX]``), and pre-flattens all
-    ``(kmer_id, meth_id, IPD, PW, fraction, meth_ctx)`` entries into
-    contiguous arrays. The ``DataLoader`` shuffles the flat index each
-    epoch, so every sample is seen exactly once per epoch in random order.
+    Loads a single merged .pkl entirely into RAM, partitions every kmer's
+    rows by ``meth_id`` at the prediction position, and pre-flattens all
+    rows into contiguous arrays. The ``DataLoader`` shuffles the flat
+    index each epoch — every sample is seen exactly once per epoch.
 
-    Methylation context output
-    --------------------------
-    ``__getitem__`` returns ``meth_full``: a ``Float[K, num_meth_types]``
-    tensor encoding the methylation state at each of the K=11 positions in
-    the asymmetric meth-context window ``[-7, +3]`` around the prediction
-    position. The prediction position sits at ``KMER_PRED_IDX = 7``.
-
-    Encoding rules:
-        - prediction position with meth_id = m: ``meth_full[7, m] = frac``
-          (soft label using the stoichiometric fraction)
-        - upstream/downstream position with meth_id = m:
-          ``meth_full[pos, m] = 1.0`` (hard label)
-        - any position with meth_id = 0: row is all zero
+    Use this for small datasets that fit in RAM. For larger corpora use
+    :class:`ShardedSignalDataset`.
 
     Args:
         pkl_path:       Path to a merged .pkl produced by ``kinsim merge``.
@@ -122,71 +202,28 @@ class MLPSignalDataset(Dataset):
         if len(data_dict) == 0:
             raise ValueError(f"The .pkl file is empty: {pkl_path}")
 
-        # Probe a representative value to learn column count.
-        first_val = None
-        for k, v in data_dict.items():
-            if k == "__meta__":
-                continue
-            first_val = v
-            break
-        if not isinstance(first_val, np.ndarray) or first_val.ndim != 2:
-            raise TypeError(
-                f"Expected dict values to be 2D ndarray, got shape "
-                f"{getattr(first_val, 'shape', '?')}."
-            )
+        flat = _flatten_data_dict(data_dict, kmer_size)
+        if flat["n_keys"] == 0:
+            raise ValueError(f"No int-keyed kmer data found in {pkl_path}")
 
         self._num_meth_types = num_meth_types
         self._kmer_size = kmer_size
-
-        from ..utils.encoding import KMER_PRED_IDX
-
-        pred_idx_in_ctx = KMER_PRED_IDX
-
-        kmer_ids_list: list = []
-        meth_ids_list: list = []
-        signals_list: list = []
-        fractions_list: list = []
-        meth_ctx_list: list = []
-        n_keys = 0
-        n_meth_counts = defaultdict(int)
-
-        for key, samples in data_dict.items():
-            if key == "__meta__":
-                continue
-            if not isinstance(key, (int, np.integer)):
-                continue
-            kmer_id = int(key)
-            ctx = samples[:, 3 : 3 + kmer_size].astype(np.uint8)
-            meth_at_center = ctx[:, pred_idx_in_ctx].astype(np.int8)
-            n = len(samples)
-            kmer_ids_list.append(np.full(n, kmer_id, dtype=np.int32))
-            meth_ids_list.append(meth_at_center)
-            signals_list.append(samples[:, :2].astype(np.float32))
-            fractions_list.append(samples[:, 2].astype(np.float32))
-            meth_ctx_list.append(ctx)
-            for mid in np.unique(meth_at_center):
-                n_meth_counts[int(mid)] += int((meth_at_center == mid).sum())
-            n_keys += 1
-
-        self._kmer_ids = np.concatenate(kmer_ids_list)
-        self._meth_ids = np.concatenate(meth_ids_list)
-        # Pre-log-transform signals once at load time — avoids per-item overhead.
-        self._signals = log_transform(
-            torch.from_numpy(np.concatenate(signals_list, axis=0)).float()
-        )
-        self._fractions = np.concatenate(fractions_list)
-        self._meth_ctx = np.concatenate(meth_ctx_list)
+        self._kmer_ids = flat["kmer_ids"]
+        self._meth_ids = flat["meth_ids"]
+        self._signals = flat["signals_log"]
+        self._fractions = flat["fractions"]
+        self._meth_ctx = flat["meth_ctx"]
 
         n_total = len(self._kmer_ids)
         meth_labels = {0: "unmeth", 1: "m6A", 2: "m4C", 3: "m5C"}
         meth_summary = ", ".join(
-            f"{meth_labels.get(m, str(m))}={n_meth_counts[m]:,}"
-            for m in sorted(n_meth_counts)
-            if n_meth_counts[m] > 0
+            f"{meth_labels.get(m, str(m))}={flat['meth_counts'][m]:,}"
+            for m in sorted(flat["meth_counts"])
+            if flat["meth_counts"][m] > 0
         )
         log.info(
             "MLPSignalDataset ready: %s unique kmers, %s samples [%s]",
-            f"{n_keys:,}",
+            f"{flat['n_keys']:,}",
             f"{n_total:,}",
             meth_summary,
         )
@@ -196,44 +233,209 @@ class MLPSignalDataset(Dataset):
         return len(self._kmer_ids)
 
     def __getitem__(self, idx: int):
-        """Return the (IPD, PW) sample at flat index idx.
-
-        The DataLoader shuffles indices each epoch, so all samples are seen
-        exactly once per epoch in random order.
-
-        Returns:
-            Tuple of:
-              kmer_id   — Long scalar tensor (22-bit encoded 11-mer)
-              meth_full — Float tensor of shape (K, num_meth_types):
-                          per-position methylation encoding.
-                          Center (pos K//2): soft label using stored fraction.
-                          Flanking (all other positions): hard 0/1 one-hot.
-                          Unmethylated positions: all-zero row.
-              signal    — Float tensor of shape (2,): [IPD, PW] in log1p space
-              meth_id   — Long scalar tensor (for per-type metrics)
-        """
-        kmer_id = int(self._kmer_ids[idx])
-        meth_id = int(self._meth_ids[idx])
-        signal = self._signals[idx]  # already log-transformed
-        frac = float(self._fractions[idx])
-        ctx_ids = self._meth_ctx[idx]  # (L,) uint8 meth IDs ([-7, +3])
-
-        # Prediction position lives at index KMER_PRED_IDX in the asymmetric
-        # context window — NOT at kmer_size // 2.
+        """Return the (kmer_id, meth_full, log_signal, meth_id) tuple at idx."""
         from ..utils.encoding import KMER_PRED_IDX
 
-        pred_idx = KMER_PRED_IDX
-        meth_full = torch.zeros(self._kmer_size, self._num_meth_types, dtype=torch.float32)
-        for pos in range(self._kmer_size):
-            m = int(ctx_ids[pos])
-            if m > 0:
-                # Prediction position: soft label via stoichiometric fraction
-                # Other positions: hard 1.0 (upstream/downstream modification)
-                meth_full[pos, m] = frac if pos == pred_idx else 1.0
-
+        kmer_id = int(self._kmer_ids[idx])
+        meth_id = int(self._meth_ids[idx])
+        signal = self._signals[idx]  # already log1p
+        frac = float(self._fractions[idx])
+        ctx_ids = self._meth_ctx[idx]
+        meth_full = _build_meth_full(
+            ctx_ids, frac, KMER_PRED_IDX, self._kmer_size, self._num_meth_types
+        )
         return (
             torch.tensor(kmer_id, dtype=torch.long),
             meth_full,
             signal,
             torch.tensor(meth_id, dtype=torch.long),
         )
+
+
+# ---------------------------------------------------------------------------
+# Sharded dataset (scales to arbitrary corpus size — never loads all in RAM)
+# ---------------------------------------------------------------------------
+
+
+class ShardedSignalDataset(IterableDataset):
+    """Iterable training dataset over a list of shard pkls.
+
+    Each shard is loaded, flattened, shuffled (within the shard) and
+    yielded row-by-row. The next shard is loaded only after the previous
+    one is fully consumed — peak RAM is bounded by **one shard**, not by
+    the corpus size. The shard list itself is shuffled per epoch.
+
+    Worker-aware: when the ``DataLoader`` uses ``num_workers > 0``, the
+    shard list is partitioned across workers (each worker gets a disjoint
+    subset). This parallelises shard I/O and EM-flatten cost without RAM
+    pressure.
+
+    Output rows are identical to :class:`MLPSignalDataset` —
+    ``(kmer_id, meth_full, log_signal, meth_id)`` — so the model code
+    is the same regardless of dataset class.
+
+    Args:
+        shard_paths:    List of paths to per-strain shard pkls.
+        num_meth_types: Number of methylation states (default 4).
+        kmer_size:      K-mer window size (default K=11).
+        shuffle:        Shuffle shard order per epoch and rows within
+                        each shard. Default True (set False for
+                        deterministic test set evaluation).
+        seed:           Base seed for the shuffler. Combined with
+                        worker_id and epoch via ``set_epoch()`` so
+                        different workers / epochs see different orders.
+    """
+
+    def __init__(
+        self,
+        shard_paths,
+        num_meth_types: int = 4,
+        kmer_size: int = K,
+        shuffle: bool = True,
+        seed: int = 42,
+    ) -> None:
+        super().__init__()
+        self._shard_paths = [str(Path(p)) for p in shard_paths]
+        if not self._shard_paths:
+            raise ValueError("shard_paths is empty")
+        self._num_meth_types = num_meth_types
+        self._kmer_size = kmer_size
+        self._shuffle = shuffle
+        self._seed = int(seed)
+        self._epoch = 0
+        log.info(
+            "ShardedSignalDataset ready: %d shards (shuffle=%s)",
+            len(self._shard_paths),
+            shuffle,
+        )
+
+    def set_epoch(self, epoch: int) -> None:
+        """Inject the current epoch into the shuffler seed.
+
+        Lightning calls this on each new training epoch so that the
+        per-epoch shard order is reproducible-but-different. If you
+        manage the loop yourself, call it before each pass.
+        """
+        self._epoch = int(epoch)
+
+    @property
+    def shard_paths(self) -> list[str]:
+        """The list of shard pkls this dataset iterates over."""
+        return list(self._shard_paths)
+
+    def _worker_shards_and_rng(self) -> tuple[list[str], np.random.Generator]:
+        """Partition shards across DataLoader workers, return per-worker RNG."""
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            wid, n_workers = 0, 1
+        else:
+            wid, n_workers = worker_info.id, worker_info.num_workers
+        # Disjoint stride partition: worker w gets paths[w :: n_workers]
+        my_shards = list(self._shard_paths[wid::n_workers])
+        # Seed: base + worker + epoch — different orders per (worker, epoch).
+        rng = np.random.default_rng(self._seed + 1000 * wid + self._epoch)
+        if self._shuffle:
+            rng.shuffle(my_shards)
+        return my_shards, rng
+
+    def __iter__(self):
+        from ..utils.encoding import KMER_PRED_IDX
+
+        my_shards, rng = self._worker_shards_and_rng()
+        for shard_path in my_shards:
+            with open(shard_path, "rb") as f:
+                data_dict = pickle.load(f)
+            flat = _flatten_data_dict(data_dict, self._kmer_size)
+            del data_dict  # release the loaded shard before iterating
+            n = len(flat["kmer_ids"])
+            if n == 0:
+                continue
+            order = np.arange(n)
+            if self._shuffle:
+                rng.shuffle(order)
+            kmer_ids = flat["kmer_ids"]
+            meth_ids = flat["meth_ids"]
+            signals = flat["signals_log"]
+            fractions = flat["fractions"]
+            meth_ctx = flat["meth_ctx"]
+            for idx in order:
+                ctx_ids = meth_ctx[idx]
+                meth_full = _build_meth_full(
+                    ctx_ids,
+                    float(fractions[idx]),
+                    KMER_PRED_IDX,
+                    self._kmer_size,
+                    self._num_meth_types,
+                )
+                yield (
+                    torch.tensor(int(kmer_ids[idx]), dtype=torch.long),
+                    meth_full,
+                    signals[idx],
+                    torch.tensor(int(meth_ids[idx]), dtype=torch.long),
+                )
+
+
+# ---------------------------------------------------------------------------
+# Train/test split helpers
+# ---------------------------------------------------------------------------
+
+
+def list_shards(shards_dir, glob: str = "*_shard.pkl") -> list[str]:
+    """Return a sorted list of shard pkl paths in ``shards_dir``."""
+    return sorted(str(p) for p in Path(shards_dir).glob(glob))
+
+
+def shard_sample_id(shard_path: str) -> str:
+    """Recover the manifest sample_id from a shard filename.
+
+    Expects the filename ``<sample_id>_shard.pkl`` or
+    ``<sample_id>_shard_clean.pkl`` (post-refine). Returns the leading
+    sample_id portion.
+    """
+    name = Path(shard_path).stem
+    for suffix in ("_shard_clean", "_shard"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def split_shards(
+    shard_paths,
+    test_strains: list | None = None,
+    test_fraction: float | None = None,
+    seed: int = 42,
+) -> tuple[list[str], list[str]]:
+    """Split shard paths into (train, test) lists.
+
+    Priority:
+      1. ``test_strains`` (explicit sample_id list) — shards whose
+         sample_id is in that list go to test. Strict — every name must
+         match an existing shard.
+      2. ``test_fraction`` (random by-shard split) — round to nearest int.
+      3. Otherwise: 90 / 10 random split with ``seed``.
+    """
+    paths = [str(p) for p in shard_paths]
+    if not paths:
+        raise ValueError("shard_paths is empty")
+
+    if test_strains:
+        wanted = set(test_strains)
+        train_paths = [p for p in paths if shard_sample_id(p) not in wanted]
+        test_paths = [p for p in paths if shard_sample_id(p) in wanted]
+        found = {shard_sample_id(p) for p in test_paths}
+        missing = wanted - found
+        if missing:
+            raise ValueError(
+                f"--test-strains contains sample_ids with no matching shard: {sorted(missing)}"
+            )
+        return train_paths, test_paths
+
+    rng = np.random.default_rng(int(seed))
+    idx = np.arange(len(paths))
+    rng.shuffle(idx)
+    frac = float(test_fraction) if test_fraction is not None else 0.10
+    n_test = max(1, round(len(paths) * frac))
+    test_idx = set(int(i) for i in idx[:n_test])
+    train_paths = [p for i, p in enumerate(paths) if i not in test_idx]
+    test_paths = [p for i, p in enumerate(paths) if i in test_idx]
+    return train_paths, test_paths
