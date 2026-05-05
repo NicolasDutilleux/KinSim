@@ -19,6 +19,12 @@ for missing columns. For raw ipdSummary kinetics output (CSV/GFF), use the
 format-specific parsing below.
 """
 
+# `from __future__ import annotations` makes module-level type hints lazy
+# (stored as strings, not evaluated at import). Without it, the
+# ``dict[str, str] | None`` annotation on _BASE_TO_METH_CACHE below fails
+# on the cluster's Python 3.9 (PEP-604 union syntax requires 3.10+).
+from __future__ import annotations
+
 import csv
 import logging
 import re
