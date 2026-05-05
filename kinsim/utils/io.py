@@ -1,8 +1,10 @@
-"""File I/O utilities for FASTA references, MAF alignments, and PBSIM3 discovery.
+"""File I/O utilities for FASTA references, MAF alignments, atomic writes,
+and PBSIM3 discovery.
 
 Functions for loading FASTA references, parsing PBSIM3 MAF alignments,
 extracting extended reference context for 11-mer encoding at read edges,
-and discovering PBSIM3 output directory layouts.
+discovering PBSIM3 output directory layouts, and writing pickles / text
+files atomically (write-to-tmp, fsync, rename).
 """
 
 from __future__ import annotations
@@ -11,11 +13,61 @@ import glob
 import gzip
 import logging
 import os
+import pickle
+from pathlib import Path
+from typing import Any
 
 from .encoding import KMER_LEFT_PAD, KMER_RIGHT_PAD
 from .motifs import load_motif_string
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Atomic writes — crash-safe outputs
+# ---------------------------------------------------------------------------
+#
+# A long-running KinSim step (extract / merge / refine / analyze) may be
+# killed mid-write by SLURM (OOM, wall clock, scancel) and leave a
+# truncated output behind. The next stage then either fails opaquely on
+# unpickling or — worse — silently consumes garbage. Atomic writes
+# eliminate that class of failure: we write to a sibling ``.tmp`` file,
+# fsync it to disk, then ``os.replace`` it onto the destination. The
+# replace is atomic on POSIX, so the destination either contains the
+# complete file or doesn't exist at all — never a partial.
+
+
+def atomic_write_pickle(
+    obj: Any, path: str | Path, protocol: int = pickle.HIGHEST_PROTOCOL
+) -> None:
+    """Pickle ``obj`` to ``path`` atomically (write-to-tmp, fsync, rename).
+
+    If the process is killed mid-write, ``path`` is either the complete
+    pickle (write succeeded and rename committed) or absent (rename never
+    happened) — never a half-written file that subsequent loads would
+    silently corrupt.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(obj, f, protocol=protocol)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)  # atomic on POSIX, best-effort atomic on Windows
+
+
+def atomic_write_text(text: str, path: str | Path, encoding: str = "utf-8") -> None:
+    """Write ``text`` to ``path`` atomically. See :func:`atomic_write_pickle`."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding=encoding) as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
 
 # Asymmetric padding around each prediction position. With kmer covering
 # [-KMER_LEFT_PAD, +KMER_RIGHT_PAD] from the prediction position, the

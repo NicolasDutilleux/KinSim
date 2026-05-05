@@ -865,8 +865,9 @@ def render_txt_report(
     p()
     p("=" * W)
 
-    with open(output_path, "w", encoding="utf-8") as fh:
-        fh.write(buf.getvalue())
+    from .utils.io import atomic_write_text
+
+    atomic_write_text(buf.getvalue(), output_path)
     print(f"\nTXT report saved: {output_path}")
 
 
@@ -1077,7 +1078,159 @@ def _build_html_figures(
         )
         figures.append(("Sample counts per bucket", fig4))
 
+    # ── Fig 5: 3D density surfaces — per-bucket joint (IPD, PW) KDE ─────
+    fig5 = _build_ipd_pw_density_figure(data)
+    if fig5 is not None:
+        figures.append(("3D density: joint (IPD, PW) per bucket", fig5))
+
     return figures
+
+
+def _build_ipd_pw_density_figure(data: dict):
+    """Layered Plotly Surface plot — one 2D KDE per bucket on a shared (IPD, PW) grid.
+
+    Lets the user rotate the plot and visually verify that the slowed
+    surfaces sit in a different region of (IPD, PW) than baseline /
+    near_meth surfaces. Uses ``scipy.stats.gaussian_kde``.
+    """
+    try:
+        import plotly.graph_objects as go
+        from scipy.stats import gaussian_kde
+    except ImportError:
+        log.warning("scipy or plotly not installed — skipping 3D density figure")
+        return None
+
+    from .utils.encoding import get_meth_ids
+    from .utils.sample_layout import (
+        CATEGORY_BASELINE,
+        CATEGORY_NEAR_METH,
+        CATEGORY_SLOWED,
+        COL_CATEGORY,
+        COL_IPD,
+        COL_PARENT_METH,
+        COL_PW,
+    )
+
+    name_by_mid = {v: k for k, v in get_meth_ids().items()}
+    rng = np.random.default_rng(0)
+
+    # Gather (IPD, PW) per bucket. Cap at 50k points per bucket — KDE
+    # is O(n²) on bandwidth selection and slows hard above that, with
+    # negligible visual gain (the surface is already smooth).
+    BUCKET_CAP = 50_000
+    buckets: dict[str, list] = {}
+    for kid, arr in data.items():
+        if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
+            continue
+        if arr.shape[1] <= COL_PARENT_METH:
+            continue
+        cats = arr[:, COL_CATEGORY].astype(np.int8)
+        parent = arr[:, COL_PARENT_METH].astype(np.int8)
+        ipd_pw = arr[:, [COL_IPD, COL_PW]]
+
+        m_base = cats == CATEGORY_BASELINE
+        if m_base.any():
+            buckets.setdefault("baseline", []).append(ipd_pw[m_base])
+
+        for cat_id, prefix in (
+            (CATEGORY_SLOWED, "slowed_by_"),
+            (CATEGORY_NEAR_METH, "near_meth_by_"),
+        ):
+            m_cat = cats == cat_id
+            if not m_cat.any():
+                continue
+            for T_id in np.unique(parent[m_cat]):
+                T_id_int = int(T_id)
+                if T_id_int == 0:
+                    continue
+                mask = m_cat & (parent == T_id)
+                if not mask.any():
+                    continue
+                T_name = name_by_mid.get(T_id_int, f"meth{T_id_int}")
+                buckets.setdefault(prefix + T_name, []).append(ipd_pw[mask])
+
+    if not buckets:
+        return None
+
+    # Cap each bucket and concatenate.
+    pooled: dict[str, np.ndarray] = {}
+    for name, chunks in buckets.items():
+        x = np.concatenate(chunks).astype(np.float32)
+        if len(x) > BUCKET_CAP:
+            idx = rng.choice(len(x), BUCKET_CAP, replace=False)
+            x = x[idx]
+        pooled[name] = x
+
+    # Shared grid in raw signal space.
+    all_pts = np.concatenate(list(pooled.values()))
+    ipd_hi = float(np.percentile(all_pts[:, 0], 99.5))
+    pw_hi = float(np.percentile(all_pts[:, 1], 99.5))
+    grid_n = 60
+    ipd_grid = np.linspace(0.0, max(ipd_hi, 80.0), grid_n)
+    pw_grid = np.linspace(0.0, max(pw_hi, 60.0), grid_n)
+    ipd_mesh, pw_mesh = np.meshgrid(ipd_grid, pw_grid)
+    grid_pts = np.vstack([ipd_mesh.ravel(), pw_mesh.ravel()])
+
+    palette = {
+        "baseline": "#1f77b4",
+    }
+    slowed_palette = ["#d62728", "#ff7f0e", "#9467bd", "#8c564b"]
+    near_palette = ["#2ca02c", "#17becf", "#bcbd22", "#7f7f7f"]
+    s_idx = n_idx = 0
+
+    fig = go.Figure()
+    for name in sorted(pooled.keys(), key=_bucket_order_key):
+        x = pooled[name]
+        if len(x) < 50:
+            continue
+        try:
+            kde = gaussian_kde(x.T, bw_method=0.2)
+            z = kde(grid_pts).reshape(grid_n, grid_n)
+        except np.linalg.LinAlgError:
+            continue
+        z_max = z.max()
+        if z_max <= 0:
+            continue
+        z = z / z_max  # normalise so each surface peaks at 1 (visual comparability)
+        if name == "baseline":
+            color = palette["baseline"]
+        elif name.startswith("slowed_by_"):
+            color = slowed_palette[s_idx % len(slowed_palette)]
+            s_idx += 1
+        else:
+            color = near_palette[n_idx % len(near_palette)]
+            n_idx += 1
+        fig.add_trace(
+            go.Surface(
+                x=ipd_grid,
+                y=pw_grid,
+                z=z,
+                name=f"{name} (n={len(x):,})",
+                showscale=False,
+                opacity=0.6,
+                colorscale=[[0.0, color], [1.0, color]],
+                showlegend=True,
+            )
+        )
+
+    fig.update_layout(
+        title="Joint (IPD, PW) density per bucket  (rotate to compare distributions)",
+        scene=dict(
+            xaxis_title="IPD (uint8 [0, 255])",
+            yaxis_title="PW  (uint8 [0, 255])",
+            zaxis_title="Normalised density",
+            camera=dict(eye=dict(x=1.6, y=-1.6, z=1.0)),
+            bgcolor="rgb(240, 240, 240)",
+        ),
+        legend=dict(
+            x=0.01,
+            y=0.99,
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="rgba(0,0,0,0.3)",
+            borderwidth=1,
+        ),
+    )
+    return fig
 
 
 def _write_html_report(figures, stats: DictStats, output_path: str, meth_summary: str) -> None:
@@ -1156,8 +1309,9 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
     html_parts.append("""
 <div class="footer">Generated by KinSim &mdash; kinsim analyze</div>
 </div></body></html>""")
-    with open(output_path, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(html_parts))
+    from .utils.io import atomic_write_text
+
+    atomic_write_text("\n".join(html_parts), output_path)
     log.info("HTML report saved: %s", output_path)
 
     # Standalone per-figure exports.

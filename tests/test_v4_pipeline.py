@@ -35,6 +35,7 @@ from kinsim.utils.sample_layout import (
     COL_IPD,
     COL_PARENT_METH,
     COL_PARENT_OFFSET,
+    COL_PW,
     SAMPLE_NCOLS,
     get_categories,
 )
@@ -252,6 +253,13 @@ def _build_gmm_dataset(
     """
     rng = np.random.default_rng(seed)
     data: dict = {}
+
+    # PW is populated as a noisy linear function of IPD so the GMM's
+    # covariance matrix is non-singular (otherwise the multivariate fit
+    # degenerates on a 1D subspace).
+    def _pw_from_ipd(ipd: float) -> float:
+        return float(max(0.0, 0.5 * ipd + rng.normal(0.0, 1.5)))
+
     for kid in range(n_kmers):
         rows = []
         # Baseline rows
@@ -259,6 +267,7 @@ def _build_gmm_dataset(
         for ipd in base_ipd:
             r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
             r[COL_IPD] = float(max(0.0, ipd))
+            r[COL_PW] = _pw_from_ipd(r[COL_IPD])
             r[COL_CATEGORY] = CATEGORY_BASELINE
             rows.append(r)
         # Slowed rows — mostly real, with `contamination_rate` from baseline.
@@ -269,6 +278,7 @@ def _build_gmm_dataset(
             else:
                 ipd = float(max(0.0, rng.normal(slowed_mu, slowed_sigma)))
             r[COL_IPD] = ipd
+            r[COL_PW] = _pw_from_ipd(ipd)
             r[COL_CATEGORY] = CATEGORY_SLOWED
             r[COL_PARENT_METH] = parent_meth_id
             r[COL_PARENT_OFFSET] = 0
@@ -277,10 +287,9 @@ def _build_gmm_dataset(
     return data
 
 
-def test_gmm_separates_clean_two_distributions():
-    """With well-separated baseline (μ=30) and slowed (μ=90) Gaussians,
-    a 25 % contamination of slowed-from-baseline should be largely dropped
-    and the genuine slowed should be largely kept."""
+def test_gmm_k2_separates_clean_two_distributions():
+    """K=2 GMM on well-separated baseline (μ=30) + slowed (μ=90) Gaussians:
+    a 25 % contamination of slowed-from-baseline should be largely dropped."""
     data = _build_gmm_dataset(
         n_kmers=200,
         n_baseline_per_kmer=50,
@@ -292,7 +301,9 @@ def test_gmm_separates_clean_two_distributions():
         contamination_rate=0.25,
         seed=1,
     )
-    _new_data, stats = slowed_split_gmm(data, seed=42)
+    # K=2 because the synthetic data is genuinely bimodal — K=3 would
+    # over-fit the second baseline mode and the slowed Gaussian together.
+    _new_data, stats = slowed_split_gmm(data, n_components=2, seed=42)
 
     # Baseline + near pass through.
     assert stats["n_baseline_in"] == stats["n_baseline_out"]
@@ -306,50 +317,166 @@ def test_gmm_separates_clean_two_distributions():
         f"survival {survival:.2%} outside expected 65-85% (kept {n_kept}/{n_in})"
     )
 
-    # Method recorded; per-type fit stored with reasonable means.
+    # Per-type fit stored with reasonable means (lowest ~30, highest ~90).
     assert stats["method"] == "gmm_per_meth_type"
     m6a_stats = stats["per_type"]["m6A"]
     assert not m6a_stats["skipped"]
-    means = sorted(m6a_stats["gmm_means"])
-    assert 25 < means[0] < 40, f"lower-component mean ~30 expected, got {means[0]}"
-    assert 80 < means[1] < 100, f"higher-component mean ~90 expected, got {means[1]}"
+    # 2D fit: gmm_means is (K, 2) — read the IPD axis only for the assertion.
+    ipd_means = sorted(row[0] for row in m6a_stats["gmm_means"])
+    assert 25 < ipd_means[0] < 40, f"lowest-IPD-mean ~30 expected, got {ipd_means[0]}"
+    assert 80 < ipd_means[-1] < 100, f"highest-IPD-mean ~90 expected, got {ipd_means[-1]}"
 
 
-def test_gmm_validation_fails_on_bimodal_baseline():
-    """If baseline is itself bimodal (50/50 around two centres), the GMM's
-    lower-mean component won't capture most baselines — validation must
-    fail and the filter must keep all slowed (defensive)."""
-    rng = np.random.default_rng(0)
+def _set_ipd_pw(r, ipd, rng):
+    """Helper: set IPD and a PW that is a noisy linear function of IPD.
+
+    The 2D GMM needs both axes populated and weakly correlated to avoid
+    a singular covariance matrix on the PW axis.
+    """
+    r[COL_IPD] = float(max(0.0, ipd))
+    r[COL_PW] = float(max(0.0, 0.5 * r[COL_IPD] + rng.normal(0.0, 1.5)))
+
+
+def test_gmm_k3_handles_long_tail_baseline():
+    """K=3 should cleanly handle a long-tailed baseline (PacBio-realistic):
+    baseline is N(30, 5) + N(70, 15) tail; slowed is N(120, 10).
+    The two lower components capture the bimodal baseline; the highest
+    captures the meth signal. Validation passes; meth survives cleanly."""
+    rng = np.random.default_rng(7)
     n_kmers = 100
-    n_base = 100
-    n_slowed = 200
     data: dict = {}
     for kid in range(n_kmers):
         rows = []
-        # Bimodal baseline: half at μ=20, half at μ=80
-        for i in range(n_base):
+        # Bimodal baseline (PacBio-realistic): 70 % fast, 30 % long tail.
+        for _ in range(100):
+            mu, sig = (30.0, 5.0) if rng.random() < 0.7 else (70.0, 15.0)
             r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
-            mu = 20.0 if i % 2 == 0 else 80.0
-            r[COL_IPD] = float(max(0.0, rng.normal(mu, 5.0)))
+            _set_ipd_pw(r, rng.normal(mu, sig), rng)
             r[COL_CATEGORY] = CATEGORY_BASELINE
             rows.append(r)
-        # Slowed at μ=90 (overlaps with the upper baseline mode)
-        for _ in range(n_slowed):
+        # Slowed: clean Gaussian at μ=120, well above the baseline tail.
+        for _ in range(50):
             r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
-            r[COL_IPD] = float(max(0.0, rng.normal(90.0, 8.0)))
+            _set_ipd_pw(r, rng.normal(120.0, 10.0), rng)
             r[COL_CATEGORY] = CATEGORY_SLOWED
             r[COL_PARENT_METH] = 1  # m6A
             r[COL_PARENT_OFFSET] = 0
             rows.append(r)
         data[kid] = np.stack(rows)
 
-    _new_data, stats = slowed_split_gmm(data, seed=42)
+    # K=3 (default) should handle this cleanly.
+    _new_data, stats = slowed_split_gmm(data, n_components=3, seed=42)
     m6a_stats = stats["per_type"]["m6A"]
-    # Validation should fail: baseline is split across components, so
-    # < 85 % land in the lower-mean one. Filter is skipped.
-    assert m6a_stats["skipped"] is True
-    assert m6a_stats["reason"] == "baseline_validation_failed"
-    assert stats["n_slowed_kept"] == stats["n_slowed_in"]  # all kept
+
+    # Validation passes — baseline cleanly captured by the two lower comps.
+    assert not m6a_stats["skipped"], (
+        f"K=3 should pass validation on long-tail baseline; got "
+        f"{m6a_stats.get('reason')} (pct_in_baseline="
+        f"{m6a_stats.get('baseline_in_baseline_pct')})"
+    )
+    # Most of the slowed (which is at μ=120, far above baseline) should survive.
+    survival = stats["n_slowed_kept"] / stats["n_slowed_in"]
+    assert survival > 0.85, f"survival {survival:.2%} too low for clean meth signal"
+    # The meth_idx component's IPD mean should be ~120 (far above baseline).
+    means = m6a_stats["gmm_means"]  # (K, 2)
+    meth_ipd_mean = means[m6a_stats["meth_idx"]][0]
+    assert meth_ipd_mean > 100, f"meth-component IPD mean expected > 100, got {meth_ipd_mean}"
+
+
+def test_gmm_validation_fails_when_meth_indistinguishable_from_baseline():
+    """If 'slowed' overlaps the upper baseline mode (no real elevation),
+    the GMM places it inside one of the baseline-like components and the
+    fit produces no meth peak. The validation must reject (or the cut
+    keeps essentially everything because no rows have posterior_meth ≥ 0.5).
+    Either way the safety net prevents dropping valid baselines."""
+    rng = np.random.default_rng(0)
+    n_kmers = 100
+    data: dict = {}
+    for kid in range(n_kmers):
+        rows = []
+        # Tight baseline at μ=30
+        for _ in range(100):
+            r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
+            _set_ipd_pw(r, rng.normal(30.0, 4.0), rng)
+            r[COL_CATEGORY] = CATEGORY_BASELINE
+            rows.append(r)
+        # "Slowed" at μ=32 — indistinguishable from baseline
+        for _ in range(200):
+            r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
+            _set_ipd_pw(r, rng.normal(32.0, 4.0), rng)
+            r[COL_CATEGORY] = CATEGORY_SLOWED
+            r[COL_PARENT_METH] = 1  # m6A
+            r[COL_PARENT_OFFSET] = 0
+            rows.append(r)
+        data[kid] = np.stack(rows)
+
+    _new_data, stats = slowed_split_gmm(data, n_components=3, seed=42)
+    m6a_stats = stats["per_type"]["m6A"]
+    # Either validation rejects, OR no slowed gets cut because the meth
+    # component sits inside the baseline range (P(meth | x) low everywhere).
+    survival = stats["n_slowed_kept"] / stats["n_slowed_in"]
+    # In both scenarios, we expect "keep all" (defensive) — the filter
+    # should not aggressively drop slowed when the meth signal is absent.
+    assert survival > 0.95 or m6a_stats["skipped"], (
+        f"expected defensive behaviour (≥ 95 % survival or skip), got "
+        f"survival={survival:.2%} skipped={m6a_stats.get('skipped')}"
+    )
+
+
+def test_gmm_bic_picks_k2_for_unimodal_baseline():
+    """BIC over (2, 3) should select K=2 when baseline is unimodal —
+    K=3 would over-fit the unimodal baseline into 3 sub-components."""
+    data = _build_gmm_dataset(
+        n_kmers=200,
+        n_baseline_per_kmer=80,
+        n_slowed_per_kmer=40,
+        baseline_mu=30.0,
+        baseline_sigma=4.0,  # unimodal, tight
+        slowed_mu=100.0,
+        slowed_sigma=8.0,
+        contamination_rate=0.0,
+        seed=11,
+    )
+    _new_data, stats = slowed_split_gmm(data, n_components=(2, 3), seed=42)
+    m6a = stats["per_type"]["m6A"]
+    assert not m6a["skipped"]
+    assert m6a["n_components_used"] == 2, (
+        f"BIC should pick K=2 for unimodal baseline; picked K={m6a['n_components_used']} "
+        f"(BICs: {m6a['bic_per_k']})"
+    )
+
+
+def test_gmm_bic_picks_k3_for_long_tail_baseline():
+    """BIC over (2, 3) should select K=3 when baseline has a long tail —
+    K=2 would conflate the baseline tail with the meth signal."""
+    rng = np.random.default_rng(13)
+    n_kmers = 100
+    data: dict = {}
+    for kid in range(n_kmers):
+        rows = []
+        # Bimodal baseline (PacBio-realistic)
+        for _ in range(150):
+            mu, sig = (30.0, 4.0) if rng.random() < 0.7 else (75.0, 12.0)
+            r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
+            _set_ipd_pw(r, rng.normal(mu, sig), rng)
+            r[COL_CATEGORY] = CATEGORY_BASELINE
+            rows.append(r)
+        # Strong meth signal at μ=140
+        for _ in range(60):
+            r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
+            _set_ipd_pw(r, rng.normal(140.0, 10.0), rng)
+            r[COL_CATEGORY] = CATEGORY_SLOWED
+            r[COL_PARENT_METH] = 1  # m6A
+            r[COL_PARENT_OFFSET] = 0
+            rows.append(r)
+        data[kid] = np.stack(rows)
+
+    _new_data, stats = slowed_split_gmm(data, n_components=(2, 3), seed=42)
+    m6a = stats["per_type"]["m6A"]
+    assert m6a["n_components_used"] == 3, (
+        f"BIC should pick K=3 for long-tail baseline + clean meth signal; "
+        f"picked K={m6a['n_components_used']} (BICs: {m6a['bic_per_k']})"
+    )
 
 
 def test_gmm_too_few_slowed_keeps_all():
@@ -539,10 +666,16 @@ if __name__ == "__main__":
     print("[pass] refine_pkl (p95)")
     test_refine_fails_fast_on_obsolete_layout()
     print("[pass] refine fails fast on obsolete layout")
-    test_gmm_separates_clean_two_distributions()
-    print("[pass] GMM separates two clean distributions")
-    test_gmm_validation_fails_on_bimodal_baseline()
-    print("[pass] GMM validation fails on bimodal baseline → keeps all")
+    test_gmm_k2_separates_clean_two_distributions()
+    print("[pass] GMM K=2 separates two clean distributions")
+    test_gmm_k3_handles_long_tail_baseline()
+    print("[pass] GMM K=3 handles long-tail baseline (PacBio-realistic)")
+    test_gmm_validation_fails_when_meth_indistinguishable_from_baseline()
+    print("[pass] GMM defensive when meth indistinguishable from baseline")
+    test_gmm_bic_picks_k2_for_unimodal_baseline()
+    print("[pass] GMM BIC picks K=2 for unimodal baseline")
+    test_gmm_bic_picks_k3_for_long_tail_baseline()
+    print("[pass] GMM BIC picks K=3 for long-tail baseline")
     test_gmm_too_few_slowed_keeps_all()
     print("[pass] GMM too-few-slowed → keeps all")
     test_refine_pkl_writes_output_gmm()

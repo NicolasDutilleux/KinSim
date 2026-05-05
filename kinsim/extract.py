@@ -716,8 +716,9 @@ def extract_from_manifest_task(
         meth_types=meth_types,
     )
 
-    with open(output_pkl, "wb") as f:
-        pickle.dump(result, f)
+    from .utils.io import atomic_write_pickle
+
+    atomic_write_pickle(result, output_pkl)
     meta = result.get("__meta__", {})
     log.info(
         "shard saved: %s  slowed=%d near_meth=%d baseline=%d",
@@ -810,9 +811,9 @@ def merge_shards(
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
     }
 
-    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_file, "wb") as f:
-        pickle.dump(result, f)
+    from .utils.io import atomic_write_pickle
+
+    atomic_write_pickle(result, output_file)
 
     total_keys = len(result) - 1
     total_samples = sum(len(v) for k, v in result.items() if k != "__meta__")
@@ -1097,9 +1098,9 @@ def main(argv=None) -> None:
         meth_types=meth_types,
     )
 
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output, "wb") as f:
-        pickle.dump(result, f)
+    from .utils.io import atomic_write_pickle
+
+    atomic_write_pickle(result, args.output)
 
     meta = result.get("__meta__", {})
     log.info(
