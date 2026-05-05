@@ -62,16 +62,29 @@ Positions far from any methylation (distance ≥ `baseline_min_dist_to_meth`,
 default = K = 11) → CATEGORY_BASELINE candidate, capped per kmer at
 `n_baseline_per_kmer` via streaming reservoir sampling.
 
-**Refine** runs a single pass — `slowed_split`. Builds the per-kmer
-baseline IPD mean for every kmer with at least 5 baseline rows; takes
-the `secondary_percentile`-th percentile (default 95) of the per-kmer
-mean distribution as the threshold; drops CATEGORY_SLOWED rows whose
-IPD < threshold (motif false positives). BASELINE and NEAR_METH pass
-through unchanged.
+**Refine** has two methods, both keep BASELINE and NEAR_METH unchanged
+and only filter CATEGORY_SLOWED rows:
 
-Per-kmer mean (rather than per-sample) avoids the natural per-sample
-Poisson tail of polymerase pauses on unmodified DNA — under CLT the
-per-kmer mean is much tighter, so weak signals (m4C, m5C) survive.
+- **`--method gmm` (default, `slowed_split_gmm`)** — for each meth type
+  T present in the slowed rows, fit a 2-component GaussianMixture on
+  the combined `baseline + slowed_by_T` IPD pool (baseline subsampled
+  to match `slowed_by_T` count). Validate that ≥ 85 % of the baseline
+  subsample lands in the lower-mean component; if so, drop slowed_by_T
+  rows whose posterior in that component exceeds 0.5. If validation
+  fails or the type has < `min_samples_for_gmm` slowed rows, keep all
+  rows of that type. Per-type GMM params (means, sigmas, weights, lower
+  index, baseline-in-lower fraction) are recorded in
+  `__meta__["stats"]["per_type"]`.
+- **`--method p95` (legacy, `slowed_split`)** — single global threshold
+  = `secondary_percentile`-th percentile of the per-kmer baseline-mean
+  distribution. Same threshold for every meth type. Kept as a fallback
+  / comparison method.
+
+The GMM is the default because the p95 threshold is unfair to
+low-baseline kmers and to weak-signal meth types (m4C with
+fraction 0.5, m5C with sig=[2,6]). Per-type GMM lets each type's
+boundary be chosen by data, and the validation step rejects fits where
+the baseline doesn't cluster cleanly (defensive).
 
 ---
 

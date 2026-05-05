@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
-from kinsim.refine import refine_pkl, slowed_split
+from kinsim.refine import refine_pkl, slowed_split, slowed_split_gmm
 from kinsim.utils.encoding import KMER_PRED_IDX, get_meth_ids
 from kinsim.utils.sample_layout import (
     CATEGORY_BASELINE,
@@ -204,15 +204,15 @@ def test_slowed_split_only_filters_slowed():
     assert stats["n_slowed_dropped"] == 5 * 20  # IPD=20 below
 
 
-def test_refine_pkl_writes_output():
-    """refine_pkl loads, runs slowed_split, writes a clean pkl."""
+def test_refine_pkl_writes_output_p95():
+    """Legacy p95 method end-to-end: loads, runs slowed_split, writes a clean pkl."""
     data = _build_v4_master(3)
     with tempfile.TemporaryDirectory() as td:
         inp = Path(td) / "in.pkl"
         out = Path(td) / "out.pkl"
         with open(inp, "wb") as f:
             pickle.dump(data, f)
-        refine_pkl(inp, out)
+        refine_pkl(inp, out, method="p95")
         with open(out, "rb") as f:
             refined = pickle.load(f)
         meta = refined.pop("__meta__")
@@ -223,6 +223,175 @@ def test_refine_pkl_writes_output():
             arr = refined[kid]
             assert arr.shape[1] == SAMPLE_NCOLS
             assert len(arr) == 105
+
+
+# ---------------------------------------------------------------------------
+# Refine — GMM method (default)
+# ---------------------------------------------------------------------------
+
+
+def _build_gmm_dataset(
+    n_kmers: int = 200,
+    n_baseline_per_kmer: int = 50,
+    n_slowed_per_kmer: int = 20,
+    baseline_mu: float = 30.0,
+    baseline_sigma: float = 5.0,
+    slowed_mu: float = 90.0,
+    slowed_sigma: float = 10.0,
+    contamination_rate: float = 0.0,
+    contamination_mu: float = 30.0,
+    contamination_sigma: float = 5.0,
+    parent_meth_id: int = 1,  # m6A
+    seed: int = 0,
+) -> dict:
+    """Build a synthetic master with two clean Gaussians for GMM testing.
+
+    ``contamination_rate`` of slowed rows are drawn from the baseline
+    Gaussian instead of the slowed one — those are the FP motif matches
+    the GMM should drop.
+    """
+    rng = np.random.default_rng(seed)
+    data: dict = {}
+    for kid in range(n_kmers):
+        rows = []
+        # Baseline rows
+        base_ipd = rng.normal(baseline_mu, baseline_sigma, n_baseline_per_kmer)
+        for ipd in base_ipd:
+            r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
+            r[COL_IPD] = float(max(0.0, ipd))
+            r[COL_CATEGORY] = CATEGORY_BASELINE
+            rows.append(r)
+        # Slowed rows — mostly real, with `contamination_rate` from baseline.
+        for _ in range(n_slowed_per_kmer):
+            r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
+            if rng.random() < contamination_rate:
+                ipd = float(max(0.0, rng.normal(contamination_mu, contamination_sigma)))
+            else:
+                ipd = float(max(0.0, rng.normal(slowed_mu, slowed_sigma)))
+            r[COL_IPD] = ipd
+            r[COL_CATEGORY] = CATEGORY_SLOWED
+            r[COL_PARENT_METH] = parent_meth_id
+            r[COL_PARENT_OFFSET] = 0
+            rows.append(r)
+        data[kid] = np.stack(rows)
+    return data
+
+
+def test_gmm_separates_clean_two_distributions():
+    """With well-separated baseline (μ=30) and slowed (μ=90) Gaussians,
+    a 25 % contamination of slowed-from-baseline should be largely dropped
+    and the genuine slowed should be largely kept."""
+    data = _build_gmm_dataset(
+        n_kmers=200,
+        n_baseline_per_kmer=50,
+        n_slowed_per_kmer=40,
+        baseline_mu=30.0,
+        baseline_sigma=5.0,
+        slowed_mu=90.0,
+        slowed_sigma=10.0,
+        contamination_rate=0.25,
+        seed=1,
+    )
+    _new_data, stats = slowed_split_gmm(data, seed=42)
+
+    # Baseline + near pass through.
+    assert stats["n_baseline_in"] == stats["n_baseline_out"]
+    assert stats["n_near_in"] == stats["n_near_out"]
+
+    # Slowed: ~75 % real, ~25 % contamination. Keep should land near 75 %.
+    n_in = stats["n_slowed_in"]
+    n_kept = stats["n_slowed_kept"]
+    survival = n_kept / n_in
+    assert 0.65 < survival < 0.85, (
+        f"survival {survival:.2%} outside expected 65-85% (kept {n_kept}/{n_in})"
+    )
+
+    # Method recorded; per-type fit stored with reasonable means.
+    assert stats["method"] == "gmm_per_meth_type"
+    m6a_stats = stats["per_type"]["m6A"]
+    assert not m6a_stats["skipped"]
+    means = sorted(m6a_stats["gmm_means"])
+    assert 25 < means[0] < 40, f"lower-component mean ~30 expected, got {means[0]}"
+    assert 80 < means[1] < 100, f"higher-component mean ~90 expected, got {means[1]}"
+
+
+def test_gmm_validation_fails_on_bimodal_baseline():
+    """If baseline is itself bimodal (50/50 around two centres), the GMM's
+    lower-mean component won't capture most baselines — validation must
+    fail and the filter must keep all slowed (defensive)."""
+    rng = np.random.default_rng(0)
+    n_kmers = 100
+    n_base = 100
+    n_slowed = 200
+    data: dict = {}
+    for kid in range(n_kmers):
+        rows = []
+        # Bimodal baseline: half at μ=20, half at μ=80
+        for i in range(n_base):
+            r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
+            mu = 20.0 if i % 2 == 0 else 80.0
+            r[COL_IPD] = float(max(0.0, rng.normal(mu, 5.0)))
+            r[COL_CATEGORY] = CATEGORY_BASELINE
+            rows.append(r)
+        # Slowed at μ=90 (overlaps with the upper baseline mode)
+        for _ in range(n_slowed):
+            r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
+            r[COL_IPD] = float(max(0.0, rng.normal(90.0, 8.0)))
+            r[COL_CATEGORY] = CATEGORY_SLOWED
+            r[COL_PARENT_METH] = 1  # m6A
+            r[COL_PARENT_OFFSET] = 0
+            rows.append(r)
+        data[kid] = np.stack(rows)
+
+    _new_data, stats = slowed_split_gmm(data, seed=42)
+    m6a_stats = stats["per_type"]["m6A"]
+    # Validation should fail: baseline is split across components, so
+    # < 85 % land in the lower-mean one. Filter is skipped.
+    assert m6a_stats["skipped"] is True
+    assert m6a_stats["reason"] == "baseline_validation_failed"
+    assert stats["n_slowed_kept"] == stats["n_slowed_in"]  # all kept
+
+
+def test_gmm_too_few_slowed_keeps_all():
+    """A meth type with fewer than ``min_samples_for_gmm`` slowed rows
+    should skip the fit entirely and keep them all."""
+    data = _build_gmm_dataset(
+        n_kmers=2,  # → only 40 slowed total
+        n_baseline_per_kmer=100,
+        n_slowed_per_kmer=20,
+        seed=2,
+    )
+    _new_data, stats = slowed_split_gmm(data, min_samples_for_gmm=200, seed=42)
+    m6a_stats = stats["per_type"]["m6A"]
+    assert m6a_stats["skipped"] is True
+    assert m6a_stats["reason"] == "too_few_samples"
+    assert stats["n_slowed_kept"] == stats["n_slowed_in"]
+
+
+def test_refine_pkl_writes_output_gmm():
+    """Default GMM end-to-end: writes a clean pkl with method recorded in __meta__."""
+    data = _build_gmm_dataset(
+        n_kmers=50,
+        n_baseline_per_kmer=80,
+        n_slowed_per_kmer=40,
+        contamination_rate=0.3,
+        seed=3,
+    )
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.pkl"
+        out = Path(td) / "out.pkl"
+        with open(inp, "wb") as f:
+            pickle.dump(data, f)
+        refine_pkl(inp, out)  # default method=gmm
+        with open(out, "rb") as f:
+            refined = pickle.load(f)
+        meta = refined.pop("__meta__")
+        assert meta["method"] == "gmm_per_meth_type"
+        assert "m6A" in meta["stats"]["per_type"]
+        # Each kmer has at least baseline rows surviving.
+        for kid in range(50):
+            assert kid in refined
+            assert refined[kid].shape[1] == SAMPLE_NCOLS
 
 
 # ---------------------------------------------------------------------------
@@ -365,11 +534,19 @@ if __name__ == "__main__":
     test_layout_column_contract()
     print("[pass] layout column contract (38 cols, 35 cat, 36 parent_meth, 37 parent_off)")
     test_slowed_split_only_filters_slowed()
-    print("[pass] slowed_split")
-    test_refine_pkl_writes_output()
-    print("[pass] refine_pkl")
+    print("[pass] slowed_split (p95)")
+    test_refine_pkl_writes_output_p95()
+    print("[pass] refine_pkl (p95)")
     test_refine_fails_fast_on_obsolete_layout()
     print("[pass] refine fails fast on obsolete layout")
+    test_gmm_separates_clean_two_distributions()
+    print("[pass] GMM separates two clean distributions")
+    test_gmm_validation_fails_on_bimodal_baseline()
+    print("[pass] GMM validation fails on bimodal baseline → keeps all")
+    test_gmm_too_few_slowed_keeps_all()
+    print("[pass] GMM too-few-slowed → keeps all")
+    test_refine_pkl_writes_output_gmm()
+    print("[pass] refine_pkl (gmm)")
     test_compute_signature_profiles()
     print("[pass] compute_signature_profiles")
     test_analyze_uses_parent_meth_column_not_meth_context()
