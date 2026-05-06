@@ -29,7 +29,9 @@ conda activate kinsim_env
 set -euo pipefail
 
 HERE=$(dirname "$(readlink -f "$0")")
-EXTRACT_CONCURRENT=4
+# Cap concurrent extract tasks to avoid hammering shared I/O. 16 fits
+# comfortably under typical pibu_el8 fairshare; bump for short bursts.
+EXTRACT_CONCURRENT=${EXTRACT_CONCURRENT:-16}
 
 paths() {
     local prefix=$1

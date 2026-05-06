@@ -25,7 +25,7 @@
 # routing — raw HiFi without alignment is not supported (orientation
 # ambiguity averages the per-row signal away).
 #
-# Output layout: 38-col rows per kmer (see kinsim/utils/sample_layout.py).
+# Output layout: 20-col rows per kmer (see kinsim/utils/sample_layout.py).
 # ============================================================
 
 set +u
