@@ -280,11 +280,47 @@ def _gmm_posterior(
     return p / p.sum(axis=1, keepdims=True)
 
 
+def _maybe_cap_chunks(
+    chunks: list,
+    cap: int,
+    paired_chunks: list | None = None,
+    rng: np.random.Generator | None = None,
+) -> bool:
+    """Reservoir-cap ``chunks`` at ``cap`` rows in place.
+
+    Concatenates + random-subsamples only when accumulated rows exceed
+    ``1.5 × cap`` (avoids thrashing on small overshoots). If
+    ``paired_chunks`` is provided (e.g. matching frac arrays), the same
+    sample indices are applied so the pair stays row-aligned.
+
+    Returns True if a cap was applied. ``cap <= 0`` means "no cap" and
+    is a no-op.
+    """
+    if cap <= 0:
+        return False
+    total = sum(int(c.shape[0]) for c in chunks)
+    if total <= int(cap * 1.5):
+        return False
+    pool = np.concatenate(chunks)
+    if rng is None:
+        rng = np.random.default_rng(42)
+    idx = rng.choice(total, cap, replace=False)
+    chunks[:] = [pool[idx].copy()]
+    if paired_chunks is not None and paired_chunks:
+        ppool = np.concatenate(paired_chunks)
+        paired_chunks[:] = [ppool[idx].copy()]
+    return True
+
+
 def _harvest_into(
     data: dict,
     baseline_chunks: list,
     slowed_chunks_by_TO: dict,
     slowed_frac_by_TO: dict,
+    *,
+    max_baseline_pool: int = 0,
+    max_slowed_per_bucket: int = 0,
+    rng: np.random.Generator | None = None,
 ) -> None:
     """Append (IPD, PW) and frac chunks from ``data`` into the containers.
 
@@ -296,6 +332,13 @@ def _harvest_into(
     The frac chunks let downstream code average per-bucket motif occupancy
     so generate.py can decompose ``p_fire = mean_occupancy × p_efficiency``
     and apply per-site target occupancy at inference time.
+
+    ``max_baseline_pool`` / ``max_slowed_per_bucket`` (0 = no cap) bound
+    each pool's row count via reservoir sampling. Applied at the end of
+    each call, so per-shard harvest in a loop keeps memory bounded
+    regardless of corpus size. ~50 M baseline + ~10 M per bucket is
+    statistically wildly over the top for a 2-component GMM and keeps
+    peak under ~1 GB even for thousand-shard corpora.
     """
     from .utils.sample_layout import (
         CATEGORY_BASELINE,
@@ -341,6 +384,16 @@ def _harvest_into(
                     slowed_frac_by_TO.setdefault((T_id_int, O_int), []).append(
                         frac[mask].astype(np.float32)
                     )
+
+    # Reservoir-cap pools to bound memory regardless of corpus size.
+    _maybe_cap_chunks(baseline_chunks, max_baseline_pool, rng=rng)
+    for key in list(slowed_chunks_by_TO.keys()):
+        _maybe_cap_chunks(
+            slowed_chunks_by_TO[key],
+            max_slowed_per_bucket,
+            paired_chunks=slowed_frac_by_TO.get(key),
+            rng=rng,
+        )
 
 
 def _bucket_label(T_name: str, offset: int) -> str:
@@ -814,6 +867,8 @@ def slowed_split_gmm(
     min_samples_for_gmm: int = 100,
     n_components: int | tuple[int, ...] = (2, 3),
     strict_bic_nats_per_sample: float = 1.0,
+    max_baseline_pool: int = 50_000_000,
+    max_slowed_per_bucket: int = 10_000_000,
     seed: int = 42,
 ) -> tuple[dict, dict]:
     """Per-(meth, offset) 2D GMM filter with a baseline-anchored mixture.
@@ -871,7 +926,15 @@ def slowed_split_gmm(
     baseline_chunks: list = []
     slowed_chunks_by_TO: dict[tuple[int, int], list] = {}
     slowed_frac_by_TO: dict[tuple[int, int], list] = {}
-    _harvest_into(data, baseline_chunks, slowed_chunks_by_TO, slowed_frac_by_TO)
+    _harvest_into(
+        data,
+        baseline_chunks,
+        slowed_chunks_by_TO,
+        slowed_frac_by_TO,
+        max_baseline_pool=max_baseline_pool,
+        max_slowed_per_bucket=max_slowed_per_bucket,
+        rng=rng,
+    )
 
     if not baseline_chunks:
         log.warning("[refine.gmm] no baseline samples — keeping all slowed (no filter)")
@@ -935,6 +998,8 @@ def slowed_split_gmm_shards(
     min_samples_for_gmm: int = 100,
     n_components: int | tuple[int, ...] = (2, 3),
     strict_bic_nats_per_sample: float = 1.0,
+    max_baseline_pool: int = 50_000_000,
+    max_slowed_per_bucket: int = 10_000_000,
     seed: int = 42,
     shard_glob: str = "*_shard.pkl",
 ) -> dict:
@@ -988,7 +1053,11 @@ def slowed_split_gmm_shards(
 
     # ── Phase 1: harvest (IPD, PW) pool from every shard ──────────────
     log.info(
-        "[refine.gmm.shards] phase 1/3: harvesting (IPD, PW) from %d shards ...", len(shard_paths)
+        "[refine.gmm.shards] phase 1/3: harvesting (IPD, PW) from %d shards "
+        "(caps: baseline=%s, slowed/bucket=%s) ...",
+        len(shard_paths),
+        f"{max_baseline_pool:,}" if max_baseline_pool > 0 else "off",
+        f"{max_slowed_per_bucket:,}" if max_slowed_per_bucket > 0 else "off",
     )
     baseline_chunks: list = []
     slowed_chunks_by_TO: dict[tuple[int, int], list] = {}
@@ -997,7 +1066,17 @@ def slowed_split_gmm_shards(
         log.info("[refine.gmm.shards]   harvest %d/%d  %s", i, len(shard_paths), shard_path.name)
         with open(shard_path, "rb") as f:
             data = pickle.load(f)
-        _harvest_into(data, baseline_chunks, slowed_chunks_by_TO, slowed_frac_by_TO)
+        # Reservoir caps are applied at the END of each _harvest_into call,
+        # so peak memory is bounded by ~1.5 × cap regardless of corpus size.
+        _harvest_into(
+            data,
+            baseline_chunks,
+            slowed_chunks_by_TO,
+            slowed_frac_by_TO,
+            max_baseline_pool=max_baseline_pool,
+            max_slowed_per_bucket=max_slowed_per_bucket,
+            rng=rng,
+        )
         del data  # release the shard before loading the next
 
     if not baseline_chunks:
@@ -1153,6 +1232,8 @@ def refine_pkl(
     min_samples_for_gmm: int = 100,
     n_components: int | tuple[int, ...] = (2, 3),
     strict_bic_nats_per_sample: float = 1.0,
+    max_baseline_pool: int = 50_000_000,
+    max_slowed_per_bucket: int = 10_000_000,
     seed: int = 42,
 ) -> dict:
     """Refine one master .pkl OR a directory of shards (auto-detected).
@@ -1217,6 +1298,8 @@ def refine_pkl(
             min_samples_for_gmm=min_samples_for_gmm,
             n_components=n_components,
             strict_bic_nats_per_sample=strict_bic_nats_per_sample,
+            max_baseline_pool=max_baseline_pool,
+            max_slowed_per_bucket=max_slowed_per_bucket,
             seed=seed,
         )
 
@@ -1265,6 +1348,8 @@ def refine_pkl(
             min_samples_for_gmm=min_samples_for_gmm,
             n_components=n_components,
             strict_bic_nats_per_sample=strict_bic_nats_per_sample,
+            max_baseline_pool=max_baseline_pool,
+            max_slowed_per_bucket=max_slowed_per_bucket,
             seed=seed,
         )
     elif method == "p95":
@@ -1345,6 +1430,23 @@ def main(argv=None):
         "Pass 2.0+ for even stricter K=2 preference.",
     )
     ap.add_argument(
+        "--max-baseline-pool",
+        type=int,
+        default=50_000_000,
+        help="GMM only. Reservoir-cap the harvested baseline pool at this many "
+        "rows. 0 = no cap. Default 50,000,000 — way more than needed for a "
+        "2-component GMM (10K rows would converge identically), bounds peak "
+        "memory at ~800 MB regardless of corpus size.",
+    )
+    ap.add_argument(
+        "--max-slowed-per-bucket",
+        type=int,
+        default=10_000_000,
+        help="GMM only. Reservoir-cap each (meth, offset) slowed pool at this "
+        "many rows. 0 = no cap. Default 10,000,000 — generous for the meth "
+        "lobe fit, bounds peak memory at ~80 MB per bucket.",
+    )
+    ap.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -1387,6 +1489,8 @@ def main(argv=None):
         min_samples_for_gmm=args.min_samples_for_gmm,
         n_components=n_components_arg,
         strict_bic_nats_per_sample=args.strict_bic,
+        max_baseline_pool=args.max_baseline_pool,
+        max_slowed_per_bucket=args.max_slowed_per_bucket,
         seed=args.seed,
     )
 
