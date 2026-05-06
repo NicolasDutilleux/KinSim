@@ -5,6 +5,48 @@ go on top. Each entry: **what** changed, **why**, **affected files**.
 
 ---
 
+## 2026-05-06 (late evening) — Strepto corpus: 6 strains excluded at data-prep level
+
+### What
+The Strepto corpus contains barcode IDs `bc2033`–`bc2090` (58 numbers) but
+only **52 strains** have a `pipeline/<bc####>/` directory with the full
+prep output (aligned BAM, ipdSummary GFF, jasmine 5mC calls, merged
+motifs.csv). The remaining 6 strains were dropped before the prep
+pipeline produced training-ready artifacts:
+
+| Strain  | Status                | Likely reason                       |
+|---------|-----------------------|-------------------------------------|
+| bc2035  | No `pipeline/` dir    | _to be filled in by user_           |
+| bc2036  | No `pipeline/` dir    | _to be filled in by user_           |
+| bc2047  | No `pipeline/` dir    | _to be filled in by user_           |
+| bc2050  | No `pipeline/` dir    | _to be filled in by user_           |
+| bc2057  | No `pipeline/` dir    | _to be filled in by user_           |
+| bc2060  | No `pipeline/` dir    | _to be filled in by user_           |
+
+All four production manifests
+(`manifest_strepto.csv`, `manifest_strepto_merged.csv`,
+`manifest_strepto_motif.csv`, `manifest_strepto_gff.csv`) include the
+same 52 strains — i.e. nothing is excluded at the manifest level, only
+upstream of it. `manifest_strepto_test.csv` is a single-strain holdout
+(bc2080) and not part of the training corpus.
+
+### Why
+Documenting the exclusion list because it isn't visible from
+`pipeline/` alone — you have to know to compare against the full
+barcode range. The 6 missing strains failed somewhere in the upstream
+pipeline (likely assembly, alignment, or QC) and were never promoted
+into `pipeline/`. Without this note, a future re-run that recovers
+those samples might be mistakenly added to the corpus before
+re-investigating their original failure mode.
+
+10 % exclusion rate (6/58) is in the typical range for bacterial
+sequencing corpora — failed assemblies, low coverage, contamination.
+
+### Affected files
+- This note (no code change). The training corpus is unchanged.
+
+---
+
 ## 2026-05-06 (evening) — prep/ dissolved, parsers into kinsim, kinsim-prep CLI gone, fi/fp loud-fail, meth_id_map frozen at train
 
 ### What
