@@ -725,6 +725,11 @@ def extract_to_shard(
         "source_bam": bam_path,
         "source_ref": ref_path,
         "motif_string": motif_string,
+        # Freeze the meth_id mapping at extract time. Train reads this from
+        # the first shard's __meta__ to set num_meth_types — independent of
+        # whatever kinsim_config.yaml looks like at train time, which may
+        # have been edited or be missing.
+        "meth_id_map": get_meth_ids(),
         "n_baseline_per_kmer": n_baseline_per_kmer,
         "baseline_min_dist_to_meth": baseline_min_dist_to_meth,
         "baseline_sample_rate": baseline_sample_rate,

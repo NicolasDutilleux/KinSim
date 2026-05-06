@@ -752,6 +752,84 @@ class LegacyCheckpointCallback(Callback):
 # ---------------------------------------------------------------------------
 
 
+def _infer_num_meth_types_from_data(pkl_path: str) -> int:
+    """Derive ``num_meth_types`` from the actual training data, ignoring the YAML.
+
+    Strategy (cheapest first):
+      1. **First shard's ``__meta__["meth_id_map"]``** — extract writes this
+         since v0.4.0. Instant lookup, no data scan.
+      2. **Scan all shards' meth-ID columns** (mc_0..mc_10, rev_meth_-1..+1,
+         PARENT_METH) and take ``max + 1``. Slow but always correct, used
+         when ``__meta__`` is from an older extract.
+
+    Returns at least 4 (the canonical baseline + m6A/m4C/m5C alphabet) so
+    pre-existing checkpoints stay loadable even with shards that happen
+    to contain only baseline rows.
+    """
+    from .utils.sample_layout import (
+        COL_METH_CTX_START,
+        COL_PARENT_METH,
+        COL_REV_METH,
+        REV_METH_LEN,
+        SAMPLE_NCOLS,
+    )
+
+    p = Path(pkl_path)
+    if p.is_dir():
+        paths = [Path(s) for s in list_shards(str(p))]
+    else:
+        paths = [p]
+
+    if not paths:
+        log.warning("No shards/pkl found for num_meth_types inference; defaulting to 4")
+        return 4
+
+    # ── Fast path: first-shard __meta__ ───────────────────────────────
+    try:
+        with open(paths[0], "rb") as f:
+            first = pickle.load(f)
+        meta = first.get("__meta__", {}) if isinstance(first, dict) else {}
+        meth_id_map = meta.get("meth_id_map") if isinstance(meta, dict) else None
+        if isinstance(meth_id_map, dict) and meth_id_map:
+            n = max(int(v) for v in meth_id_map.values()) + 1
+            log.info(
+                "num_meth_types from %s __meta__['meth_id_map'] = %s -> n=%d",
+                paths[0].name, meth_id_map, n,
+            )
+            return max(n, 4)
+        del first  # release if we don't return
+    except (OSError, pickle.UnpicklingError) as exc:
+        log.warning("Could not read __meta__ from %s: %s", paths[0], exc)
+
+    # ── Slow path: scan meth-ID columns across all shards ─────────────
+    log.info(
+        "No meth_id_map in __meta__; scanning %d shard(s) for max meth_id ...",
+        len(paths),
+    )
+    max_id = 0
+    meth_cols_end = COL_REV_METH + REV_METH_LEN  # = 17
+    for i, path in enumerate(paths, 1):
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        for k, arr in data.items():
+            if not isinstance(k, (int, np.integer)) or not isinstance(arr, np.ndarray):
+                continue
+            if arr.shape[1] < SAMPLE_NCOLS or arr.size == 0:
+                continue
+            # mc + rev_meth columns (3..17) are all meth_id-bearing
+            mc_block_max = int(arr[:, COL_METH_CTX_START:meth_cols_end].max())
+            pm_max = int(arr[:, COL_PARENT_METH].max())
+            shard_max = max(mc_block_max, pm_max)
+            if shard_max > max_id:
+                max_id = shard_max
+        log.info("  scanned %d/%d  current max meth_id = %d", i, len(paths), max_id)
+        del data
+
+    n = max(max_id + 1, 4)
+    log.info("num_meth_types (data scan) = %d (max meth_id seen = %d)", n, max_id)
+    return n
+
+
 def _read_pkl_meta(pkl_path: str) -> dict:
     """Return the ``__meta__`` provenance dict from a training .pkl, or {}.
 
@@ -888,8 +966,8 @@ def objective(
     Returns:
         Best val_loss seen during this trial (lower is better).
     """
-    from .utils.encoding import get_meth_ids
-    num_meth_types = max(get_meth_ids().values()) + 1
+    # Derive from the data, not the YAML — see _infer_num_meth_types_from_data.
+    num_meth_types = _infer_num_meth_types_from_data(pkl_path)
 
     lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
     dropout = trial.suggest_float("dropout", 0.0, 0.4)
@@ -1085,15 +1163,18 @@ def train_mlp(
     # ── Build model ───────────────────────────────────────────────────────
     accelerator = "gpu" if device == "cuda" and torch.cuda.is_available() else "cpu"
 
-    # Number of methylation states is YAML-driven: max(meth_id) + 1 from
-    # get_meth_ids(). Adding a new mod type to kinsim_config.yaml's
-    # ``kinetic_signatures`` is enough to widen the embedding here — no
-    # code change. The value is persisted in model_config.json via
-    # model.get_config(), so generate.py reads it back at inference and
-    # never relies on the YAML matching the trained model.
-    from .utils.encoding import get_meth_ids
-    num_meth_types = max(get_meth_ids().values()) + 1
-    log.info("num_meth_types from YAML: %d (meth_id_map=%s)", num_meth_types, get_meth_ids())
+    # Number of methylation states is **data-driven**, NOT YAML-driven.
+    # Reasoning: the YAML at train time may have been edited / drifted /
+    # be missing relative to extract time. The shards themselves are the
+    # authoritative record of what meth IDs exist in this corpus. We
+    # check (in order):
+    #   1. __meta__["meth_id_map"] from the first shard, if extract wrote it.
+    #   2. Else: scan the meth-ID columns across all shards for the max.
+    # The value is persisted in model_config.json via model.get_config()
+    # so generate.py reads it back from the trained model at inference,
+    # not from any YAML.
+    num_meth_types = _infer_num_meth_types_from_data(pkl_path)
+    log.info("num_meth_types (data-derived): %d", num_meth_types)
 
     if architecture == "conv":
         log.info(
