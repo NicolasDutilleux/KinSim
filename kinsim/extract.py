@@ -278,9 +278,12 @@ def _build_contig_arrays(
 
     # Sliding 11-mer encoding on the + strand. window[i] covers ref
     # positions i-LEFT .. i+(K-LEFT)-1; out-of-range → invalid.
+    # Start the accumulator at 0 (not -1) — left-shifting a negative
+    # number leaves the sign bit set forever, so every kmer would come
+    # out negative and the inner loop would skip every position.
     LEFT = KMER_LEFT_PAD
     RIGHT = K - LEFT
-    kmer_fwd = np.full(n, -1, dtype=np.int64)
+    kmer_fwd = np.zeros(n, dtype=np.int64)
     kmer_window_valid = np.ones(n, dtype=bool)
     for j in range(K):
         # In + strand 5'→3' frame: the j-th base of the kmer at ref_pos i
