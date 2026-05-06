@@ -133,12 +133,12 @@ def _parse_motif_string_no_rc(motif_string: str) -> list[dict]:
         try:
             mod_pos = int(pos) - 1
         except ValueError:
-            log.warning("extract_aligned: invalid mod_pos for '%s' (%s) — skipped", seq, pos)
+            log.warning("extract: invalid mod_pos for '%s' (%s) — skipped", seq, pos)
             continue
         try:
             _validate_mod_pos(seq, mod_pos, m_type)
         except ValueError as exc:
-            log.warning("extract_aligned: motif '%s' (%s) failed validation: %s — skipped",
+            log.warning("extract: motif '%s' (%s) failed validation: %s — skipped",
                         seq, m_type, exc)
             continue
         m_id = get_meth_ids().get(m_type, 0)
@@ -341,7 +341,7 @@ def _extract_one_bam(
     rng = np.random.default_rng(seed)
     motifs = _parse_motif_string_no_rc(motif_string)
     if not motifs:
-        raise ValueError("extract_aligned: no valid motifs after parsing.")
+        raise ValueError("extract: no valid motifs after parsing.")
 
     # Resolve signal offsets per meth type from kinsim_config.yaml.
     sig_offsets_by_mid: dict = {}
@@ -560,7 +560,7 @@ def _extract_one_bam(
 # ---------------------------------------------------------------------------
 
 
-def extract_aligned_to_shard(
+def extract_to_shard(
     bam_path: str,
     ref_path: str,
     motif_string: str,
@@ -702,7 +702,7 @@ def extract_from_manifest_task(
         log.warning("No motifs resolved for '%s' — SKIPPING.", entry.sample_id)
         return
 
-    extract_aligned_to_shard(
+    extract_to_shard(
         bam_path=entry.bam_path,
         ref_path=entry.ref_path,
         motif_string=motif_string,
@@ -791,7 +791,7 @@ def main(argv=None) -> None:
         log.error("No motifs resolved from '%s'", motifs_arg)
         _sys.exit(1)
 
-    extract_aligned_to_shard(
+    extract_to_shard(
         bam_path=bam,
         ref_path=ref,
         motif_string=motif_string,

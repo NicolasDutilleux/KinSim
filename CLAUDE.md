@@ -50,10 +50,11 @@ declared in `kinsim_config.yaml`). Training only on methylation centers
 would deprive the model of the slowing signal at those offsets.
 
 ```
-  BAM + motifs --> kinsim extract  --> shard.pkl  (36 cols, key=kmer_id, CATEGORY at col 35)
-               --> kinsim merge    --> master.pkl
-               --> kinsim refine   --> master_clean.pkl  (drops motif-FP slowed samples)
-               --> kinsim train    --> checkpoint.pt
+  aligned BAM + ref + motifs --> kinsim extract  --> shards/<sample>_shard.pkl
+                             --> kinsim refine   --> refined/<sample>_clean.pkl
+                                                    (per-(meth, offset) GMM filter)
+                             --> kinsim train    --> checkpoints/  (model_config.json
+                                                                    carries p_fire)
 ```
 
 **Three categories** (col 35 of the 38-col layout):
@@ -168,8 +169,6 @@ KinSim/
 │       ├── ipd_summary.py          IpdSummaryParser -- ipdSummary CSV/GFF3
 │       └── combined.py             CombinedParser -- mod_type,motif,offset,frac_mod,n_sites,source
 │
-├── archive/                        archived code (dictionary, cGAN) — not active
-│
 ├── baseline/                       baseline models for comparison
 │   ├── __init__.py
 │   ├── global_gaussian.py          4 Gaussians (one per meth type, no kmer context)
@@ -211,13 +210,12 @@ KinSim/
     │
     ├── ml/                         ML pipeline — generic across Vega/Sequel/Strepto
     │   ├── 00_extract.slurm        kinsim extract per manifest row (array job)
-    │   ├── 01_merge.slurm          kinsim merge shards/ → master.pkl
-    │   ├── 02_refine.slurm         kinsim refine master.pkl → master_clean.pkl
+    │   ├── 02_refine.slurm         kinsim refine shards/ → refined/
     │   ├── 03_train.slurm          kinsim train (1 GPU)
     │   ├── 04_generate.slurm       kinsim generate on PBSIM3 reads (array)
     │   ├── 05_evaluate.slurm       kinsim evaluate
     │   ├── 06_verify_generate.slurm   kinsim verify-generate (array)
-    │   └── run.sh                  orchestrator — extract/merge/refine/train/evaluate chain
+    │   └── run.sh                  orchestrator — extract/refine/train/evaluate chain
     │
     ├── config/                     example configuration files
     │   ├── config_example.yaml     training config example
@@ -554,28 +552,28 @@ kinsim-prep manifest list <csv>        # tabular display
 ## Data Flow
 
 ```
-Real PacBio BAMs (raw HiFi or bystrandified — never aligned post-pbmm2)
+Aligned bystrandified BAMs (sorted, indexed, ip/pw tags)
       |
       +-- Motif discovery (jasmine + ipdSummary + pbmotifmaker, threshold 0.7)
       |   produces a merged motifs.csv per sample
       |
-      v  manifest.csv  [sample_id, bam_path, motifs]
+      v  manifest.csv  [sample_id, bam_path, motifs, ref_path]
       |
       v  kinsim extract --manifest manifest.csv --task $TASK --output-dir shards/
 strain1_shard.pkl  strain2_shard.pkl  ...
-      |   (36 cols, key=kmer_id only, CATEGORY at col 35)
+      |   (38 cols, key=kmer_id only, CATEGORY at col 35,
+      |    PARENT_METH at 36, PARENT_OFFSET at 37)
       |   Each row tagged 0=baseline / 1=slowed / 2=near_meth
       |
-      v  kinsim merge shards/ master.pkl
+      v  kinsim refine shards/ refined/
+      |   Per-(meth, offset) GMM filter on slowed rows;
+      |   baseline + near_meth pass through unchanged;
+      |   p_fire = n_kept / n_in stored per bucket in __meta__.
+refined/<sample>_clean.pkl
       |
-      v  kinsim refine master.pkl master_clean.pkl
-      |   p95 of per-kmer baseline mean drops motif-FP slowed samples;
-      |   baseline + near_meth pass through unchanged.
-master_clean.pkl
-      |
-      v  kinsim train master_clean.pkl checkpoints/
+      v  kinsim train refined/ checkpoints/
       v
-checkpoint_epoch50.pt + model_config.json
+checkpoint_epoch50.pt + model_config.json (carries p_fire)
       |
       v  kinsim generate <pbsim3_reads> <ref> <ckpt.pt> <motifs> <output.bam>
       v
@@ -604,17 +602,20 @@ verify_report.tsv
 ## CLI Command Map
 
 ```
-# kinsim -- ML pipeline --------------------------------------------------
-kinsim extract                -> kinsim/extract.py
-kinsim merge                  -> kinsim/extract.py
-kinsim refine                 -> kinsim/refine.py           (per-kmer baseline mean p95 filter)
+# kinsim -- ML pipeline (7 verbs) ----------------------------------------
+kinsim extract                -> kinsim/extract.py            (aligned BAM → shard.pkl)
+kinsim refine                 -> kinsim/refine.py             (per-(meth, offset) GMM)
 kinsim train                  -> kinsim/train.py
 kinsim generate               -> kinsim/generate.py
 kinsim evaluate               -> kinsim/evaluate.py
-kinsim verify-generate        -> kinsim/verify_generate.py  (ref vs gen BAM comparison)
+kinsim verify-generate        -> kinsim/verify_generate.py    (per-(kmer, meth) ref vs gen)
 kinsim analyze                -> kinsim/analyze.py
-kinsim sample                 -> kinsim/sample.py
-kinsim strip-kinetics         -> kinsim/strip_kinetics.py
+
+# Auxiliary scripts (run with python, not via the CLI) -------------------
+scripts/sample.py             — subsample a shard pkl
+scripts/strip_kinetics.py     — strip fi/fp/ri/rp from a BAM
+scripts/compare.py            — cross-dataset kinetic comparison
+scripts/inspect_null_model.py — inspect an ipdSummary .npz.gz null model
 
 # kinsim-prep -- data preparation ----------------------------------------
 kinsim-prep parse             -> kinsim/utils/motifs.py        (unified motif parser)

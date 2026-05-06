@@ -112,16 +112,14 @@ See [`slurm_kinsim/README.md`](slurm_kinsim/README.md) for details.
 ```bash
 N=$(kinsim-prep manifest count manifest.csv)
 SHARDS=/path/to/shards
-MASTER=/path/to/master.pkl
+REFINED=/path/to/refined
 
 EX=$(sbatch --parsable --array=1-${N}%8 slurm_kinsim/ml/00_extract.slurm \
     manifest.csv $SHARDS)
-MG=$(sbatch --parsable --dependency=afterany:$EX slurm_kinsim/ml/01_merge.slurm \
-    $SHARDS $MASTER)
-RF=$(sbatch --parsable --dependency=afterok:$MG slurm_kinsim/ml/02_refine.slurm \
-    $MASTER ${MASTER%.pkl}_clean.pkl)
+RF=$(sbatch --parsable --dependency=afterany:$EX slurm_kinsim/ml/02_refine.slurm \
+    $SHARDS $REFINED)
 sbatch --dependency=afterok:$RF slurm_kinsim/ml/03_train.slurm \
-    ${MASTER%.pkl}_clean.pkl checkpoints/
+    $REFINED checkpoints/
 ```
 
 See [`kinsim/README.md`](kinsim/README.md) for the full ML pipeline reference.
@@ -148,8 +146,7 @@ KinSim/
 ├── kinsim/                  ← ML pipeline package      [docs: kinsim/README.md]
 ├── prep/                    ← Data preparation package [docs: prep/README.md]
 ├── slurm_kinsim/            ← HPC SLURM scripts        [docs: slurm_kinsim/README.md]
-│
-├── archive/                 ← legacy code (dictionary, cGAN — not active)
+├── scripts/                 ← auxiliary one-off tools (compare, sample, strip-kinetics, …)
 ├── baseline/                ← baseline models for comparison
 └── images/                  ← logos / figures
 ```

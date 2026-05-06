@@ -16,24 +16,16 @@
 #
 # Output: <shards_dir>/<sample_id>_shard.pkl
 #
-# The manifest CSV MUST have these columns:
-#       sample_id,bam_path,motifs[,ref_path]
+# The manifest CSV MUST have these columns (all required):
+#       sample_id,bam_path,motifs,ref_path
 #
-# When the OPTIONAL `ref_path` column is provided AND non-empty for
-# a row, kinsim extract auto-dispatches to the orientation-aware
-# aligned-BAM path (kinsim/extract_aligned.py). This is the correct
-# path for HiFi data because raw fi/ri without alignment cannot
-# disambiguate which kinetic tag carries the methylation signal at
-# each genomic position — half the reads end up reading the wrong
-# tag and the per-row signal averages away.
-#
-# When `ref_path` is absent or empty, the legacy raw-HiFi extract
-# path runs (motif scan on read sequence + fi/fp). Use this only for
-# Sequel subreads or BAMs where strand orientation is unambiguous.
+# kinsim extract is aligned-only: bam_path must be an aligned bystrandified
+# BAM (sorted, indexed, ip/pw tags) and ref_path is the reference FASTA
+# the BAM was mapped against. read.is_reverse drives per-strand methylation
+# routing — raw HiFi without alignment is not supported (orientation
+# ambiguity averages the per-row signal away).
 #
 # Output layout: 38-col rows per kmer (see kinsim/utils/sample_layout.py).
-# Refine on the resulting shards is identical for both paths; only
-# the underlying source of per-row IPDs differs.
 # ============================================================
 
 set +u

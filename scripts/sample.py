@@ -1,21 +1,16 @@
-"""Randomly subsample a dictionary .pkl for train/test splits.
+"""Randomly subsample a shard .pkl for train/test splits.
 
 Usage examples:
 
-    # Sample 500 observations per key from a dictionary
-    kinsim sample general.pkl sampled.pkl --n-samples 500
+    # Sample 500 observations per kmer from one shard
+    python scripts/sample.py general.pkl sampled.pkl --n-samples 500
 
-    # Sample with a specific seed (reproducible)
-    kinsim sample general.pkl sampled.pkl --n-samples 500 --seed 42
-
-    # Create multiple samples and merge them into one dictionary
-    kinsim sample msa_dict.pkl   samples/msa_sample.pkl   --n-samples 1000
-    kinsim sample strep_dict.pkl samples/strep_sample.pkl --n-samples 1000
-    kinsim merge samples/ combined_training.pkl
+    # Reproducible
+    python scripts/sample.py general.pkl sampled.pkl --n-samples 500 --seed 42
 
     # Train/test split: sample test set, remainder is training
-    kinsim sample general.pkl test.pkl --n-samples 100 --seed 42
-    kinsim sample general.pkl train.pkl --n-samples 5000 --exclude test.pkl
+    python scripts/sample.py general.pkl test.pkl  --n-samples 100  --seed 42
+    python scripts/sample.py general.pkl train.pkl --n-samples 5000 --exclude test.pkl
 """
 
 import logging
@@ -133,14 +128,9 @@ def main(argv=None):
             "  - Downsampling large dictionaries for faster training\n"
             "  - Combining samples from multiple species dictionaries\n\n"
             "Examples:\n"
-            "  kinsim sample general.pkl train.pkl --n-samples 5000\n"
-            "  kinsim sample general.pkl test.pkl --n-samples 100 --seed 42\n"
-            "  kinsim sample general.pkl train.pkl --n-samples 5000 --exclude test.pkl\n\n"
-            "To combine multiple sampled dictionaries:\n"
-            "  mkdir samples/\n"
-            "  kinsim sample msa.pkl   samples/msa.pkl   --n-samples 1000\n"
-            "  kinsim sample strep.pkl samples/strep.pkl --n-samples 1000\n"
-            "  kinsim merge samples/ combined.pkl"
+            "  python scripts/sample.py general.pkl train.pkl --n-samples 5000\n"
+            "  python scripts/sample.py general.pkl test.pkl  --n-samples 100  --seed 42\n"
+            "  python scripts/sample.py general.pkl train.pkl --n-samples 5000 --exclude test.pkl"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

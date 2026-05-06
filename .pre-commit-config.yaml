@@ -29,7 +29,6 @@ repos:
         args: ["--ignore-words-list=ist,nd,thi,thise"]
         exclude: |
           (?x)^(
-            archive/.*|
             baseline/.*|
             kinsim/utils/motifs\.py|
             slurm_kinsim/.*\.csv

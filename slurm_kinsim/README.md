@@ -35,12 +35,11 @@ and **ML** (shared across datasets, training and generation).
    │ manifest_strepto.csv    │ │                       │ │  sequel.csv     │
    └─────────────────────────┘ └───────────────────────┘ └─────────────────┘
                               ↓
-2. ML pipeline (shared, manifest-driven)
+2. ML pipeline (shared, manifest-driven — sharded end-to-end)
    ┌────────────────────────────────────────────────────────────┐
    │ slurm_kinsim/ml/                                           │
    │  00_extract.slurm  →  shards/<sample_id>_shard.pkl  (array)│
-   │  01_merge.slurm    →  master.pkl                           │
-   │  02_refine.slurm   →  master_clean.pkl                     │
+   │  02_refine.slurm   →  refined/   (per-(meth, offset) GMM)  │
    │  03_train.slurm    →  checkpoints/  (1 GPU)                │
    │  04_generate.slurm →  simulated BAM (per genome / array)   │
    │  05_evaluate.slurm →  calibration report                   │
@@ -95,39 +94,34 @@ emitted by a prep pipeline.
 N=$(kinsim-prep manifest count manifest.csv)
 
 SHARDS=/path/to/shards
-MASTER=/path/to/master.pkl
+REFINED=/path/to/refined
 
 # 1. Extract — array job, one task per sample
 EX=$(sbatch --parsable --array=1-${N}%8 slurm_kinsim/ml/00_extract.slurm \
     manifest.csv $SHARDS)
 
-# 2. Merge
-MG=$(sbatch --parsable --dependency=afterany:$EX slurm_kinsim/ml/01_merge.slurm \
-    $SHARDS $MASTER)
+# 2. Refine — pool harvest across shards, fit GMMs once, apply per-shard
+RF=$(sbatch --parsable --dependency=afterany:$EX slurm_kinsim/ml/02_refine.slurm \
+    $SHARDS $REFINED)
 
-# 3. Refine
-RF=$(sbatch --parsable --dependency=afterok:$MG slurm_kinsim/ml/02_refine.slurm \
-    $MASTER ${MASTER%.pkl}_clean.pkl ${MASTER%.pkl}_refine.tsv)
-
-# 4. Train
+# 3. Train — directory input, ShardedSignalDataset reads from refined/
 TR=$(sbatch --parsable --dependency=afterok:$RF slurm_kinsim/ml/03_train.slurm \
-    ${MASTER%.pkl}_clean.pkl checkpoints/)
+    $REFINED checkpoints/)
 
-# 5. Generate (typically a separate chain on PBSIM3 reads)
+# 4. Generate (typically a separate chain on PBSIM3 reads)
 sbatch --dependency=afterok:$TR slurm_kinsim/ml/04_generate.slurm \
     <pbsim3_dir> checkpoints/best.pt motifs.csv output_dir/
 ```
 
-The `slurm_kinsim/ml/run.sh` orchestrator wraps the extract → merge →
-refine → analyze chain.
+The `slurm_kinsim/ml/run.sh` orchestrator wraps the extract → refine →
+train → evaluate chain.
 
 ### Resource defaults
 
 | Step | Mem | CPUs | GPU | Time | Notes |
 |---|---|---|---|---|---|
 | `00_extract` | 128 GB | 1 | — | 24h | Per-sample array task |
-| `01_merge` | 750 GB | 2 | — | 4h | Single-shot merge — needs lots of RAM |
-| `02_refine` | 96 GB | 4 | — | 6h | scikit-learn GMM is single-threaded internally |
+| `02_refine` | 96 GB | 4 | — | 6h | Pool-harvest pass + per-shard GMM apply (peak ≈ one shard) |
 | `03_train` | 32 GB | 8 | 1 | 24h | A100 / H100 / V100 — auto-detected |
 | `04_generate` | 32 GB | 4 | 1 | 4h | One job per simulated genome |
 
@@ -144,7 +138,6 @@ The IBU cluster offers several partitions:
 |---|---|---|
 | `pibu_el8` | 28 days | Long jobs (extract array, train) |
 | `pshort_el8` | 2 hours | Quick tests, refine on small datasets |
-| `phighmem` | unlimited | Merge step (>500 GB RAM) |
 | `pgpu` | 28 days | Train / generate (1 GPU per node) |
 
 Use `pshort_el8` for smoke tests (`--max-reads 200000`) — they queue
@@ -186,7 +179,6 @@ slurm_kinsim/
 │
 ├── ml/                             — Shared ML pipeline
 │   ├── 00_extract.slurm
-│   ├── 01_merge.slurm
 │   ├── 02_refine.slurm
 │   ├── 03_train.slurm
 │   ├── 04_generate.slurm
@@ -217,7 +209,6 @@ All SLURM scripts write logs to:
 ```
 /data/projects/p774_MARSD/NDutilleux/logs/
 ├── ml_00_extract_<JOBID>_<TASKID>.log
-├── ml_01_merge_<JOBID>.log
 ├── ml_02_refine_<JOBID>.log
 ├── ml_03_train_<JOBID>.log
 └── …

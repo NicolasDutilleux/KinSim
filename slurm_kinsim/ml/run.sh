@@ -2,9 +2,11 @@
 # ============================================================
 # ML pipeline orchestrator — generic across Vega / Sequel / Strepto.
 #
+# Sharded end-to-end: extract → refine → train → evaluate, each step
+# consumes a directory (or file) from the previous one. No merge step.
+#
 # Per-step submit:
 #   bash slurm_kinsim/ml/run.sh extract  <manifest.csv> <prefix>
-#   bash slurm_kinsim/ml/run.sh merge    <prefix>
 #   bash slurm_kinsim/ml/run.sh refine   <prefix>
 #   bash slurm_kinsim/ml/run.sh train    <prefix>  [train_flags...]
 #   bash slurm_kinsim/ml/run.sh generate <prefix>  <pbsim3_dir> <motifs> [ckpt_epoch]
@@ -13,10 +15,9 @@
 #   bash slurm_kinsim/ml/run.sh analyze  <prefix>
 #   bash slurm_kinsim/ml/run.sh all      <manifest.csv> <prefix>
 #
-# <prefix> is a working directory. The pipeline lays out:
-#   <prefix>/shards/             per-sample *_shard.pkl
-#   <prefix>/master.pkl          merged
-#   <prefix>/master_clean.pkl    after refine
+# <prefix> is a working directory laid out as:
+#   <prefix>/shards/             per-sample *_shard.pkl    (extract output)
+#   <prefix>/refined/            per-sample *_clean.pkl    (refine output)
 #   <prefix>/checkpoints/        model_config.json + checkpoint_epoch*.pt
 #   <prefix>/generated/          generated BAMs
 #   <prefix>/verify/             per-sample verify tsvs
@@ -33,8 +34,7 @@ EXTRACT_CONCURRENT=4
 paths() {
     local prefix=$1
     SHARDS="${prefix}/shards"
-    MASTER="${prefix}/master.pkl"
-    MASTER_CLEAN="${prefix}/master_clean.pkl"
+    REFINED="${prefix}/refined"
     CKPT_DIR="${prefix}/checkpoints"
     GEN_DIR="${prefix}/generated"
     VERIFY_DIR="${prefix}/verify"
@@ -50,18 +50,12 @@ submit_extract() {
         "${HERE}/00_extract.slurm" "$manifest" "$SHARDS"
 }
 
-submit_merge() {
+submit_refine() {
     local prefix=$1; local dep=${2:-}
     local d=""; [ -n "$dep" ] && d="--dependency=afterany:${dep}"
     paths "$prefix"
-    sbatch --parsable $d "${HERE}/01_merge.slurm" "$SHARDS" "$MASTER"
-}
-
-submit_refine() {
-    local prefix=$1; local dep=${2:-}
-    local d=""; [ -n "$dep" ] && d="--dependency=afterok:${dep}"
-    paths "$prefix"
-    sbatch --parsable $d "${HERE}/02_refine.slurm" "$MASTER" "$MASTER_CLEAN"
+    mkdir -p "$REFINED"
+    sbatch --parsable $d "${HERE}/02_refine.slurm" "$SHARDS" "$REFINED"
 }
 
 submit_train() {
@@ -69,7 +63,7 @@ submit_train() {
     local d=""; [ -n "$dep" ] && d="--dependency=afterok:${dep}"
     paths "$prefix"
     mkdir -p "$CKPT_DIR"
-    sbatch --parsable $d "${HERE}/03_train.slurm" "$MASTER_CLEAN" "$CKPT_DIR" "$@"
+    sbatch --parsable $d "${HERE}/03_train.slurm" "$REFINED" "$CKPT_DIR" "$@"
 }
 
 submit_generate() {
@@ -98,7 +92,7 @@ submit_evaluate() {
     local prefix=$1; local dep=${2:-}
     local d=""; [ -n "$dep" ] && d="--dependency=afterok:${dep}"
     paths "$prefix"
-    sbatch --parsable $d "${HERE}/05_evaluate.slurm" "$CKPT_DIR" "$MASTER_CLEAN"
+    sbatch --parsable $d "${HERE}/05_evaluate.slurm" "$CKPT_DIR" "$REFINED"
 }
 
 submit_verify() {
@@ -116,8 +110,8 @@ submit_analyze() {
     local prefix=$1; local dep=${2:-}
     local d=""; [ -n "$dep" ] && d="--dependency=afterok:${dep}"
     paths "$prefix"
-    local pkl="${MASTER_CLEAN}"
-    [ -f "$pkl" ] || pkl="${MASTER}"   # fall back to pre-refine if clean not ready
+    local pkl="${REFINED}"
+    [ -d "$pkl" ] || pkl="${SHARDS}"   # fall back to pre-refine if refined not ready
     sbatch --parsable $d \
         --partition=pibu_el8 --account=p774 \
         --mem=32G --cpus-per-task=2 --time=02:00:00 \
@@ -132,10 +126,6 @@ case "$STEP" in
     extract)
         MANIFEST=${2:?"manifest required"}; PREFIX=${3:?"prefix required"}
         J=$(submit_extract "$MANIFEST" "$PREFIX"); echo "ml.00 extract:  $J"
-        ;;
-    merge)
-        PREFIX=${2:?"prefix required"}
-        J=$(submit_merge "$PREFIX"); echo "ml.01 merge:    $J"
         ;;
     refine)
         PREFIX=${2:?"prefix required"}
@@ -169,11 +159,10 @@ case "$STEP" in
         ;;
     all)
         MANIFEST=${2:?"manifest required"}; PREFIX=${3:?"prefix required"}
-        J0=$(submit_extract "$MANIFEST" "$PREFIX");  echo "ml.00 extract:  $J0"
-        J1=$(submit_merge   "$PREFIX" "$J0");        echo "ml.01 merge:    $J1 (after $J0)"
-        J2=$(submit_refine  "$PREFIX" "$J1");        echo "ml.02 refine:   $J2 (after $J1)"
-        J3=$(submit_train   "$PREFIX" "$J2");        echo "ml.03 train:    $J3 (after $J2)"
-        J4=$(submit_evaluate "$PREFIX" "$J3");       echo "ml.05 evaluate: $J4 (after $J3)"
+        J0=$(submit_extract "$MANIFEST" "$PREFIX"); echo "ml.00 extract:  $J0"
+        J1=$(submit_refine  "$PREFIX" "$J0");       echo "ml.02 refine:   $J1 (after $J0)"
+        J2=$(submit_train   "$PREFIX" "$J1");       echo "ml.03 train:    $J2 (after $J1)"
+        J3=$(submit_evaluate "$PREFIX" "$J2");      echo "ml.05 evaluate: $J3 (after $J2)"
         echo ""
         echo "generate + verify require a pbsim3 dir and motifs — submit manually:"
         echo "  bash $0 generate $PREFIX <pbsim3_dir> <motifs>"
@@ -185,21 +174,19 @@ Usage: bash slurm_kinsim/ml/run.sh <step> [args...]
 
 Steps:
   extract  <manifest.csv> <prefix>                       array per manifest row → shards/
-  merge    <prefix>                                       shards/ → master.pkl
-  refine   <prefix>                                       master.pkl → master_clean.pkl (p95 baseline filter)
-  train    <prefix> [flags...]                            train ConvPredictor on master_clean.pkl
+  refine   <prefix>                                       shards/ → refined/   (per-(meth, offset) GMM)
+  train    <prefix> [flags...]                            train ConvPredictor on refined/
   generate <prefix> <pbsim3_dir> <motifs> [epoch]         array per PBSIM3 species
   evaluate <prefix>                                       calibration report
   verify   <manifest.csv> <prefix> [gen_dir]              kinsim verify-generate per sample
-  analyze  <prefix>                                       kinsim analyze on master_clean.pkl
+  analyze  <prefix>                                       kinsim analyze on refined/
 
 Chains:
-  all      <manifest.csv> <prefix>                        extract → merge → refine → train → evaluate
+  all      <manifest.csv> <prefix>                        extract → refine → train → evaluate
 
 Prefix layout:
   <prefix>/shards/           per-sample *_shard.pkl
-  <prefix>/master.pkl        merged
-  <prefix>/master_clean.pkl  after refine — input to train
+  <prefix>/refined/          per-sample *_clean.pkl  — input to train
   <prefix>/checkpoints/      model_config.json + checkpoint_epoch*.pt
   <prefix>/generated/        generated BAMs
   <prefix>/verify/           per-sample verify tsvs

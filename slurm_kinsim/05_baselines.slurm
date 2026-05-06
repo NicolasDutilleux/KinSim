@@ -22,8 +22,8 @@
 #   sbatch slurm_kinsim/05_baselines.slurm <manifest.csv> <merged.pkl> <output_dir> [epochs]
 #
 # Arguments:
-#   $1  Manifest CSV (sample_id, bam_path, motifs) — for baselines 1 & 2
-#   $2  Merged training .pkl (from kinsim merge) — for baseline 3
+#   $1  Manifest CSV (sample_id, bam_path, motifs, ref_path) — for baselines 1 & 2
+#   $2  Refined shards directory (from kinsim refine) — for baseline 3
 #   $3  Output directory (subdirs created per baseline)
 #   $4  (optional) Epochs for ConvNoFiLM training (default: 50)
 # ============================================================

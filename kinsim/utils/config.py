@@ -68,17 +68,16 @@ _OPTIONAL_COLUMNS = {"ref_path"}  # added: reference FASTA for orientation-aware
 
 @dataclass
 class SampleEntry:
-    """One BAM + motif (+ optional ref) entry from a manifest CSV.
+    """One BAM + motifs + reference entry from a manifest CSV.
 
-    ``ref_path`` triggers the orientation-aware aligned-BAM extract path
-    in :mod:`kinsim.extract_aligned`. When absent or empty, the legacy
-    motif-scan-on-reads extract path is used (raw HiFi BAMs).
+    ``ref_path`` is required by :mod:`kinsim.extract` — the orientation-aware
+    pipeline needs the reference FASTA the aligned BAM was mapped against.
     """
 
     sample_id: str
     bam_path: str
     motifs: str  # KinSim motif string or path (resolved later by load_motif_string)
-    ref_path: str = ""  # optional — reference FASTA for the aligned extract path
+    ref_path: str = ""  # required — reference FASTA for the aligned extract path
 
 
 def load_manifest(manifest_path: str) -> list[SampleEntry]:
@@ -86,13 +85,11 @@ def load_manifest(manifest_path: str) -> list[SampleEntry]:
 
     The manifest must be a comma-separated file with the header:
 
-        sample_id,bam_path,motifs[,ref_path]
+        sample_id,bam_path,motifs,ref_path
 
-    ``ref_path`` is optional. When present and non-empty, the row triggers
-    the orientation-aware aligned-BAM extract path (:mod:`extract_aligned`),
-    which uses per-read alignment info to disambiguate which kinetic tag
-    carries the methylation signal. When absent or empty, the legacy
-    raw-HiFi extract path runs (motif-scan on read sequence + ``fi``).
+    ``ref_path`` is the reference FASTA the aligned BAM was mapped against.
+    :mod:`kinsim.extract` requires it to build per-strand methylation maps
+    and route ``read.is_reverse`` lookups correctly.
 
     Any column order is accepted.  Empty rows and rows starting with ``#``
     are silently skipped.

@@ -44,9 +44,10 @@ CI runs the matrix on Python 3.10 / 3.11 / 3.12.
 - `kinsim/`            ML pipeline (the `kinsim` CLI)
 - `prep/`              Data preparation (the `kinsim-prep` CLI)
 - `slurm_kinsim/`      HPC SLURM scripts
+- `scripts/`           auxiliary one-off tools (run with `python`, not via the CLI)
 - `kinsim_config.yaml` biology / refine knobs (signature offsets, etc.)
 - `tests/`             pytest suite
-- `archive/`           legacy code, frozen — not edited
+- `baseline/`          baseline models for ablations
 
 See [CLAUDE.md](CLAUDE.md) for the in-depth developer reference (data
 flow, file formats, import rules, conventions).
