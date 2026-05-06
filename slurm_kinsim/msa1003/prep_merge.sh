@@ -77,7 +77,7 @@ for EXP in "${EXPERIENCES[@]}"; do
         fi
 
         # -- Merge calling + REBASE -> final_motifs.csv --
-        kinsim-prep merge-motifs "${INPUTS[@]}" \
+        python -m kinsim.utils.parsers.motif_merge "${INPUTS[@]}" \
             --output "$FINAL_CSV" \
             --min-frac 0.8 \
             --min-sites 300
@@ -100,4 +100,4 @@ echo "  final_motifs.csv written into every species folder under $SPLIT/"
 echo "  Manifest: $MANIFEST  ($(grep -c ',' "$MANIFEST" || true) rows)"
 echo ""
 echo "Next step: validate the manifest with:"
-echo "  kinsim-prep manifest validate $MANIFEST"
+echo "  python scripts/manifest.py validate $MANIFEST"

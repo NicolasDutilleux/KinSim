@@ -99,8 +99,8 @@ device: cuda                # cuda | cpu (auto-falls-back to cpu if no GPU)
 # min_detected:        20      # min nDetected from PacBio CSV
 
 # ============================================================
-# BALANCE PARAMETERS (for reference — used with kinsim-prep balance)
-# kinsim-prep balance merged.pkl balanced.pkl \
+# BALANCE PARAMETERS (for reference — used with scripts/balance.py)
+# python scripts/balance.py merged.pkl balanced.pkl \
 #     --meth-fraction 0.5 \
 #     --samples-per-key 200
 # ============================================================

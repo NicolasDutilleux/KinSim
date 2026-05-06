@@ -58,4 +58,4 @@ for SPECIES_DIR in "$OUTBASE"/bc*/; do
 done
 
 echo "Wrote $MANIFEST ($kept rows, $skipped skipped)"
-kinsim-prep manifest validate "$MANIFEST" || true
+python scripts/manifest.py validate "$MANIFEST" || true

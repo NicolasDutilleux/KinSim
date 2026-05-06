@@ -14,7 +14,7 @@ sample_id,bam_path,motifs,gff
 #   REBASE file:   /data/rebase/strain1_rebase.txt
 #
 # Count rows for --array flag:
-#   N=$(kinsim-prep manifest count manifest.csv)
+#   N=$(python scripts/manifest.py count manifest.csv)
 #   sbatch --array=1-$N kinsim_extract.slurm manifest.csv shards/ master_data.pkl
 #
 # Motif-based extraction (unaligned BAMs, motif sequence scanning):

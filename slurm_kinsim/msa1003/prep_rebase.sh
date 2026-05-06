@@ -76,7 +76,7 @@ for SPECIES_DIR in "$SPLIT/${EXPERIENCES[0]}"/*/; do
 
     # Fetch into the first experience
     FIRST_CSV="$SPLIT/${EXPERIENCES[0]}/$ACC/rebase_motifs.csv"
-    kinsim-prep rebase fetch "$ORG_NUM" --output "$FIRST_CSV"
+    python -m kinsim.utils.parsers.rebase fetch "$ORG_NUM" --output "$FIRST_CSV"
 
     # Copy to the other experiences
     for EXP in "${EXPERIENCES[@]:1}"; do

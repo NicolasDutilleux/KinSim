@@ -52,4 +52,4 @@ for BC in "${BARCODES[@]}"; do
 done
 
 echo "Wrote $MANIFEST ($kept rows kept, $skipped skipped)"
-kinsim-prep manifest validate "$MANIFEST" || true
+python scripts/manifest.py validate "$MANIFEST" || true

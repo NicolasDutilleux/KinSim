@@ -18,7 +18,7 @@
 #   3. samtools index
 #   4. modkit pileup         per-site bedMethyl
 #   5. modkit find-motifs    motif enrichment from bedMethyl
-#   6. emit motifs.csv       combined-parser format (kinsim-prep compatible)
+#   6. emit motifs.csv       combined-parser format (kinsim-compatible)
 #
 #   sbatch --array=1-N%K slurm_kinsim/jasmine_5mc.slurm <manifest.csv> <out_dir>
 #

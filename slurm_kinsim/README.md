@@ -91,7 +91,7 @@ emitted by a prep pipeline.
 
 ```bash
 # Compute manifest size for SLURM array
-N=$(kinsim-prep manifest count manifest.csv)
+N=$(python scripts/manifest.py count manifest.csv)
 
 SHARDS=/path/to/shards
 REFINED=/path/to/refined

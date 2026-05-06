@@ -48,4 +48,4 @@ for s in skipped:
     print(f'  skip: {s}')
 PY
 
-kinsim-prep manifest validate "$OUT_MANIFEST" || true
+python scripts/manifest.py validate "$OUT_MANIFEST" || true

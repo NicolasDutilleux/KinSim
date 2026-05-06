@@ -47,4 +47,4 @@ for sid, reason in skipped:
     print(f'  skip {sid}: {reason}')
 PY
 
-kinsim-prep manifest validate "$OUT_MANIFEST" || true
+python scripts/manifest.py validate "$OUT_MANIFEST" || true
