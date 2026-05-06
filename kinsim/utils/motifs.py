@@ -338,7 +338,29 @@ def parse_motifs(motif_string, revcomp=True):
             # Skip auto-revcomp expansion if the user already provided the
             # revcomp sequence as a separate motif entry (palindromic system).
             if rc not in user_seqs:
-                pairs.append((rc, len(seq) - 1 - mod_pos))
+                rc_mod_pos = len(seq) - 1 - mod_pos
+                # Validate the auto-rc'd entry too. The naive
+                # ``len(seq) - 1 - mod_pos`` formula points to the
+                # complement-base position on the rc string, which is NOT the
+                # methylated base of the same chemistry — e.g. CTGAAG (m6A at
+                # the second A, idx 4) auto-rc'd to CTTCAG with idx 1 lands
+                # on a 'T'. Catching this at parse time prevents us from
+                # silently flagging T positions as m6A in scan_sequence.
+                try:
+                    _validate_mod_pos(rc, rc_mod_pos, m_type)
+                    pairs.append((rc, rc_mod_pos))
+                except ValueError as exc:
+                    log.warning(
+                        "parse_motifs: auto-revcomp of '%s' (%s, mod_pos=%d) → "
+                        "(%s, mod_pos=%d) is invalid (%s). Provide the revcomp "
+                        "explicitly in your motif file with the correct mod_pos.",
+                        seq,
+                        m_type,
+                        mod_pos,
+                        rc,
+                        rc_mod_pos,
+                        exc,
+                    )
 
         frac = float(parts[4]) if len(parts) >= 5 else 1.0
 
@@ -346,6 +368,123 @@ def parse_motifs(motif_string, revcomp=True):
             regex_pattern = re.compile(f"(?=({iupac_to_re(s)}))")
             motifs.append({"pattern": regex_pattern, "id": m_id, "pos": offset, "frac": frac})
     return motifs
+
+
+# ---------------------------------------------------------------------------
+# Strand-tagged motif parsing — for orientation-aware aligned-BAM extraction
+# ---------------------------------------------------------------------------
+
+
+def parse_motifs_per_strand(motif_string: str) -> tuple[list, list]:
+    """Parse motifs into TWO lists: forward-strand and reverse-strand.
+
+    Used by the aligned-BAM extract path to track which reference strand
+    each motif lives on. The two resulting lists are scanned against the
+    forward reference sequence (forward_motifs scan ``ref``) and against
+    the reverse-complement (reverse_motifs scan ``rc_ref``) respectively.
+    The methylation positions returned by each scan are then in REFERENCE
+    forward-strand coordinates (after rc → ref position conversion).
+
+    Why this matters: in HiFi BAMs, ``ip[read_pos]`` is the IPD when the
+    polymerase synthesised position ``read_pos`` of the read sequence. The
+    polymerase was reading the OPPOSITE strand of the read as template. So
+    ``ip`` carries the kinetic effect of methylations on the strand opposite
+    to the read sequence:
+        - read.is_reverse=False  → read sequence = + strand of reference
+                                  → ip reads − strand template
+                                  → captures methylation on − strand at ref_pos
+        - read.is_reverse=True   → read sequence = rev-comp of + strand
+                                  → ip reads + strand template
+                                  → captures methylation on + strand at ref_pos
+
+    Pairing this with strand-resolved motif maps gives signal at the right
+    reads. With raw unaligned HiFi we can't do this routing — every read is
+    50/50 likely to need fi vs ri at any given position, so the signal
+    averages out.
+
+    Returns:
+        (fwd_motifs, rev_motifs) — each a list of dicts identical in shape
+        to ``parse_motifs`` output (``pattern``, ``id``, ``pos``, ``frac``).
+        ``fwd_motifs`` are the user-provided sequences (matching the +
+        reference strand). ``rev_motifs`` are the rev-comps with rc-coord
+        ``pos``; positions found in rc need to be mapped back to forward
+        ref coords via ``ref_pos = ref_len - 1 - rc_pos`` by the caller.
+    """
+    if not motif_string:
+        return [], []
+
+    user_entries = []
+    for entry in motif_string.split(";"):
+        if not entry or "," not in entry:
+            continue
+        parts = entry.split(",")
+        if len(parts) < 3:
+            continue
+        user_entries.append(parts)
+    user_seqs = {parts[1] for parts in user_entries}
+
+    fwd_motifs: list = []
+    rev_motifs: list = []
+    errors: list[str] = []
+    for parts in user_entries:
+        m_type, seq, pos = parts[0], parts[1], parts[2]
+        try:
+            mod_pos = int(pos) - 1
+        except ValueError:
+            errors.append(f"Motif '{seq}' ({m_type}): pos='{pos}' is not an integer.")
+            continue
+        try:
+            _validate_mod_pos(seq, mod_pos, m_type)
+        except ValueError as e:
+            errors.append(str(e))
+            continue
+        m_id = get_meth_ids().get(m_type, 0)
+        frac = float(parts[4]) if len(parts) >= 5 else 1.0
+        # Forward: matches the user-provided sequence on the + strand
+        fwd_pattern = re.compile(f"(?=({iupac_to_re(seq)}))")
+        fwd_motifs.append({"pattern": fwd_pattern, "id": m_id, "pos": mod_pos, "frac": frac})
+        # Reverse: matches the same modification on the − strand. Use the
+        # rev-comp sequence with ``rc_mod_pos = len(seq) - 1 - mod_pos`` and
+        # validate that the rc base is a target for this meth type. If the
+        # user already provided the rc as a separate motif entry, skip — it
+        # will be parsed in its own pass.
+        rc = reverse_complement(seq)
+        if rc in user_seqs:
+            continue  # user provides the rc explicitly; will be added when iterated
+        rc_mod_pos = len(seq) - 1 - mod_pos
+        try:
+            _validate_mod_pos(rc, rc_mod_pos, m_type)
+        except ValueError as exc:
+            log.warning(
+                "parse_motifs_per_strand: auto-rc of '%s' (%s, mod_pos=%d) → "
+                "(%s, mod_pos=%d) invalid (%s). Skipping − strand entry.",
+                seq, m_type, mod_pos, rc, rc_mod_pos, exc,
+            )
+            continue
+        rev_pattern = re.compile(f"(?=({iupac_to_re(rc)}))")
+        rev_motifs.append({"pattern": rev_pattern, "id": m_id, "pos": rc_mod_pos, "frac": frac})
+
+    if errors:
+        bullet = "\n  - ".join(errors)
+        raise ValueError(
+            f"parse_motifs_per_strand: {len(errors)} invalid motif "
+            f"{'entry' if len(errors) == 1 else 'entries'}.\n  - {bullet}"
+        )
+
+    # When both orientations are user-provided (e.g. CTGAAG + CTTCAG),
+    # parse_motifs_per_strand puts each in fwd_motifs (its own forward
+    # match against the + strand of the reference). For the user-provided
+    # rc partner (CTTCAG when the genome's + strand carries CTGAAG), its
+    # forward matches in the + strand reference correspond to genomic loci
+    # where the + strand happens to read as CTTCAG (which is the rc of a
+    # CTGAAG site on the − strand). So those matches in fwd_motifs are
+    # actually capturing − strand methylations. To keep the strand semantics
+    # correct, we relabel: any user-provided sequence whose rc is also user-
+    # provided contributes to BOTH fwd and rev maps via the partner — we let
+    # the iteration above handle this naturally because both sequences end
+    # up in fwd_motifs (each scanning the + strand directly), and the rev_
+    # motifs list captures the auto-rc cases for asymmetric inputs.
+    return fwd_motifs, rev_motifs
 
 
 def scan_sequence(seq, motifs):

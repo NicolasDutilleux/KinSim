@@ -422,13 +422,27 @@ def extract_samples_from_bam(
                 continue
             mname = name_by_mid.get(T_id, f"meth{T_id}")
             # SLOWED: positions p+k for each k in sig_off (k incl. 0).
-            # Last writer wins on conflict (matches the existing behaviour).
+            # Closest-offset wins on conflict — when two motif occurrences
+            # both flag the same target position, prefer the one whose
+            # |offset| is smaller. The smaller-|k| offset is biophysically
+            # the primary kinetic signal (the methylation itself or the
+            # nearest downstream footprint); a larger-|k| offset from a
+            # different motif is a secondary footprint that shouldn't
+            # overwrite the primary.
             for k in sig_off.tolist():
                 tgt = centers_T + k
                 in_range = (tgt >= 0) & (tgt < n)
                 tgt_in = tgt[in_range]
-                slowed[tgt_in] = T_id
-                slowed_parent_off[tgt_in] = int(k)
+                # Determine which targets we can safely overwrite (existing
+                # offset has |k_existing| > |k|, OR position not yet flagged).
+                k_abs = abs(int(k))
+                if tgt_in.size:
+                    existing_off_abs = np.abs(slowed_parent_off[tgt_in].astype(np.int32))
+                    not_set = slowed[tgt_in] == 0
+                    overwrite_ok = not_set | (existing_off_abs > k_abs)
+                    write_idx = tgt_in[overwrite_ok]
+                    slowed[write_idx] = T_id
+                    slowed_parent_off[write_idx] = int(k)
                 slowed_offset_dist[(mname, int(k))] += int(in_range.sum())
             # NEAR: positions p+k for k in [0, near_max] not in sig, only
             # if not already slowed and meth_status[c]==0 for that target.
@@ -734,6 +748,31 @@ def extract_from_manifest_task(
     motif_string = _load_motif_string(entry.motifs)
     if not motif_string:
         log.warning("No motifs resolved for '%s' — SKIPPING.", entry.sample_id)
+        return
+
+    # Auto-dispatch: if the manifest provides a ref_path, use the
+    # orientation-aware aligned-BAM extract path. This is the right path
+    # for HiFi data because raw fi/ri without alignment can't disambiguate
+    # which kinetic tag carries the methylation signal at each position.
+    if entry.ref_path:
+        if not Path(entry.ref_path).exists():
+            log.error("ref_path does not exist for %s: %s", entry.sample_id, entry.ref_path)
+            sys.exit(1)
+        log.info("[manifest] ref_path provided → using aligned-BAM extract path")
+        from .extract_aligned import extract_aligned_to_shard
+
+        extract_aligned_to_shard(
+            bam_path=entry.bam_path,
+            ref_path=entry.ref_path,
+            motif_string=motif_string,
+            output_path=output_pkl,
+            meth_types=meth_types,
+            n_baseline_per_kmer=n_baseline_per_kmer,
+            baseline_min_dist_to_meth=baseline_min_dist_to_meth,
+            baseline_sample_rate=baseline_sample_rate,
+            near_max_dist=near_meth_max_dist,
+            max_reads=max_reads,
+        )
         return
 
     result = extract_samples_from_bam(

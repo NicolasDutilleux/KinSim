@@ -63,15 +63,22 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _REQUIRED_COLUMNS = {"sample_id", "bam_path", "motifs"}
+_OPTIONAL_COLUMNS = {"ref_path"}  # added: reference FASTA for orientation-aware extract
 
 
 @dataclass
 class SampleEntry:
-    """One BAM + motif pair from a manifest CSV."""
+    """One BAM + motif (+ optional ref) entry from a manifest CSV.
+
+    ``ref_path`` triggers the orientation-aware aligned-BAM extract path
+    in :mod:`kinsim.extract_aligned`. When absent or empty, the legacy
+    motif-scan-on-reads extract path is used (raw HiFi BAMs).
+    """
 
     sample_id: str
     bam_path: str
     motifs: str  # KinSim motif string or path (resolved later by load_motif_string)
+    ref_path: str = ""  # optional — reference FASTA for the aligned extract path
 
 
 def load_manifest(manifest_path: str) -> list[SampleEntry]:
@@ -79,7 +86,13 @@ def load_manifest(manifest_path: str) -> list[SampleEntry]:
 
     The manifest must be a comma-separated file with the header:
 
-        sample_id,bam_path,motifs
+        sample_id,bam_path,motifs[,ref_path]
+
+    ``ref_path`` is optional. When present and non-empty, the row triggers
+    the orientation-aware aligned-BAM extract path (:mod:`extract_aligned`),
+    which uses per-read alignment info to disambiguate which kinetic tag
+    carries the methylation signal. When absent or empty, the legacy
+    raw-HiFi extract path runs (motif-scan on read sequence + ``fi``).
 
     Any column order is accepted.  Empty rows and rows starting with ``#``
     are silently skipped.
@@ -109,9 +122,12 @@ def load_manifest(manifest_path: str) -> list[SampleEntry]:
             raise ValueError(
                 f"Manifest CSV is missing required columns: {missing}\n"
                 f"Required: {_REQUIRED_COLUMNS}\n"
+                f"Optional: {_OPTIONAL_COLUMNS}\n"
                 f"Found:    {fieldnames}\n"
                 f"File:     {manifest_path}"
             )
+
+        has_ref = "ref_path" in fieldnames
 
         for row_num, row in enumerate(reader, start=2):
             # Skip comment rows
@@ -125,6 +141,7 @@ def load_manifest(manifest_path: str) -> list[SampleEntry]:
             sample_id = row["sample_id"].strip()
             bam_path = row["bam_path"].strip()
             motifs = row["motifs"].strip()
+            ref_path = row["ref_path"].strip() if has_ref else ""
 
             if not sample_id:
                 raise ValueError(f"Empty 'sample_id' at row {row_num} in {manifest_path}")
@@ -138,13 +155,18 @@ def load_manifest(manifest_path: str) -> list[SampleEntry]:
                     sample_id=sample_id,
                     bam_path=bam_path,
                     motifs=motifs,
+                    ref_path=ref_path,
                 )
             )
 
     if not entries:
         raise ValueError(f"Manifest is empty (no data rows): {manifest_path}")
 
-    log.info("Loaded %d samples from manifest: %s", len(entries), manifest_path)
+    n_aligned = sum(1 for e in entries if e.ref_path)
+    log.info(
+        "Loaded %d samples from manifest: %s (%d with ref_path → aligned extract path)",
+        len(entries), manifest_path, n_aligned,
+    )
     return entries
 
 

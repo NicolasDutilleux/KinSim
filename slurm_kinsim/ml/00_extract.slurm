@@ -16,10 +16,24 @@
 #
 # Output: <shards_dir>/<sample_id>_shard.pkl
 #
-# Single-pass extract: emits BASELINE / SLOWED / NEAR_METH samples in
-# the 36-col layout per kmer (see kinsim/utils/sample_layout.py).
-# False-positive motif matches survive this pass; `kinsim refine`
-# drops them downstream via the per-kmer-mean baseline IPD threshold.
+# The manifest CSV MUST have these columns:
+#       sample_id,bam_path,motifs[,ref_path]
+#
+# When the OPTIONAL `ref_path` column is provided AND non-empty for
+# a row, kinsim extract auto-dispatches to the orientation-aware
+# aligned-BAM path (kinsim/extract_aligned.py). This is the correct
+# path for HiFi data because raw fi/ri without alignment cannot
+# disambiguate which kinetic tag carries the methylation signal at
+# each genomic position — half the reads end up reading the wrong
+# tag and the per-row signal averages away.
+#
+# When `ref_path` is absent or empty, the legacy raw-HiFi extract
+# path runs (motif scan on read sequence + fi/fp). Use this only for
+# Sequel subreads or BAMs where strand orientation is unambiguous.
+#
+# Output layout: 38-col rows per kmer (see kinsim/utils/sample_layout.py).
+# Refine on the resulting shards is identical for both paths; only
+# the underlying source of per-row IPDs differs.
 # ============================================================
 
 set +u
