@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ml_03_train
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --mem=64G
 #SBATCH --account=p774
 #SBATCH --partition=pgpu
 #SBATCH --gres=gpu:1
