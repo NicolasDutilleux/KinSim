@@ -4,18 +4,22 @@ Input format: ``dict[kmer_id (int)] -> ndarray(N, 20)`` produced by
 ``kinsim extract``. Cols 17/18/19 carry CATEGORY, PARENT_METH and
 PARENT_OFFSET (see ``kinsim.utils.sample_layout``).
 
-Default method — ``--method gmm`` (anchored, log1p)
----------------------------------------------------
+Default method — ``--method gmm`` (baseline-anchored)
+-----------------------------------------------------
 Single rule. For each (meth_type T, parent_offset off) bucket:
 
-  1. Fit a Gaussian mixture on (log1p IPD, log1p PW) of the joint
+  1. Fit a 2-component Gaussian mixture on (IPD, PW) of the joint
      baseline_subsample + slowed_by_T@+off pool, with **component 0
      initialised at the global baseline pool's (mean, cov)** so EM
-     keeps it pinned at baseline kinetics. The remaining K-1
-     components fit freely on the residual variance.
-  2. Pick K∈{2, 3} (configurable) by BIC.
-  3. Drop slowed rows whose argmax posterior is component 0 (the
-     baseline-anchored component). Keep all other rows.
+     keeps it pinned at baseline kinetics. The free component fits
+     the meth signal.
+  2. Default K=2 (the simplest "anchor + one meth cluster"). Pass
+     ``--n-components 2,3`` to let BIC try K=3 as a fallback when
+     K=2 is clearly inadequate.
+  3. Keep only slowed rows whose argmax posterior is the
+     **highest-IPD** component (= the meth cluster). Drop the rest:
+     anchor rows always; with K=3, also any intermediate cluster
+     that didn't make it to the top.
 
 No validation gate. The baseline anchor guarantees component 0 is
 identifiable, so the drop rule is always defined. For weak-signal
@@ -23,11 +27,13 @@ types (m4C, m5C) where a free GMM might collapse to a single Gaussian
 and miss the methylation entirely, the anchor forces the unconstrained
 components to capture whatever variance differs from baseline.
 
-Why log1p? PacBio IPD/PW are log-normal at the population level
-(mixture of per-kmer Gaussians). Fitting in raw space inflates σ 5-10×
-and causes BIC to chase the long right tail with extra components. In
-log1p space the components are tight Gaussians, σ values are
-comparable across buckets, and BIC consistently picks K=2 or K=3.
+Why raw IPD/PW (not log)? PacBio uint8 [0, 255] encoding gives roughly
+Gaussian per-kmer distributions by design (that's what ipdSummary
+assumes). The pooled aggregate across kmers is a mixture either way,
+and raw space gives cleaner cluster separation than log: the meth
+component (raw IPD ~90 for m6A) sits well above baseline (~26),
+whereas log1p compresses them to log 4.5 vs 3.3 and harder-to-separate
+intermediate components appear.
 
 Legacy method — ``--method p95``
 --------------------------------
@@ -362,19 +368,17 @@ def _fit_gmms_per_bucket(
     fit_params_by_TO: dict[tuple[int, int], dict] = {}
     per_bucket_stats: dict = {}
 
-    # Fit in log1p space — PacBio IPD/PW are log-normal, so Gaussian
-    # mixtures fit cleanly here (raw-space σ values inflated 5-10x by
-    # the long right tail). We also TRAIN and GENERATE in log1p space,
-    # so refining there is the consistent choice.
-    baseline_log = np.log1p(baseline_pool).astype(np.float64)
-    base_mu = baseline_log.mean(axis=0)
-    base_cov = np.cov(baseline_log.T) + 1e-3 * np.eye(2)
+    # Fit in raw IPD/PW space. PacBio encodes uint8 [0, 255] so per-kmer
+    # baseline distributions are roughly Gaussian (that's what ipdSummary
+    # assumes for its null model). Pooled across kmers it's a mixture of
+    # Gaussians; raw space gives cleaner cluster separation than log1p
+    # for that mixture (meth components don't get squashed toward baseline).
+    base_mu = baseline_pool.mean(axis=0).astype(np.float64)
+    base_cov = (np.cov(baseline_pool.T) + 1e-3 * np.eye(2)).astype(np.float64)
     base_precision = np.linalg.inv(base_cov)
     log.info(
-        "[refine.gmm] baseline anchor (log1p): IPD %.3f±%.3f  PW %.3f±%.3f  "
-        "(raw IPD≈%.1f, raw PW≈%.1f)",
+        "[refine.gmm] baseline anchor: IPD %.2f±%.2f  PW %.2f±%.2f",
         base_mu[0], np.sqrt(base_cov[0, 0]), base_mu[1], np.sqrt(base_cov[1, 1]),
-        np.expm1(base_mu[0]), np.expm1(base_mu[1]),
     )
 
     bucket_keys = sorted(slowed_chunks_by_TO.keys(), key=lambda k: (name_by_mid.get(k[0], "z"), k[1]))
@@ -399,17 +403,16 @@ def _fit_gmms_per_bucket(
             }
             continue
 
-        # All math in log1p space (Gaussians appropriate for log-normal kinetics).
-        slowed_log = np.log1p(slowed_TO).astype(np.float64)
-        # Subsample baseline_log to roughly match slowed bucket size for the
+        # Subsample baseline to roughly match slowed bucket size for the
         # joint fit (so the meth components don't get drowned by baseline mass).
-        n_match = min(n_TO, len(baseline_log))
-        if n_match == len(baseline_log):
-            base_sample = baseline_log
+        n_match = min(n_TO, len(baseline_pool))
+        if n_match == len(baseline_pool):
+            base_sample = baseline_pool
         else:
-            idx = rng.choice(len(baseline_log), n_match, replace=False)
-            base_sample = baseline_log[idx]
-        pool = np.concatenate([base_sample, slowed_log])
+            idx = rng.choice(len(baseline_pool), n_match, replace=False)
+            base_sample = baseline_pool[idx]
+        slowed_arr = slowed_TO.astype(np.float64)
+        pool = np.concatenate([base_sample, slowed_arr])
 
         # BIC over candidate Ks. For each K: component 0 is anchored at
         # baseline stats; components 1..K-1 are initialised at high-IPD
@@ -418,19 +421,19 @@ def _fit_gmms_per_bucket(
         best_gmm = None
         best_k = -1
         best_bic = float("inf")
-        sorted_log_ipd = np.sort(slowed_log[:, 0])
+        sorted_ipd = np.sort(slowed_arr[:, 0])
         for k in candidate_ks:
             means_init = np.zeros((k, 2), dtype=np.float64)
             means_init[0] = base_mu
             for j in range(1, k):
-                # Spread component j across the upper half of slowed log-IPDs.
+                # Spread component j across the upper half of slowed IPDs.
                 pct = 50 + 45 * (j / max(k - 1, 1))     # K=2: [50,95]; K=3: [50,72.5,95]
-                idx_j = min(int(pct / 100 * (len(sorted_log_ipd) - 1)), len(sorted_log_ipd) - 1)
-                means_init[j] = slowed_log[idx_j]
+                idx_j = min(int(pct / 100 * (len(sorted_ipd) - 1)), len(sorted_ipd) - 1)
+                means_init[j] = slowed_arr[idx_j]
             precisions_init = np.zeros((k, 2, 2), dtype=np.float64)
             precisions_init[0] = base_precision
-            # Free components: σ ≈ 1.0 in log1p space (broad enough for any meth shift).
-            free_precision = np.linalg.inv(np.eye(2) * 1.0 + 1e-3 * np.eye(2))
+            # Free components: large variance init so EM has room to converge.
+            free_precision = np.linalg.inv(np.eye(2) * 100.0 + 1e-3 * np.eye(2))
             for j in range(1, k):
                 precisions_init[j] = free_precision
             try:
@@ -464,51 +467,70 @@ def _fit_gmms_per_bucket(
             continue
 
         gmm = best_gmm
-        means = gmm.means_              # in log1p space
-        covariances = gmm.covariances_  # in log1p space
+        means = gmm.means_
+        covariances = gmm.covariances_
         weights = gmm.weights_
         # Component 0 is the baseline anchor by construction; verify it
         # didn't drift far during EM (warn if it did, but keep going).
-        anchor_drift_log_ipd = abs(float(means[0, 0]) - float(base_mu[0]))
-        anchor_drift_log_pw = abs(float(means[0, 1]) - float(base_mu[1]))
+        anchor_drift_ipd = abs(float(means[0, 0]) - float(base_mu[0]))
+        anchor_drift_pw = abs(float(means[0, 1]) - float(base_mu[1]))
 
-        # Pretty-print components: log1p means/sigmas, plus raw-IPD equivalents
-        # in parentheses so the numbers are intuitive at a glance.
+        # Pretty-print all components in IPD-ascending order; tag the
+        # baseline-anchored component (original index 0) explicitly so
+        # the reader doesn't have to guess which one is "baseline".
         sort_order = np.argsort(means[:, 0])
         comp_summary_parts = []
         for i in sort_order:
-            mu_log_i, mu_log_p = float(means[i, 0]), float(means[i, 1])
-            sig_log_i = float(np.sqrt(covariances[i, 0, 0]))
-            sig_log_p = float(np.sqrt(covariances[i, 1, 1]))
-            rho = float(covariances[i, 0, 1] / max(sig_log_i * sig_log_p, 1e-9))
-            raw_ipd = float(np.expm1(mu_log_i))
-            raw_pw = float(np.expm1(mu_log_p))
+            mu_i, mu_p = float(means[i, 0]), float(means[i, 1])
+            sig_i = float(np.sqrt(covariances[i, 0, 0]))
+            sig_p = float(np.sqrt(covariances[i, 1, 1]))
+            rho = float(covariances[i, 0, 1] / max(sig_i * sig_p, 1e-9))
             anchor_tag = " [ANCHOR]" if i == 0 else ""
             comp_summary_parts.append(
-                f"N(IPD log={mu_log_i:.2f}±{sig_log_i:.2f} (raw≈{raw_ipd:.0f}), "
-                f"PW log={mu_log_p:.2f}±{sig_log_p:.2f} (raw≈{raw_pw:.0f}), "
+                f"N(IPD {mu_i:.1f}±{sig_i:.1f}, PW {mu_p:.1f}±{sig_p:.1f}, "
                 f"ρ={rho:+.2f})·{float(weights[i]):.3f}{anchor_tag}"
             )
         comp_summary = "  ".join(comp_summary_parts)
 
-        # Apply the rule (in log1p space): drop slowed rows whose argmax
-        # posterior is component 0 (the baseline-anchored component).
-        post = _gmm_posterior(slowed_log, means, covariances, weights)
+        # Apply the rule: keep only rows whose argmax posterior is the
+        # highest-IPD component. With K=2 that's "drop the anchor and
+        # keep the one meth cluster". With K=3 it's "drop the anchor
+        # AND any intermediate, keep only the topmost cluster" — the
+        # strict, biophysically conservative interpretation.
+        sort_order = np.argsort(means[:, 0])
+        top_idx = int(sort_order[-1])
+        if top_idx == 0:
+            log.warning(
+                "[refine.gmm] %s: highest-IPD component is the baseline anchor — "
+                "no detectable meth signal in this bucket. Keeping all rows.",
+                label,
+            )
+            per_bucket_stats[label] = {
+                "meth_type": T_name, "offset": off,
+                "n_in": n_TO, "n_kept": n_TO, "n_dropped": 0,
+                "p_fire": 1.0, "mean_occupancy": mean_occ,
+                "skipped": True, "reason": "no_signal_above_anchor",
+                "n_components_used": best_k,
+                "bic_per_k": bic_per_k,
+                "gmm_means": means.tolist(),
+            }
+            continue
+        post = _gmm_posterior(slowed_arr, means, covariances, weights)
         assigned = post.argmax(axis=1)
         keep_mask = assigned != 0
         n_kept = int(keep_mask.sum())
         drop_count = n_TO - n_kept
 
         log.info(
-            "[refine.gmm] %s: K=%d  BIC=%.0f  drift_log(IPD,PW)=(%.2f, %.2f)  %s.  "
+            "[refine.gmm] %s: K=%d  BIC=%.0f  drift(IPD,PW)=(%.1f, %.1f)  %s.  "
             "Kept %d/%d (%.1f%%), dropped %d.",
-            label, best_k, best_bic, anchor_drift_log_ipd, anchor_drift_log_pw, comp_summary,
+            label, best_k, best_bic, anchor_drift_ipd, anchor_drift_pw, comp_summary,
             n_kept, n_TO, 100.0 * n_kept / max(n_TO, 1), drop_count,
         )
-        if anchor_drift_log_ipd > 0.5:  # ~0.5 in log1p ≈ 65% raw multiplier
+        if anchor_drift_ipd > 5 * float(np.sqrt(base_cov[0, 0])):
             log.warning(
-                "[refine.gmm] %s: baseline anchor drifted %.2f in log1p space — "
-                "fit may be unreliable for this bucket.", label, anchor_drift_log_ipd,
+                "[refine.gmm] %s: baseline anchor drifted %.1f IPD units (>5σ_baseline) — "
+                "fit may be unreliable for this bucket.", label, anchor_drift_ipd,
             )
 
         fit_params_by_TO[(T_id, off)] = {
@@ -528,8 +550,8 @@ def _fit_gmms_per_bucket(
             "gmm_means": means.tolist(),
             "gmm_covariances": covariances.tolist(),
             "gmm_weights": weights.tolist(),
-            "anchor_drift_log_ipd": anchor_drift_log_ipd,
-            "anchor_drift_log_pw": anchor_drift_log_pw,
+            "anchor_drift_ipd": anchor_drift_ipd,
+            "anchor_drift_pw": anchor_drift_pw,
         }
 
     return fit_params_by_TO, per_bucket_stats
@@ -599,7 +621,7 @@ def _apply_gmm_filter_to_data(
                         # not seen at fit time) — keep all rows in the bucket.
                         slow_keep |= mask_TO
                         continue
-                    xs_TO = ipd_pw[mask_TO]
+                    xs_TO = ipd_pw[mask_TO].astype(np.float64)
                     post = _gmm_posterior(
                         xs_TO,
                         np.asarray(params["means"]),
@@ -636,7 +658,7 @@ def _apply_gmm_filter_to_data(
 def slowed_split_gmm(
     data: dict,
     min_samples_for_gmm: int = 100,
-    n_components: int | tuple[int, ...] = (2, 3),
+    n_components: int | tuple[int, ...] = 2,
     seed: int = 42,
 ) -> tuple[dict, dict]:
     """Per-(meth, offset) 2D GMM filter with a baseline-anchored mixture.
@@ -751,7 +773,7 @@ def slowed_split_gmm_shards(
     shards_dir: Path,
     output_dir: Path,
     min_samples_for_gmm: int = 100,
-    n_components: int | tuple[int, ...] = (2, 3),
+    n_components: int | tuple[int, ...] = 2,
     seed: int = 42,
     shard_glob: str = "*_shard.pkl",
 ) -> dict:
@@ -963,7 +985,7 @@ def refine_pkl(
     method: str = "gmm",
     secondary_percentile: float | None = None,
     min_samples_for_gmm: int = 100,
-    n_components: int | tuple[int, ...] = (2, 3),
+    n_components: int | tuple[int, ...] = 2,
     seed: int = 42,
 ) -> dict:
     """Refine one master .pkl OR a directory of shards (auto-detected).
@@ -1128,11 +1150,11 @@ def main(argv=None):
     ap.add_argument(
         "--n-components",
         type=str,
-        default="2,3",
+        default="2",
         help="GMM only. Either a single integer K (forced K) or a "
         "comma-separated list of candidate Ks for BIC-based selection. "
-        "Default '2,3'. Component 0 is anchored at the baseline pool's "
-        "(mean, cov); the remaining K-1 components fit freely.",
+        "Default '2' — anchor + one free meth cluster, the simplest "
+        "possible explanation. Pass '2,3' to let BIC try K=3 as well.",
     )
     ap.add_argument(
         "--seed",
