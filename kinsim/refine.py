@@ -13,13 +13,32 @@ Single rule. For each (meth_type T, parent_offset off) bucket:
      initialised at the global baseline pool's (mean, cov)** so EM
      keeps it pinned at baseline kinetics. The free component fits
      the meth signal.
-  2. Default K=2 (the simplest "anchor + one meth cluster"). Pass
-     ``--n-components 2,3`` to let BIC try K=3 as a fallback when
-     K=2 is clearly inadequate.
-  3. Keep only slowed rows whose argmax posterior is the
-     **highest-IPD** component (= the meth cluster). Drop the rest:
-     anchor rows always; with K=3, also any intermediate cluster
-     that didn't make it to the top.
+  2. Default ``--n-components 2,3``: BIC picks between K=2 (anchor +
+     one meth lobe — the simple case) and K=3 (anchor + two free
+     components, e.g. when the meth signal is bimodal). **Strict
+     biological veto on K>2**: a K>2 fit is rejected if EM places
+     any non-anchor component at or below the anchor's IPD.
+     Methylation never produces sub-baseline kinetics, so a
+     low-IPD free component is by construction overfitting noise
+     and gets thrown out — no matter how good its BIC looks. With
+     huge N, BIC alone is too lenient; the veto enforces the
+     biological prior. Pass ``--n-components 2`` to disable K=3
+     entirely.
+  3. Keep only slowed rows whose argmax-posterior component has
+     mean IPD **strictly above the global baseline pool mean
+     (``base_mu``)**. Drop everything else — including the
+     initialised anchor if it stayed near baseline AND any free
+     component that landed at or below baseline (motif-FPs or
+     unmethylated reads). The reference is ``base_mu``, not the
+     post-EM mean of component 0; the "anchor" is only an init,
+     sklearn lets all components drift during EM, and ``base_mu``
+     is the invariant biological reference.
+
+     With K=3 this typically drops two components (a low-IPD
+     motif-FP cluster + the ex-anchor sitting near baseline) and
+     keeps the high-IPD meth lobe; if the meth signal is bimodal
+     (e.g. partial + full occupancy) BOTH above-baseline
+     components survive.
 
 No validation gate. The baseline anchor guarantees component 0 is
 identifiable, so the drop rule is always defined. For weak-signal
@@ -335,6 +354,7 @@ def _fit_gmms_per_bucket(
     slowed_frac_by_TO: dict,
     min_samples_for_gmm: int,
     candidate_ks: tuple,
+    strict_bic_nats_per_sample: float,
     seed: int,
     rng: np.random.Generator,
 ) -> tuple[dict, dict]:
@@ -414,22 +434,48 @@ def _fit_gmms_per_bucket(
         slowed_arr = slowed_TO.astype(np.float64)
         pool = np.concatenate([base_sample, slowed_arr])
 
-        # BIC over candidate Ks. For each K: component 0 is anchored at
-        # baseline stats; components 1..K-1 are initialised at high-IPD
-        # quantiles of the slowed pool so EM lands them in the meth zone.
+        # BIC over candidate Ks. For each K: component 0 is initialised
+        # at baseline stats; components 1..K-1 are initialised at
+        # high-IPD quantiles of the slowed pool so EM lands them in
+        # the meth zone.
+        #
+        # Important: with N ~ millions, the BIC complexity penalty
+        # (k·ln(N)) is small relative to typical ΔlogL, so K>2 wins
+        # easily even when the extra component is fitting noise. We
+        # add a hard biological veto on top of BIC: K>2 is rejected
+        # if EM places ANY component at or below the global baseline
+        # pool mean (base_mu). Methylation never produces
+        # sub-baseline kinetics — a low-IPD component is
+        # overfitting motif-kmer-context heterogeneity, not real
+        # signal. Pass --n-components 2,3,4,5 to give EM more
+        # components to work with; the veto still rejects fits with
+        # any below-baseline mass.
         bic_per_k: dict[int, float] = {}
-        best_gmm = None
-        best_k = -1
-        best_bic = float("inf")
-        sorted_ipd = np.sort(slowed_arr[:, 0])
+        vetoed_ks: dict[int, str] = {}
+        # Cache surviving fits so the strict-K=2 selection below can
+        # pick among them after seeing all BICs.
+        fits_by_k: dict[int, "GaussianMixture"] = {}
         for k in candidate_ks:
+            # Biology-aligned init: free components placed at fixed
+            # multiples of ``base_mu`` (above baseline by construction).
+            #   comp 0 (anchor):  base_mu × 1.0   = baseline
+            #   comp 1 (free):    base_mu × 1.5   (m5C-ish IPD zone)
+            #   comp 2 (free):    base_mu × 2.0   (m6A-ish IPD zone)
+            #   comp 3 (free):    base_mu × 2.5   (very strong meth)
+            #   ... etc, +0.5 × base_mu per added component.
+            #
+            # Why fixed multiples of base_mu and not slowed-pool
+            # percentiles: percentiles can sit below baseline when the
+            # slowed pool is trimodal (motif-FPs at low IPD pull the
+            # 50th percentile down). That made the previous K=2 fit
+            # converge with comp 1 below comp 0 — the failure mode
+            # we just saw on bc2034. Multiples of base_mu guarantee
+            # all free comps START above baseline; EM may still drift
+            # them, but the basin of attraction is the meth zone.
             means_init = np.zeros((k, 2), dtype=np.float64)
             means_init[0] = base_mu
             for j in range(1, k):
-                # Spread component j across the upper half of slowed IPDs.
-                pct = 50 + 45 * (j / max(k - 1, 1))     # K=2: [50,95]; K=3: [50,72.5,95]
-                idx_j = min(int(pct / 100 * (len(sorted_ipd) - 1)), len(sorted_ipd) - 1)
-                means_init[j] = slowed_arr[idx_j]
+                means_init[j] = base_mu * (1.0 + 0.5 * j)
             precisions_init = np.zeros((k, 2, 2), dtype=np.float64)
             precisions_init[0] = base_precision
             # Free components: large variance init so EM has room to converge.
@@ -451,10 +497,90 @@ def _fit_gmms_per_bucket(
                 continue
             bic = float(g.bic(pool))
             bic_per_k[k] = bic
-            if bic < best_bic:
-                best_bic = bic
-                best_gmm = g
-                best_k = k
+
+            # Biological veto on K>2 only. The reference is the
+            # **global baseline pool mean** (``base_mu``), not the
+            # post-EM anchor — EM can drift the anchor away from
+            # baseline, so checking against where comp 0 ended up
+            # would miss exactly the failure mode we want to catch.
+            #
+            # K=2 doesn't get a veto (it has no fallback K to fall to);
+            # the downstream keep-rule still drops below-baseline
+            # components from the K=2 fit. For K>2 we reject the
+            # whole fit if any component lands at/below baseline —
+            # the user's domain claim is that methylation never
+            # produces sub-baseline kinetics, even cross-kmer.
+            if k > 2:
+                base_ipd = float(base_mu[0])
+                # Strict below-baseline: a component sitting exactly at
+                # baseline is the anchor doing its job; we only veto if a
+                # component drifted strictly below baseline ("under" the
+                # baseline distribution, per the user's prior).
+                below = [
+                    (j, float(g.means_[j, 0]))
+                    for j in range(k)
+                    if float(g.means_[j, 0]) < base_ipd - 1e-6
+                ]
+                if below:
+                    parts = ", ".join(f"comp{j} IPD={mu:.1f}" for j, mu in below)
+                    msg = (
+                        f"component(s) STRICTLY below baseline IPD={base_ipd:.1f}: "
+                        f"{parts}"
+                    )
+                    vetoed_ks[k] = msg
+                    log.info(
+                        "[refine.gmm] %s: K=%d VETOED (%s, BIC=%.0f) — "
+                        "excluded from selection",
+                        label, k, msg, bic,
+                    )
+                    continue
+
+            fits_by_k[k] = g
+
+        # Selection with strict K=2 preference. Standard BIC's complexity
+        # penalty is k·ln(N) — peanuts when N ~ millions. To make K=2
+        # the default unless K>2 is overwhelmingly better, we require
+        # ΔBIC > strict_bic_nats_per_sample · N. Default 1.0 means K>2
+        # has to improve average log-likelihood by ≥ 1 nat per sample
+        # (i.e. "every sample is meaningfully better explained" on
+        # average). On bc2034 m6A@+0, ΔBIC=1M, N=2.44M → 1M < 2.44M →
+        # K=2 wins on strictness alone, before the veto runs.
+        n_pool = len(pool)
+        strictness_threshold = strict_bic_nats_per_sample * n_pool
+        if not fits_by_k:
+            best_gmm = None
+        elif 2 in fits_by_k:
+            best_k = 2
+            best_gmm = fits_by_k[2]
+            best_bic = bic_per_k[2]
+            for k in sorted(fits_by_k.keys()):
+                if k <= 2:
+                    continue
+                delta = best_bic - bic_per_k[k]   # positive means K beats K=2
+                if delta > strictness_threshold:
+                    log.info(
+                        "[refine.gmm] %s: K=%d wins (ΔBIC=%.0f > %.0f = %.2f·N) — "
+                        "switching from K=2", label, k, delta, strictness_threshold,
+                        strict_bic_nats_per_sample,
+                    )
+                    best_k = k
+                    best_gmm = fits_by_k[k]
+                    best_bic = bic_per_k[k]
+                else:
+                    log.info(
+                        "[refine.gmm] %s: K=%d not strict enough (ΔBIC=%.0f ≤ %.0f) — "
+                        "keeping K=2", label, k, delta, strictness_threshold,
+                    )
+        else:
+            # K=2 itself was unavailable (failed fit, etc.) — fall back to
+            # whatever K survived. This branch is unusual.
+            best_k = min(fits_by_k.keys())
+            best_gmm = fits_by_k[best_k]
+            best_bic = bic_per_k[best_k]
+            log.info(
+                "[refine.gmm] %s: K=2 unavailable — falling back to K=%d",
+                label, best_k,
+            )
 
         if best_gmm is None:
             log.warning("[refine.gmm] %s: all candidate Ks failed — keeping all", label)
@@ -475,9 +601,27 @@ def _fit_gmms_per_bucket(
         anchor_drift_ipd = abs(float(means[0, 0]) - float(base_mu[0]))
         anchor_drift_pw = abs(float(means[0, 1]) - float(base_mu[1]))
 
+        # Apply the rule: keep rows whose argmax-posterior component
+        # has mean IPD strictly **above** the global baseline pool
+        # mean (``base_mu``). Drop everything else — including the
+        # initialised anchor if it stayed near baseline AND any free
+        # component that landed at or below baseline (motif-FPs /
+        # unmethylated reads masquerading as slowed).
+        #
+        # We compare against base_mu, NOT the post-EM mean of
+        # component 0. The "anchor" is only an initialiser; sklearn
+        # lets all components drift during EM. base_mu is the
+        # invariant biological reference (where unmethylated kinetics
+        # actually live across the whole genome).
+        base_ipd = float(base_mu[0])
+        keep_idxs = [
+            k for k in range(len(means))
+            if float(means[k, 0]) > base_ipd
+        ]
+
         # Pretty-print all components in IPD-ascending order; tag the
-        # baseline-anchored component (original index 0) explicitly so
-        # the reader doesn't have to guess which one is "baseline".
+        # baseline-anchored component (original index 0) and mark
+        # which components survive the drop rule.
         sort_order = np.argsort(means[:, 0])
         comp_summary_parts = []
         for i in sort_order:
@@ -485,31 +629,31 @@ def _fit_gmms_per_bucket(
             sig_i = float(np.sqrt(covariances[i, 0, 0]))
             sig_p = float(np.sqrt(covariances[i, 1, 1]))
             rho = float(covariances[i, 0, 1] / max(sig_i * sig_p, 1e-9))
-            anchor_tag = " [ANCHOR]" if i == 0 else ""
+            tags = []
+            if i == 0:
+                tags.append("ANCHOR")
+            if i in keep_idxs:
+                tags.append("KEEP")
+            else:
+                tags.append("DROP")
             comp_summary_parts.append(
                 f"N(IPD {mu_i:.1f}±{sig_i:.1f}, PW {mu_p:.1f}±{sig_p:.1f}, "
-                f"ρ={rho:+.2f})·{float(weights[i]):.3f}{anchor_tag}"
+                f"ρ={rho:+.2f})·{float(weights[i]):.3f} [{','.join(tags)}]"
             )
         comp_summary = "  ".join(comp_summary_parts)
 
-        # Apply the rule: keep only rows whose argmax posterior is the
-        # highest-IPD component. With K=2 that's "drop the anchor and
-        # keep the one meth cluster". With K=3 it's "drop the anchor
-        # AND any intermediate, keep only the topmost cluster" — the
-        # strict, biophysically conservative interpretation.
-        sort_order = np.argsort(means[:, 0])
-        top_idx = int(sort_order[-1])
-        if top_idx == 0:
+        if not keep_idxs:
             log.warning(
-                "[refine.gmm] %s: highest-IPD component is the baseline anchor — "
-                "no detectable meth signal in this bucket. Keeping all rows.",
-                label,
+                "[refine.gmm] %s: no component sits above baseline "
+                "(IPD %.2f) — no detectable meth signal. Keeping all rows. "
+                "Components: %s",
+                label, base_ipd, comp_summary,
             )
             per_bucket_stats[label] = {
                 "meth_type": T_name, "offset": off,
                 "n_in": n_TO, "n_kept": n_TO, "n_dropped": 0,
                 "p_fire": 1.0, "mean_occupancy": mean_occ,
-                "skipped": True, "reason": "no_signal_above_anchor",
+                "skipped": True, "reason": "no_component_above_anchor",
                 "n_components_used": best_k,
                 "bic_per_k": bic_per_k,
                 "gmm_means": means.tolist(),
@@ -517,7 +661,7 @@ def _fit_gmms_per_bucket(
             continue
         post = _gmm_posterior(slowed_arr, means, covariances, weights)
         assigned = post.argmax(axis=1)
-        keep_mask = assigned != 0
+        keep_mask = np.isin(assigned, keep_idxs)
         n_kept = int(keep_mask.sum())
         drop_count = n_TO - n_kept
 
@@ -538,6 +682,7 @@ def _fit_gmms_per_bucket(
             "covariances": covariances.tolist(),
             "weights": weights.tolist(),
             "baseline_idx": 0,
+            "keep_idxs": list(keep_idxs),
         }
         per_bucket_stats[label] = {
             "meth_type": T_name, "offset": off,
@@ -547,6 +692,7 @@ def _fit_gmms_per_bucket(
             "n_components_used": best_k,
             "n_components_candidates": list(candidate_ks),
             "bic_per_k": bic_per_k,
+            "vetoed_ks": vetoed_ks,
             "gmm_means": means.tolist(),
             "gmm_covariances": covariances.tolist(),
             "gmm_weights": weights.tolist(),
@@ -628,10 +774,18 @@ def _apply_gmm_filter_to_data(
                         np.asarray(params["covariances"]),
                         np.asarray(params["weights"]),
                     )
-                    # Drop rows assigned (argmax) to the baseline-anchored
-                    # component; keep all others (lenient single rule).
+                    # Keep only rows whose argmax-posterior component sits
+                    # **above** the baseline anchor's mean IPD. Drops anchor
+                    # rows + any below-anchor component (motif-FPs).
                     assigned = post.argmax(axis=1)
-                    keep_local = assigned != int(params["baseline_idx"])
+                    keep_idxs_TO = params.get("keep_idxs")
+                    if keep_idxs_TO is None:
+                        # Backwards-compat with older fit params.
+                        keep_local = assigned != int(params["baseline_idx"])
+                    else:
+                        keep_local = np.isin(
+                            assigned, np.asarray(keep_idxs_TO, dtype=int)
+                        )
                     full_idx = np.where(mask_TO)[0]
                     tmp = np.zeros_like(mask_TO)
                     tmp[full_idx[keep_local]] = True
@@ -658,7 +812,8 @@ def _apply_gmm_filter_to_data(
 def slowed_split_gmm(
     data: dict,
     min_samples_for_gmm: int = 100,
-    n_components: int | tuple[int, ...] = 2,
+    n_components: int | tuple[int, ...] = (2, 3),
+    strict_bic_nats_per_sample: float = 1.0,
     seed: int = 42,
 ) -> tuple[dict, dict]:
     """Per-(meth, offset) 2D GMM filter with a baseline-anchored mixture.
@@ -671,10 +826,14 @@ def slowed_split_gmm(
        so EM keeps it pinned at baseline kinetics. Initialise the
        remaining ``K-1`` components at high-IPD quantiles of the
        slowed pool. Fit on ``baseline_subsample + slowed`` jointly.
-    3. Pick K∈``n_components`` (default ``(2, 3)``) by BIC.
-    4. Drop rows whose ``argmax`` posterior is component 0 (baseline-
-       anchored). Keep the rest (lenient: every non-baseline cluster
-       contributes to training, including weaker intermediates).
+    3. Pick K∈``n_components`` (default ``(2, 3)``) by BIC, **with
+       a biological veto on K>2**: any K>2 fit that places a
+       non-anchor component at or below the anchor's IPD is
+       rejected outright (overfit — methylation never sub-baseline).
+    4. Drop rows whose ``argmax`` posterior is the anchor or any
+       component below the anchor's IPD. Keep components strictly
+       above (so a bimodal meth signal — partial + full occupancy
+       — keeps both above-anchor lobes).
 
     No validation gate. The baseline anchor guarantees the drop rule
     is always defined; small drift is logged as a warning, not a
@@ -734,6 +893,7 @@ def slowed_split_gmm(
         slowed_frac_by_TO,
         min_samples_for_gmm=min_samples_for_gmm,
         candidate_ks=candidate_ks,
+        strict_bic_nats_per_sample=strict_bic_nats_per_sample,
         seed=seed,
         rng=rng,
     )
@@ -773,7 +933,8 @@ def slowed_split_gmm_shards(
     shards_dir: Path,
     output_dir: Path,
     min_samples_for_gmm: int = 100,
-    n_components: int | tuple[int, ...] = 2,
+    n_components: int | tuple[int, ...] = (2, 3),
+    strict_bic_nats_per_sample: float = 1.0,
     seed: int = 42,
     shard_glob: str = "*_shard.pkl",
 ) -> dict:
@@ -877,6 +1038,7 @@ def slowed_split_gmm_shards(
         slowed_frac_by_TO,
         min_samples_for_gmm=min_samples_for_gmm,
         candidate_ks=candidate_ks,
+        strict_bic_nats_per_sample=strict_bic_nats_per_sample,
         seed=seed,
         rng=rng,
     )
@@ -989,7 +1151,8 @@ def refine_pkl(
     method: str = "gmm",
     secondary_percentile: float | None = None,
     min_samples_for_gmm: int = 100,
-    n_components: int | tuple[int, ...] = 2,
+    n_components: int | tuple[int, ...] = (2, 3),
+    strict_bic_nats_per_sample: float = 1.0,
     seed: int = 42,
 ) -> dict:
     """Refine one master .pkl OR a directory of shards (auto-detected).
@@ -1040,10 +1203,12 @@ def refine_pkl(
         del probe
 
         log.info(
-            "Refine (sharded, anchored log1p): in=%s  out=%s  n_components=%s  min_samples_for_gmm=%d",
+            "Refine (sharded, anchored): in=%s  out=%s  n_components=%s  "
+            "strict_bic=%.2f nats/sample  min_samples_for_gmm=%d",
             in_path,
             out_path,
             n_components if isinstance(n_components, int) else ",".join(map(str, n_components)),
+            strict_bic_nats_per_sample,
             min_samples_for_gmm,
         )
         return slowed_split_gmm_shards(
@@ -1051,6 +1216,7 @@ def refine_pkl(
             out_path,
             min_samples_for_gmm=min_samples_for_gmm,
             n_components=n_components,
+            strict_bic_nats_per_sample=strict_bic_nats_per_sample,
             seed=seed,
         )
 
@@ -1088,14 +1254,17 @@ def refine_pkl(
             else "auto-BIC over " + ",".join(str(k) for k in n_components)
         )
         log.info(
-            "Refine: method=gmm (anchored log1p)  n_components=%s  min_samples_for_gmm=%d",
+            "Refine: method=gmm (anchored)  n_components=%s  "
+            "strict_bic=%.2f nats/sample  min_samples_for_gmm=%d",
             n_comp_summary,
+            strict_bic_nats_per_sample,
             min_samples_for_gmm,
         )
         new_data, stats = slowed_split_gmm(
             int_keyed,
             min_samples_for_gmm=min_samples_for_gmm,
             n_components=n_components,
+            strict_bic_nats_per_sample=strict_bic_nats_per_sample,
             seed=seed,
         )
     elif method == "p95":
@@ -1154,11 +1323,26 @@ def main(argv=None):
     ap.add_argument(
         "--n-components",
         type=str,
-        default="2",
+        default="2,3",
         help="GMM only. Either a single integer K (forced K) or a "
         "comma-separated list of candidate Ks for BIC-based selection. "
-        "Default '2' — anchor + one free meth cluster, the simplest "
-        "possible explanation. Pass '2,3' to let BIC try K=3 as well.",
+        "Default '2,3' — BIC picks between anchor+1-free (K=2, simple "
+        "case) and anchor+2-free (K=3, when slowed pool is bimodal "
+        "with motif-FP low-IPD mass + real-meth high-IPD mass). Pass "
+        "'2' to force the simpler model. Combined with --strict-bic, "
+        "K=2 is the default unless K>2 beats it by a large margin.",
+    )
+    ap.add_argument(
+        "--strict-bic",
+        type=float,
+        default=1.0,
+        help="GMM only. Strictness margin for selecting K>2 over K=2: "
+        "K>2 wins only if its BIC beats K=2's by at least "
+        "(strict_bic × N) nats, where N is the joint-pool size. "
+        "Default 1.0 means 'K>2 must improve average per-sample "
+        "log-likelihood by ≥1 nat' — strict, K=2 is sticky. "
+        "Pass 0.0 for standard BIC (any improvement wins). "
+        "Pass 2.0+ for even stricter K=2 preference.",
     )
     ap.add_argument(
         "--seed",
@@ -1202,6 +1386,7 @@ def main(argv=None):
         secondary_percentile=args.secondary_percentile,
         min_samples_for_gmm=args.min_samples_for_gmm,
         n_components=n_components_arg,
+        strict_bic_nats_per_sample=args.strict_bic,
         seed=args.seed,
     )
 
