@@ -3,9 +3,11 @@
 Training data format (produced by ``kinsim extract`` and optionally
 filtered by ``kinsim refine``):
 
-    dict[kmer_id (int)] -> np.ndarray(N, 38)
+    dict[kmer_id (int)] -> np.ndarray(N, SAMPLE_NCOLS)
 
-with the column layout from ``kinsim.utils.sample_layout``.
+with the column layout from ``kinsim.utils.sample_layout`` (currently
+20 cols: IPD, PW, frac, mc[11], rev_meth[3], CATEGORY, PARENT_METH,
+PARENT_OFFSET).
 
 This module provides:
 
@@ -18,9 +20,11 @@ This module provides:
                             DataLoader workers) and per-epoch shuffling at
                             both the shard level and the row level.
 
-Both datasets emit identical ``(kmer_id, meth_full, log_signal, meth_id)``
-tuples — the model code is unchanged whether you point training at a
-single shard.pkl or a directory of shards.
+Both datasets emit ``(kmer_id, meth_full, log_signal, meth_id)`` tuples.
+``meth_full`` has shape ``(kmer_size + REV_METH_LEN, num_meth_types)`` =
+``(14, 4)`` — 11 forward-context entries followed by the 3 rev_meth
+entries at active-site neighbours. The model's FiLM projection consumes
+the flattened tensor, so all 14 positions contribute to ``(γ, β)``.
 """
 
 from __future__ import annotations
@@ -77,15 +81,20 @@ def inv_log_transform(x: torch.Tensor) -> torch.Tensor:
 
 
 def _flatten_data_dict(data_dict: dict, kmer_size: int) -> dict:
-    """Flatten one ``dict[kmer_id] -> ndarray(N, ≥14)`` into per-row ndarrays.
+    """Flatten one ``dict[kmer_id] -> ndarray(N, SAMPLE_NCOLS)`` into per-row ndarrays.
 
-    Returns a small dict with keys: ``kmer_ids`` (int32), ``meth_ids``
-    (int8 — meth at the prediction position), ``signals_log``
-    (float32 (n, 2) tensor pre-log1p-transformed), ``fractions`` (float32),
-    ``meth_ctx`` (uint8 (n, kmer_size)), ``n_keys`` (int),
-    ``meth_counts`` (dict[int, int]).
+    Returns a dict with: ``kmer_ids`` (int32), ``meth_ids`` (int8 — meth
+    at the prediction position), ``signals_log`` (n, 2 log1p tensor),
+    ``fractions`` (float32), ``meth_ctx`` (uint8 (n, kmer_size)),
+    ``rev_meth`` (uint8 (n, REV_METH_LEN)), ``n_keys``, ``meth_counts``.
     """
     from ..utils.encoding import KMER_PRED_IDX
+    from ..utils.sample_layout import (
+        COL_METH_CTX_START,
+        COL_REV_METH,
+        REV_METH_LEN,
+        SAMPLE_NCOLS,
+    )
 
     pred_idx = KMER_PRED_IDX
     kmer_ids_list: list = []
@@ -93,6 +102,7 @@ def _flatten_data_dict(data_dict: dict, kmer_size: int) -> dict:
     signals_list: list = []
     fractions_list: list = []
     meth_ctx_list: list = []
+    rev_meth_list: list = []
     n_keys = 0
     n_meth_counts: dict[int, int] = defaultdict(int)
 
@@ -103,10 +113,11 @@ def _flatten_data_dict(data_dict: dict, kmer_size: int) -> dict:
             continue
         if not isinstance(samples, np.ndarray) or samples.ndim != 2:
             continue
-        if samples.shape[1] < 3 + kmer_size:
+        if samples.shape[1] < SAMPLE_NCOLS:
             continue
         kmer_id = int(key)
-        ctx = samples[:, 3 : 3 + kmer_size].astype(np.uint8)
+        ctx = samples[:, COL_METH_CTX_START : COL_METH_CTX_START + kmer_size].astype(np.uint8)
+        rev = samples[:, COL_REV_METH : COL_REV_METH + REV_METH_LEN].astype(np.uint8)
         meth_at_center = ctx[:, pred_idx].astype(np.int8)
         n = len(samples)
         kmer_ids_list.append(np.full(n, kmer_id, dtype=np.int32))
@@ -114,6 +125,7 @@ def _flatten_data_dict(data_dict: dict, kmer_size: int) -> dict:
         signals_list.append(samples[:, :2].astype(np.float32))
         fractions_list.append(samples[:, 2].astype(np.float32))
         meth_ctx_list.append(ctx)
+        rev_meth_list.append(rev)
         for mid in np.unique(meth_at_center):
             n_meth_counts[int(mid)] += int((meth_at_center == mid).sum())
         n_keys += 1
@@ -125,6 +137,7 @@ def _flatten_data_dict(data_dict: dict, kmer_size: int) -> dict:
             "signals_log": torch.empty(0, 2, dtype=torch.float32),
             "fractions": np.empty(0, dtype=np.float32),
             "meth_ctx": np.empty((0, kmer_size), dtype=np.uint8),
+            "rev_meth": np.empty((0, REV_METH_LEN), dtype=np.uint8),
             "n_keys": 0,
             "meth_counts": dict(n_meth_counts),
         }
@@ -137,6 +150,7 @@ def _flatten_data_dict(data_dict: dict, kmer_size: int) -> dict:
         ),
         "fractions": np.concatenate(fractions_list),
         "meth_ctx": np.concatenate(meth_ctx_list),
+        "rev_meth": np.concatenate(rev_meth_list),
         "n_keys": n_keys,
         "meth_counts": dict(n_meth_counts),
     }
@@ -144,25 +158,36 @@ def _flatten_data_dict(data_dict: dict, kmer_size: int) -> dict:
 
 def _build_meth_full(
     ctx_ids: np.ndarray,
+    rev_ids: np.ndarray,
     frac: float,
     pred_idx: int,
     kmer_size: int,
     num_meth_types: int,
 ) -> torch.Tensor:
-    """Build the per-row ``meth_full`` Float[kmer_size, num_meth_types] tensor.
+    """Build the per-row ``meth_full`` Float[kmer_size + REV_METH_LEN, M] tensor.
 
-    Encoding:
-      - prediction position with meth_id = m: ``meth_full[pred_idx, m] = frac``
-        (soft label using the stored stoichiometric fraction).
-      - any other position with meth_id = m: ``meth_full[pos, m] = 1.0``
-        (hard upstream/downstream label).
-      - any position with meth_id = 0: row stays all-zero.
+    Layout:
+      positions [0, kmer_size)         forward meth context (offsets [-7..+3])
+      positions [kmer_size, ...)       rev_meth at active-site neighbours [-1, 0, +1]
+
+    Encoding within the forward block:
+      - prediction position, meth_id m: ``meth_full[pred_idx, m] = frac``
+      - any other position, meth_id m: ``meth_full[pos, m] = 1.0``
+    Rev_meth positions are always one-hot (no frac mixing — they describe
+    a different strand's methylation status, not this row's stoichiometry).
     """
-    meth_full = torch.zeros(kmer_size, num_meth_types, dtype=torch.float32)
+    from ..utils.sample_layout import REV_METH_LEN
+
+    total_pos = kmer_size + REV_METH_LEN
+    meth_full = torch.zeros(total_pos, num_meth_types, dtype=torch.float32)
     for pos in range(kmer_size):
         m = int(ctx_ids[pos])
         if m > 0:
             meth_full[pos, m] = frac if pos == pred_idx else 1.0
+    for k in range(REV_METH_LEN):
+        m = int(rev_ids[k])
+        if m > 0:
+            meth_full[kmer_size + k, m] = 1.0
     return meth_full
 
 
@@ -214,6 +239,7 @@ class MLPSignalDataset(Dataset):
         self._signals = flat["signals_log"]
         self._fractions = flat["fractions"]
         self._meth_ctx = flat["meth_ctx"]
+        self._rev_meth = flat["rev_meth"]
 
         n_total = len(self._kmer_ids)
         # Derive id→name from the YAML so adding a new methylation type
@@ -248,8 +274,10 @@ class MLPSignalDataset(Dataset):
         signal = self._signals[idx]  # already log1p
         frac = float(self._fractions[idx])
         ctx_ids = self._meth_ctx[idx]
+        rev_ids = self._rev_meth[idx]
         meth_full = _build_meth_full(
-            ctx_ids, frac, KMER_PRED_IDX, self._kmer_size, self._num_meth_types
+            ctx_ids, rev_ids, frac, KMER_PRED_IDX,
+            self._kmer_size, self._num_meth_types,
         )
         return (
             torch.tensor(kmer_id, dtype=torch.long),
@@ -365,10 +393,11 @@ class ShardedSignalDataset(IterableDataset):
             signals = flat["signals_log"]
             fractions = flat["fractions"]
             meth_ctx = flat["meth_ctx"]
+            rev_meth = flat["rev_meth"]
             for idx in order:
-                ctx_ids = meth_ctx[idx]
                 meth_full = _build_meth_full(
-                    ctx_ids,
+                    meth_ctx[idx],
+                    rev_meth[idx],
                     float(fractions[idx]),
                     KMER_PRED_IDX,
                     self._kmer_size,

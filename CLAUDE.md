@@ -57,7 +57,7 @@ would deprive the model of the slowing signal at those offsets.
                                                                     carries p_fire)
 ```
 
-**Three categories** (col 35 of the 38-col layout):
+**Three categories** (col 17 of the 20-col layout):
 - `0` BASELINE  — far from any methylation; meth_context window is empty.
 - `1` SLOWED    — at a signature offset of a methylation. Includes the
   methylation itself when `0 ∈ signature_offsets[T]` (m6A, m4C). For m5C
@@ -341,17 +341,15 @@ Per-sample column layout, category enum, slice helpers. Pure Python
 extract/BAM dependency.
 
 ```python
-SAMPLE_NCOLS = 38
+SAMPLE_NCOLS = 20
 COL_IPD            = 0
 COL_PW             = 1
 COL_FRACTION       = 2
 COL_METH_CTX_*     = 3..14    # mc_0..mc_10 (offsets [-7..+3])
-COL_PROFILE_IPD    = 14..23   # IPD profile at downstream offsets 0..+8
-COL_PROFILE_PW     = 23..32   # PW  profile at downstream offsets 0..+8
-COL_REV_METH       = 32..35   # complementary-strand meth at offsets [-1, 0, +1]
-COL_CATEGORY       = 35
-COL_PARENT_METH    = 36       # meth_id of the parent meth (0 for baseline)
-COL_PARENT_OFFSET  = 37       # row_pos − parent_meth_pos (small int, [0, 7])
+COL_REV_METH       = 14..17   # complementary-strand meth at offsets [-1, 0, +1]
+COL_CATEGORY       = 17
+COL_PARENT_METH    = 18       # meth_id of the parent meth (0 for baseline)
+COL_PARENT_OFFSET  = 19       # row_pos − parent_meth_pos (small int, [0, 7])
 
 CATEGORY_BASELINE  = 0
 CATEGORY_SLOWED    = 1   # at a signature offset (incl. meth itself if 0 ∈ sig)
@@ -394,9 +392,9 @@ validate_bam_kinetics(bam_path, n_check=10)
     # Returns "fi" (unaligned) or "ip" (aligned) — used to route the
     # forward extraction; reverse-strand pass gated by read.has_tag("ri").
 
-# Single-pass extract emits dict[kmer_id (int)] -> ndarray(N, 36).
-# Per row: IPD, PW, fraction, mc_0..10, profile_IPD/PW_0..+8, rev_meth_-1/0/+1,
-# CATEGORY (col 35 — see kinsim.utils.sample_layout).
+# Single-pass extract emits dict[kmer_id (int)] -> ndarray(N, 20).
+# Per row: IPD, PW, fraction, mc_0..10, rev_meth_-1/0/+1, CATEGORY,
+# PARENT_METH, PARENT_OFFSET (see kinsim.utils.sample_layout).
 extract_samples_from_bam(bam_path, motif_string,
                          n_baseline_per_kmer=50,
                          baseline_min_dist_to_meth=K,
@@ -807,17 +805,15 @@ torch.save({
 
 ## Future Work
 
-### Feed `rev_meth` into FiLM
-The 36-col layout already stores `rev_meth_-1, rev_meth_0, rev_meth_+1`
-(complementary-strand meth_id at the active-site footprint, cols 32-34).
-For palindromic methylation sites (Type II R-M systems) both strands
-carry an m6A; the polymerase contacts both strands of the duplex
-(~12 bp footprint) so the opposite-strand methylation also shifts
-IPD/PW. On bc2033 (HMB-10) the m6A profile shows a strong IPD spike
-at +8 in addition to the expected peak at +0 — the kinetic footprint
-of the bilateral methylation (reverse-strand m6A sits 8 bp downstream
-of the forward m6A on the same palindrome).
+### Per-occupancy p_fire curve
+Today's decomposition uses ``p_fire(target site) = target_frac × p_efficiency``,
+which is linear in occupancy. For weak-signal types where the relationship
+isn't linear, stratify per-bucket survival by ``frac`` bin (e.g. 0–0.3,
+0.3–0.6, 0.6–1.0) and store a curve. Generate looks up by target frac.
+Worth doing only if cross-strain verify shows occupancy mismatch.
 
-**TODO:** route `rev_meth` into the FiLM conditioning vector alongside
-the forward meth context. ``generate.py`` will need a reverse meth
-map at inference time. ~100 lines of code, retraining required.
+### Wider rev_meth window for distal palindromes
+Today's rev_meth captures only [-1, 0, +1] active-site neighbours.
+8+ bp palindromic motifs (some Type II R-M) can place the partner meth
+at ±3 to ±5. Extending the window is a layout change + retrain — wait
+for evidence the model fails on those motif classes before doing this.

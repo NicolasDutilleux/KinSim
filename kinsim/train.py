@@ -774,11 +774,28 @@ def _extract_p_fire(meta: dict) -> dict[str, float]:
     }
 
 
+def _extract_mean_occupancy(meta: dict) -> dict[str, float]:
+    """Pull {bucket_label: mean_occupancy} from refined meta.
+
+    Empty when the meta predates the mean_occupancy field. Generate uses
+    it together with target-genome per-site fractions to apply
+    ``p_fire = target_frac × (p_fire / mean_occupancy)`` as the firing
+    Bernoulli rate.
+    """
+    per_bucket = (meta.get("stats") or {}).get("per_bucket") or {}
+    return {
+        label: float(b["mean_occupancy"])
+        for label, b in per_bucket.items()
+        if isinstance(b, dict) and "mean_occupancy" in b
+    }
+
+
 def _save_model_config(
     output_dir: Path,
     model: nn.Module,
     meth_types: list[str] | None = None,
     p_fire: dict[str, float] | None = None,
+    mean_occupancy: dict[str, float] | None = None,
 ) -> None:
     """Write model_config.json before training starts.
 
@@ -795,14 +812,17 @@ def _save_model_config(
         cfg["meth_types"] = sorted(meth_types)
     if p_fire:
         cfg["p_fire"] = p_fire
+    if mean_occupancy:
+        cfg["mean_occupancy"] = mean_occupancy
     path = output_dir / "model_config.json"
     path.write_text(json.dumps(cfg, indent=2))
     log.info(
-        "Model config saved: %s  (architecture=%s, meth_types=%s, p_fire=%s)",
+        "Model config saved: %s  (architecture=%s, meth_types=%s, p_fire=%s, mean_occ=%s)",
         path,
         cfg.get("architecture"),
         cfg.get("meth_types", "all"),
         f"{len(p_fire)} buckets" if p_fire else "none",
+        f"{len(mean_occupancy)} buckets" if mean_occupancy else "none",
     )
 
 
@@ -1093,18 +1113,31 @@ def train_mlp(
             "was applied during extraction)"
         )
 
-    # GMM survival rate per (meth, offset) bucket — generate.py uses it as the
-    # Bernoulli firing probability so simulated reads carry realistic
-    # methylation noise (not every site fires every time).
+    # GMM survival rate + mean motif occupancy per (meth, offset) bucket —
+    # generate.py decomposes them as p_efficiency = p_fire / mean_occupancy
+    # and applies p_fire(target site) = target_frac × p_efficiency at
+    # inference time, so synthetic reads track per-strain occupancy
+    # (not just the training-corpus average rate).
     p_fire = _extract_p_fire(meta)
+    mean_occ = _extract_mean_occupancy(meta)
     if p_fire:
         log.info(
             "p_fire (GMM survival): %s",
             ", ".join(f"{k}={v:.2f}" for k, v in sorted(p_fire.items())),
         )
+    if mean_occ:
+        log.info(
+            "mean_occupancy (training corpus): %s",
+            ", ".join(f"{k}={v:.2f}" for k, v in sorted(mean_occ.items())),
+        )
 
     # Save model config BEFORE first epoch — generate.py needs it even if interrupted
-    _save_model_config(output_dir, model, meth_types=pkl_meth_types, p_fire=p_fire)
+    _save_model_config(
+        output_dir, model,
+        meth_types=pkl_meth_types,
+        p_fire=p_fire,
+        mean_occupancy=mean_occ,
+    )
 
     if resume_ckpt:
         log.info("Loading weights from: %s", resume_ckpt)

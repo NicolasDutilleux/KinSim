@@ -220,26 +220,17 @@ def compute_category_distributions(data: dict) -> dict:
 
 
 def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
-    """Aggregate the kinetic profile per (category, parent_meth, parent_offset) bucket.
+    """Aggregate IPD/PW means per (category, parent_meth, parent_offset) bucket.
 
-    Buckets: ``baseline``, ``slowed_by_<T>_at_+<off>``,
-    ``near_meth_by_<T>_at_+<off>`` — one bucket per (meth type T, parent
-    offset off) pair found in the data. Splitting per-offset means a
-    noisy offset (e.g. m6A@+5 from a Type I R-M motif that doesn't
-    actually carry a +5 signature) can be inspected independently from
-    a clean offset of the same meth type (e.g. m6A@+0 from GATC). With
-    a merged ``slowed_by_<T>`` bucket, a flat profile could mean
-    "extraction is broken" OR "one offset is noisy" — splitting makes
-    that distinction visible at a glance.
+    Buckets: ``baseline``, ``slowed_by_<T>_at_+<off>``, ``near_meth_by_<T>_at_+<off>``.
+    Splitting per (T, offset) keeps noisy offsets (e.g. m6A@+5 from a
+    Type I R-M motif that doesn't actually carry +5) inspectable
+    independently from clean ones (m6A@+0 from GATC).
 
-    Parent attribution is read directly from ``COL_PARENT_METH`` /
-    ``COL_PARENT_OFFSET`` (written at extract time) — no inference
-    from the meth_context window.
-
-    Returns ``dict[bucket] -> {profile_ipd, profile_pw, n_samples, sig_offsets}``.
-    For per-offset buckets, ``sig_offsets`` is the singleton ``[off]`` so
-    Fig 3 marks exactly the offset where the polymerase-slowing signal
-    is biophysically expected for that bucket.
+    Returns ``dict[bucket] -> {mean_ipd, mean_pw, n_samples}`` — scalars,
+    not per-offset arrays. The legacy 9-position downstream profile was
+    dropped: with PARENT_OFFSET written at extract time, comparing the
+    mean IPD across buckets is the cleaner diagnostic.
     """
     from .utils.encoding import get_meth_ids
     from .utils.sample_layout import (
@@ -247,28 +238,16 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
         CATEGORY_NEAR_METH,
         CATEGORY_SLOWED,
         COL_CATEGORY,
+        COL_IPD,
         COL_PARENT_METH,
         COL_PARENT_OFFSET,
-        METH_CTX_LEN,
-        PROFILE_LEN,
+        COL_PW,
     )
-
-    profile_start_col = 3 + METH_CTX_LEN
-    pw_start_col = profile_start_col + PROFILE_LEN
-    needed_cols = pw_start_col + PROFILE_LEN  # = 32
 
     meth_ids = get_meth_ids()
     name_by_mid = {v: k for k, v in meth_ids.items()}
 
-    def _new_acc():
-        return [
-            np.zeros(PROFILE_LEN, dtype=np.float64),
-            np.zeros(PROFILE_LEN, dtype=np.float64),
-            0,
-        ]
-
-    baseline_acc = _new_acc()
-    # Keys: (T_id, offset) — one accumulator per (meth, signature offset).
+    baseline_acc = [0.0, 0.0, 0]  # sum_ipd, sum_pw, n
     slowed_acc: dict[tuple[int, int], list] = {}
     near_acc: dict[tuple[int, int], list] = {}
 
@@ -280,13 +259,13 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
         cats = v[:, COL_CATEGORY].astype(np.int8)
         parent = v[:, COL_PARENT_METH].astype(np.int8)
         offset = v[:, COL_PARENT_OFFSET].astype(np.int8)
-        ipd_prof = v[:, profile_start_col:pw_start_col]
-        pw_prof = v[:, pw_start_col:needed_cols]
+        ipd = v[:, COL_IPD]
+        pw = v[:, COL_PW]
 
         base_m = cats == CATEGORY_BASELINE
         if base_m.any():
-            baseline_acc[0] += ipd_prof[base_m].sum(axis=0)
-            baseline_acc[1] += pw_prof[base_m].sum(axis=0)
+            baseline_acc[0] += float(ipd[base_m].sum())
+            baseline_acc[1] += float(pw[base_m].sum())
             baseline_acc[2] += int(base_m.sum())
 
         for cat_id, acc_dict in (
@@ -308,35 +287,27 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
                     mask = m_T & (offset == O_int)
                     if not mask.any():
                         continue
-                    acc = acc_dict.setdefault((T_int, O_int), _new_acc())
-                    acc[0] += ipd_prof[mask].sum(axis=0)
-                    acc[1] += pw_prof[mask].sum(axis=0)
+                    acc = acc_dict.setdefault((T_int, O_int), [0.0, 0.0, 0])
+                    acc[0] += float(ipd[mask].sum())
+                    acc[1] += float(pw[mask].sum())
                     acc[2] += int(mask.sum())
+
+    def _pack(s_i: float, s_p: float, n: int) -> dict:
+        return {
+            "mean_ipd": float(s_i / max(n, 1)),
+            "mean_pw": float(s_p / max(n, 1)),
+            "n_samples": n,
+        }
 
     out: dict = {}
     if baseline_acc[2] > 0:
-        out["baseline"] = {
-            "profile_ipd": (baseline_acc[0] / baseline_acc[2]).astype(np.float32),
-            "profile_pw": (baseline_acc[1] / baseline_acc[2]).astype(np.float32),
-            "n_samples": baseline_acc[2],
-            "sig_offsets": [],
-        }
+        out["baseline"] = _pack(baseline_acc[0], baseline_acc[1], baseline_acc[2])
     for (T_id, off), (s_i, s_p, n) in slowed_acc.items():
         mname = name_by_mid.get(T_id, f"meth{T_id}")
-        out[_bucket_name("slowed_by_", mname, off)] = {
-            "profile_ipd": (s_i / max(n, 1)).astype(np.float32),
-            "profile_pw": (s_p / max(n, 1)).astype(np.float32),
-            "n_samples": n,
-            "sig_offsets": [off] if 0 <= off < PROFILE_LEN else [],
-        }
+        out[_bucket_name("slowed_by_", mname, off)] = _pack(s_i, s_p, n)
     for (T_id, off), (s_i, s_p, n) in near_acc.items():
         mname = name_by_mid.get(T_id, f"meth{T_id}")
-        out[_bucket_name("near_meth_by_", mname, off)] = {
-            "profile_ipd": (s_i / max(n, 1)).astype(np.float32),
-            "profile_pw": (s_p / max(n, 1)).astype(np.float32),
-            "n_samples": n,
-            "sig_offsets": [off] if 0 <= off < PROFILE_LEN else [],
-        }
+        out[_bucket_name("near_meth_by_", mname, off)] = _pack(s_i, s_p, n)
     return out
 
 
@@ -694,58 +665,36 @@ def render_txt_report(
             )
     p()
 
-    # ── 4. Kinetic signature profiles ───────────────────────────────────
+    # ── 4. Per-bucket IPD/PW means ──────────────────────────────────────
     if signature_profiles:
         p("-" * W)
-        p("Kinetic signature profiles  (mean IPD/PW at offsets 0..+8)")
+        p("Per-bucket IPD/PW means  (one value per (category, meth, offset) bucket)")
         p("-" * W)
-        p("Each row is the mean profile across all samples of that bucket. The")
-        p("signature offsets (***) are where the polymerase-slowing signal of")
-        p("that meth type is biophysically expected. A clean signal shows high")
-        p("IPD at signature offsets relative to baseline.")
+        p("Each line is the mean of the centre row's IPD/PW across all samples in")
+        p("that bucket. SLOWED buckets should have higher IPD than baseline;")
+        p("NEAR_METH should look baseline-like (meth in mc context, but no slowing).")
 
         baseline_profile = signature_profiles.get("baseline")
+        b_ipd = baseline_profile["mean_ipd"] if baseline_profile else None
         for name in sorted(signature_profiles.keys(), key=_bucket_order_key):
             sp = signature_profiles[name]
-            offsets_str = "  ".join(f"+{i}" for i in range(len(sp["profile_ipd"])))
-            ipd_str = "  ".join(f"{v:5.1f}" for v in sp["profile_ipd"])
-            pw_str = "  ".join(f"{v:5.1f}" for v in sp["profile_pw"])
-            sig = sp.get("sig_offsets", [])
-            sig_marker = "  ".join(
-                "***" if i in sig else "   " for i in range(len(sp["profile_ipd"]))
-            )
             tag = ""
             if name == "baseline":
-                tag = "  [should be FLAT]"
-            elif name.startswith("slowed_by_"):
-                tag = f"  [should peak at {sig}]"
+                tag = "  [reference]"
             elif name.startswith("near_meth_by_"):
-                tag = "  [should look baseline-like — meth in mc but no slowing]"
-            p(f"\n  {name}{tag}  (n={sp['n_samples']:,} samples, signature at {sig})")
-            p(f"    Offset      :  {offsets_str}")
-            p(f"    Signature   :  {sig_marker}")
-            p(f"    IPD profile :  {ipd_str}")
-            p(f"    PW  profile :  {pw_str}")
-
-            # vs baseline at signature offsets
-            if sig and baseline_profile is not None and name != "baseline":
-                m_ipd = sp["profile_ipd"]
-                b_ipd = baseline_profile["profile_ipd"]
-                lines = []
-                for off in sig:
-                    if not (0 <= off < len(m_ipd)):
-                        continue
-                    delta = m_ipd[off] - b_ipd[off]
-                    rat = m_ipd[off] / max(b_ipd[off], 1.0)
-                    lines.append(
-                        f"+{off}: bucket={m_ipd[off]:5.1f}  "
-                        f"baseline={b_ipd[off]:5.1f}  "
-                        f"delta={delta:+5.1f}  ratio={rat:5.2f}x"
-                    )
-                if lines:
-                    p("    vs baseline at signature offsets:")
-                    for ln in lines:
-                        p(f"      {ln}")
+                tag = "  [should look baseline-like]"
+            elif name.startswith("slowed_by_"):
+                tag = "  [should be HIGHER than baseline]"
+            line = (
+                f"  {name}{tag}\n"
+                f"    n={sp['n_samples']:,}   IPD={sp['mean_ipd']:6.2f}   "
+                f"PW={sp['mean_pw']:6.2f}"
+            )
+            if b_ipd and name != "baseline":
+                delta = sp["mean_ipd"] - b_ipd
+                ratio = sp["mean_ipd"] / max(b_ipd, 1.0)
+                line += f"   Δ_IPD={delta:+6.2f}   ratio={ratio:5.2f}x"
+            p(line)
         p()
 
     # ── 5. IPD distribution per category + refine threshold check ──────
@@ -1040,60 +989,35 @@ def _build_html_figures(
         )
         figures.append(("Per-kmer baseline mean distribution", fig2))
 
-    # ── Fig 3: Kinetic signature profiles ───────────────────────────────
+    # ── Fig 3: Per-bucket mean IPD ──────────────────────────────────────
     if signature_profiles:
-        fig3 = go.Figure()
         ordered = sorted(signature_profiles.keys(), key=_bucket_order_key)
-        palette = [
-            "#1f77b4",
-            "#d62728",
-            "#ff7f0e",
-            "#9467bd",
-            "#8c564b",
-            "#2ca02c",
-            "#17becf",
-            "#bcbd22",
+        means = [signature_profiles[n]["mean_ipd"] for n in ordered]
+        ns = [signature_profiles[n]["n_samples"] for n in ordered]
+        colors = [
+            "#1f77b4" if n == "baseline"
+            else "#d62728" if n.startswith("slowed_by_")
+            else "#2ca02c"
+            for n in ordered
         ]
-        offsets = list(range(9))
-        for i, name in enumerate(ordered):
-            sp = signature_profiles.get(name)
-            if sp is None:
-                continue
-            color = palette[i % len(palette)]
-            sig_offs = sp.get("sig_offsets", [])
-            line_dash = "dash" if name.startswith("near_meth_by_") else "solid"
-            fig3.add_trace(
-                go.Scatter(
-                    x=offsets,
-                    y=sp["profile_ipd"],
-                    mode="lines+markers",
-                    name=f"{name} (n={sp['n_samples']:,})",
-                    line=dict(color=color, width=2, dash=line_dash),
-                    marker=dict(size=8),
-                )
+        fig3 = go.Figure(
+            go.Bar(
+                x=ordered,
+                y=means,
+                marker_color=colors,
+                text=[f"{m:.2f}" for m in means],
+                textposition="auto",
+                customdata=ns,
+                hovertemplate="%{x}<br>mean IPD: %{y:.2f}<br>n: %{customdata:,}<extra></extra>",
             )
-            if sig_offs:
-                fig3.add_trace(
-                    go.Scatter(
-                        x=sig_offs,
-                        y=[sp["profile_ipd"][o] for o in sig_offs if 0 <= o < 9],
-                        mode="markers",
-                        showlegend=False,
-                        marker=dict(
-                            symbol="diamond",
-                            size=14,
-                            color=color,
-                            line=dict(color="black", width=1),
-                        ),
-                    )
-                )
-        fig3.update_layout(
-            title="Kinetic signature profiles  "
-            "(diamonds = signature offsets — IPD should peak there)",
-            xaxis=dict(title="Offset from prediction position", dtick=1),
-            yaxis_title="Mean IPD",
         )
-        figures.append(("Kinetic signature profiles", fig3))
+        fig3.update_layout(
+            title="Per-bucket mean IPD  "
+                  "(SLOWED should sit higher than baseline; NEAR_METH ≈ baseline)",
+            yaxis_title="Mean IPD",
+            xaxis_tickangle=-45,
+        )
+        figures.append(("Per-bucket mean IPD", fig3))
 
     # ── Fig 4: Sample counts per bucket ─────────────────────────────────
     if signature_profiles:

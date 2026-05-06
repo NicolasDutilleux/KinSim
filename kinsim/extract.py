@@ -68,7 +68,7 @@ import numpy as np
 import pysam
 
 from .utils.config import load_kinsim_config
-from .utils.encoding import KMER_LEFT_PAD, K, encode_kmer, get_meth_ids
+from .utils.encoding import KMER_LEFT_PAD, K, get_meth_ids
 from .utils.io import atomic_write_pickle, load_reference
 from .utils.motifs import (
     filter_motif_string_by_types,
@@ -84,8 +84,6 @@ from .utils.sample_layout import (
     COL_PARENT_OFFSET,
     METH_CTX_LEFT,
     METH_CTX_LEN,
-    PROFILE_LEN,
-    PROFILE_START,
     REV_METH_OFFSETS,
     SAMPLE_NCOLS,
 )
@@ -161,22 +159,21 @@ def _build_strand_maps(
     motifs: list[dict],
     sig_offsets_by_mid: dict[int, list[int]],
     near_max_dist: int,
-) -> tuple[dict, dict, dict, dict]:
+) -> tuple[dict, dict, dict, dict, dict, dict]:
     """Pre-scan the reference and build per-strand methylation maps.
 
-    Returns
-    -------
-    fwd_slowed_map, rev_slowed_map : dict[(contig, ref_pos)] → (meth_id, parent_offset)
-        Positions where a methylation's signature offset lands. The
-        ``fwd_*`` map covers methylations on the + reference strand
-        (signature at ``mod_position + k`` in + strand direction); the
-        ``rev_*`` map covers methylations on the − reference strand
-        (signature at ``mod_position - k`` in + ref coords because
-        − strand 5'→3' = + strand 3'→5').
-    fwd_meth_map, rev_meth_map : dict[(contig, ref_pos)] → meth_id
-        All methylated base positions per strand (the "centre" — only
-        the modified base itself, not signature offsets). Used for
-        meth_context filling and for the near_meth proximity check.
+    Returns six dicts:
+        fwd_slowed, rev_slowed : (contig, ref_pos) → (meth_id, parent_offset, frac)
+        fwd_near,   rev_near   : same shape (NEAR_METH within ±near_max_dist)
+        fwd_meth,   rev_meth   : (contig, ref_pos) → meth_id (canonical centre only)
+
+    Per-strand semantics: signature offsets propagate downstream in 5'→3'
+    of the methylated strand. For + strand methylations that's + ref
+    direction; for − strand it's − ref direction (since − strand 5'→3'
+    runs from high to low + coords). Closest-offset-wins on overlapping
+    motif claims: a position p+1 of one motif and p of another both
+    qualify for SLOWED, but the one whose canonical site is at smaller
+    |k| keeps the slot.
     """
     fwd_slowed: dict = {}
     rev_slowed: dict = {}
@@ -187,11 +184,9 @@ def _build_strand_maps(
         rc_seq = reverse_complement(seq)
         seq_len = len(seq)
 
-        # Forward-strand motif occurrences: scan + strand reference.
-        # Methylated A position = match.start() + mod_pos (in + ref coords).
-        # Signature offsets propagate downstream on + strand → ref_pos + k.
         for motif in motifs:
             sig_off = sig_offsets_by_mid.get(motif["id"], [0])
+            frac = float(motif.get("frac", 1.0))
             for match in motif["pattern"].finditer(seq):
                 meth_pos = match.start() + motif["mod_pos"]
                 if not (0 <= meth_pos < seq_len):
@@ -200,21 +195,13 @@ def _build_strand_maps(
                 for k in sig_off:
                     tgt = meth_pos + k
                     if 0 <= tgt < seq_len:
-                        # Last-writer-wins on overlap, but prefer smaller |k|
-                        # (closest to the modification — biophysically the
-                        # primary signal).
                         existing = fwd_slowed.get((contig, tgt))
                         if existing is None or abs(k) < abs(existing[1]):
-                            fwd_slowed[(contig, tgt)] = (motif["id"], int(k))
+                            fwd_slowed[(contig, tgt)] = (motif["id"], int(k), frac)
 
-        # Reverse-strand motif occurrences: scan − strand (= rc of + strand).
-        # rc_match.start() + motif["mod_pos"] = methylated A position in rc coords.
-        # Convert to + ref coords: ref_pos = seq_len - 1 - rc_pos.
-        # Signature offsets propagate downstream on − strand → ref_pos - k
-        # (since − strand 5'→3' = + strand 3'→5', so "downstream" on − is
-        # numerically smaller in + ref coords).
         for motif in motifs:
             sig_off = sig_offsets_by_mid.get(motif["id"], [0])
+            frac = float(motif.get("frac", 1.0))
             for match in motif["pattern"].finditer(rc_seq):
                 rc_meth_pos = match.start() + motif["mod_pos"]
                 if not (0 <= rc_meth_pos < seq_len):
@@ -226,102 +213,162 @@ def _build_strand_maps(
                     if 0 <= tgt < seq_len:
                         existing = rev_slowed.get((contig, tgt))
                         if existing is None or abs(k) < abs(existing[1]):
-                            rev_slowed[(contig, tgt)] = (motif["id"], int(k))
+                            rev_slowed[(contig, tgt)] = (motif["id"], int(k), frac)
 
-    # Add near_meth window: positions within near_max_dist of a meth on the
-    # same strand that are NOT already in slowed. We mark these so the
-    # extraction loop can route them to CATEGORY_NEAR_METH (keeping refine's
-    # negative-control samples).
+    # NEAR_METH = within ±near_max_dist of a canonical meth on the same
+    # strand AND not already a SLOWED position. Inherits the meth's frac.
     fwd_near: dict = {}
     rev_near: dict = {}
+    fwd_meth_to_frac = {pos: fwd_slowed.get(pos, (0, 0, 1.0))[2]
+                        for pos in fwd_meth.keys()}
+    rev_meth_to_frac = {pos: rev_slowed.get(pos, (0, 0, 1.0))[2]
+                        for pos in rev_meth.keys()}
     for (contig, p), m_id in fwd_meth.items():
+        frac = fwd_meth_to_frac[(contig, p)]
         for k in range(1, near_max_dist + 1):
             tgt = p + k
             if (contig, tgt) in fwd_slowed:
                 continue
             existing = fwd_near.get((contig, tgt))
             if existing is None or abs(k) < abs(existing[1]):
-                fwd_near[(contig, tgt)] = (m_id, k)
+                fwd_near[(contig, tgt)] = (m_id, k, frac)
     for (contig, p), m_id in rev_meth.items():
+        frac = rev_meth_to_frac[(contig, p)]
         for k in range(1, near_max_dist + 1):
             tgt = p - k
             if (contig, tgt) in rev_slowed:
                 continue
             existing = rev_near.get((contig, tgt))
             if existing is None or abs(k) < abs(existing[1]):
-                rev_near[(contig, tgt)] = (m_id, k)
+                rev_near[(contig, tgt)] = (m_id, k, frac)
 
     return fwd_slowed, rev_slowed, fwd_near, rev_near, fwd_meth, rev_meth
 
 
 # ---------------------------------------------------------------------------
-# Per-position kmer + meth_context extraction from REFERENCE
+# Per-contig precompute + per-read extraction
 # ---------------------------------------------------------------------------
 
 
-def _kmer_at_ref(ref_seq: str, ref_pos: int, is_reverse: bool) -> tuple[int, bool]:
-    """Encode the 11-base kmer centred at ``ref_pos`` on the strand the polymerase READ.
-
-    For ``is_reverse=False`` (ip reads − strand), we encode the − strand
-    kmer at ref_pos. The kmer is read 5'→3' on the − strand, which is
-    the reverse-complement of the + strand kmer at ref_pos.
-
-    For ``is_reverse=True`` (ip reads + strand), we encode the + strand
-    kmer at ref_pos directly.
-
-    Returns (kmer_id, valid). valid=False if the window is out of range
-    or contains non-ACGT bases.
-    """
-    n = len(ref_seq)
-    lo = ref_pos - KMER_LEFT_PAD
-    hi = ref_pos + (K - KMER_LEFT_PAD)  # exclusive
-    if lo < 0 or hi > n:
-        return 0, False
-    window = ref_seq[lo:hi]
-    if not is_reverse:
-        # Polymerase read − strand template; the kmer in the polymerase's
-        # frame is the rev-comp of the + strand kmer at this window.
-        window = reverse_complement(window)
-    if any(b not in "ACGT" for b in window):
-        return 0, False
-    return encode_kmer(window), True
-
-
-def _meth_context_at(
+def _build_contig_arrays(
     contig: str,
-    ref_pos: int,
-    is_reverse: bool,
-    fwd_meth_map: dict,
-    rev_meth_map: dict,
-) -> np.ndarray:
-    """Build the meth_context array for a sample at ``ref_pos`` on the polymerase strand.
+    seq: str,
+    fwd_slowed: dict,
+    rev_slowed: dict,
+    fwd_near: dict,
+    rev_near: dict,
+    fwd_meth: dict,
+    rev_meth: dict,
+    baseline_min_dist: int,
+) -> dict:
+    """Materialise per-position lookup arrays for one contig.
 
-    The polymerase-strand meth at offset k (in polymerase 5'→3' frame)
-    corresponds to:
-       is_reverse=False (polymerase frame == − strand 5'→3'): ref_pos − k
-       is_reverse=True  (polymerase frame == + strand 5'→3'): ref_pos + k
-
-    We use the polymerase-strand methylation map for each direction
-    (rev_meth_map for is_reverse=False, fwd_meth_map for is_reverse=True),
-    so meth_context flags reflect the strand whose kinetics we're storing.
+    Replaces the per-position dict lookups in the BAM inner loop with
+    O(1) array indexing. Memory is ~14 bytes per ref base — negligible
+    for bacterial genomes — and reads of millions of positions become
+    measurably faster.
     """
-    mc = np.zeros(METH_CTX_LEN, dtype=np.int8)
-    pol_map = fwd_meth_map if is_reverse else rev_meth_map
-    for k in range(METH_CTX_LEN):
-        offset = k - METH_CTX_LEFT  # in polymerase 5'→3' frame
-        if is_reverse:
-            ref_off = ref_pos + offset
-        else:
-            ref_off = ref_pos - offset
-        m_id = pol_map.get((contig, ref_off))
-        if m_id is not None:
-            mc[k] = m_id
-    return mc
+    n = len(seq)
+    base_int = np.full(n, -1, dtype=np.int8)  # -1 → non-ACGT
+    base_int[np.frombuffer(seq.encode("ascii"), dtype=np.uint8) == ord("A")] = 0
+    base_int[np.frombuffer(seq.encode("ascii"), dtype=np.uint8) == ord("C")] = 1
+    base_int[np.frombuffer(seq.encode("ascii"), dtype=np.uint8) == ord("G")] = 2
+    base_int[np.frombuffer(seq.encode("ascii"), dtype=np.uint8) == ord("T")] = 3
+    valid_base = base_int >= 0
 
+    # Sliding 11-mer encoding on the + strand. window[i] covers ref
+    # positions i-LEFT .. i+(K-LEFT)-1; out-of-range → invalid.
+    LEFT = KMER_LEFT_PAD
+    RIGHT = K - LEFT
+    kmer_fwd = np.full(n, -1, dtype=np.int64)
+    kmer_window_valid = np.ones(n, dtype=bool)
+    for j in range(K):
+        # In + strand 5'→3' frame: the j-th base of the kmer at ref_pos i
+        # sits at ref position (i - LEFT + j).
+        offset = j - LEFT
+        # roll() gives wrap-around; we mask out boundary positions below.
+        rolled = np.roll(base_int, -offset)
+        kmer_window_valid &= np.roll(valid_base, -offset)
+        kmer_fwd = (kmer_fwd << 2) | (rolled.astype(np.int64) & 3)
+    # Boundary mask: any position whose 11-mer reaches outside [0, n) is
+    # invalid. The kmer at ref_pos i needs positions [i-LEFT, i+RIGHT-1].
+    edge_invalid = np.zeros(n, dtype=bool)
+    edge_invalid[:LEFT] = True
+    if RIGHT > 0:
+        edge_invalid[n - RIGHT + 1:] = True
+    kmer_fwd[edge_invalid | ~kmer_window_valid] = -1
 
-# ---------------------------------------------------------------------------
-# Per-read extraction
-# ---------------------------------------------------------------------------
+    # Reverse-complement kmer at the same ref position: the polymerase
+    # reading the − strand sees a different 11-mer here. Bit-reverse pairs
+    # of the + strand kmer and complement them (XOR with 0b1111... pattern).
+    # XOR pattern over K bases: each 2-bit unit XORs with 3 (A↔T, C↔G).
+    xor_mask = np.int64(0)
+    for _ in range(K):
+        xor_mask = (xor_mask << 2) | 3
+    # Bit-reverse the K base-pairs:
+    src = kmer_fwd.copy()
+    kmer_rev = np.zeros_like(src)
+    for _ in range(K):
+        kmer_rev = (kmer_rev << 2) | (src & 3)
+        src >>= 2
+    kmer_rev ^= xor_mask
+    kmer_rev[kmer_fwd < 0] = -1
+
+    # Meth presence + categorisation arrays. int8 holds meth_id (1-3),
+    # offset (-7..+7), and frac×100 quantised. We keep frac as float32.
+    fwd_meth_arr = np.zeros(n, dtype=np.int8)
+    rev_meth_arr = np.zeros(n, dtype=np.int8)
+    for (c, p), m_id in fwd_meth.items():
+        if c == contig and 0 <= p < n:
+            fwd_meth_arr[p] = m_id
+    for (c, p), m_id in rev_meth.items():
+        if c == contig and 0 <= p < n:
+            rev_meth_arr[p] = m_id
+
+    def _from_dict(d, n_):
+        T = np.zeros(n_, dtype=np.int8)
+        off = np.zeros(n_, dtype=np.int8)
+        frac = np.zeros(n_, dtype=np.float32)
+        for (c, p), val in d.items():
+            if c == contig and 0 <= p < n_:
+                T[p] = val[0]
+                off[p] = val[1]
+                frac[p] = val[2]
+        return T, off, frac
+
+    fwd_slowed_T, fwd_slowed_off, fwd_slowed_frac = _from_dict(fwd_slowed, n)
+    rev_slowed_T, rev_slowed_off, rev_slowed_frac = _from_dict(rev_slowed, n)
+    fwd_near_T, fwd_near_off, fwd_near_frac = _from_dict(fwd_near, n)
+    rev_near_T, rev_near_off, rev_near_frac = _from_dict(rev_near, n)
+
+    # Baseline-exclusion mask: True at positions within ±baseline_min_dist
+    # of ANY canonical meth (either strand). Single boolean array
+    # replaces the per-position 22-dict-lookup distance check.
+    meth_present = (fwd_meth_arr > 0) | (rev_meth_arr > 0)
+    excluded = meth_present.copy()
+    for d in range(1, baseline_min_dist + 1):
+        excluded[:-d] |= meth_present[d:]
+        excluded[d:] |= meth_present[:-d]
+
+    return {
+        "kmer_fwd": kmer_fwd,
+        "kmer_rev": kmer_rev,
+        "fwd_meth": fwd_meth_arr,
+        "rev_meth": rev_meth_arr,
+        "fwd_slowed_T": fwd_slowed_T,
+        "fwd_slowed_off": fwd_slowed_off,
+        "fwd_slowed_frac": fwd_slowed_frac,
+        "rev_slowed_T": rev_slowed_T,
+        "rev_slowed_off": rev_slowed_off,
+        "rev_slowed_frac": rev_slowed_frac,
+        "fwd_near_T": fwd_near_T,
+        "fwd_near_off": fwd_near_off,
+        "fwd_near_frac": fwd_near_frac,
+        "rev_near_T": rev_near_T,
+        "rev_near_off": rev_near_off,
+        "rev_near_frac": rev_near_frac,
+        "excluded": excluded,
+    }
 
 
 def _extract_one_bam(
@@ -336,14 +383,13 @@ def _extract_one_bam(
     seed: int,
     max_reads: int,
 ) -> dict:
-    """Run orientation-aware extraction on one aligned BAM. Returns dict[kmer_id] → ndarray(N, 38)."""
+    """Run orientation-aware extraction. Returns dict[kmer_id] → ndarray(N, 20)."""
 
     rng = np.random.default_rng(seed)
     motifs = _parse_motif_string_no_rc(motif_string)
     if not motifs:
         raise ValueError("extract: no valid motifs after parsing.")
 
-    # Resolve signal offsets per meth type from kinsim_config.yaml.
     sig_offsets_by_mid: dict = {}
     cfg_sigs = cfg.get("kinetic_signatures") or {}
     name_by_mid = {v: k for k, v in get_meth_ids().items()}
@@ -357,39 +403,50 @@ def _extract_one_bam(
             "kinsim_config.yaml has no `kinetic_signatures` entries. "
             "Declare per-meth-type signal_offsets and re-run."
         )
-    log.info("[aligned] signal offsets: %s",
+    log.info("[extract] signal offsets: %s",
              {name_by_mid[mid]: offs for mid, offs in sig_offsets_by_mid.items()})
 
-    log.info("[aligned] pre-scanning reference for motif positions (per strand) ...")
+    log.info("[extract] pre-scanning reference for motif positions (per strand) ...")
     fwd_slowed, rev_slowed, fwd_near, rev_near, fwd_meth, rev_meth = _build_strand_maps(
         ref_seqs, motifs, sig_offsets_by_mid, near_max_dist
     )
     log.info(
-        "[aligned] motif positions: fwd_slowed=%d  rev_slowed=%d  fwd_meth=%d  rev_meth=%d",
+        "[extract] motif positions: fwd_slowed=%d  rev_slowed=%d  fwd_meth=%d  rev_meth=%d",
         len(fwd_slowed), len(rev_slowed), len(fwd_meth), len(rev_meth),
     )
 
-    # --------- Iterate aligned reads ---------------------------------
+    # Per-contig precompute: replaces all per-position dict lookups in the
+    # BAM inner loop with O(1) array indexing. Memory cost ~14 bytes per
+    # ref base — trivial for bacterial genomes.
+    log.info("[extract] precomputing per-contig lookup arrays ...")
+    contig_arrs = {
+        contig: _build_contig_arrays(
+            contig, seq, fwd_slowed, rev_slowed, fwd_near, rev_near,
+            fwd_meth, rev_meth, baseline_min_dist_to_meth,
+        )
+        for contig, seq in ref_seqs.items()
+    }
+
     samples: dict[int, list] = defaultdict(list)
     baseline_buffer: dict[int, list] = defaultdict(list)
     baseline_seen_per_kmer: dict[int, int] = defaultdict(int)
     n_slowed = n_near = n_baseline_seen = n_baseline_kept = 0
     n_reads_processed = n_reads_used = 0
 
-    # Pre-compute fast lookups by contig for the per-read inner loop.
-    # We'll filter with `(contig, pos) in dict` directly — Python dict
-    # lookups are O(1).
+    # Polymerase-frame meth_context offsets: the 11 positions [-LEFT..+RIGHT].
+    # Built once; used to vectorise the per-row context slice.
+    mc_offsets = np.arange(METH_CTX_LEN, dtype=np.int64) - METH_CTX_LEFT
+    rev_offsets = np.array(REV_METH_OFFSETS, dtype=np.int64)
+
     with pysam.AlignmentFile(bam_path, "rb", check_sq=True) as bam:
-        # Sanity check: BAM must be aligned to the reference whose contigs
-        # match what we loaded.
         bam_contigs = set(bam.references)
         ref_contigs = set(ref_seqs.keys())
         missing = ref_contigs - bam_contigs
         extra = bam_contigs - ref_contigs
         if missing:
-            log.warning("[aligned] reference has contigs missing from BAM: %s", sorted(missing))
+            log.warning("[extract] reference has contigs missing from BAM: %s", sorted(missing))
         if extra:
-            log.warning("[aligned] BAM has contigs missing from reference: %s", sorted(extra))
+            log.warning("[extract] BAM has contigs missing from reference: %s", sorted(extra))
 
         for read in bam:
             n_reads_processed += 1
@@ -398,15 +455,14 @@ def _extract_one_bam(
                 break
             if read.is_unmapped or read.is_secondary or read.is_supplementary:
                 continue
-            contig = read.reference_name
-            ref_seq = ref_seqs.get(contig)
-            if ref_seq is None:
+            arrs = contig_arrs.get(read.reference_name)
+            if arrs is None:
                 continue
             try:
                 ipd = read.get_tag("ip")
             except KeyError:
                 try:
-                    ipd = read.get_tag("fi")  # fallback
+                    ipd = read.get_tag("fi")
                 except KeyError:
                     continue
             try:
@@ -420,98 +476,85 @@ def _extract_one_bam(
             pw = np.asarray(pw, dtype=np.float32)
             n_reads_used += 1
 
-            # Strand-route the methylation map: ``ip`` represents the IPD
-            # of the polymerase synthesising this read. The polymerase
-            # was reading the OPPOSITE strand of the read sequence as
-            # template. So ``ip`` carries methylations on the strand
-            # opposite to the read's aligned orientation.
+            # Strand-route the per-position lookups: ``ip`` carries the
+            # polymerase-template-strand methylations. is_reverse=False
+            # means polymerase read − strand → use rev_* arrays.
             if read.is_reverse:
-                slowed_map = fwd_slowed
-                near_map = fwd_near
-                opp_meth_map = rev_meth
+                slowed_T = arrs["fwd_slowed_T"]
+                slowed_off = arrs["fwd_slowed_off"]
+                slowed_frac = arrs["fwd_slowed_frac"]
+                near_T = arrs["fwd_near_T"]
+                near_off = arrs["fwd_near_off"]
+                near_frac = arrs["fwd_near_frac"]
+                pol_meth_arr = arrs["fwd_meth"]
+                opp_meth_arr = arrs["rev_meth"]
+                kmer_arr = arrs["kmer_rev"]   # polymerase 5'→3' frame is the rc
+                mc_dir = +1                    # downstream pol = + ref direction
+                rev_dir = +1
             else:
-                slowed_map = rev_slowed
-                near_map = rev_near
-                opp_meth_map = fwd_meth
+                slowed_T = arrs["rev_slowed_T"]
+                slowed_off = arrs["rev_slowed_off"]
+                slowed_frac = arrs["rev_slowed_frac"]
+                near_T = arrs["rev_near_T"]
+                near_off = arrs["rev_near_off"]
+                near_frac = arrs["rev_near_frac"]
+                pol_meth_arr = arrs["rev_meth"]
+                opp_meth_arr = arrs["fwd_meth"]
+                kmer_arr = arrs["kmer_fwd"]
+                mc_dir = -1
+                rev_dir = -1
+            excluded = arrs["excluded"]
+            n_ref = pol_meth_arr.shape[0]
 
-            # Walk aligned positions and emit rows per category.
-            # ``aligned_pairs`` returns (read_pos, ref_pos) only for
-            # matched (no soft-clip, no indel) positions.
             for read_pos, ref_pos in read.get_aligned_pairs(matches_only=True):
-                # SLOWED: this ref_pos hits a signature offset on the
-                # polymerase-template strand for this read.
-                slowed_hit = slowed_map.get((contig, ref_pos))
-                near_hit = None if slowed_hit else near_map.get((contig, ref_pos))
-
-                if slowed_hit is None and near_hit is None:
-                    # Baseline candidate. Filter by distance to any meth
-                    # position on EITHER strand to avoid contaminating
-                    # baseline with positions inside the polymerase
-                    # footprint of a methylation.
-                    is_base = True
-                    for d in range(1, baseline_min_dist_to_meth + 1):
-                        if (
-                            (contig, ref_pos + d) in fwd_meth
-                            or (contig, ref_pos - d) in fwd_meth
-                            or (contig, ref_pos + d) in rev_meth
-                            or (contig, ref_pos - d) in rev_meth
-                        ):
-                            is_base = False
-                            break
-                    if not is_base:
-                        continue
-                    if baseline_sample_rate < 1.0 and rng.random() >= baseline_sample_rate:
-                        continue
-                    n_baseline_seen += 1
-                    cat = CATEGORY_BASELINE
-                    parent_meth = 0
-                    parent_off = 0
-                else:
-                    if slowed_hit is not None:
-                        cat = CATEGORY_SLOWED
-                        parent_meth, parent_off = slowed_hit
-                        n_slowed += 1
-                    else:
-                        cat = CATEGORY_NEAR_METH
-                        parent_meth, parent_off = near_hit
-                        n_near += 1
-
-                # Encode kmer in polymerase-strand frame (so the same kmer
-                # context is consistent across reads regardless of alignment
-                # direction).
-                kmer_id, kmer_valid = _kmer_at_ref(ref_seq, ref_pos, read.is_reverse)
-                if not kmer_valid:
+                if ref_pos < 0 or ref_pos >= n_ref:
                     continue
+                kmer_id = int(kmer_arr[ref_pos])
+                if kmer_id < 0:
+                    continue
+                s_T = int(slowed_T[ref_pos])
+                if s_T:
+                    cat = CATEGORY_SLOWED
+                    parent_meth = s_T
+                    parent_off = int(slowed_off[ref_pos])
+                    frac = float(slowed_frac[ref_pos])
+                    n_slowed += 1
+                else:
+                    nm_T = int(near_T[ref_pos])
+                    if nm_T:
+                        cat = CATEGORY_NEAR_METH
+                        parent_meth = nm_T
+                        parent_off = int(near_off[ref_pos])
+                        frac = float(near_frac[ref_pos])
+                        n_near += 1
+                    else:
+                        if excluded[ref_pos]:
+                            continue
+                        if baseline_sample_rate < 1.0 and rng.random() >= baseline_sample_rate:
+                            continue
+                        n_baseline_seen += 1
+                        cat = CATEGORY_BASELINE
+                        parent_meth = 0
+                        parent_off = 0
+                        frac = 0.0
+
+                # Vectorised meth_context: 11 lookups on a padded array
+                # would be cleaner, but bounds-mask + take is just as fast
+                # and avoids a copy.
+                ctx_idx = ref_pos + mc_dir * mc_offsets
+                in_bounds = (ctx_idx >= 0) & (ctx_idx < n_ref)
+                mc = np.where(in_bounds, pol_meth_arr[np.clip(ctx_idx, 0, n_ref - 1)], 0)
+
+                rev_idx = ref_pos + rev_dir * rev_offsets
+                in_bounds = (rev_idx >= 0) & (rev_idx < n_ref)
+                rev_vals = np.where(in_bounds, opp_meth_arr[np.clip(rev_idx, 0, n_ref - 1)], 0)
 
                 row = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
                 row[0] = ipd[read_pos]
                 row[1] = pw[read_pos]
-                row[2] = 1.0  # frac is per-position; could be filled from motif map later
-                # meth_context [-7..+3] in polymerase-strand frame
-                row[3:3 + METH_CTX_LEN] = _meth_context_at(
-                    contig, ref_pos, read.is_reverse, fwd_meth, rev_meth
-                )
-                # kinetic profile downstream — the next 9 polymerase positions.
-                # In polymerase frame, "downstream" means later in the read,
-                # so read_pos + 0 .. read_pos + 8.
-                for k in range(PROFILE_LEN):
-                    rp = read_pos + PROFILE_START + k
-                    if 0 <= rp < len(ipd):
-                        row[14 + k] = ipd[rp]
-                        row[23 + k] = pw[rp]
-                # rev_meth: methylations on the OPPOSITE strand at active-site
-                # neighbours. In polymerase frame, the opposite strand is the
-                # read sequence's strand (which the polymerase did NOT read as
-                # template). So we look up ``opp_meth_map`` at the corresponding
-                # ref_pos.
-                for k, off in enumerate(REV_METH_OFFSETS):
-                    if read.is_reverse:
-                        ref_off = ref_pos + off
-                    else:
-                        ref_off = ref_pos - off
-                    rev_id = opp_meth_map.get((contig, ref_off))
-                    if rev_id is not None:
-                        row[32 + k] = rev_id
+                row[2] = frac
+                row[3:14] = mc
+                row[14:17] = rev_vals
                 row[COL_CATEGORY] = cat
                 row[COL_PARENT_METH] = parent_meth
                 row[COL_PARENT_OFFSET] = parent_off
@@ -523,7 +566,6 @@ def _extract_one_bam(
                         baseline_buffer[kmer_id].append(row)
                         n_baseline_kept += 1
                     else:
-                        # Vitter's reservoir
                         j = int(rng.integers(0, seen))
                         if j < n_baseline_per_kmer:
                             baseline_buffer[kmer_id][j] = row
@@ -532,26 +574,24 @@ def _extract_one_bam(
 
             if n_reads_used % PROGRESS_EVERY == 0:
                 log.info(
-                    "[aligned] progress: %d reads used | slowed=%d near=%d baseline_seen=%d kept=%d",
+                    "[extract] progress: %d reads used | slowed=%d near=%d baseline_seen=%d kept=%d",
                     n_reads_used, n_slowed, n_near, n_baseline_seen, n_baseline_kept,
                 )
 
-    # Merge baseline buffer into samples
     for kid, rows in baseline_buffer.items():
         if rows:
             samples[kid].extend(rows)
 
-    # Pack to ndarrays
     result: dict = {}
     for kid, rows in samples.items():
         if rows:
             result[int(kid)] = np.array(rows, dtype=np.float32)
 
     log.info(
-        "[aligned] DONE  reads_used=%d  slowed=%d  near=%d  baseline_seen=%d  baseline_kept=%d",
+        "[extract] DONE  reads_used=%d  slowed=%d  near=%d  baseline_seen=%d  baseline_kept=%d",
         n_reads_used, n_slowed, n_near, n_baseline_seen, n_baseline_kept,
     )
-    log.info("[aligned] kmers in output: %d", len(result))
+    log.info("[extract] kmers in output: %d", len(result))
     return result
 
 

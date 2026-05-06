@@ -17,7 +17,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from kinsim.utils.encoding import K, KMER_MASK, BASE_MAP, METH_IDS
+from kinsim.utils.encoding import BASE_MAP, KMER_MASK, METH_IDS, K
 from kinsim.utils.motifs import load_motif_string, parse_motifs, scan_sequence
 
 log = logging.getLogger(__name__)
@@ -81,7 +81,7 @@ def extract_from_bam(bam_path: str, motif_string: str, max_reads: int = 5000) ->
 def compute_group_means(data: dict, min_ipd_m6a: float = 0.0) -> dict[int, tuple]:
     """Returns {meth_id: (ipd_means, pw_means)} from per-key means."""
     collectors: dict[int, tuple[list, list]] = {}
-    for (kmer_id, meth_id), arr in data.items():
+    for (_kmer_id, meth_id), arr in data.items():
         mu_ipd = float(arr[:, 0].mean())
         mu_pw = float(arr[:, 1].mean())
 

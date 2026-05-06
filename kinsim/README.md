@@ -25,7 +25,7 @@ motifs.csv   ──┴──► kinsim extract  ──► shards/*.pkl
 
 Each stage consumes the previous stage's output. Shards are the canonical
 on-disk format throughout — `dict[kmer_id (int) → np.ndarray(N, 38)]`,
-plus a `__meta__` provenance entry. The 38-column layout is defined in
+plus a `__meta__` provenance entry. The 20-column layout is defined in
 [`utils/sample_layout.py`](utils/sample_layout.py).
 
 | Verb | Module | Input | Output |
@@ -60,7 +60,7 @@ kinsim/
 └── utils/
     ├── encoding.py        kmer bit-packing (K=11, asymmetric window)
     ├── motifs.py          motif parsing + scan + IUPAC
-    ├── sample_layout.py   the 38-column row contract
+    ├── sample_layout.py   the 20-column row contract
     ├── config.py          YAML + manifest loader
     └── io.py              FASTA loader + atomic pickle writes
 ```

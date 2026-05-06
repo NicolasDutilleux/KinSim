@@ -69,11 +69,11 @@ def test_get_categories_reads_col35():
 
 
 def test_layout_column_contract():
-    """Layout columns 36/37 are PARENT_METH and PARENT_OFFSET respectively."""
-    assert SAMPLE_NCOLS == 38
-    assert COL_CATEGORY == 35
-    assert COL_PARENT_METH == 36
-    assert COL_PARENT_OFFSET == 37
+    """20-col layout: profile dropped, rev_meth keeps active-site footprint."""
+    assert SAMPLE_NCOLS == 20
+    assert COL_CATEGORY == 17
+    assert COL_PARENT_METH == 18
+    assert COL_PARENT_OFFSET == 19
 
 
 def test_analyze_uses_parent_meth_column_not_meth_context():
@@ -96,18 +96,15 @@ def test_analyze_uses_parent_meth_column_not_meth_context():
     for _ in range(50):
         r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
         r[COL_IPD] = 30.0
-        r[14:23] = 30.0
         rows.append(r)
     r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
     r[COL_IPD] = 200.0
-    r[14:23] = 200.0
     r[COL_CATEGORY] = CATEGORY_SLOWED
     r[COL_PARENT_METH] = m6a
     # mc is all zeros for this row — no m6A trace
     rows.append(r)
     r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
     r[COL_IPD] = 150.0
-    r[14:23] = 150.0
     r[COL_CATEGORY] = CATEGORY_SLOWED
     r[COL_PARENT_METH] = m5c
     r[3 + KMER_PRED_IDX] = m6a  # red herring — m6A in mc but parent says m5C
@@ -703,14 +700,13 @@ def _build_v4_with_signatures(n_kmers: int = 5) -> dict:
     data = {}
     for kid in range(n_kmers):
         rows = []
-        # Baseline: flat profile
+        # Baseline
         for _ in range(40):
             r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
             r[COL_IPD] = 30.0
             r[COL_CATEGORY] = CATEGORY_BASELINE
-            r[14:23] = 30.0
             rows.append(r)
-        # Slowed-by-m6A at p = m6A (offset 0): m6A in mc[7]
+        # Slowed-by-m6A at offset 0: m6A in mc[KMER_PRED_IDX]
         for _ in range(20):
             r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
             r[COL_IPD] = 200.0
@@ -718,11 +714,8 @@ def _build_v4_with_signatures(n_kmers: int = 5) -> dict:
             r[COL_PARENT_METH] = m6a
             r[COL_PARENT_OFFSET] = 0
             r[3 + KMER_PRED_IDX] = m6a
-            r[14:23] = 30.0
-            r[14] = 200.0
-            r[19] = 180.0
             rows.append(r)
-        # Slowed-by-m6A at p = m6A+5 (offset 5): m6A at mc[2] (-5 from centre)
+        # Slowed-by-m6A at offset +5: m6A in mc[KMER_PRED_IDX - 5]
         for _ in range(15):
             r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
             r[COL_IPD] = 150.0
@@ -730,11 +723,8 @@ def _build_v4_with_signatures(n_kmers: int = 5) -> dict:
             r[COL_PARENT_METH] = m6a
             r[COL_PARENT_OFFSET] = 5
             r[3 + KMER_PRED_IDX - 5] = m6a
-            r[14:23] = 30.0
-            r[14] = 150.0
-            r[19] = 130.0
             rows.append(r)
-        # Near_meth-by-m6A at p = m6A+3 (non-sig): m6A at mc[4] (-3 from centre)
+        # Near_meth-by-m6A at offset +3 (non-sig)
         for _ in range(10):
             r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
             r[COL_IPD] = 32.0
@@ -742,9 +732,8 @@ def _build_v4_with_signatures(n_kmers: int = 5) -> dict:
             r[COL_PARENT_METH] = m6a
             r[COL_PARENT_OFFSET] = 3
             r[3 + KMER_PRED_IDX - 3] = m6a
-            r[14:23] = 32.0
             rows.append(r)
-        # Near_meth-by-m5C at p = m5C (offset 0; 0 not in m5C sig=[2,6])
+        # Near_meth-by-m5C at offset 0 (0 not in m5C sig=[2,6])
         for _ in range(8):
             r = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
             r[COL_IPD] = 35.0
@@ -752,7 +741,6 @@ def _build_v4_with_signatures(n_kmers: int = 5) -> dict:
             r[COL_PARENT_METH] = m5c
             r[COL_PARENT_OFFSET] = 0
             r[3 + KMER_PRED_IDX] = m5c
-            r[14:23] = 35.0
             rows.append(r)
         data[kid] = np.stack(rows)
     return data
@@ -783,26 +771,23 @@ def test_compute_signature_profiles():
 
     base = profiles["baseline"]
     assert base["n_samples"] == 5 * 40
-    for v in base["profile_ipd"]:
-        assert abs(v - 30.0) < 0.1
+    assert abs(base["mean_ipd"] - 30.0) < 0.1
 
     slow0 = profiles["slowed_by_m6A_at_+0"]
     assert slow0["n_samples"] == 5 * 20
-    assert abs(slow0["profile_ipd"][0] - 200.0) < 0.5
-    assert slow0["sig_offsets"] == [0]
+    assert abs(slow0["mean_ipd"] - 200.0) < 0.5
 
     slow5 = profiles["slowed_by_m6A_at_+5"]
     assert slow5["n_samples"] == 5 * 15
-    assert abs(slow5["profile_ipd"][0] - 150.0) < 0.5
-    assert slow5["sig_offsets"] == [5]
+    assert abs(slow5["mean_ipd"] - 150.0) < 0.5
 
     near_a = profiles["near_meth_by_m6A_at_+3"]
     assert near_a["n_samples"] == 5 * 10
-    assert abs(near_a["profile_ipd"][0] - 32.0) < 0.1
+    assert abs(near_a["mean_ipd"] - 32.0) < 0.1
 
     near_c = profiles["near_meth_by_m5C_at_+0"]
     assert near_c["n_samples"] == 5 * 8
-    assert abs(near_c["profile_ipd"][0] - 35.0) < 0.1
+    assert abs(near_c["mean_ipd"] - 35.0) < 0.1
 
 
 def test_compute_meth_context_distribution():

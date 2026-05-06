@@ -48,6 +48,7 @@ import torch.nn as nn
 from ..data.dataset import inv_log_transform, log_transform  # noqa: F401
 from ..utils.encoding import KMER_PRED_IDX
 from ..utils.encoding import K as _DEFAULT_K
+from ..utils.sample_layout import REV_METH_LEN as _REV_METH_LEN
 
 # =========================================================================
 # MLPPredictor (legacy architecture)
@@ -93,8 +94,13 @@ class MLPPredictor(nn.Module):
 
         _num_kmers = 4**kmer_size
         self.kmer_embed = nn.Embedding(_num_kmers, kmer_embed_dim)
-        # Accepts full K*M flat context
-        self.meth_proj = nn.Linear(kmer_size * num_meth_types, meth_proj_dim, bias=False)
+        # Accepts the (kmer_size + rev_meth) × num_meth_types flat context
+        # — forward meth at offsets [-7..+3] plus rev_meth at active-site
+        # neighbours [-1, 0, +1] from sample_layout.REV_METH_LEN.
+        self._meth_positions = kmer_size + _REV_METH_LEN
+        self.meth_proj = nn.Linear(
+            self._meth_positions * num_meth_types, meth_proj_dim, bias=False
+        )
 
         input_dim = kmer_embed_dim + meth_proj_dim
         self.net = nn.Sequential(
@@ -135,15 +141,15 @@ class MLPPredictor(nn.Module):
         kmer_emb = self.kmer_embed(kmer_ids)
 
         if meth_probs.dim() == 2:
-            # Legacy (B, M): place at center position, zeros elsewhere
+            # Legacy (B, M): place at center position; pad rev_meth with 0
             B, M = meth_probs.shape
             full = torch.zeros(
-                B, self.kmer_size, M, device=meth_probs.device, dtype=meth_probs.dtype
+                B, self._meth_positions, M, device=meth_probs.device, dtype=meth_probs.dtype
             )
             full[:, KMER_PRED_IDX, :] = meth_probs
             meth_flat = full.view(B, -1)
         else:
-            # (B, K, M) → flatten to (B, K*M)
+            # (B, total_pos, M) → flatten to (B, total_pos*M)
             meth_flat = meth_probs.reshape(meth_probs.shape[0], -1)
 
         meth_emb = self.meth_proj(meth_flat)
@@ -263,11 +269,16 @@ class ConvPredictor(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, kmer_size, base_embed_dim))
 
         # --- Methylation projection: GLOBAL embedding from per-position context.
-        # Methylation context is an asymmetric window [-8, +2] around the
-        # prediction position (length 11), independent of the kmer's [-5, +5]
-        # window. Flatten to (B, 11*M) and project to a single embedding so
-        # FiLM conditioning is decoupled from per-position alignment.
-        self.meth_proj = nn.Linear(kmer_size * num_meth_types, meth_proj_dim, bias=False)
+        # Forward meth context [-7, +3] (kmer_size positions) plus rev_meth
+        # at active-site neighbours [-1, 0, +1] (REV_METH_LEN positions) —
+        # flattened to (B, (kmer_size + REV_METH_LEN) * M) and projected
+        # to a single embedding. FiLM conditioning is decoupled from
+        # per-position alignment, so the model sees both strands' meth
+        # status simultaneously (handles bilateral palindromic sites).
+        self._meth_positions = kmer_size + _REV_METH_LEN
+        self.meth_proj = nn.Linear(
+            self._meth_positions * num_meth_types, meth_proj_dim, bias=False
+        )
 
         # --- FiLM conditioning: meth -> (gamma, beta) -> modulate base emb ---
         # x_modulated = (1 + gamma) * x_base + beta, broadcast over positions.
@@ -361,23 +372,16 @@ class ConvPredictor(nn.Module):
         return (kmer_ids.unsqueeze(1) >> self._shifts.unsqueeze(0)) & 3
 
     def _expand_center_meth(self, meth_probs: torch.Tensor) -> torch.Tensor:
-        """Expand center-only methylation probs to per-position tensor.
+        """Expand center-only methylation probs to the full meth tensor.
 
-        The current pipeline stores methylation only for the center position
-        (where the polymerase incorporates).  This method places it at
-        position kmer_size//2, with zeros at all flanking positions.
-
-        Forward-compatible: when the data pipeline provides per-position
-        methylation, pass (B, kmer_size, M) directly to forward_positional().
-
-        Args:
-            meth_probs: (B, M) methylation probabilities for center position.
-
-        Returns:
-            (B, kmer_size, M) tensor with meth_probs at center, zeros elsewhere.
+        Backwards-compat shim for the legacy (B, M) input shape: places
+        the centre meth at the prediction position and zeros everywhere
+        else (including the rev_meth slots at the tail).
         """
         B, M = meth_probs.shape
-        full = torch.zeros(B, self.kmer_size, M, device=meth_probs.device, dtype=meth_probs.dtype)
+        full = torch.zeros(
+            B, self._meth_positions, M, device=meth_probs.device, dtype=meth_probs.dtype
+        )
         full[:, KMER_PRED_IDX, :] = meth_probs
         return full
 
@@ -393,8 +397,8 @@ class ConvPredictor(nn.Module):
         """Core forward pass with decoded per-position inputs.
 
         Args:
-            bases:     (B, 11) Long tensor of base indices [0-3].
-            meth_full: (B, 11, M) Float tensor of per-position methylation probs.
+            bases:     (B, 11) Long tensor of base indices [0-3] — forward kmer.
+            meth_full: (B, 11+REV_METH_LEN, M) per-position methylation probs.
 
         Returns:
             (B, 4) Float tensor: [mu_ipd, mu_pw, log_sigma_ipd, log_sigma_pw].
@@ -402,8 +406,8 @@ class ConvPredictor(nn.Module):
         # Per-base embedding + positional encoding
         x = self.base_embed(bases) + self.pos_embed  # (B, 11, base_embed_dim)
 
-        # FiLM conditioning: GLOBAL meth context modulates the kmer uniformly.
-        # Flatten the per-position meth context (B, 11, M) into (B, 11*M),
+        # FiLM conditioning: GLOBAL meth context (forward + rev_meth) modulates
+        # the kmer uniformly. Flatten per-position meth (B, 14, M) → (B, 14*M),
         # project to a single embedding, derive (gamma, beta), broadcast.
         # When meth_full is all zeros -> meth_feat=0 -> gamma=0, beta=0 -> identity.
         meth_flat = meth_full.reshape(meth_full.shape[0], -1)  # (B, 11*M)

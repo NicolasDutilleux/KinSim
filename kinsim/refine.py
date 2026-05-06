@@ -270,24 +270,24 @@ def _harvest_into(
     data: dict,
     baseline_chunks: list,
     slowed_chunks_by_TO: dict,
+    slowed_frac_by_TO: dict,
 ) -> None:
-    """Append (IPD, PW) pairs from ``data`` into the passed-in containers.
+    """Append (IPD, PW) and frac chunks from ``data`` into the containers.
 
-    Mutates ``baseline_chunks`` (list of (n, 2) arrays) and
-    ``slowed_chunks_by_TO`` (dict[(T_id, offset)] -> list of (n, 2)
-    arrays). Used by both the single-pkl and sharded pass-1 harvest.
+    Mutates:
+      ``baseline_chunks``      list of (n, 2) arrays of (IPD, PW)
+      ``slowed_chunks_by_TO``  dict[(T_id, offset)] → list of (n, 2) (IPD, PW) chunks
+      ``slowed_frac_by_TO``    dict[(T_id, offset)] → list of (n,) frac chunks
 
-    Slowed rows are now bucketed per **(parent_meth, parent_offset)**
-    pair rather than per parent_meth alone, so each signature offset
-    of a meth type fits its own GMM independently. This protects the
-    high-confidence offsets (e.g. m6A@+0 from GATC) from contamination
-    by a noisier offset of the same meth type (e.g. m6A@+5 emitted by
-    a Type I R-M motif that doesn't actually carry a +5 signature).
+    The frac chunks let downstream code average per-bucket motif occupancy
+    so generate.py can decompose ``p_fire = mean_occupancy × p_efficiency``
+    and apply per-site target occupancy at inference time.
     """
     from .utils.sample_layout import (
         CATEGORY_BASELINE,
         CATEGORY_SLOWED,
         COL_CATEGORY,
+        COL_FRACTION,
         COL_IPD,
         COL_PARENT_METH,
         COL_PARENT_OFFSET,
@@ -303,6 +303,7 @@ def _harvest_into(
         parent = arr[:, COL_PARENT_METH].astype(np.int8)
         offset = arr[:, COL_PARENT_OFFSET].astype(np.int8)
         ipd_pw = arr[:, [COL_IPD, COL_PW]]
+        frac = arr[:, COL_FRACTION]
 
         base_m = cats == CATEGORY_BASELINE
         if base_m.any():
@@ -323,6 +324,9 @@ def _harvest_into(
                     slowed_chunks_by_TO.setdefault((T_id_int, O_int), []).append(
                         ipd_pw[mask].astype(np.float32)
                     )
+                    slowed_frac_by_TO.setdefault((T_id_int, O_int), []).append(
+                        frac[mask].astype(np.float32)
+                    )
 
 
 def _bucket_label(T_name: str, offset: int) -> str:
@@ -333,6 +337,7 @@ def _bucket_label(T_name: str, offset: int) -> str:
 def _fit_gmms_per_bucket(
     baseline_pool: np.ndarray,
     slowed_chunks_by_TO: dict,
+    slowed_frac_by_TO: dict,
     posterior_threshold: float,
     baseline_validation_min: float,
     min_samples_for_gmm: int,
@@ -369,6 +374,8 @@ def _fit_gmms_per_bucket(
         label = _bucket_label(T_name, off)
         slowed_TO = np.concatenate(slowed_chunks_by_TO[(T_id, off)])
         n_TO = len(slowed_TO)
+        frac_chunks = slowed_frac_by_TO.get((T_id, off), [])
+        mean_occ = float(np.concatenate(frac_chunks).mean()) if frac_chunks else 1.0
 
         if n_TO < min_samples_for_gmm:
             log.warning(
@@ -384,6 +391,7 @@ def _fit_gmms_per_bucket(
                 "n_kept": n_TO,
                 "n_dropped": 0,
                 "p_fire": 1.0,
+                "mean_occupancy": mean_occ,
                 "skipped": True,
                 "reason": "too_few_samples",
             }
@@ -465,6 +473,7 @@ def _fit_gmms_per_bucket(
                 "n_kept": n_TO,
                 "n_dropped": 0,
                 "p_fire": 1.0,
+                "mean_occupancy": mean_occ,
                 "skipped": True,
                 "reason": "baseline_validation_failed",
                 "n_components_used": n_components_used,
@@ -512,6 +521,7 @@ def _fit_gmms_per_bucket(
             "n_kept": n_kept,
             "n_dropped": drop_count,
             "p_fire": n_kept / n_TO,
+            "mean_occupancy": mean_occ,
             "skipped": False,
             "n_components_used": n_components_used,
             "n_components_candidates": list(candidate_ks),
@@ -700,7 +710,8 @@ def slowed_split_gmm(
     log.info("[refine.gmm] pass 1/2: harvesting (IPD, PW) per (meth, offset) ...")
     baseline_chunks: list = []
     slowed_chunks_by_TO: dict[tuple[int, int], list] = {}
-    _harvest_into(data, baseline_chunks, slowed_chunks_by_TO)
+    slowed_frac_by_TO: dict[tuple[int, int], list] = {}
+    _harvest_into(data, baseline_chunks, slowed_chunks_by_TO, slowed_frac_by_TO)
 
     if not baseline_chunks:
         log.warning("[refine.gmm] no baseline samples — keeping all slowed (no filter)")
@@ -719,6 +730,7 @@ def slowed_split_gmm(
     fit_params_by_TO, per_bucket_stats = _fit_gmms_per_bucket(
         baseline_pool,
         slowed_chunks_by_TO,
+        slowed_frac_by_TO,
         posterior_threshold=posterior_threshold,
         baseline_validation_min=baseline_validation_min,
         min_samples_for_gmm=min_samples_for_gmm,
@@ -824,11 +836,12 @@ def slowed_split_gmm_shards(
     )
     baseline_chunks: list = []
     slowed_chunks_by_TO: dict[tuple[int, int], list] = {}
+    slowed_frac_by_TO: dict[tuple[int, int], list] = {}
     for i, shard_path in enumerate(shard_paths, start=1):
         log.info("[refine.gmm.shards]   harvest %d/%d  %s", i, len(shard_paths), shard_path.name)
         with open(shard_path, "rb") as f:
             data = pickle.load(f)
-        _harvest_into(data, baseline_chunks, slowed_chunks_by_TO)
+        _harvest_into(data, baseline_chunks, slowed_chunks_by_TO, slowed_frac_by_TO)
         del data  # release the shard before loading the next
 
     if not baseline_chunks:
@@ -862,6 +875,7 @@ def slowed_split_gmm_shards(
     fit_params_by_TO, per_bucket_stats = _fit_gmms_per_bucket(
         baseline_pool,
         slowed_chunks_by_TO,
+        slowed_frac_by_TO,
         posterior_threshold=posterior_threshold,
         baseline_validation_min=baseline_validation_min,
         min_samples_for_gmm=min_samples_for_gmm,
@@ -870,7 +884,7 @@ def slowed_split_gmm_shards(
         rng=rng,
     )
     # Free the pool memory before phase 3.
-    del baseline_chunks, slowed_chunks_by_TO, baseline_pool
+    del baseline_chunks, slowed_chunks_by_TO, slowed_frac_by_TO, baseline_pool
 
     # ── Phase 3: apply per-shard, write atomically ─────────────────────
     log.info("[refine.gmm.shards] phase 3/3: filtering + writing %d shards ...", len(shard_paths))

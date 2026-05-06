@@ -66,6 +66,7 @@ from .utils.io import (
     resolve_motifs_for_species,
 )
 from .utils.motifs import (
+    build_reference_frac_map,
     build_reference_meth_map,
     filter_motif_string_by_types,
     load_motif_string,
@@ -104,19 +105,26 @@ def _rc_kmer(kmer_id: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _build_p_fire_lookup(p_fire_dict: dict | None) -> dict[tuple[int, int], float]:
-    """Convert ``{"m6A@+0": 0.42, ...}`` (from model_config.json) into
-    ``{(meth_id, offset): p_fire}`` keyed by integer ids.
+def _build_p_efficiency_lookup(
+    p_fire_dict: dict | None,
+    mean_occupancy_dict: dict | None,
+) -> dict[tuple[int, int], float]:
+    """Decompose training-corpus p_fire into the occupancy-independent
+    ``p_efficiency = p_fire / mean_occupancy`` term, keyed by ``(meth_id, offset)``.
 
-    Buckets the loader can't parse are dropped silently — they degrade to
-    "always fire" (p=1.0), the safe default.
+    Generate combines this with each target site's per-site frac:
+        Bernoulli rate = target_frac × p_efficiency
+
+    Returning ``{}`` (empty) makes generate fall back to "always fire" —
+    the safe default for checkpoints predating this plumbing.
     """
     from .utils.encoding import get_meth_ids
 
+    if not p_fire_dict:
+        return {}
+    occ_dict = mean_occupancy_dict or {}
     ids = get_meth_ids()
     out: dict[tuple[int, int], float] = {}
-    if not p_fire_dict:
-        return out
     for label, p in p_fire_dict.items():
         if "@" not in label:
             continue
@@ -128,7 +136,16 @@ def _build_p_fire_lookup(p_fire_dict: dict | None) -> dict[tuple[int, int], floa
             offset = int(off_str)
         except ValueError:
             continue
-        out[(T, offset)] = float(p)
+        # Without mean_occupancy (older checkpoints), treat p_fire as the
+        # composite rate and assume occupancy=1.0 so the decomposition is
+        # an identity operation downstream.
+        occ = float(occ_dict.get(label, 1.0))
+        if occ <= 0.0:
+            continue
+        eff = float(p) / occ
+        if eff > 1.0:
+            eff = 1.0  # numerical safety: noise can push above 1
+        out[(T, offset)] = eff
     return out
 
 
@@ -155,23 +172,31 @@ def _build_sig_offsets_by_meth_id() -> dict[int, set[int]]:
 
 def _apply_p_fire_to_mc(
     ctx: np.ndarray,
-    p_fire_lookup: dict[tuple[int, int], float],
+    p_eff_lookup: dict[tuple[int, int], float],
     sig_offsets: dict[int, set[int]],
     pred_idx: int,
+    ref_pos: int,
+    target_frac_arr: np.ndarray | None,
 ) -> None:
     """Roll an independent Bernoulli per non-zero mc entry; zero non-firing.
 
-    For ``ctx[i] = T`` (a methylation in this row's context window): the
+    For ``ctx[i] = T`` (a methylation in this row's context window) the
     row is at offset ``k = pred_idx - i`` of a canonical site at
-    ``ref_pos - k``. If ``k`` is one of T's signature offsets we look up
-    ``p_fire[(T, k)]`` and on a "no-fire" roll we zero ``ctx[i]`` — the
-    model then sees baseline context at this row, which simultaneously
-    handles the canonical centre AND its phantom downstream footprints.
+    ``ref_pos - k`` (in this generate path mc is built in ref coords —
+    canonical sits at ``ref_pos + (i - pred_idx)``).
 
-    Mutates ``ctx`` in place.
+    Bernoulli rate = ``target_site_frac × p_efficiency[(T, k)]``. The
+    target frac comes from the per-position ``target_frac_arr`` (built
+    from the destination genome's motifs.csv) so each ref site uses
+    *its own* occupancy, not the training-corpus average.
+
+    On no-fire, ``ctx[i]`` is zeroed: the model emits baseline-like
+    signal at this row, which simultaneously kills the canonical centre
+    AND its phantom +5 / +2 / +6 footprints.
     """
-    if not p_fire_lookup:
+    if not p_eff_lookup:
         return
+    n = target_frac_arr.shape[0] if target_frac_arr is not None else 0
     for i in range(len(ctx)):
         T = int(ctx[i])
         if T == 0:
@@ -180,8 +205,16 @@ def _apply_p_fire_to_mc(
         offsets = sig_offsets.get(T)
         if not offsets or k not in offsets:
             continue
-        p = p_fire_lookup.get((T, k), 1.0)
-        if p < 1.0 and np.random.random() >= p:
+        p_eff = p_eff_lookup.get((T, k), 1.0)
+        # Canonical ref_pos: row sits at offset (i - pred_idx) from canonical
+        # in ref coords (mc was built from ref_meth, both strands collapsed).
+        canonical_pos = ref_pos + (i - pred_idx)
+        if target_frac_arr is not None and 0 <= canonical_pos < n:
+            target_frac = float(target_frac_arr[canonical_pos])
+        else:
+            target_frac = 1.0  # fallback (unmapped path / out-of-bounds)
+        rate = target_frac * p_eff
+        if rate < 1.0 and np.random.random() >= rate:
             ctx[i] = 0
 
 
@@ -281,11 +314,12 @@ def _read_ckpt_meth_types(checkpoint_path: str) -> list[str] | None:
         return None
 
 
-def _load_p_fire(checkpoint_path: str) -> dict[tuple[int, int], float]:
-    """Read the ``p_fire`` block from model_config.json next to the checkpoint.
+def _load_p_efficiency(checkpoint_path: str) -> dict[tuple[int, int], float]:
+    """Read p_fire + mean_occupancy from model_config.json and decompose.
 
-    Empty when the checkpoint pre-dates p_fire plumbing (fallback: no
-    Bernoulli, every site fires deterministically — same as before).
+    Returns ``{(meth_id, offset): p_efficiency}``. Empty when the
+    checkpoint predates this plumbing — generate falls back to "always
+    fire" (no Bernoulli), which matches pre-decomposition behaviour.
     """
     config_path = os.path.join(os.path.dirname(checkpoint_path), "model_config.json")
     if not os.path.exists(config_path):
@@ -295,7 +329,7 @@ def _load_p_fire(checkpoint_path: str) -> dict[tuple[int, int], float]:
             cfg = json.load(f)
     except (OSError, json.JSONDecodeError):
         return {}
-    return _build_p_fire_lookup(cfg.get("p_fire"))
+    return _build_p_efficiency_lookup(cfg.get("p_fire"), cfg.get("mean_occupancy"))
 
 
 def _resolve_meth_types(
@@ -451,21 +485,24 @@ def generate_signals(
     meth_map = build_reference_meth_map(
         ref_seqs, motif_string, revcomp=revcomp, no_fuzznuc=no_fuzznuc
     )
+    # Per-position fraction (target-genome occupancy) — pairs with p_efficiency
+    # so the per-site Bernoulli rate at generate is target_frac × p_efficiency.
+    frac_map = build_reference_frac_map(ref_seqs, motif_string, revcomp=revcomp)
 
     # Keep regex motifs for the fallback path (unmapped reads)
     fallback_motifs = parse_motifs(motif_string, revcomp=revcomp)
 
     log.info("Loading checkpoint: %s", checkpoint_path)
     model = _load_model(checkpoint_path, device)
-    p_fire_lookup = _load_p_fire(checkpoint_path)
+    p_eff_lookup = _load_p_efficiency(checkpoint_path)
     sig_offsets = _build_sig_offsets_by_meth_id()
-    if p_fire_lookup:
+    if p_eff_lookup:
         log.info(
             "Statistical firing enabled: %d (meth, offset) buckets with p_fire ∈ "
             "[%.2f, %.2f]",
-            len(p_fire_lookup),
-            min(p_fire_lookup.values()),
-            max(p_fire_lookup.values()),
+            len(p_eff_lookup),
+            min(p_eff_lookup.values()),
+            max(p_eff_lookup.values()),
         )
     else:
         log.info("No p_fire in checkpoint — every motif site fires deterministically.")
@@ -517,8 +554,9 @@ def generate_signals(
                     ref_seqs,
                     maf_mapping,
                     meth_map,
+                    frac_map,
                     fallback_motifs,
-                    p_fire_lookup,
+                    p_eff_lookup,
                     sig_offsets,
                     model,
                     device,
@@ -537,8 +575,9 @@ def generate_signals(
                 ref_seqs,
                 maf_mapping,
                 meth_map,
+                frac_map,
                 fallback_motifs,
-                p_fire_lookup,
+                p_eff_lookup,
                 sig_offsets,
                 model,
                 device,
@@ -561,8 +600,9 @@ def _process_batch(
     ref_seqs,
     maf_mapping,
     meth_map,
+    frac_map,
     fallback_motifs,
-    p_fire_lookup,
+    p_eff_lookup,
     sig_offsets,
     model,
     device,
@@ -616,6 +656,7 @@ def _process_batch(
             ref_seq = ref_seqs[ref_name]
             ref_len = len(ref_seq)
             ref_meth = meth_map[ref_name]
+            ref_frac = frac_map.get(ref_name) if frac_map else None
 
             # Extended context pads K//2 bases on each side from the reference,
             # ensuring accurate 11-mer encoding at the read edges.
@@ -649,7 +690,10 @@ def _process_batch(
                                     ctx[k_pos] = int(ref_meth[rp_k % ref_len])
                                 elif 0 <= rp_k < ref_len:
                                     ctx[k_pos] = int(ref_meth[rp_k])
-                            _apply_p_fire_to_mc(ctx, p_fire_lookup, sig_offsets, _PRED_IDX)
+                            _apply_p_fire_to_mc(
+                                ctx, p_eff_lookup, sig_offsets, _PRED_IDX,
+                                ref_pos, ref_frac,
+                            )
                             meth_id = int(ctx[_PRED_IDX])
                             all_kmer_ids.append(current_kmer)
                             all_rc_kmer_ids.append(_rc_kmer(current_kmer))
@@ -685,7 +729,13 @@ def _process_batch(
                         rp_k = center + k_pos - _LEFT
                         if 0 <= rp_k < n_status:
                             ctx[k_pos] = int(meth_status[rp_k])
-                    _apply_p_fire_to_mc(ctx, p_fire_lookup, sig_offsets, _PRED_IDX)
+                    # Unmapped path: no per-site frac available — pass None
+                    # so _apply_p_fire_to_mc falls back to target_frac=1.0
+                    # (Bernoulli rate becomes p_efficiency alone).
+                    _apply_p_fire_to_mc(
+                        ctx, p_eff_lookup, sig_offsets, _PRED_IDX,
+                        center, None,
+                    )
                     meth_id = int(ctx[_PRED_IDX])
                     all_kmer_ids.append(current_kmer)
                     all_rc_kmer_ids.append(_rc_kmer(current_kmer))
@@ -864,19 +914,20 @@ def generate_from_bam(
     meth_map = build_reference_meth_map(
         ref_seqs, motif_string, revcomp=revcomp, no_fuzznuc=no_fuzznuc
     )
+    frac_map = build_reference_frac_map(ref_seqs, motif_string, revcomp=revcomp)
     fallback_motifs = parse_motifs(motif_string, revcomp=revcomp)
 
     log.info("Loading checkpoint: %s", checkpoint_path)
     model = _load_model(checkpoint_path, device_obj)
-    p_fire_lookup = _load_p_fire(checkpoint_path)
+    p_eff_lookup = _load_p_efficiency(checkpoint_path)
     sig_offsets = _build_sig_offsets_by_meth_id()
-    if p_fire_lookup:
+    if p_eff_lookup:
         log.info(
             "Statistical firing enabled: %d (meth, offset) buckets with p_fire ∈ "
             "[%.2f, %.2f]",
-            len(p_fire_lookup),
-            min(p_fire_lookup.values()),
-            max(p_fire_lookup.values()),
+            len(p_eff_lookup),
+            min(p_eff_lookup.values()),
+            max(p_eff_lookup.values()),
         )
     else:
         log.info("No p_fire in checkpoint — every motif site fires deterministically.")
@@ -943,8 +994,9 @@ def generate_from_bam(
                     ref_seqs,
                     batch_maf,
                     meth_map,
+                    frac_map,
                     fallback_motifs,
-                    p_fire_lookup,
+                    p_eff_lookup,
                     sig_offsets,
                     model,
                     device_obj,
@@ -966,8 +1018,9 @@ def generate_from_bam(
                 ref_seqs,
                 batch_maf,
                 meth_map,
+                frac_map,
                 fallback_motifs,
-                p_fire_lookup,
+                p_eff_lookup,
                 sig_offsets,
                 model,
                 device_obj,
