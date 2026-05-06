@@ -718,7 +718,7 @@ def slowed_split_gmm(
         log.warning("[refine.gmm] no baseline samples — keeping all slowed (no filter)")
         return _passthrough(data, method="gmm_no_baseline")
 
-    baseline_pool = np.concatenate(baseline_chunks)  # (N, 2)
+    baseline_pool = np.concatenate(baseline_chunks).astype(np.float64)  # (N, 2)
     log.info(
         "[refine.gmm] baseline pool: n=%d  IPD mean=%.2f std=%.2f  PW mean=%.2f std=%.2f",
         len(baseline_pool),
@@ -855,7 +855,11 @@ def slowed_split_gmm_shards(
             atomic_write_pickle(data, out_path)
         return {"method": "gmm_no_baseline", "skipped": True, "n_shards": len(shard_paths)}
 
-    baseline_pool = np.concatenate(baseline_chunks)
+    # Cast to float64 — float32 sums of 56M values blow past float32
+    # precision and the resulting mean is wrong by several IPD units
+    # (the anchor logs would say IPD 26.4 when the real mean is 35.4).
+    baseline_pool = np.concatenate(baseline_chunks).astype(np.float64)
+    del baseline_chunks  # release the per-shard chunks now (~450 MB on bc2034)
     log.info(
         "[refine.gmm.shards] baseline pool: n=%d  IPD %.2f±%.2f  PW %.2f±%.2f",
         len(baseline_pool),
@@ -877,7 +881,7 @@ def slowed_split_gmm_shards(
         rng=rng,
     )
     # Free the pool memory before phase 3.
-    del baseline_chunks, slowed_chunks_by_TO, slowed_frac_by_TO, baseline_pool
+    del slowed_chunks_by_TO, slowed_frac_by_TO, baseline_pool
 
     # ── Phase 3: apply per-shard, write atomically ─────────────────────
     log.info("[refine.gmm.shards] phase 3/3: filtering + writing %d shards ...", len(shard_paths))
