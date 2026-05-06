@@ -9,9 +9,11 @@ predicts N(mu, sigma^2) per 11-mer context with methylation conditioning.
 
 Output BAMs carry standard PacBio tags: `fi:B:C` (IPD) and `fp:B:C` (PW).
 
-Two CLI tools are installed from the same repository:
-- **`kinsim`**      — ML pipeline: extract, merge, train, generate, evaluate, analyze
-- **`kinsim-prep`** — Data preparation: rebase, merge-motifs, manifest, filter, balance, parse
+A single CLI is installed:
+- **`kinsim`** — ML pipeline: extract, refine, train, generate, evaluate, analyze, verify-generate
+
+Convenience offline tools live in `scripts/` (run via `python scripts/<name>.py`):
+manifest count/validate/list, balance, filter, rebase fetch/parse, motif_merge.
 
 ## Sharded mode (preferred for ≥ 10 strains)
 
@@ -120,7 +122,7 @@ the baseline doesn't cluster cleanly (defensive).
 
 ```
 KinSim/
-├── pyproject.toml                  entry points: kinsim + kinsim-prep
+├── pyproject.toml                  single entry point: kinsim
 │
 ├── kinsim/                         ML pipeline package (v0.4.0)
 │   ├── __init__.py
@@ -146,28 +148,25 @@ KinSim/
 │   │
 │   └── utils/                      shared utilities
 │       ├── __init__.py
-│       ├── encoding.py             11-mer bit-packing (no dependencies)
+│       ├── encoding.py             11-mer bit-packing + get_meth_ids() (YAML-driven)
+│       ├── sample_layout.py        20-col row layout constants (COL_*, CATEGORY_*)
 │       ├── motifs.py               IUPAC motif parsing, sequence scanning, meth maps
 │       ├── config.py               manifest CSV loader, YAML config, logging setup
-│       └── io.py                   FASTA loading, MAF parsing, PBSIM3 discovery
+│       ├── io.py                   FASTA loading, MAF parsing, PBSIM3 discovery
+│       └── parsers/                methylation caller output parsers (plugin registry)
+│           ├── __init__.py         exports: BaseOutputParser, create_parser, list_parsers, auto_detect_parser
+│           ├── base.py             BaseOutputParser ABC
+│           ├── registry.py         @register decorator, factory functions
+│           ├── pacbio.py           PacBioParser -- motifs.csv with variable columns
+│           ├── modkit.py           ModkitParser -- modkit pileup --bedMethyl TSV (per-site, requires post motif discovery)
+│           ├── combined.py         CombinedParser -- mod_type,motif,offset,frac_mod,n_sites,source
+│           ├── rebase.py           REBASE web fetch + file parsing + fuzznuc patterns
+│           └── motif_merge.py      merge/filter/dedup motifs -> standard PacBio CSV
 │
-├── prep/                           data preparation package (kinsim-prep CLI)
-│   ├── __init__.py
-│   ├── __main__.py                 CLI router for kinsim-prep
-│   │
-│   ├── rebase.py                   REBASE web fetch + file parsing + fuzznuc patterns
-│   ├── motif_merge.py              merge/filter/dedup motifs -> standard PacBio CSV
+├── scripts/                        offline utilities (run with python scripts/X.py)
 │   ├── manifest.py                 manifest CSV CLI (count / validate / list)
 │   ├── balance.py                  balance .pkl by methylation type
-│   ├── filter.py                   filter .pkl by coverage, mod type, max keys
-│   └── callers/                    methylation caller output parsers (plugin registry)
-│       ├── __init__.py             exports: BaseOutputParser, create_parser, list_parsers, auto_detect_parser
-│       ├── base.py                 BaseOutputParser ABC
-│       ├── registry.py             @register decorator, factory functions
-│       ├── pacbio.py               PacBioParser -- motifs.csv with variable columns
-│       ├── modkit.py               ModkitParser -- modkit pileup --bedMethyl TSV
-│       ├── ipd_summary.py          IpdSummaryParser -- ipdSummary CSV/GFF3
-│       └── combined.py             CombinedParser -- mod_type,motif,offset,frac_mod,n_sites,source
+│   └── filter.py                   filter .pkl by coverage, mod type, max keys
 │
 ├── baseline/                       baseline models for comparison
 │   ├── __init__.py
@@ -265,9 +264,10 @@ build_reference_meth_map(ref_seqs, motif_string)  # genome-wide O(1) lookup arra
 Example: `"m6A,GATC,1;m4C,CCWGG,2"`.
 Position is 0-based index of the modified base within the pattern.
 
-`load_motif_string()` uses lazy imports from `prep.callers` and `prep.rebase`
-for file-based motif loading. Both packages are installed together so these
-imports always succeed.
+`load_motif_string()` uses lazy imports from `kinsim.utils.parsers` for
+file-based motif loading. Lazy because the parser module path was moved
+from the dissolved `prep/` package — the lazy form keeps the import
+graph DAG-safe.
 
 `build_reference_meth_map()` uses EMBOSS fuzznuc as primary backend for genome-wide
 motif scanning, with automatic fallback to Python regex if fuzznuc is not installed
@@ -275,7 +275,6 @@ or returns empty results (fuzznuc can silently fail on some IUPAC patterns).
 
 ### `kinsim/utils/config.py`
 Manifest CSV parsing, YAML config loading, and logging setup.
-Used by both `kinsim` and `prep` packages.
 
 ```python
 @dataclass
@@ -464,24 +463,24 @@ CLI: `kinsim evaluate <ckpt_dir> <pkl>`
 Training data analysis report (text + optional HTML).
 CLI: `kinsim analyze <pkl> [--output-dir reports/] [--no-html]`
 
-### `prep/` — Data Preparation Package
+### `kinsim/utils/parsers/` — Methylation Caller Parsing Library
 
-#### `prep/callers/`
+#### `kinsim/utils/parsers/`
 Read-only parsing library for methylation caller output files. Plugin registry
 with `@register` decorator — adding a new format = one file + `@register` class.
 
 ```python
-from prep.callers import create_parser, list_parsers, auto_detect_parser
+from kinsim.utils.parsers import create_parser, list_parsers, auto_detect_parser
 
 # Explicit parser
-parser = create_parser("pacbio")       # or "modkit", "ipd_summary", "combined"
+parser = create_parser("pacbio")       # or "modkit", "combined"
 motif_string = parser.parse("motifs.csv", min_fraction=0.40, min_detected=20)
 
 # Auto-detect from file content
 parser = auto_detect_parser("output.csv")
 
 # List registered parsers
-list_parsers()  # ['combined', 'ipd_summary', 'modkit', 'pacbio']
+list_parsers()  # ['combined', 'modkit', 'pacbio']
 ```
 
 **BaseOutputParser ABC** (`base.py`):
@@ -494,8 +493,9 @@ list_parsers()  # ['combined', 'ipd_summary', 'modkit', 'pacbio']
 Required: `motifString`, `centerPos`. Optional: `modificationType`, `fraction`, `nDetected`.
 
 **ModkitParser** (`modkit.py`): Handles modkit pileup `--bedMethyl` TSV (11+ columns).
-
-**IpdSummaryParser** (`ipd_summary.py`): Auto-detects CSV vs GFF3 from ipdSummary.
+**Note**: emits per-site pseudo-motifs (`chrom:start:strand`), NOT real motif
+patterns. End users feeding raw modkit output need a separate motif-discovery
+step (or use the upstream PacBio motifmaker output if available).
 
 **CombinedParser** (`combined.py`): Handles combined methylation CSV with columns:
 `mod_type,motif,offset,frac_mod,n_sites,source`. Auto-detected when CSV header
@@ -504,7 +504,7 @@ contains both `mod_type` and `frac_mod`.
 **Integration**: `load_motif_string()` in `kinsim/utils/motifs.py` accepts optional
 `parser_name` kwarg. When provided, bypasses auto-detection and uses the named parser.
 
-#### `prep/rebase.py`
+#### `kinsim/utils/parsers/rebase.py`
 Converts REBASE notation (1-based) to KinSim notation (0-based).
 
 ```python
@@ -518,30 +518,30 @@ decode_fuzznuc_pattern_name(name) -> (meth_id, mod_pos)
 fetch_rebase_org(org_num, output_path) -> list[dict]   # web fetch
 ```
 
-CLI:
-- `kinsim-prep rebase fetch <org_num>` — fetch from REBASE website, write CSV
-- `kinsim-prep rebase parse <file>` — parse local REBASE file, print motif string
-- `kinsim-prep rebase patterns <motifs> <outfile>` — write fuzznuc pattern file
+CLI (run via `python -m kinsim.utils.parsers.rebase ...`):
+- `fetch <org_num> --output <csv>` — fetch from REBASE website, write CSV
+- `parse <file>` — parse local REBASE file, print motif string
+- `patterns <motifs> <outfile>` — write fuzznuc pattern file
 
-#### `prep/motif_merge.py`
+#### `kinsim/utils/parsers/motif_merge.py`
 Merges, filters, and deduplicates motifs from calling-derived CSV and REBASE
 into a single standard PacBio `motifs.csv`.
 
-CLI: `kinsim-prep merge-motifs species_motifs.csv rebase_motifs.csv --output final_motifs.csv`
+CLI: `python -m kinsim.utils.parsers.motif_merge species_motifs.csv rebase_motifs.csv --output final_motifs.csv`
 
-#### `prep/filter.py`
+#### `scripts/filter.py`
 Filter .pkl by coverage, mod type, or max keys.
 
-CLI: `kinsim-prep filter general.pkl training.pkl --min-coverage 50 --mod-type m6A,m5C`
+CLI: `python scripts/filter.py general.pkl training.pkl --min-coverage 50 --mod-type m6A,m5C`
 
-#### `prep/manifest.py`
+#### `scripts/manifest.py`
 Manifest CSV inspection utilities.
 
 CLI:
 ```
-kinsim-prep manifest count <csv>       # prints integer for SLURM --array
-kinsim-prep manifest validate <csv>    # checks duplicates, file existence
-kinsim-prep manifest list <csv>        # tabular display
+python scripts/manifest.py count <csv>       # prints integer for SLURM --array
+python scripts/manifest.py validate <csv>    # checks duplicates, file existence
+python scripts/manifest.py list <csv>        # tabular display
 ```
 
 ---
@@ -608,24 +608,22 @@ kinsim evaluate               -> kinsim/evaluate.py
 kinsim verify-generate        -> kinsim/verify_generate.py    (per-(kmer, meth) ref vs gen)
 kinsim analyze                -> kinsim/analyze.py
 
-# Auxiliary scripts (run with python, not via the CLI) -------------------
-scripts/sample.py             — subsample a shard pkl
-scripts/strip_kinetics.py     — strip fi/fp/ri/rp from a BAM
-scripts/compare.py            — cross-dataset kinetic comparison
-scripts/inspect_null_model.py — inspect an ipdSummary .npz.gz null model
+# Offline tooling (run with python, not via the CLI) --------------------
+python scripts/manifest.py        — count / validate / list manifest CSV
+python scripts/balance.py         — balance .pkl by mod type
+python scripts/filter.py          — filter .pkl by coverage / mod type / max keys
+python scripts/sample.py          — subsample a shard pkl
+python scripts/strip_kinetics.py  — strip fi/fp/ri/rp from a BAM
+python scripts/compare.py         — cross-dataset kinetic comparison
+python scripts/inspect_null_model.py — inspect an ipdSummary .npz.gz null model
 
-# kinsim-prep -- data preparation ----------------------------------------
-kinsim-prep parse             -> kinsim/utils/motifs.py        (unified motif parser)
-kinsim-prep rebase            -> prep/rebase.py                (REBASE fetch + parse)
-kinsim-prep merge-motifs      -> prep/motif_merge.py           (merge + filter + dedup)
-kinsim-prep manifest          -> prep/manifest.py              (count/validate/list)
-kinsim-prep filter            -> prep/filter.py                (filter .pkl)
-kinsim-prep balance           -> prep/balance.py               (balance .pkl by mod type)
+python -m kinsim.utils.parsers.rebase       — REBASE fetch / parse
+python -m kinsim.utils.parsers.motif_merge  — merge + filter + dedup motifs
 ```
 
-Typo suggestions via `difflib.get_close_matches` in both `__main__.py` files.
-If a user types `kinsim prep`, `kinsim rebase`, etc., a helpful redirect message
-points them to `kinsim-prep`.
+Typo suggestions via `difflib.get_close_matches` in `kinsim/__main__.py`.
+The `kinsim-prep` console script was removed during the prep/ dissolution;
+its functionality is in `scripts/` and `kinsim/utils/parsers/`.
 
 ---
 
@@ -653,38 +651,39 @@ from ..utils.encoding import K, kmer_mask
 from ..data.dataset import log_transform, inv_log_transform
 ```
 
-### Within `prep/` package
+### Within `kinsim/utils/parsers/` package
 
-Files under `prep/callers/` are **1 level** below `prep/`.
-Use absolute imports for `kinsim` modules:
+Use relative imports for sibling modules, and absolute imports for the
+rest of `kinsim`:
 
 ```python
-# From prep/callers/:
-from kinsim.utils.encoding import METH_IDS
+# From kinsim/utils/parsers/<name>.py:
+from kinsim.utils.encoding import METH_IDS, get_meth_ids
 from .base import BaseOutputParser
 from .registry import register
 ```
 
-Files directly under `prep/` use absolute imports for `kinsim`:
+`scripts/` files are run as standalone python scripts, so they import
+`kinsim` absolutely:
 
 ```python
-# From prep/:
+# From scripts/<name>.py:
 from kinsim.utils.encoding import METH_IDS
 from kinsim.utils.motifs import load_motif_string
 from kinsim.utils.config import setup_logging, load_manifest
 ```
 
-### Cross-package lazy imports (in `kinsim/utils/motifs.py`)
+### Lazy imports in `kinsim/utils/motifs.py`
 
-`load_motif_string()` and `_build_meth_map_fuzznuc()` use lazy imports from `prep`
-to avoid circular imports at module-load time. Both packages are always co-installed
-(same `pyproject.toml`), so these imports always succeed at runtime:
+`load_motif_string()` and `_build_meth_map_fuzznuc()` use lazy imports from
+`kinsim.utils.parsers` to keep the import graph DAG-safe (the parsers
+module can transitively touch `motifs` for IUPAC helpers):
 
 ```python
-from prep.callers import create_parser      # lazy, inside function
-from prep.callers import auto_detect_parser # lazy, inside function
-from prep.rebase import parse_rebase_file   # lazy, inside function
-from prep.rebase import write_fuzznuc_pattern_file  # lazy, inside function
+from kinsim.utils.parsers import create_parser      # lazy, inside function
+from kinsim.utils.parsers import auto_detect_parser # lazy, inside function
+from kinsim.utils.parsers.rebase import parse_rebase_file   # lazy
+from kinsim.utils.parsers.rebase import write_fuzznuc_pattern_file  # lazy
 ```
 
 **Never use bare `print()` for operational output.**
@@ -754,7 +753,7 @@ torch.save({
 
 ### Manifest CSV
 - Manifest columns: `sample_id`, `bam_path`, `motifs` (CSV with header).
-- Count rows for `--array`: `N=$(kinsim-prep manifest count manifest.csv)`.
+- Count rows for `--array`: `N=$(python scripts/manifest.py count manifest.csv)`.
 - Output shard naming: `shards/<sample_id>_shard.pkl` (derived from manifest `sample_id`).
 
 ---
@@ -765,17 +764,17 @@ torch.save({
 - **Do not** use `verbose=True` in `ReduceLROnPlateau` — crashes on PyTorch >= 2.1.
 - **Do not** hardcode architecture params in `generate.py` — always read from `model_config.json` via `create_from_config()`.
 - **Do not** modify `motifs.py` for stoichiometric fraction handling — fractions are parsed at the storage level (`_build_fraction_lookup` in `extract.py` and `generate.py`).
-- **Do not** add new callers/parsers outside of `prep/callers/` — use the `@register` decorator pattern.
-- **Do not** add data preparation commands to `kinsim/__main__.py` — they belong in `prep/__main__.py`.
-- **Do not** use relative imports (`from ..prep`) from `kinsim` to reach `prep` — use absolute `from prep.` imports (lazy, inside functions only).
+- **Do not** add new callers/parsers outside of `kinsim/utils/parsers/` — use the `@register` decorator pattern.
+- **Do not** add data preparation logic to `kinsim/__main__.py` — convenience CLIs live in `scripts/` (run via `python scripts/<name>.py`).
+- **Do not** import parsers eagerly at module top — use lazy imports inside the function that needs them (the parser package transitively touches `kinsim.utils.motifs`).
 
 ---
 
 ## Adding a New Motif Parser
 
-1. Create `prep/callers/<name>.py` with a `@register` class inheriting `BaseOutputParser`.
+1. Create `kinsim/utils/parsers/<name>.py` with a `@register` class inheriting `BaseOutputParser`.
 2. Define `name`, `supported_mods`, `parse()`, and `is_file_for_this_parser()`.
-3. Import the new module in `prep/callers/__init__.py` to trigger registration.
+3. Import the new module in `kinsim/utils/parsers/__init__.py` to trigger registration.
 4. The parser is immediately available via `create_parser("name")` and auto-detection.
 
 ---
