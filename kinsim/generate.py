@@ -252,7 +252,11 @@ def generate_signals_batch(
 
     K_SIZE = METH_CTX_LEN
     PRED_IDX = METH_CTX_LEFT
-    NUM_M = 4
+    # Number of methylation states is set by the trained model — read it
+    # from the model's config rather than hard-coding 4. Adding a new mod
+    # type to kinsim_config.yaml widens this automatically once the model
+    # is retrained; the saved checkpoint carries the correct value.
+    NUM_M = int(model.get_config().get("num_meth_types", 4))
     ctx_np = np.asarray(meth_contexts, dtype=np.int64)
     meth_full_np = np.zeros((N, K_SIZE, NUM_M), dtype=np.float32)
 

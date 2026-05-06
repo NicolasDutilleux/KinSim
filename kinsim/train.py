@@ -398,6 +398,7 @@ class KineticDataModule(L.LightningDataModule):
         test_fraction: float | None = None,
         val_fraction: float = 0.10,
         batch_size: int = 4096,
+        num_meth_types: int | None = None,
         seed: int = 42,
     ) -> None:
         super().__init__()
@@ -407,6 +408,13 @@ class KineticDataModule(L.LightningDataModule):
         self.test_fraction = test_fraction
         self.val_fraction = val_fraction
         self.batch_size = batch_size
+        # ``num_meth_types`` defaults to whatever the YAML declares right now
+        # (max meth_id + 1 from get_meth_ids()). Caller can override for tests
+        # or to pin a value matching a pre-existing checkpoint.
+        if num_meth_types is None:
+            from .utils.encoding import get_meth_ids
+            num_meth_types = max(get_meth_ids().values()) + 1
+        self.num_meth_types = int(num_meth_types)
         self.seed = seed
         # populated in setup()
         self._train_subset = None
@@ -423,7 +431,7 @@ class KineticDataModule(L.LightningDataModule):
     # ── Single-pkl path ────────────────────────────────────────────────
     def _setup_monolithic(self, stage: str | None) -> None:
         if stage in ("fit", None):
-            dataset = MLPSignalDataset(self.input_path)
+            dataset = MLPSignalDataset(self.input_path, num_meth_types=self.num_meth_types)
             n_val = max(1, int(len(dataset) * self.val_fraction))
             n_train = len(dataset) - n_val
             rng = torch.Generator().manual_seed(self.seed)
@@ -432,7 +440,7 @@ class KineticDataModule(L.LightningDataModule):
             self._val_subset = Subset(dataset, indices[n_train:])
             log.info("Data split — train: %d samples, val: %d samples", n_train, n_val)
         if stage in ("test", None) and self.test_pkl:
-            self._test_dataset = MLPSignalDataset(self.test_pkl)
+            self._test_dataset = MLPSignalDataset(self.test_pkl, num_meth_types=self.num_meth_types)
             log.info("Test set: %d keys from %s", len(self._test_dataset), self.test_pkl)
 
     # ── Sharded path ───────────────────────────────────────────────────
@@ -472,17 +480,20 @@ class KineticDataModule(L.LightningDataModule):
             self._train_subset = ShardedSignalDataset(
                 train_only_shards,
                 shuffle=True,
+                num_meth_types=self.num_meth_types,
                 seed=self.seed,
             )
             self._val_subset = ShardedSignalDataset(
                 val_shards,
                 shuffle=False,
+                num_meth_types=self.num_meth_types,
                 seed=self.seed + 100,
             )
         if stage in ("test", None) and test_shards:
             self._test_dataset = ShardedSignalDataset(
                 test_shards,
                 shuffle=False,
+                num_meth_types=self.num_meth_types,
                 seed=self.seed + 200,
             )
 
@@ -877,6 +888,9 @@ def objective(
     Returns:
         Best val_loss seen during this trial (lower is better).
     """
+    from .utils.encoding import get_meth_ids
+    num_meth_types = max(get_meth_ids().values()) + 1
+
     lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
     dropout = trial.suggest_float("dropout", 0.0, 0.4)
 
@@ -890,6 +904,7 @@ def objective(
             conv_dim=conv_dim,
             head_dim=head_dim,
             kernel_size=kernel_size,
+            num_meth_types=num_meth_types,
             dropout=dropout,
         )
     else:
@@ -899,6 +914,7 @@ def objective(
             kmer_embed_dim=kmer_embed_dim,
             hidden_dim=hidden_dim,
             meth_proj_dim=8,
+            num_meth_types=num_meth_types,
             dropout=dropout,
         )
 
@@ -907,6 +923,7 @@ def objective(
         input_path=pkl_path,
         val_fraction=val_fraction,
         batch_size=batch_size,
+        num_meth_types=num_meth_types,
     )
 
     callbacks: list = [EarlyStopping(monitor="val_loss", patience=5, mode="min")]
@@ -1068,6 +1085,16 @@ def train_mlp(
     # ── Build model ───────────────────────────────────────────────────────
     accelerator = "gpu" if device == "cuda" and torch.cuda.is_available() else "cpu"
 
+    # Number of methylation states is YAML-driven: max(meth_id) + 1 from
+    # get_meth_ids(). Adding a new mod type to kinsim_config.yaml's
+    # ``kinetic_signatures`` is enough to widen the embedding here — no
+    # code change. The value is persisted in model_config.json via
+    # model.get_config(), so generate.py reads it back at inference and
+    # never relies on the YAML matching the trained model.
+    from .utils.encoding import get_meth_ids
+    num_meth_types = max(get_meth_ids().values()) + 1
+    log.info("num_meth_types from YAML: %d (meth_id_map=%s)", num_meth_types, get_meth_ids())
+
     if architecture == "conv":
         log.info(
             "Training — arch=conv  %d epochs  loss=%s  lr=%.2e  base_embed=%d  "
@@ -1087,6 +1114,7 @@ def train_mlp(
         model = ConvPredictor(
             base_embed_dim=base_embed_dim,
             meth_proj_dim=meth_proj_dim,
+            num_meth_types=num_meth_types,
             conv_dim=conv_dim,
             n_conv_layers=n_conv_layers,
             kernel_size=kernel_size,
@@ -1110,6 +1138,7 @@ def train_mlp(
             kmer_embed_dim=kmer_embed_dim,
             hidden_dim=hidden_dim,
             meth_proj_dim=meth_proj_dim,
+            num_meth_types=num_meth_types,
             dropout=dropout,
         )
 
@@ -1183,6 +1212,7 @@ def train_mlp(
         test_fraction=test_fraction,
         val_fraction=val_fraction,
         batch_size=batch_size,
+        num_meth_types=num_meth_types,
         seed=split_seed,
     )
 
