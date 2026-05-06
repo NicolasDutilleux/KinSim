@@ -674,9 +674,9 @@ def extract_to_shard(
 ) -> None:
     """Extract a shard from an aligned bystrandified BAM with strand-aware kinetics.
 
-    The output pkl is a dict[kmer_id (int) -> ndarray(N, 38)] following
-    the same layout as ``kinsim/extract.py``. Refine, train, analyze
-    operate identically on the resulting shards.
+    The output pkl is a dict[kmer_id (int) -> ndarray(N, 20)] following
+    the layout in :mod:`kinsim.utils.sample_layout`. Refine, train,
+    analyze operate identically on the resulting shards.
     """
     cfg = load_kinsim_config()
     extract_cfg = cfg.get("extract") or {}

@@ -7,7 +7,7 @@ Either:
     ``ShardedSignalDataset``, never holds the corpus in RAM
   - a single ``shard.pkl`` (small datasets / debugging) — loads into RAM
 
-Each shard is ``dict[kmer_id (int) → np.ndarray(N, 38)]`` with the column
+Each shard is ``dict[kmer_id (int) → np.ndarray(N, 20)]`` with the column
 layout from :mod:`kinsim.utils.sample_layout`. Produced by
 ``kinsim extract`` and optionally filtered by ``kinsim refine``.
 
@@ -439,7 +439,9 @@ class KineticDataModule(L.LightningDataModule):
     def _setup_sharded(self, stage: str | None) -> None:
         all_shards = list_shards(self.input_path)
         if not all_shards:
-            raise FileNotFoundError(f"No *_shard.pkl in {self.input_path}")
+            raise FileNotFoundError(
+                f"No *_shard*.pkl (raw or refined) in {self.input_path}"
+            )
 
         train_shards, test_shards = split_shards(
             all_shards,
@@ -743,12 +745,14 @@ def _read_pkl_meta(pkl_path: str) -> dict:
     """Return the ``__meta__`` provenance dict from a training .pkl, or {}.
 
     For sharded mode (pkl_path is a directory), reads the meta from the
-    first ``*_shard.pkl`` found — refine writes the same global stats
-    (including ``per_bucket`` p_fire) into every shard's __meta__.
+    first ``*_shard*.pkl`` found (matches both raw ``<sample>_shard.pkl``
+    and refined ``<sample>_shard_clean.pkl``) — refine writes the same
+    global stats (including ``per_bucket`` p_fire) into every shard's
+    __meta__.
     """
     p = Path(pkl_path)
     if p.is_dir():
-        shard = next(iter(sorted(p.glob("*_shard.pkl"))), None)
+        shard = next(iter(sorted(p.glob("*_shard*.pkl"))), None)
         if shard is None:
             return {}
         p = shard

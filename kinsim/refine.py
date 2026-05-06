@@ -100,7 +100,7 @@ def slowed_split(
     distribution.
 
     Args:
-        data: dict[kmer_id -> ndarray(N, 38)]. Col 35 carries the
+        data: dict[kmer_id -> ndarray(N, 20)]. Col 17 carries the
             category enum (0=baseline, 1=slowed, 2=near_meth).
         secondary_pct: percentile of the per-kmer baseline mean used as
             the lower threshold for slowed samples (typically 95).

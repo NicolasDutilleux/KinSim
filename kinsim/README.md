@@ -24,7 +24,7 @@ motifs.csv   ──┴──► kinsim extract  ──► shards/*.pkl
 ```
 
 Each stage consumes the previous stage's output. Shards are the canonical
-on-disk format throughout — `dict[kmer_id (int) → np.ndarray(N, 38)]`,
+on-disk format throughout — `dict[kmer_id (int) → np.ndarray(N, 20)]`,
 plus a `__meta__` provenance entry. The 20-column layout is defined in
 [`utils/sample_layout.py`](utils/sample_layout.py).
 

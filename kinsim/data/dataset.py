@@ -416,8 +416,13 @@ class ShardedSignalDataset(IterableDataset):
 # ---------------------------------------------------------------------------
 
 
-def list_shards(shards_dir, glob: str = "*_shard.pkl") -> list[str]:
-    """Return a sorted list of shard pkl paths in ``shards_dir``."""
+def list_shards(shards_dir, glob: str = "*_shard*.pkl") -> list[str]:
+    """Return a sorted list of shard pkl paths in ``shards_dir``.
+
+    Default glob ``*_shard*.pkl`` matches both raw extract output
+    (``<sample>_shard.pkl``) and refined output (``<sample>_shard_clean.pkl``)
+    so train can be pointed at either.
+    """
     return sorted(str(p) for p in Path(shards_dir).glob(glob))
 
 

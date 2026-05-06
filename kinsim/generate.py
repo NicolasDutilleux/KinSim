@@ -248,7 +248,7 @@ def generate_signals_batch(
     meth_ids_bin = np.asarray(meth_ids, dtype=np.int64)
     fractions_bin = np.asarray(fractions, dtype=np.float32)
 
-    from .extract import METH_CTX_LEFT, METH_CTX_LEN
+    from .utils.sample_layout import METH_CTX_LEFT, METH_CTX_LEN
 
     K_SIZE = METH_CTX_LEN
     PRED_IDX = METH_CTX_LEFT
@@ -633,10 +633,10 @@ def _process_batch(
     is_n_context = []  # Per-position flag: True = N-context, use default signal
     read_offsets = [0]
     _K = K
-    from .extract import METH_CTX_LEFT, METH_CTX_LEN, METH_CTX_RIGHT
+    from .utils.sample_layout import METH_CTX_LEFT, METH_CTX_LEN, METH_CTX_RIGHT
 
-    _LEFT = METH_CTX_LEFT  # 8
-    _RIGHT = METH_CTX_RIGHT  # 2
+    _LEFT = METH_CTX_LEFT  # 7
+    _RIGHT = METH_CTX_RIGHT  # 3
     _CTX_LEN = METH_CTX_LEN  # 11
     _PRED_IDX = METH_CTX_LEFT  # prediction position inside the context array
     _ZERO_CTX = np.zeros(_CTX_LEN, dtype=np.int64)  # placeholder for N/unmapped
