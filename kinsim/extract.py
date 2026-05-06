@@ -79,13 +79,7 @@ from .utils.sample_layout import (
     CATEGORY_BASELINE,
     CATEGORY_NEAR_METH,
     CATEGORY_SLOWED,
-    COL_CATEGORY,
-    COL_PARENT_METH,
-    COL_PARENT_OFFSET,
     METH_CTX_LEFT,
-    METH_CTX_LEN,
-    REV_METH_OFFSETS,
-    SAMPLE_NCOLS,
 )
 
 try:
@@ -353,11 +347,21 @@ def _build_contig_arrays(
         excluded[:-d] |= meth_present[d:]
         excluded[d:] |= meth_present[:-d]
 
+    # Pre-pad meth arrays so the inner-loop meth_context slice never
+    # needs bounds-checking. PAD=METH_CTX_LEFT covers all offsets the
+    # hot path ever touches (mc up to ±7, rev_meth up to ±1). With
+    # padding, mc becomes a single numpy slice — no np.where, no np.clip.
+    PAD = METH_CTX_LEFT  # = 7
+    fwd_meth_padded = np.zeros(n + 2 * PAD, dtype=np.int8)
+    fwd_meth_padded[PAD:PAD + n] = fwd_meth_arr
+    rev_meth_padded = np.zeros(n + 2 * PAD, dtype=np.int8)
+    rev_meth_padded[PAD:PAD + n] = rev_meth_arr
+
     return {
         "kmer_fwd": kmer_fwd,
         "kmer_rev": kmer_rev,
-        "fwd_meth": fwd_meth_arr,
-        "rev_meth": rev_meth_arr,
+        "fwd_meth_padded": fwd_meth_padded,
+        "rev_meth_padded": rev_meth_padded,
         "fwd_slowed_T": fwd_slowed_T,
         "fwd_slowed_off": fwd_slowed_off,
         "fwd_slowed_frac": fwd_slowed_frac,
@@ -436,10 +440,8 @@ def _extract_one_bam(
     n_slowed = n_near = n_baseline_seen = n_baseline_kept = 0
     n_reads_processed = n_reads_used = 0
 
-    # Polymerase-frame meth_context offsets: the 11 positions [-LEFT..+RIGHT].
-    # Built once; used to vectorise the per-row context slice.
-    mc_offsets = np.arange(METH_CTX_LEN, dtype=np.int64) - METH_CTX_LEFT
-    rev_offsets = np.array(REV_METH_OFFSETS, dtype=np.int64)
+    # PAD on each meth_padded array: the inner-loop slice doesn't bounds-check.
+    PAD = METH_CTX_LEFT  # = 7
 
     with pysam.AlignmentFile(bam_path, "rb", check_sq=True) as bam:
         bam_contigs = set(bam.references)
@@ -489,11 +491,10 @@ def _extract_one_bam(
                 near_T = arrs["fwd_near_T"]
                 near_off = arrs["fwd_near_off"]
                 near_frac = arrs["fwd_near_frac"]
-                pol_meth_arr = arrs["fwd_meth"]
-                opp_meth_arr = arrs["rev_meth"]
+                pol_padded = arrs["fwd_meth_padded"]
+                opp_padded = arrs["rev_meth_padded"]
                 kmer_arr = arrs["kmer_rev"]   # polymerase 5'→3' frame is the rc
-                mc_dir = +1                    # downstream pol = + ref direction
-                rev_dir = +1
+                pol_reverse_slice = False     # mc/rev read forward in pol frame
             else:
                 slowed_T = arrs["rev_slowed_T"]
                 slowed_off = arrs["rev_slowed_off"]
@@ -501,13 +502,12 @@ def _extract_one_bam(
                 near_T = arrs["rev_near_T"]
                 near_off = arrs["rev_near_off"]
                 near_frac = arrs["rev_near_frac"]
-                pol_meth_arr = arrs["rev_meth"]
-                opp_meth_arr = arrs["fwd_meth"]
+                pol_padded = arrs["rev_meth_padded"]
+                opp_padded = arrs["fwd_meth_padded"]
                 kmer_arr = arrs["kmer_fwd"]
-                mc_dir = -1
-                rev_dir = -1
+                pol_reverse_slice = True      # − strand polymerase reads ref backward
             excluded = arrs["excluded"]
-            n_ref = pol_meth_arr.shape[0]
+            n_ref = excluded.shape[0]
 
             for read_pos, ref_pos in read.get_aligned_pairs(matches_only=True):
                 if ref_pos < 0 or ref_pos >= n_ref:
@@ -541,26 +541,26 @@ def _extract_one_bam(
                         parent_off = 0
                         frac = 0.0
 
-                # Vectorised meth_context: 11 lookups on a padded array
-                # would be cleaner, but bounds-mask + take is just as fast
-                # and avoids a copy.
-                ctx_idx = ref_pos + mc_dir * mc_offsets
-                in_bounds = (ctx_idx >= 0) & (ctx_idx < n_ref)
-                mc = np.where(in_bounds, pol_meth_arr[np.clip(ctx_idx, 0, n_ref - 1)], 0)
+                # mc context (11 positions [-7..+3] in polymerase frame)
+                # and rev_meth (3 positions [-1..+1]) via single padded
+                # slices — no np.where, no np.clip. PAD=7 zeros on each
+                # side guarantee in-bounds for any ref_pos.
+                ppos = ref_pos + PAD
+                if pol_reverse_slice:
+                    mc = pol_padded[ppos - 3:ppos + 8][::-1]
+                    rev = opp_padded[ppos - 1:ppos + 2][::-1]
+                else:
+                    mc = pol_padded[ppos - 7:ppos + 4]
+                    rev = opp_padded[ppos - 1:ppos + 2]
 
-                rev_idx = ref_pos + rev_dir * rev_offsets
-                in_bounds = (rev_idx >= 0) & (rev_idx < n_ref)
-                rev_vals = np.where(in_bounds, opp_meth_arr[np.clip(rev_idx, 0, n_ref - 1)], 0)
-
-                row = np.zeros(SAMPLE_NCOLS, dtype=np.float32)
-                row[0] = ipd[read_pos]
-                row[1] = pw[read_pos]
-                row[2] = frac
-                row[3:14] = mc
-                row[14:17] = rev_vals
-                row[COL_CATEGORY] = cat
-                row[COL_PARENT_METH] = parent_meth
-                row[COL_PARENT_OFFSET] = parent_off
+                # Tuple instead of np.zeros() per row — 5-10× faster.
+                # tolist() handles the int8→Python-int unbox once per row.
+                row = (
+                    float(ipd[read_pos]), float(pw[read_pos]), frac,
+                    *mc.tolist(),
+                    *rev.tolist(),
+                    cat, parent_meth, parent_off,
+                )
 
                 if cat == CATEGORY_BASELINE:
                     baseline_seen_per_kmer[kmer_id] += 1
