@@ -657,16 +657,15 @@ def load_motif_string(motifs_arg, min_fraction=0.40, min_detected=20, parser_nam
     """
     # Explicit parser requested
     if parser_name is not None:
-        from prep.callers import create_parser
+        from .parsers import create_parser
 
         parser = create_parser(parser_name)
         return parser.parse(motifs_arg, min_fraction=min_fraction, min_detected=min_detected)
 
     if os.path.isfile(motifs_arg):
-        # Try the callers registry first (covers combined CSV, PacBio CSV,
-        # modkit, ipd_summary) — auto-detection is more precise than the
-        # legacy parse_motifs_csv fallback.
-        from prep.callers import auto_detect_parser
+        # Try the callers registry first (covers PacBio motifs.csv,
+        # modkit bedMethyl, combined CSV).
+        from .parsers import auto_detect_parser
 
         parser = auto_detect_parser(motifs_arg)
         if parser is not None:
@@ -682,7 +681,7 @@ def load_motif_string(motifs_arg, min_fraction=0.40, min_detected=20, parser_nam
                 return result
 
         # Fall through to REBASE
-        from prep.rebase import parse_rebase_file
+        from .parsers.rebase import parse_rebase_file
 
         return parse_rebase_file(motifs_arg)
 
@@ -778,7 +777,7 @@ def _build_meth_map_fuzznuc(ref_seqs, motif_string, revcomp=True):
             meth_pos = (End - 1) - p
         (End is 1-based inclusive; the - strand 5' corresponds to End on +)
     """
-    from prep.rebase import write_fuzznuc_pattern_file
+    from .parsers.rebase import write_fuzznuc_pattern_file
 
     if not motif_string:
         return {name: np.zeros(len(seq), dtype=np.int8) for name, seq in ref_seqs.items()}
@@ -855,7 +854,7 @@ def _build_meth_map_fuzznuc(ref_seqs, motif_string, revcomp=True):
                         meth_id, mod_pos = pattern_lookup[pname]
                     else:
                         # Try decode from name convention directly
-                        from prep.rebase import decode_fuzznuc_pattern_name
+                        from .parsers.rebase import decode_fuzznuc_pattern_name
 
                         meth_id, mod_pos = decode_fuzznuc_pattern_name(pname)
 

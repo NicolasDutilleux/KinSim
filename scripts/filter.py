@@ -17,7 +17,7 @@ Filtering criteria (all optional, combinable):
   --max-keys       Keep only top N most data-rich keys
 
 CLI:
-    kinsim-prep filter general.pkl training.pkl [--min-coverage 50] [--min-fraction 0.4] [...]
+    python scripts/filter.py general.pkl training.pkl [--min-coverage 50] [--min-fraction 0.4] [...]
 """
 
 from __future__ import annotations
@@ -176,7 +176,7 @@ def main(argv=None) -> None:
     from kinsim.utils.config import setup_logging
 
     parser = argparse.ArgumentParser(
-        prog="kinsim-prep filter",
+        prog="python scripts/filter.py",
         description=(
             "Filter a General Dictionary .pkl into a Training Dictionary.\n\n"
             "The General Dictionary contains ALL extracted kinetic data.\n"
@@ -185,13 +185,13 @@ def main(argv=None) -> None:
             "re-extracting from BAMs.\n\n"
             "Examples:\n"
             "  # Keep only well-covered methylated keys:\n"
-            "  kinsim-prep filter general.pkl training.pkl --min-coverage 50\n\n"
+            "  python scripts/filter.py general.pkl training.pkl --min-coverage 50\n\n"
             "  # Keep methylated keys with >=40% mean fraction:\n"
-            "  kinsim-prep filter general.pkl training.pkl --min-fraction 0.4\n\n"
+            "  python scripts/filter.py general.pkl training.pkl --min-fraction 0.4\n\n"
             "  # Keep only m6A data:\n"
-            "  kinsim-prep filter general.pkl training.pkl --mod-type m6A\n\n"
+            "  python scripts/filter.py general.pkl training.pkl --mod-type m6A\n\n"
             "  # Keep top 100k most data-rich keys, m6A and m5C only:\n"
-            "  kinsim-prep filter general.pkl training.pkl \\\n"
+            "  python scripts/filter.py general.pkl training.pkl \\\n"
             "      --mod-type m6A,m5C --max-keys 100000 --min-coverage 10 --min-fraction 0.4"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,

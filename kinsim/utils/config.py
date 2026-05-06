@@ -30,7 +30,7 @@ A YAML config file can pin all training hyperparameters for reproducibility.
 Pass it with ``kinsim train --model mlp --config config.yaml``.
 
     # config_mlp.yaml
-    pkl:           /data/master.pkl
+    pkl:           /data/refined/        # directory of *_clean.pkl shards
     output_dir:    /data/checkpoints_mlp/
     epochs:        50
     batch_size:    4096
@@ -284,7 +284,6 @@ _DEFAULT_KINSIM_CONFIG = {
         "m5C": {"modified_base": "C", "signal_offsets": [2, 6]},
     },
     "meth_context": {"left": 7, "right": 3},
-    "kinetic_profile": {"start": 0, "end": 8},
     "extract": {
         "n_baseline_per_kmer": 50,
         "baseline_min_dist_to_meth": 11,

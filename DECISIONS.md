@@ -5,7 +5,156 @@ go on top. Each entry: **what** changed, **why**, **affected files**.
 
 ---
 
-## 2026-05-06 — Statistical-firing decomposition + 20-col layout + rev_meth FiLM + extract speed
+## 2026-05-06 (evening) — prep/ dissolved, parsers into kinsim, kinsim-prep CLI gone, fi/fp loud-fail, meth_id_map frozen at train
+
+### What
+- **`prep/` package dissolved.** Parsers (`callers/` + `rebase.py` + `motif_merge.py`) moved into `kinsim/utils/parsers/`. Convenience CLIs (`manifest.py`, `balance.py`, `filter.py`) moved to `scripts/`. `prep/__main__.py`, `prep/__init__.py`, `prep/README.md`, `prep/py.typed` deleted.
+- **`kinsim-prep` CLI entry point removed** from `pyproject.toml`. Single-binary distribution: only `kinsim` is exposed. Convenience scripts are invoked via `python scripts/<name>.py`.
+- **`prep/callers/ipd_summary.py` deleted.** GFF parsing path is unused for current pipelines and the user has standardised on motifs.csv.
+- **`slurm_kinsim/ml/run.sh`** updated: replaced `kinsim-prep manifest count` with a python one-liner using `csv.DictReader`. The build_manifest.sh scripts in dataset prep dirs still reference `kinsim-prep` — those break only on next prep-pipeline rerun and are tracked as a follow-up.
+- **`extract.py`: hard-fail on fi/fp fallback.** Previously, missing `ip` tags fell back silently to `fi` (forward-pass only — half data). Now `_extract_one_bam` raises `RuntimeError` if `ip`/`pw` are absent. The bystrandify sniff at the top also fails (instead of warns) when only `fi` is found.
+- **`train.py`: freeze `meth_id_map` in `model_config.json`.** Calls `get_meth_ids()` at config-save time and persists the full `{name: int}` mapping. Generate / evaluate can now decode integer meth IDs without re-deriving from the YAML — protects against YAML edits between train and generate.
+
+### Why
+- **prep/ dissolution**: the convenience-CLI / parser distinction was clearer once `extract` started actually depending on the parsers (via `motifs.load_motif_string`). Splitting "stuff that runs at extract time" (now `kinsim/utils/parsers/`) from "stuff that builds inputs offline" (now `scripts/`) makes the package boundary obvious. Reduces cognitive load for anyone reading the repo.
+- **Single binary**: `kinsim-prep` always felt like an admin utility that grew accidental dependencies on core. Replacing it with `python scripts/<name>.py` keeps the CLI surface minimal — `kinsim` itself is the only published binary.
+- **Drop ipd_summary parser**: user explicitly asked. GFFs are noisy compared to motifs.csv; PacBio's pipeline already converts internally. One less format to maintain.
+- **Loud-fail on fi/fp**: silent half-data is the worst kind of bug — it produces plausible-looking but wrong training data. Per the user's standing rule "no silent bugs", any fallback that materially changes data quality should fail with a clear pointer to the prep step that prevents it.
+- **meth_id_map at train time**: `get_meth_ids()` is YAML-driven, which is great for adding new mod types but creates a versioning hazard between train and generate. Pinning the mapping in the checkpoint config decouples model-vs-config drift; generate uses what the model was actually trained with.
+
+### Affected files
+- Moved: `prep/callers/*` → `kinsim/utils/parsers/{base,registry,pacbio,modkit,combined}.py`; `prep/rebase.py` → `kinsim/utils/parsers/rebase.py`; `prep/motif_merge.py` → `kinsim/utils/parsers/motif_merge.py`; `prep/{manifest,balance,filter}.py` → `scripts/`
+- Deleted: `prep/__main__.py`, `prep/__init__.py`, `prep/README.md`, `prep/py.typed`, `prep/callers/ipd_summary.py`, `prep/`
+- `kinsim/utils/parsers/__init__.py`: dropped ipd_summary import; updated docstring usage block
+- `kinsim/utils/motifs.py`: lazy imports `from prep.callers/rebase` → `from .parsers/.parsers.rebase`
+- `kinsim/extract.py`: ip/pw KeyError → `RuntimeError`; sniff bails on fi-only
+- `kinsim/train.py`: `meth_id_map` in `_save_model_config`
+- `scripts/{manifest,balance,filter}.py`: docstring/prog rename `kinsim-prep X` → `python scripts/X.py`
+- `slurm_kinsim/ml/run.sh`: `kinsim-prep manifest count` → python one-liner
+- `pyproject.toml`: drop `kinsim-prep` script entry, drop `prep` package include
+
+### Follow-ups (not blocking)
+- `slurm_kinsim/{strepto,vega,sequel}/build_manifest.sh` and `slurm_kinsim/msa1003/prep_*.sh` still call `kinsim-prep`. They break on next prep-pipeline rerun. Replace with direct `python scripts/...` calls when the user touches those datasets again.
+- `CLAUDE.md` still has section `### prep/ — Data Preparation Package` and example imports `from prep.callers ...`. Will update on next CLAUDE refresh.
+
+---
+
+## 2026-05-06 (late afternoon) — Repo cleanliness + benchmarking + bystrandified sniff check
+
+### What
+- **Bystrandified sniff check** added to `extract.py:_check_bystrandified`,
+  called at the top of `_extract_one_bam`. Peeks at the first 50 primary
+  mapped reads and refuses to run if any has the `ri` tag (raw HiFi
+  marker). Warns on `fi`-only fallback.
+- **`kinetic_profile` removed from config**: was dead since the layout
+  dropped the profile cols. Removed from `kinsim_config.yaml`, the
+  `_DEFAULT_KINSIM_CONFIG` fallback in `kinsim/utils/config.py`, and the
+  example blocks in README.md, kinsim/README.md, CLAUDE.md.
+- **README.md restructured for benchmarking clarity**: collapsed the
+  duplicate "tool versions" table I had added; the existing "Tools used"
+  table (with versions for SMRT-Tools 25.1, jasmine, modkit, PBSIM3,
+  Python deps) is now the single source of truth. Added a
+  "Reproducibility / Benchmarking" section listing the IBU cluster
+  paths used in development, expected per-stage runtimes (validated
+  2026-05-06 on bc2034), and a one-shot reproduction snippet.
+- Pointed users to capture `git rev-parse HEAD` next to results so the
+  exact code state used to produce a benchmark is recoverable.
+
+### Why
+- **Sniff check**: silent half-data on raw HiFi BAMs is exactly the
+  kind of trap that wastes weeks of debugging. Cheap to detect, fail-fast
+  is the right ergonomics.
+- **Dead config**: `kinetic_profile.{start, end}` no longer drove any
+  code after the 38→20-col layout change. Leaving stale config invites
+  future confusion about whether it does anything.
+- **README cleanup**: bioinformatics tools live or die by reproducibility.
+  A reader landing on the GitHub page should see the tool versions,
+  expected runtimes, and exact reproduction steps within ~30 seconds of
+  scrolling. The "Tools used" + "Reproducibility / Benchmarking" pair
+  delivers that.
+
+### Affected files
+- `kinsim/extract.py` (new `_check_bystrandified`)
+- `kinsim_config.yaml` (drop `kinetic_profile` block + comment)
+- `kinsim/utils/config.py` (drop `kinetic_profile` from default dict)
+- `README.md` (drop redundant version table; add Reproducibility section;
+  drop `kinetic_profile` from config example)
+- `kinsim/README.md` (drop `kinetic_profile` from config example)
+- `CLAUDE.md` (drop `kinetic_profile` from config example)
+
+---
+
+## 2026-05-06 (afternoon) — Extract bug fixes + perf optimisations + log/docstring polish
+
+### What
+- **kmer accumulator bug fix** in `_build_contig_arrays`: replaced
+  `kmer_fwd = np.full(n, -1, dtype=np.int64)` with
+  `kmer_fwd = np.zeros(n, dtype=np.int64)`. The `-1` initialiser kept
+  the int64 sign bit set across every left-shift iteration, so every
+  kmer came out negative and the inner loop's
+  `if kmer_id < 0: continue` skipped every position. First smoke
+  test produced shards with `slowed=0 near=0 baseline_seen=0` —
+  caught the bug before any refine/train wasted time on empty data.
+- **Perf: padded meth arrays.** Pre-pad `fwd_meth_arr` /
+  `rev_meth_arr` with `PAD=METH_CTX_LEFT` zeros on each side so the
+  inner-loop meth_context slice doesn't need bounds-checking.
+  Replaces three numpy ops per row (`np.where`, `np.clip`,
+  `np.zeros`-style mask) with a single `pol_padded[ppos-7:ppos+4]`
+  slice. ~3× faster on the slicing portion of the hot loop.
+- **Perf: tuple row construction.** Per-row `np.zeros(SAMPLE_NCOLS)`
+  allocation + N assignments replaced with a single Python tuple
+  literal. `np.array(rows, dtype=np.float32)` at packing time still
+  yields the same final 2D ndarray. Avoids allocating millions of
+  small numpy arrays. ~2× faster on the row-construction portion.
+- **Combined extract speedup**: 5 min per 10k reads → 2 min per
+  10k reads (2.5× total). For bc2034 (248k reads): ~50 min instead
+  of 2h+. Comfortable within `pshort_el8`'s 2h limit.
+- **Considered but rejected**: full numpy vectorisation of the
+  per-read inner loop (estimated 3–5× more), Numba JIT (estimated
+  10–30× more). Reverted the vectorisation prototype after
+  realising the added ~80 lines of code wasn't worth the marginal
+  gain given the corpus run is already parallelised across 52
+  strains via the SLURM array.
+- **Log prefix unification**: `[aligned]` → `[extract]` (8 lines).
+  Single extract path, no need for the orientation-aware
+  distinction in logs.
+- **"v4" terminology removed** from `analyze.py` docstrings and the
+  layout-validation error message. The version label was meaningless
+  after the v4→v7 sweep — "20-col layout" is the unambiguous term.
+- **`master.pkl` reference** in `kinsim/utils/config.py` example
+  updated to `refined/` (sharded mode is the canonical training
+  input now).
+
+### Why
+- **kmer bug**: caught at first run because we ran a smoke test
+  before the full extract. Validates the smoke-test discipline —
+  the bug would have wasted hours of cluster time silently.
+- **Padded slices**: the original `np.where(in_bounds, arr[clipped],
+  0)` pattern allocates two intermediate boolean masks per row.
+  Padding with PAD=7 zeros (negligible memory cost on a bacterial
+  genome — ~6 KB per contig) makes any slice up to ±7 in-bounds,
+  eliminating the bounds-check entirely.
+- **Tuple rows**: `np.zeros(20, dtype=np.float32)` per row is
+  ~3-5 µs of allocation + zeroing. For ~30M rows kept that's 100s
+  of pure overhead. Tuple literals dispatch in Python in ~0.5 µs.
+- **Why not vectorise / Numba**: the per-strain extract is now the
+  small problem; the SLURM array gives 52× parallelism for free,
+  so total wallclock is bounded by the slowest strain (~60–90 min).
+  Going further trades code complexity for diminishing wall-time
+  returns at corpus scale.
+- **Log prefix**: `[aligned]` was a holdover from when there were
+  two extract paths (raw HiFi and aligned). Single path now —
+  prefix is dead weight that confuses readers.
+
+### Affected files
+- `kinsim/extract.py` (kmer fix, padded slices, tuple rows, log
+  prefix unification, top docstring updated to "20 cols")
+- `kinsim/analyze.py` (drop "v4" wording in docstrings)
+- `kinsim/utils/config.py` (drop `master.pkl` from example)
+
+---
+
+## 2026-05-06 (morning) — Statistical-firing decomposition + 20-col layout + rev_meth FiLM + extract speed
 
 ### What
 - Dropped the `profile_IPD` and `profile_PW` columns from the row layout.

@@ -44,7 +44,7 @@ submit_extract() {
     local manifest=$1; local prefix=$2; local dep=${3:-}
     local d=""; [ -n "$dep" ] && d="--dependency=afterok:${dep}"
     paths "$prefix"
-    local n; n=$(kinsim-prep manifest count "$manifest")
+    local n; n=$(python -c "import csv; print(sum(1 for _ in csv.DictReader(open('$manifest'))))")
     mkdir -p "$SHARDS"
     sbatch --parsable $d --array=1-${n}%${EXTRACT_CONCURRENT} \
         "${HERE}/00_extract.slurm" "$manifest" "$SHARDS"
@@ -101,7 +101,7 @@ submit_verify() {
     paths "$prefix"
     local gen=${gen_override:-$GEN_DIR}
     mkdir -p "$VERIFY_DIR"
-    local n; n=$(kinsim-prep manifest count "$manifest")
+    local n; n=$(python -c "import csv; print(sum(1 for _ in csv.DictReader(open('$manifest'))))")
     sbatch --parsable $d --array=1-${n}%${EXTRACT_CONCURRENT} \
         "${HERE}/06_verify_generate.slurm" "$manifest" "$gen" "$VERIFY_DIR"
 }

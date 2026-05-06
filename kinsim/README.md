@@ -133,7 +133,6 @@ kinetic_signatures:
     signal_offsets: [2, 6]
 
 meth_context: { left: 7, right: 3 }
-kinetic_profile: { start: 0, end: 8 }
 
 extract:
   n_baseline_per_kmer:        50

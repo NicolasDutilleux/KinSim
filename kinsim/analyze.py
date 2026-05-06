@@ -1,10 +1,10 @@
-"""Analyse a KinSim training .pkl produced by ``extract`` + ``merge`` (+ ``refine``).
+"""Analyse a KinSim training shard or refined directory.
 
-Storage format (v4, ``kinsim.utils.sample_layout``):
+Storage format from ``kinsim.utils.sample_layout``:
 
-    dict[kmer_id (int)] -> np.ndarray(N, 38)
+    dict[kmer_id (int)] -> np.ndarray(N, 20)
 
-Cols 35/36/37 carry CATEGORY (0=baseline, 1=slowed, 2=near_meth),
+Cols 17/18/19 carry CATEGORY (0=baseline, 1=slowed, 2=near_meth),
 PARENT_METH (meth_id of the parent methylation), and PARENT_OFFSET
 (this row's distance from the parent meth position). Buckets are
 emitted **per (meth_type, offset)** — e.g. ``slowed_by_m6A_at_+0`` and
@@ -125,7 +125,7 @@ class DictStats:
 
 
 def _check_v4_input(data: dict) -> None:
-    """Fail fast on inputs that are not in the current v4 layout."""
+    """Fail fast on inputs that are not in the current 20-col layout."""
     for k, v in data.items():
         if k == "__meta__":
             continue

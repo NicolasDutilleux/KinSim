@@ -52,8 +52,7 @@ dev = [
 ]
 
 [project.scripts]
-kinsim      = "kinsim.__main__:main"
-kinsim-prep = "prep.__main__:main"
+kinsim = "kinsim.__main__:main"
 
 [project.urls]
 Homepage      = "https://github.com/NicolasDutilleux/KinSim"
@@ -66,11 +65,10 @@ Documentation = "https://github.com/NicolasDutilleux/KinSim#readme"
 # ----------------------------------------------------------------------------
 
 [tool.setuptools.packages.find]
-include = ["kinsim*", "prep*"]
+include = ["kinsim*"]
 
 [tool.setuptools.package-data]
 kinsim = ["py.typed"]
-prep   = ["py.typed"]
 
 # ----------------------------------------------------------------------------
 # Lint / format — ruff (replaces flake8 + isort + pyupgrade + pydocstyle)

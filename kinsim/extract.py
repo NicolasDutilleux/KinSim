@@ -50,10 +50,9 @@ Manifest schema (columns; ``ref_path`` is REQUIRED for this path)::
 
 Storage layout
 --------------
-``dict[kmer_id (int) → np.ndarray(N, 38)]`` plus ``"__meta__"``. The
-38-column layout is defined in :mod:`kinsim.utils.sample_layout`. Refine,
-train, analyze operate row-by-row on this layout regardless of which
-extract version produced the shard.
+``dict[kmer_id (int) → np.ndarray(N, 20)]`` plus ``"__meta__"``. The
+20-column layout is defined in :mod:`kinsim.utils.sample_layout`. Refine,
+train, analyze operate row-by-row on this layout.
 """
 
 from __future__ import annotations
@@ -378,6 +377,65 @@ def _build_contig_arrays(
     }
 
 
+def _check_bystrandified(bam_path: str, n_peek: int = 50) -> None:
+    """Fail fast if the BAM looks like raw HiFi (not bystrandified).
+
+    Raw HiFi reads carry both forward and reverse pass kinetic tags
+    (``fi``, ``fp``, ``ri``, ``rp``). Bystrandified BAMs split each CCS
+    into two reads (one per polymerase pass) and store a single
+    ``ip``/``pw`` per read. Extract's strand routing assumes the latter:
+    one read = one pass, ``read.is_reverse`` disambiguates which strand
+    the polymerase templated.
+
+    Running on an aligned-but-not-bystrandified BAM would silently fall
+    back to ``fi``/``fp`` (forward pass only), losing half the data and
+    misattributing which strand each read's IPDs reflect. This sniff
+    peeks at the first ``n_peek`` primary mapped reads and bails with a
+    clear error if it finds the ``ri`` tag — the unambiguous marker of
+    raw HiFi.
+    """
+    log.info("[extract] sniffing %s for bystrandified format ...", bam_path)
+    saw_ip = saw_ri = saw_fi = 0
+    n_seen = 0
+    with pysam.AlignmentFile(bam_path, "rb", check_sq=False) as bam:
+        for read in bam:
+            if read.is_unmapped or read.is_secondary or read.is_supplementary:
+                continue
+            n_seen += 1
+            if read.has_tag("ip"):
+                saw_ip += 1
+            if read.has_tag("ri"):
+                saw_ri += 1
+            if read.has_tag("fi"):
+                saw_fi += 1
+            if n_seen >= n_peek:
+                break
+    log.info(
+        "[extract] sniff (%d primary reads peeked): ip=%d  fi=%d  ri=%d",
+        n_seen, saw_ip, saw_fi, saw_ri,
+    )
+    if n_seen == 0:
+        log.warning("[extract] BAM has no primary mapped reads — sniff inconclusive.")
+        return
+    if saw_ri > 0:
+        raise RuntimeError(
+            f"BAM '{bam_path}' looks like raw HiFi (found 'ri' tag — both "
+            "fwd and rev kinetic passes in the same read). KinSim extract "
+            "requires a *bystrandified* BAM where each polymerase pass is its "
+            "own read with a single ip/pw array. Run "
+            "ccs-kinetics-bystrandify before pbmm2 alignment, or use the "
+            "prep pipeline at slurm_kinsim/<dataset>/00_bystrandify.slurm."
+        )
+    if saw_ip == 0 and saw_fi > 0:
+        raise RuntimeError(
+            f"BAM '{bam_path}' has 'fi' tags but no 'ip' tags — looks like "
+            "raw HiFi (kinetics tagged but not bystrandified). KinSim extract "
+            "will not silently mix forward and reverse passes. Run "
+            "ccs-kinetics-bystrandify before pbmm2 alignment to produce "
+            "one read per polymerase pass with a single ip/pw array."
+        )
+
+
 def _extract_one_bam(
     bam_path: str,
     motif_string: str,
@@ -391,6 +449,8 @@ def _extract_one_bam(
     max_reads: int,
 ) -> dict:
     """Run orientation-aware extraction. Returns dict[kmer_id] → ndarray(N, 20)."""
+
+    _check_bystrandified(bam_path)
 
     rng = np.random.default_rng(seed)
     motifs = _parse_motif_string_no_rc(motif_string)
@@ -463,20 +523,20 @@ def _extract_one_bam(
             arrs = contig_arrs.get(read.reference_name)
             if arrs is None:
                 continue
+            # ip/pw are the bystrandified per-pass kinetic tags. Hard-fail
+            # if absent — falling back to fi/fp would silently mix forward
+            # and reverse passes (the orientation ambiguity bug). The
+            # bystrandify sniff at the top of this function should have
+            # caught this, so reaching here means the BAM is malformed.
             try:
                 ipd = read.get_tag("ip")
-            except KeyError:
-                try:
-                    ipd = read.get_tag("fi")
-                except KeyError:
-                    continue
-            try:
                 pw = read.get_tag("pw")
-            except KeyError:
-                try:
-                    pw = read.get_tag("fp")
-                except KeyError:
-                    continue
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"Read {read.query_name!r}: missing ip/pw tag ({exc}). "
+                    "BAM is not bystrandified — _check_bystrandified should "
+                    "have failed earlier. This is a bug or a malformed BAM."
+                ) from exc
             ipd = np.asarray(ipd, dtype=np.float32)
             pw = np.asarray(pw, dtype=np.float32)
             n_reads_used += 1
@@ -541,10 +601,7 @@ def _extract_one_bam(
                         parent_off = 0
                         frac = 0.0
 
-                # mc context (11 positions [-7..+3] in polymerase frame)
-                # and rev_meth (3 positions [-1..+1]) via single padded
-                # slices — no np.where, no np.clip. PAD=7 zeros on each
-                # side guarantee in-bounds for any ref_pos.
+                # Padded slices — no np.where, no np.clip per row.
                 ppos = ref_pos + PAD
                 if pol_reverse_slice:
                     mc = pol_padded[ppos - 3:ppos + 8][::-1]
@@ -553,8 +610,6 @@ def _extract_one_bam(
                     mc = pol_padded[ppos - 7:ppos + 4]
                     rev = opp_padded[ppos - 1:ppos + 2]
 
-                # Tuple instead of np.zeros() per row — 5-10× faster.
-                # tolist() handles the int8→Python-int unbox once per row.
                 row = (
                     float(ipd[read_pos]), float(pw[read_pos]), frac,
                     *mc.tolist(),
@@ -632,11 +687,11 @@ def extract_to_shard(
     if near_max_dist is None:
         near_max_dist = int(extract_cfg.get("near_meth_max_dist", 7))
 
-    log.info("[aligned] BAM: %s", bam_path)
-    log.info("[aligned] REF: %s", ref_path)
-    log.info("[aligned] motifs: %s", motif_string)
+    log.info("[extract] BAM: %s", bam_path)
+    log.info("[extract] REF: %s", ref_path)
+    log.info("[extract] motifs: %s", motif_string)
     log.info(
-        "[aligned] knobs: n_baseline_per_kmer=%d  baseline_min_dist=%d  "
+        "[extract] knobs: n_baseline_per_kmer=%d  baseline_min_dist=%d  "
         "near_max_dist=%d  baseline_sample_rate=%.2f  seed=%d",
         n_baseline_per_kmer, baseline_min_dist_to_meth,
         near_max_dist, baseline_sample_rate, seed,
@@ -644,10 +699,10 @@ def extract_to_shard(
 
     if meth_types is not None:
         motif_string = filter_motif_string_by_types(motif_string, meth_types)
-        log.info("[aligned] filtered motifs to types %s: %s", sorted(meth_types), motif_string)
+        log.info("[extract] filtered motifs to types %s: %s", sorted(meth_types), motif_string)
 
     ref_seqs = load_reference(ref_path)
-    log.info("[aligned] loaded reference: %d contigs, total %d bp",
+    log.info("[extract] loaded reference: %d contigs, total %d bp",
              len(ref_seqs), sum(len(s) for s in ref_seqs.values()))
 
     samples = _extract_one_bam(
@@ -676,10 +731,10 @@ def extract_to_shard(
         "near_max_dist": near_max_dist,
         "seed": seed,
     }
-    log.info("[aligned] writing shard (atomic): %s", output_path)
+    log.info("[extract] writing shard (atomic): %s", output_path)
     atomic_write_pickle(samples, Path(output_path))
     n_kmers = sum(1 for k in samples if isinstance(k, (int, np.integer)))
-    log.info("[aligned] shard saved: %s  kmers=%d", output_path, n_kmers)
+    log.info("[extract] shard saved: %s  kmers=%d", output_path, n_kmers)
 
 
 # ---------------------------------------------------------------------------

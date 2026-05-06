@@ -95,33 +95,10 @@ meth_context:
   right: 3      # bases AFTER the prediction position
 
 # ─────────────────────────────────────────────────────────────────────────
-# Kinetic profile — per-sample IPD/PW snapshot stored at extract time
-# ─────────────────────────────────────────────────────────────────────────
-# For each sample (one row of the .pkl), KinSim stores not just the IPD/PW
-# at the prediction position itself, but a small downstream "profile":
-# raw IPD and PW at offsets [start, end] from the prediction position
-# (cols 14..22 = profile_IPD, cols 23..31 = profile_PW in the 38-col
-# layout, see kinsim/utils/sample_layout.py).
-#
-# Why we keep this snapshot:
-#   - analyze (Fig 3) plots the mean profile per (meth, offset) bucket so
-#     you can SEE whether the IPD spike lands at the configured signature
-#     offset — a primary diagnostic for "is the motif's centerPos correct".
-#   - refine could in principle use it to validate the signature shape per
-#     sample (currently it only uses the (IPD, PW) at the centre).
-#
-# Range MUST cover every signal_offset declared above plus a safety margin.
-# With m6A's +5 signature the minimum is end >= 5; we use end = 8 to leave
-# room for the bilateral palindrome footprint (+8..+9 in some R-M systems).
-kinetic_profile:
-  start: 0      # first offset stored (inclusive, relative to prediction position)
-  end:   8      # last offset stored  (inclusive). Profile length = end - start + 1
-
-# ─────────────────────────────────────────────────────────────────────────
 # Extraction parameters
 # ─────────────────────────────────────────────────────────────────────────
 # Controls how `kinsim extract` walks each read of each BAM and emits
-# rows of the per-sample storage layout (38 cols, see
+# rows of the per-sample storage layout (20 cols, see
 # kinsim/utils/sample_layout.py). For every motif-match position p of
 # type T:
 #   - positions p+k for k in signal_offsets[T]  → CATEGORY_SLOWED

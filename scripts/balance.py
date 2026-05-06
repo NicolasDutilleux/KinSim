@@ -23,7 +23,7 @@ Balancing strategy
      over-representing the mode.
 
 CLI:
-    kinsim-prep balance merged.pkl balanced.pkl \\
+    python scripts/balance.py merged.pkl balanced.pkl \\
         --meth-fraction 0.5 \\
         --max-keys 200000 \\
         --samples-per-key 200
@@ -246,7 +246,7 @@ def main(argv=None) -> None:
     from kinsim.utils.config import setup_logging
 
     parser = argparse.ArgumentParser(
-        prog="kinsim-prep balance",
+        prog="python scripts/balance.py",
         description=(
             "Balance a merged training dictionary for fair methylation representation.\n\n"
             "Ensures methylated keys are not drowned out by the far more numerous\n"
@@ -254,10 +254,10 @@ def main(argv=None) -> None:
             "get their share of the training budget.\n\n"
             "Examples:\n"
             "  # 50/50 meth/unmeth split, diversity-subsampled to 200 samples/key:\n"
-            "  kinsim-prep balance merged.pkl balanced.pkl \\\n"
+            "  python scripts/balance.py merged.pkl balanced.pkl \\\n"
             "      --meth-fraction 0.5 --samples-per-key 200\n\n"
             "  # Cap at 200k keys total, at least 25% methylated:\n"
-            "  kinsim-prep balance merged.pkl balanced.pkl \\\n"
+            "  python scripts/balance.py merged.pkl balanced.pkl \\\n"
             "      --meth-fraction 0.25 --max-keys 200000"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,

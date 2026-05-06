@@ -2,17 +2,17 @@
 
 Provides three subcommands that operate on a manifest CSV:
 
-    kinsim-prep manifest count    manifest.csv  -- print the number of data rows
-    kinsim-prep manifest validate manifest.csv  -- check for errors (files, duplicates)
-    kinsim-prep manifest list     manifest.csv  -- tabular display of all entries
+    python scripts/manifest.py count    manifest.csv  -- print the number of data rows
+    python scripts/manifest.py validate manifest.csv  -- check for errors (files, duplicates)
+    python scripts/manifest.py list     manifest.csv  -- tabular display of all entries
 
 The ``count`` subcommand is designed to be used directly in shell scripts, for
 example when setting the SLURM array size::
 
-    N=$(kinsim-prep manifest count manifest.csv)
+    N=$(python scripts/manifest.py count manifest.csv)
     sbatch --array=1-$N kinsim_extract.slurm manifest.csv shards/ master.pkl
 
-Using ``kinsim-prep manifest count`` instead of ``grep -c .`` or ``wc -l`` is
+Using ``python scripts/manifest.py count`` instead of ``grep -c .`` or ``wc -l`` is
 safer because it reuses the same Python logic as ``load_manifest()`` -- it
 correctly skips comment rows (``#``), blank rows, and the header, matching
 exactly the row indices that ``kinsim extract --task N`` will use.
@@ -27,7 +27,7 @@ def main(argv=None) -> None:
     from kinsim.utils.config import load_manifest, setup_logging, validate_manifest
 
     parser = argparse.ArgumentParser(
-        prog="kinsim-prep manifest",
+        prog="python scripts/manifest.py",
         description=(
             "Inspect and validate a KinSim manifest CSV.\n\n"
             "Manifest format:\n"
@@ -49,7 +49,7 @@ def main(argv=None) -> None:
         description=(
             "Count data rows in the manifest, skipping comment (#) and blank rows.\n\n"
             "Usage in SLURM scripts:\n"
-            "  N=$(kinsim-prep manifest count manifest.csv)\n"
+            "  N=$(python scripts/manifest.py count manifest.csv)\n"
             "  sbatch --array=1-$N kinsim_extract.slurm manifest.csv shards/ master.pkl"
         ),
     )

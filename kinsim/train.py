@@ -800,13 +800,20 @@ def _save_model_config(
     """Write model_config.json before training starts.
 
     generate.py and evaluate.py both require this file to reconstruct the
-    model architecture.  Writing it before the first epoch ensures it
+    model architecture. Writing it before the first epoch ensures it
     exists even if training is interrupted.
 
-    ``meth_types`` — the alphabet the training .pkl was extracted with — is
-    persisted so that generate.py can warn when the caller tries to simulate a
-    type that the model never saw during training.
+    The config carries:
+    - architecture + hyperparameters (from ``model.get_config()``)
+    - ``meth_types`` — alphabet the training .pkl was extracted with
+    - ``meth_id_map`` — frozen ``{name: int}`` mapping at training time, so
+      generate / evaluate can decode integer meth IDs without re-deriving
+      from the YAML at inference (the YAML may add new types between train
+      and generate, but THIS model's IDs stay pinned in this config).
+    - ``p_fire`` and ``mean_occupancy`` per (meth, offset) bucket — feed
+      the statistical-firing decomposition at generate time.
     """
+    from .utils.encoding import get_meth_ids
     cfg = model.get_config()
     if meth_types is not None:
         cfg["meth_types"] = sorted(meth_types)
@@ -814,13 +821,17 @@ def _save_model_config(
         cfg["p_fire"] = p_fire
     if mean_occupancy:
         cfg["mean_occupancy"] = mean_occupancy
+    # Freeze the meth_id mapping at train time so generate/evaluate use
+    # the same integer IDs even if kinsim_config.yaml changes later.
+    cfg["meth_id_map"] = get_meth_ids()
     path = output_dir / "model_config.json"
     path.write_text(json.dumps(cfg, indent=2))
     log.info(
-        "Model config saved: %s  (architecture=%s, meth_types=%s, p_fire=%s, mean_occ=%s)",
+        "Model config saved: %s  (architecture=%s, meth_types=%s, meth_id_map=%s, p_fire=%s, mean_occ=%s)",
         path,
         cfg.get("architecture"),
         cfg.get("meth_types", "all"),
+        cfg["meth_id_map"],
         f"{len(p_fire)} buckets" if p_fire else "none",
         f"{len(mean_occupancy)} buckets" if mean_occupancy else "none",
     )

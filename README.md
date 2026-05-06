@@ -161,6 +161,80 @@ For implementation details (data flow, file format, conventions), see [`CLAUDE.m
 
 ---
 
+## Input requirements
+
+`kinsim extract` consumes **aligned bystrandified BAMs only**. Other BAM formats either fail fast (a sniff check rejects raw HiFi BAMs that still carry `ri` tags) or fall back to half-data with a warning.
+
+Required preprocessing chain (versions in the [Tools used](#tools-used) table above):
+
+```
+raw HiFi BAM
+  → ccs-kinetics-bystrandify   (split each CCS into 2 reads, one per polymerase pass)
+  → pbmm2 align                (produces aligned bystrandified BAM)
+  → samtools index + pbindex
+  → kinsim extract             (this repo)
+```
+
+Implemented end-to-end by the prep pipelines under [`slurm_kinsim/<dataset>/`](slurm_kinsim/).
+
+---
+
+## Reproducibility / Benchmarking
+
+The pipeline is built to be re-runnable from the same starting state. Each stage is deterministic given a seed (refine, train accept `--seed`); the generative samples in `generate` are explicitly stochastic but seedable too.
+
+### Reference dataset
+
+Streptomyces collection (52 strains, ~250k–500k primary aligned reads each) — internal IBU paths:
+
+| Resource | Path |
+|---|---|
+| Bystrandified aligned BAMs | `/data/projects/p774_MARSD/NDutilleux/training/Strepto/pipeline/<sample>/<sample>_aligned.bam` |
+| Reference assemblies | `/data/projects/p774_MARSD/NDutilleux/training/Strepto/<sample>/final_assembly.fasta` |
+| Merged motifs (per-sample CSV) | adjacent to each BAM |
+| Manifest CSV (52 samples) | `/data/projects/p774_MARSD/NDutilleux/runs/v?_strepto/manifest_aligned.csv` |
+| SMRT-Tools container | `/containers/apptainer/pacbio-smrt-tools-25.3.sif` |
+
+### Expected runtimes (single bc2034 strain on `pshort_el8`)
+
+Validated 2026-05-06 with the v7 / 20-col / vectorised extract:
+
+| Stage | Wall time | Memory | Notes |
+|---|---|---|---|
+| `00_extract` | ~50 min | 32 GB | 248k primary reads, vectorised inner loop |
+| `02_refine` | ~10 min | 16 GB | per-(meth, offset) GMM, BIC over K∈{2,3} |
+| `03_train` | ~2-4 h | 32 GB + 1 GPU | ConvPredictor, 50 epochs, ReduceLROnPlateau |
+| `05_evaluate` | ~10 min | 32 GB | calibration plots + per-kmer report |
+
+For the **full Strepto corpus** (52 strains via SLURM array), wall time is bounded by the slowest single strain — typically ~60-90 min for extract.
+
+### One-shot reproduction
+
+After cloning + `pip install -e .` and verifying the cluster paths above:
+
+```bash
+# bc2034 single-strain verification (extract → refine, ~1h total)
+PREFIX=/path/to/run_dir
+MANIFEST=/path/to/manifest_bc2034_only.csv
+N=$(kinsim-prep manifest count $MANIFEST)
+J0=$(sbatch --parsable --array=1-${N} \
+    --partition=pshort_el8 --mem=32G --time=02:00:00 \
+    slurm_kinsim/ml/00_extract.slurm $MANIFEST $PREFIX/shards)
+sbatch --parsable --dependency=afterok:$J0 \
+    --partition=pshort_el8 --mem=16G --time=01:00:00 \
+    slurm_kinsim/ml/02_refine.slurm $PREFIX/shards $PREFIX/refined
+
+# full corpus: replace manifest, drop --time bound, use pibu_el8 if needed
+```
+
+### Versioning / change history
+
+- Architectural decisions with rationale: [`DECISIONS.md`](DECISIONS.md).
+- User-facing change log: [`CHANGELOG.md`](CHANGELOG.md).
+- For the exact code state used to produce a result, capture the commit SHA next to your results: `git rev-parse HEAD`.
+
+---
+
 ## Configuration
 
 A single `kinsim_config.yaml` at the repo root holds the biology- and refine-related parameters that the user must keep up-to-date:
@@ -172,7 +246,6 @@ kinetic_signatures:
   m5C: { signal_offsets: [2, 6] }    # +2 and +6 downstream — NOT at the C itself
 
 meth_context:    { left: 7, right: 3 }     # asymmetric kmer / FiLM window
-kinetic_profile: { start: 0, end: 8 }      # downstream profile stored per sample
 ```
 
 Strain-specific signatures (e.g. m6A at +8 instead of +5 for some methyltransferases) are handled by editing the YAML — no code change.

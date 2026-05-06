@@ -308,7 +308,6 @@ kinetic_signatures:
   # this is correct for m4C, but WRONG for m5C and incomplete for m6A.
 
 meth_context:    { left: 7, right: 3 }    # asymmetric kmer / FiLM window
-kinetic_profile: { start: 0, end: 8 }     # downstream profile stored per sample
 
 refine:
   slowed_split:
