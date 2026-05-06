@@ -66,7 +66,6 @@ from .utils.io import (
     resolve_motifs_for_species,
 )
 from .utils.motifs import (
-    build_reference_frac_map,
     build_reference_meth_map,
     filter_motif_string_by_types,
     load_motif_string,
@@ -101,32 +100,89 @@ def _rc_kmer(kmer_id: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Fraction lookup from motif string
+# Statistical firing — p_fire from GMM survival in refine
 # ---------------------------------------------------------------------------
 
 
-def _build_fraction_lookup(motif_string: str) -> dict[int, float]:
-    """Parse motif string to build a meth_id → fraction lookup.
+def _build_p_fire_lookup(p_fire_dict: dict | None) -> dict[tuple[int, int], float]:
+    """Convert ``{"m6A@+0": 0.42, ...}`` (from model_config.json) into
+    ``{(meth_id, offset): p_fire}`` keyed by integer ids.
 
-    The fraction is the 5th field in PacBio-derived motif strings
-    (e.g. "m6A,GATC,1,3551,0.998").  Defaults to 1.0 when absent.
-    Unmethylated (meth_id=0) always maps to 0.0.
+    Buckets the loader can't parse are dropped silently — they degrade to
+    "always fire" (p=1.0), the safe default.
     """
-    from .utils.encoding import METH_IDS
+    from .utils.encoding import get_meth_ids
 
-    fracs: dict[int, float] = {0: 0.0}
-    if not motif_string:
-        return fracs
-    for entry in motif_string.split(";"):
-        if not entry or "," not in entry:
+    ids = get_meth_ids()
+    out: dict[tuple[int, int], float] = {}
+    if not p_fire_dict:
+        return out
+    for label, p in p_fire_dict.items():
+        if "@" not in label:
             continue
-        parts = entry.split(",")
-        if len(parts) < 3:
+        name, off_str = label.split("@", 1)
+        T = ids.get(name)
+        if T is None:
             continue
-        m_id = METH_IDS.get(parts[0], 0)
-        frac = float(parts[4]) if len(parts) >= 5 else 1.0
-        fracs[m_id] = frac
-    return fracs
+        try:
+            offset = int(off_str)
+        except ValueError:
+            continue
+        out[(T, offset)] = float(p)
+    return out
+
+
+def _build_sig_offsets_by_meth_id() -> dict[int, set[int]]:
+    """``{meth_id: {signature_offsets}}`` from kinsim_config.yaml.
+
+    Used to recognise that a row at ``ref_pos`` with mc[i]=T is a
+    *signature* offset of T — only those rows are subject to the firing
+    Bernoulli; non-signature offsets pass through (the model trained on
+    them as NEAR_METH-ish).
+    """
+    from .utils.config import get_signature_offsets, load_kinsim_config
+    from .utils.encoding import get_meth_ids
+
+    cfg = load_kinsim_config()
+    ids = get_meth_ids()
+    out: dict[int, set[int]] = {}
+    for name in (cfg.get("kinetic_signatures") or {}):
+        T = ids.get(name)
+        if T is not None:
+            out[T] = set(get_signature_offsets(name))
+    return out
+
+
+def _apply_p_fire_to_mc(
+    ctx: np.ndarray,
+    p_fire_lookup: dict[tuple[int, int], float],
+    sig_offsets: dict[int, set[int]],
+    pred_idx: int,
+) -> None:
+    """Roll an independent Bernoulli per non-zero mc entry; zero non-firing.
+
+    For ``ctx[i] = T`` (a methylation in this row's context window): the
+    row is at offset ``k = pred_idx - i`` of a canonical site at
+    ``ref_pos - k``. If ``k`` is one of T's signature offsets we look up
+    ``p_fire[(T, k)]`` and on a "no-fire" roll we zero ``ctx[i]`` — the
+    model then sees baseline context at this row, which simultaneously
+    handles the canonical centre AND its phantom downstream footprints.
+
+    Mutates ``ctx`` in place.
+    """
+    if not p_fire_lookup:
+        return
+    for i in range(len(ctx)):
+        T = int(ctx[i])
+        if T == 0:
+            continue
+        k = pred_idx - i
+        offsets = sig_offsets.get(T)
+        if not offsets or k not in offsets:
+            continue
+        p = p_fire_lookup.get((T, k), 1.0)
+        if p < 1.0 and np.random.random() >= p:
+            ctx[i] = 0
 
 
 # ---------------------------------------------------------------------------
@@ -144,23 +200,11 @@ def generate_signals_batch(
     device: torch.device,
     deterministic: bool = False,
 ) -> np.ndarray:
-    """Generate IPD/PW signals for a batch of contexts using MLPPredictor.
+    """Generate IPD/PW signals for a batch of contexts.
 
-    Each position is assigned a **binary** methylation state at the center:
-    for a position with meth_id > 0 and fraction F, a random coin-flip
-    (Bernoulli(F)) decides whether this specific read is methylated or not.
-    Flanking positions use the reference methylation state directly (hard).
-
-    Args:
-        model:         Trained MLPPredictor in eval mode.
-        kmer_ids:      List of kmer integer IDs (22-bit encoded 11-mers).
-        meth_ids:      List of methylation IDs (0–3) for center position.
-        fractions:     List of stoichiometric fractions (0.0–1.0) per position.
-        meth_contexts: List of np.ndarray(K,) int arrays — per-position meth IDs
-                       for the full 11-mer window.  Center (index K//2) will be
-                       overridden by the binarised meth_id after the coin flip.
-        device:        Torch device.
-        deterministic: If True, return the predicted mean μ (no sampling).
+    Builds the per-position one-hot meth tensor from each row's mc context
+    (the per-row Bernoulli has already happened upstream — fractions arrive
+    as 0 or 1) and runs the model in chunks to bound GPU memory.
 
     Returns:
         np.ndarray of shape (N, 2) with raw [IPD, PW] values in [0, 255].
@@ -168,41 +212,28 @@ def generate_signals_batch(
     N = len(kmer_ids)
     CHUNK = 50_000  # positions per GPU forward pass — prevents OOM on long reads
 
-    # Binarize center fractions: coin-flip → each position is 100% meth or not.
-    meth_ids_bin = np.array(meth_ids, dtype=np.int64)
-    fractions_bin = np.array(fractions, dtype=np.float32)
-    partial_mask = (meth_ids_bin > 0) & (fractions_bin < 1.0)
-    if partial_mask.any():
-        coins = np.random.random(partial_mask.sum())
-        thresholds = fractions_bin[partial_mask]
-        is_meth = coins < thresholds
-        idx = np.where(partial_mask)[0]
-        fractions_bin[idx[is_meth]] = 1.0
-        fractions_bin[idx[~is_meth]] = 0.0
-        meth_ids_bin[idx[~is_meth]] = 0
+    meth_ids_bin = np.asarray(meth_ids, dtype=np.int64)
+    fractions_bin = np.asarray(fractions, dtype=np.float32)
 
-    # Build (N, L, M) meth context tensor matching the asymmetric window
-    # [-8, +2] used at extraction time. Prediction position lives at index
-    # METH_CTX_LEFT (= 8), NOT at K_SIZE // 2.
     from .extract import METH_CTX_LEFT, METH_CTX_LEN
 
     K_SIZE = METH_CTX_LEN
     PRED_IDX = METH_CTX_LEFT
     NUM_M = 4
-    ctx_np = np.array(meth_contexts, dtype=np.int64)  # (N, L)
+    ctx_np = np.asarray(meth_contexts, dtype=np.int64)
     meth_full_np = np.zeros((N, K_SIZE, NUM_M), dtype=np.float32)
 
-    # Non-prediction positions — hard one-hot (upstream/downstream state)
+    # Non-prediction positions — hard one-hot from the (already mutated) mc
     for pos in range(K_SIZE):
         if pos == PRED_IDX:
             continue
-        flanking_m = ctx_np[:, pos]  # (N,)
+        flanking_m = ctx_np[:, pos]
         mask = flanking_m > 0
         if mask.any():
             rows = np.where(mask)[0]
             meth_full_np[rows, pos, flanking_m[rows]] = 1.0
 
-    # Prediction position — binarised soft label
+    # Prediction position — fractions_bin is 1.0 for fired rows, 0.0 otherwise
     meth_full_np[np.arange(N), PRED_IDX, meth_ids_bin] = fractions_bin
 
     def _run_chunk(k_slice, mf_slice):
@@ -248,6 +279,23 @@ def _read_ckpt_meth_types(checkpoint_path: str) -> list[str] | None:
             return json.load(f).get("meth_types")
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _load_p_fire(checkpoint_path: str) -> dict[tuple[int, int], float]:
+    """Read the ``p_fire`` block from model_config.json next to the checkpoint.
+
+    Empty when the checkpoint pre-dates p_fire plumbing (fallback: no
+    Bernoulli, every site fires deterministically — same as before).
+    """
+    config_path = os.path.join(os.path.dirname(checkpoint_path), "model_config.json")
+    if not os.path.exists(config_path):
+        return {}
+    try:
+        with open(config_path) as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return _build_p_fire_lookup(cfg.get("p_fire"))
 
 
 def _resolve_meth_types(
@@ -404,19 +452,23 @@ def generate_signals(
         ref_seqs, motif_string, revcomp=revcomp, no_fuzznuc=no_fuzznuc
     )
 
-    # Per-position fraction map: each methylated site gets the fraction from
-    # the specific motif that matched it (avoids collapsing different fractions
-    # when multiple motifs share the same meth_id).
-    log.info("Building per-position fraction map...")
-    frac_map = build_reference_frac_map(ref_seqs, motif_string, revcomp=revcomp)
-    # Legacy lookup as fallback for unmapped reads (no reference context)
-    frac_lookup = _build_fraction_lookup(motif_string)
-
     # Keep regex motifs for the fallback path (unmapped reads)
     fallback_motifs = parse_motifs(motif_string, revcomp=revcomp)
 
     log.info("Loading checkpoint: %s", checkpoint_path)
     model = _load_model(checkpoint_path, device)
+    p_fire_lookup = _load_p_fire(checkpoint_path)
+    sig_offsets = _build_sig_offsets_by_meth_id()
+    if p_fire_lookup:
+        log.info(
+            "Statistical firing enabled: %d (meth, offset) buckets with p_fire ∈ "
+            "[%.2f, %.2f]",
+            len(p_fire_lookup),
+            min(p_fire_lookup.values()),
+            max(p_fire_lookup.values()),
+        )
+    else:
+        log.info("No p_fire in checkpoint — every motif site fires deterministically.")
     mode_label = "deterministic (mean)" if deterministic else "stochastic (sample)"
     log.info("Inference mode: %s", mode_label)
 
@@ -465,9 +517,9 @@ def generate_signals(
                     ref_seqs,
                     maf_mapping,
                     meth_map,
-                    frac_map,
-                    frac_lookup,
                     fallback_motifs,
+                    p_fire_lookup,
+                    sig_offsets,
                     model,
                     device,
                     deterministic,
@@ -485,9 +537,9 @@ def generate_signals(
                 ref_seqs,
                 maf_mapping,
                 meth_map,
-                frac_map,
-                frac_lookup,
                 fallback_motifs,
+                p_fire_lookup,
+                sig_offsets,
                 model,
                 device,
                 deterministic,
@@ -509,9 +561,9 @@ def _process_batch(
     ref_seqs,
     maf_mapping,
     meth_map,
-    frac_map,
-    frac_lookup,
     fallback_motifs,
+    p_fire_lookup,
+    sig_offsets,
     model,
     device,
     deterministic,
@@ -525,10 +577,10 @@ def _process_batch(
     positions across all reads in the batch, runs a single forward pass,
     then writes each read to the BAM with its slice of the generated signals.
 
-    Args:
-        frac_map:    dict[ref_name] -> np.float32 array of per-position
-                     stoichiometric fractions (from build_reference_frac_map).
-        frac_lookup: dict mapping meth_id → fraction (fallback for unmapped reads).
+    Per-row firing: for every non-zero entry in the meth context window,
+    if it sits at a signature offset of its meth type, roll
+    Bernoulli(p_fire[T,k]) and zero the entry on no-fire. Handles canonical
+    centres and downstream footprints in one sweep — no phantom +5/+2/+6.
 
     Returns:
         Tuple (n_mapped, n_unmapped) — read counts for the batch.
@@ -564,7 +616,6 @@ def _process_batch(
             ref_seq = ref_seqs[ref_name]
             ref_len = len(ref_seq)
             ref_meth = meth_map[ref_name]
-            ref_frac = frac_map.get(ref_name, None)
 
             # Extended context pads K//2 bases on each side from the reference,
             # ensuring accurate 11-mer encoding at the read edges.
@@ -591,25 +642,6 @@ def _process_batch(
                             all_meth_ctxs.append(_ZERO_CTX)
                         else:
                             ref_pos = ref_start + read_pos
-                            if circular:
-                                meth_id = int(ref_meth[ref_pos % ref_len])
-                            elif 0 <= ref_pos < ref_len:
-                                meth_id = int(ref_meth[ref_pos])
-                            else:
-                                meth_id = 0
-                            # Per-position fraction from frac_map (avoids
-                            # collapsing different fractions for same meth_id)
-                            if ref_frac is not None:
-                                pos_idx = ref_pos % ref_len if circular else ref_pos
-                                frac = float(ref_frac[pos_idx]) if 0 <= pos_idx < ref_len else 0.0
-                            else:
-                                frac = frac_lookup.get(meth_id, 0.0)
-                            if meth_id > 0:
-                                # Bernoulli: this read is either methylated
-                                # (prob=frac) or not — produces bimodal signal
-                                meth_id = meth_id if np.random.random() < frac else 0
-                                frac = 1.0 if meth_id > 0 else 0.0
-                            # Asymmetric meth context [-8, +2] from reference map
                             ctx = np.zeros(_CTX_LEN, dtype=np.int64)
                             for k_pos in range(_CTX_LEN):
                                 rp_k = ref_pos + k_pos - _LEFT
@@ -617,22 +649,21 @@ def _process_batch(
                                     ctx[k_pos] = int(ref_meth[rp_k % ref_len])
                                 elif 0 <= rp_k < ref_len:
                                     ctx[k_pos] = int(ref_meth[rp_k])
-                            ctx[_PRED_IDX] = meth_id  # binarised state at prediction pos
+                            _apply_p_fire_to_mc(ctx, p_fire_lookup, sig_offsets, _PRED_IDX)
+                            meth_id = int(ctx[_PRED_IDX])
                             all_kmer_ids.append(current_kmer)
                             all_rc_kmer_ids.append(_rc_kmer(current_kmer))
                             all_meth_ids.append(meth_id)
-                            all_fractions.append(frac)
+                            all_fractions.append(1.0 if meth_id else 0.0)
                             all_meth_ctxs.append(ctx)
 
             n_mapped += 1
 
         else:
-            # ---- Unmapped path: read-only context ----
-            # Per-read regex scanning (fuzznuc is only used for the reference
-            # pre-scan above; subprocess calls per read would be too slow).
-            # Uses frac_lookup (per-meth_id) since there is no reference context.
+            # ---- Unmapped path: per-read scan, no ref context ----
             meth_status = scan_sequence(seq, fallback_motifs)
             current_kmer = 0
+            n_status = len(meth_status)
 
             for i in range(read_len):
                 base_val = BASE_MAP.get(seq[i], 0)
@@ -648,28 +679,18 @@ def _process_batch(
                     all_meth_ctxs.append(_ZERO_CTX)
                 else:
                     is_n_context.append(False)
-                    # Asymmetric kmer: prediction position is at offset
-                    # KMER_RIGHT_PAD before the kmer's right edge i.
                     center = i - KMER_RIGHT_PAD
-                    meth_id = int(meth_status[center])
-                    frac = frac_lookup.get(meth_id, 0.0)
-                    if meth_id > 0:
-                        # Bernoulli: this read is either methylated
-                        # (prob=frac) or not — produces bimodal signal
-                        meth_id = meth_id if np.random.random() < frac else 0
-                        frac = 1.0 if meth_id > 0 else 0.0
-                    # Asymmetric meth context [-8, +2] from per-read scan
                     ctx = np.zeros(_CTX_LEN, dtype=np.int64)
-                    n_status = len(meth_status)
                     for k_pos in range(_CTX_LEN):
                         rp_k = center + k_pos - _LEFT
                         if 0 <= rp_k < n_status:
                             ctx[k_pos] = int(meth_status[rp_k])
-                    ctx[_PRED_IDX] = meth_id  # binarised state at prediction pos
+                    _apply_p_fire_to_mc(ctx, p_fire_lookup, sig_offsets, _PRED_IDX)
+                    meth_id = int(ctx[_PRED_IDX])
                     all_kmer_ids.append(current_kmer)
                     all_rc_kmer_ids.append(_rc_kmer(current_kmer))
                     all_meth_ids.append(meth_id)
-                    all_fractions.append(frac)
+                    all_fractions.append(1.0 if meth_id else 0.0)
                     all_meth_ctxs.append(ctx)
 
             n_unmapped += 1
@@ -843,13 +864,22 @@ def generate_from_bam(
     meth_map = build_reference_meth_map(
         ref_seqs, motif_string, revcomp=revcomp, no_fuzznuc=no_fuzznuc
     )
-    log.info("Building per-position fraction map...")
-    frac_map = build_reference_frac_map(ref_seqs, motif_string, revcomp=revcomp)
-    frac_lookup = _build_fraction_lookup(motif_string)
     fallback_motifs = parse_motifs(motif_string, revcomp=revcomp)
 
     log.info("Loading checkpoint: %s", checkpoint_path)
     model = _load_model(checkpoint_path, device_obj)
+    p_fire_lookup = _load_p_fire(checkpoint_path)
+    sig_offsets = _build_sig_offsets_by_meth_id()
+    if p_fire_lookup:
+        log.info(
+            "Statistical firing enabled: %d (meth, offset) buckets with p_fire ∈ "
+            "[%.2f, %.2f]",
+            len(p_fire_lookup),
+            min(p_fire_lookup.values()),
+            max(p_fire_lookup.values()),
+        )
+    else:
+        log.info("No p_fire in checkpoint — every motif site fires deterministically.")
     mode_label = "deterministic (mean)" if deterministic else "stochastic (sample)"
     log.info("Inference mode: %s", mode_label)
 
@@ -913,9 +943,9 @@ def generate_from_bam(
                     ref_seqs,
                     batch_maf,
                     meth_map,
-                    frac_map,
-                    frac_lookup,
                     fallback_motifs,
+                    p_fire_lookup,
+                    sig_offsets,
                     model,
                     device_obj,
                     deterministic,
@@ -936,9 +966,9 @@ def generate_from_bam(
                 ref_seqs,
                 batch_maf,
                 meth_map,
-                frac_map,
-                frac_lookup,
                 fallback_motifs,
+                p_fire_lookup,
+                sig_offsets,
                 model,
                 device_obj,
                 deterministic,
@@ -1158,9 +1188,9 @@ def _main_per_genome(argv):
             "The reference is pre-scanned once for methylation sites; per-read\n"
             "lookups are O(1). Outputs an unaligned BAM with fi (IPD) and fp (PW) tags.\n\n"
             "Data preparation:\n"
-            "  kinsim extract reads.bam motifs shard.pkl\n"
-            "  kinsim merge   shards/    master_data.pkl\n"
-            "  kinsim train --model mlp  master_data.pkl checkpoints_mlp/"
+            "  kinsim extract --manifest manifest.csv --task N --output-dir shards/\n"
+            "  kinsim refine  shards/   refined/\n"
+            "  kinsim train   refined/  checkpoints/"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

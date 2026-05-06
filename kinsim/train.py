@@ -1,54 +1,47 @@
-"""Train the MLP predictor with PyTorch Lightning + optional Optuna HPO.
+"""``kinsim train`` — train the kinetic predictor on shard pkls.
 
-Input format
-------------
-A single merged .pkl file produced by the shared data pipeline:
+Input
+-----
+Either:
+  - a directory of ``*_shard.pkl`` files (sharded mode, recommended) — uses
+    ``ShardedSignalDataset``, never holds the corpus in RAM
+  - a single ``shard.pkl`` (small datasets / debugging) — loads into RAM
 
-    kinsim extract <reads.bam> <motifs> <shard.pkl>   # one per BAM / SLURM task
-    kinsim merge   <shards_dir/> <master_data.pkl>     # combine all shards
+Each shard is ``dict[kmer_id (int) → np.ndarray(N, 38)]`` with the column
+layout from :mod:`kinsim.utils.sample_layout`. Produced by
+``kinsim extract`` and optionally filtered by ``kinsim refine``.
 
-The .pkl maps (kmer_id: int, meth_id: int) → np.ndarray(N, 14) where columns
-are [IPD, PW, fraction, mc_0..mc_10] — raw uint8 signals, stoichiometric
-methylation fraction, and per-position methylation IDs for the 11-mer window.
-Legacy 2-col [IPD, PW] and 3-col [IPD, PW, fraction] .pkl files are also
-supported (meth context zero-padded).  Use kinsim extract + kinsim merge.
-
-Loss function
--------------
-We use Gaussian Negative Log-Likelihood (GNLL) by default.  The model outputs
-(μ, log_σ) for both IPD and PW, so the loss is:
+Loss
+----
+Default is Gaussian Negative Log-Likelihood (GNLL). The model outputs
+``(μ, log_σ)`` for both IPD and PW in log1p space, so::
 
     L = 0.5 * [ 2·log_σ + (target − μ)² / exp(2·log_σ) ]
 
-This jointly optimises the predicted mean and spread, which is important because
-signal variance is strongly context-dependent (e.g., methylated vs. plain sites).
+Alternatives (``--loss mse`` / ``--loss huber``) use only the μ head — for
+ablations or when variance modelling isn't needed.
 
-Alternative losses (--loss mse or --loss huber) use only the μ head and ignore
-the variance head — useful for ablations or when only mean accuracy matters.
+Metrics (per epoch on the validation split)
+-------------------------------------------
+- MSE / MAE (IPD/PW) — in log1p space
+- Pearson r (IPD/PW) — predicted μ vs target
+- 2σ calibration — fraction of observations within [μ−2σ, μ+2σ] (~95.4 %)
 
-Evaluation metrics (logged per epoch)
---------------------------------------
-    MSE (IPD/PW)         — mean squared error in log1p space
-    MAE (IPD/PW)         — mean absolute error in log1p space
-    Pearson r (IPD/PW)   — correlation between predicted μ and true signal
-    2σ calibration       — fraction of observations within [μ−2σ, μ+2σ] (~95.4 %)
+Train/test split
+----------------
+- ``--test-strains bc2080,bc2081`` — explicit by-sample-id holdout
+- ``--test-fraction 0.10 --split-seed 42`` — random per-shard split
+- For single-pkl input — random 90/10 row split
 
-All metrics are reported on the 10 % validation split.
+Hyperparameter search
+---------------------
+``--optuna --n-trials N`` runs an Optuna search over lr / kmer_embed_dim /
+hidden_dim before the final training run.
 
-Hyperparameter optimisation (Optuna)
--------------------------------------
-Pass --optuna to run a search before the final training run:
-
-    kinsim train --model mlp master.pkl ckpts/ --optuna --n-trials 20
-
-Optuna searches over lr (log-uniform 1e-4..1e-2), kmer_embed_dim (32, 64),
-hidden_dim (128, 256, 512).  Best values override CLI/YAML defaults.
-
-Backward compatibility
-----------------------
-In addition to Lightning .ckpt files, this module writes checkpoint_epoch{N}.pt
-files in the legacy format so that kinsim mlp generate and kinsim mlp evaluate
-continue to work unchanged.
+Checkpoints
+-----------
+Writes ``checkpoint_epoch{N}.pt`` + ``model_config.json`` to the output
+directory. ``kinsim generate`` / ``kinsim evaluate`` consume these.
 """
 
 from __future__ import annotations
@@ -749,22 +742,43 @@ class LegacyCheckpointCallback(Callback):
 def _read_pkl_meta(pkl_path: str) -> dict:
     """Return the ``__meta__`` provenance dict from a training .pkl, or {}.
 
-    Reads only the top-level dict without loading the full training tensors —
-    we just need the metadata key.
+    For sharded mode (pkl_path is a directory), reads the meta from the
+    first ``*_shard.pkl`` found — refine writes the same global stats
+    (including ``per_bucket`` p_fire) into every shard's __meta__.
     """
+    p = Path(pkl_path)
+    if p.is_dir():
+        shard = next(iter(sorted(p.glob("*_shard.pkl"))), None)
+        if shard is None:
+            return {}
+        p = shard
     try:
-        with open(pkl_path, "rb") as f:
+        with open(p, "rb") as f:
             data = pickle.load(f)
     except (OSError, pickle.UnpicklingError) as exc:
-        log.warning("Could not read __meta__ from %s: %s", pkl_path, exc)
+        log.warning("Could not read __meta__ from %s: %s", p, exc)
         return {}
     return data.get("__meta__", {}) if isinstance(data, dict) else {}
+
+
+def _extract_p_fire(meta: dict) -> dict[str, float]:
+    """Pull a flat {bucket_label: p_fire} dict out of a refined shard's meta.
+
+    Returns ``{}`` if the meta isn't from a refined shard (no per_bucket key).
+    """
+    per_bucket = (meta.get("stats") or {}).get("per_bucket") or {}
+    return {
+        label: float(b["p_fire"])
+        for label, b in per_bucket.items()
+        if isinstance(b, dict) and "p_fire" in b
+    }
 
 
 def _save_model_config(
     output_dir: Path,
     model: nn.Module,
     meth_types: list[str] | None = None,
+    p_fire: dict[str, float] | None = None,
 ) -> None:
     """Write model_config.json before training starts.
 
@@ -779,13 +793,16 @@ def _save_model_config(
     cfg = model.get_config()
     if meth_types is not None:
         cfg["meth_types"] = sorted(meth_types)
+    if p_fire:
+        cfg["p_fire"] = p_fire
     path = output_dir / "model_config.json"
     path.write_text(json.dumps(cfg, indent=2))
     log.info(
-        "Model config saved: %s  (architecture=%s, meth_types=%s)",
+        "Model config saved: %s  (architecture=%s, meth_types=%s, p_fire=%s)",
         path,
         cfg.get("architecture"),
         cfg.get("meth_types", "all"),
+        f"{len(p_fire)} buckets" if p_fire else "none",
     )
 
 
@@ -934,7 +951,7 @@ def train_mlp(
     defaults for the final training run.
 
     Args:
-        pkl_path:         Merged .pkl file from kinsim merge.
+        pkl_path:         Shard .pkl OR a directory of shard.pkl files (sharded mode).
         output_dir:       Directory for checkpoints, logs, and model config.
         architecture:     "conv" (default) or "mlp".
         epochs:           Total training epochs for the final run.
@@ -1076,8 +1093,18 @@ def train_mlp(
             "was applied during extraction)"
         )
 
+    # GMM survival rate per (meth, offset) bucket — generate.py uses it as the
+    # Bernoulli firing probability so simulated reads carry realistic
+    # methylation noise (not every site fires every time).
+    p_fire = _extract_p_fire(meta)
+    if p_fire:
+        log.info(
+            "p_fire (GMM survival): %s",
+            ", ".join(f"{k}={v:.2f}" for k, v in sorted(p_fire.items())),
+        )
+
     # Save model config BEFORE first epoch — generate.py needs it even if interrupted
-    _save_model_config(output_dir, model, meth_types=pkl_meth_types)
+    _save_model_config(output_dir, model, meth_types=pkl_meth_types, p_fire=p_fire)
 
     if resume_ckpt:
         log.info("Loading weights from: %s", resume_ckpt)
@@ -1167,18 +1194,18 @@ def main(argv: list[str] | None = None) -> None:
     from .utils.config import load_yaml_config, setup_logging
 
     parser = argparse.ArgumentParser(
-        prog="kinsim train --model mlp",
+        prog="kinsim train",
         description=(
-            "Train an MLPPredictor for kinetic signal generation.\n\n"
-            "Input: a merged .pkl from the shared extraction pipeline:\n"
-            "  kinsim extract reads.bam motifs shard.pkl   # repeat per BAM\n"
-            "  kinsim merge   shards/    master_data.pkl   # combine all shards\n\n"
-            "The .pkl maps (kmer_id, meth_id) -> np.ndarray(N, 14) [IPD, PW, fraction, mc_0..mc_10].\n"
-            "Use kinsim extract + kinsim merge to prepare the training data.\n\n"
+            "Train ConvPredictor / MLPPredictor on shard pkls.\n\n"
+            "Input: a directory of refined *_shard.pkl (sharded mode, recommended)\n"
+            "or a single shard.pkl (small datasets, debugging). Auto-detected.\n\n"
+            "Pipeline:\n"
+            "  kinsim extract --manifest manifest.csv --task N --output-dir shards/\n"
+            "  kinsim refine  shards/   refined/\n"
+            "  kinsim train   refined/  checkpoints/\n\n"
             "All flags may be specified in a YAML config file (--config).\n"
             "Command-line flags override YAML values.\n\n"
-            "Optuna HPO:\n"
-            "  kinsim train --model mlp master.pkl ckpts/ --optuna --n-trials 20"
+            "Optuna HPO: --optuna --n-trials N  (searches lr / kmer_embed_dim / hidden_dim)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1186,9 +1213,8 @@ def main(argv: list[str] | None = None) -> None:
         "pkl",
         nargs="?",
         default=None,
-        help="Training input — either a master_clean.pkl (small datasets, in-memory) "
-        "or a directory of refined *_shard.pkl files (sharded streaming). "
-        "Auto-detected from the path.",
+        help="Training input — either a single shard.pkl (in-memory) or a directory "
+        "of refined *_shard.pkl files (sharded streaming). Auto-detected from the path.",
     )
     parser.add_argument(
         "output_dir", nargs="?", default=None, help="Directory for checkpoints and logs"

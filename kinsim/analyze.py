@@ -133,7 +133,7 @@ def _check_v4_input(data: dict) -> None:
             raise ValueError(
                 f"Input is not in the current 36-col layout: got key type "
                 f"{type(k).__name__}, expected int kmer_id. Re-run "
-                f"`kinsim extract` + `kinsim merge`."
+                f"`kinsim extract`."
             )
         if not isinstance(v, np.ndarray) or v.ndim != 2:
             raise ValueError(f"Input value for kmer {k!r} is not a 2D ndarray.")

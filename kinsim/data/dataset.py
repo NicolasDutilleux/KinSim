@@ -1,6 +1,7 @@
 """Dataset and signal-space transforms for KinSim training.
 
-Training data format (produced by ``kinsim extract`` + ``kinsim merge`` + ``refine``):
+Training data format (produced by ``kinsim extract`` and optionally
+filtered by ``kinsim refine``):
 
     dict[kmer_id (int)] -> np.ndarray(N, 38)
 
@@ -10,7 +11,7 @@ This module provides:
 
     log_transform(x)        map raw [0, 255] signals into log1p space for training
     inv_log_transform(x)    recover raw uint8 [0, 255] from log1p (inference)
-    MLPSignalDataset        loads a single merged .pkl into RAM (small datasets)
+    MLPSignalDataset        loads a single shard into RAM (small datasets / debugging)
     ShardedSignalDataset    PyTorch ``IterableDataset`` over a list of shard
                             pkls. Memory bounded by one shard regardless of
                             corpus size. Worker-aware (partitions shards across
@@ -18,8 +19,8 @@ This module provides:
                             both the shard level and the row level.
 
 Both datasets emit identical ``(kmer_id, meth_full, log_signal, meth_id)``
-tuples — the model code is unchanged whether you train on a master.pkl
-or on a shards directory.
+tuples — the model code is unchanged whether you point training at a
+single shard.pkl or a directory of shards.
 """
 
 from __future__ import annotations
@@ -182,7 +183,7 @@ class MLPSignalDataset(Dataset):
     :class:`ShardedSignalDataset`.
 
     Args:
-        pkl_path:       Path to a merged .pkl produced by ``kinsim merge``.
+        pkl_path:       Path to a single shard .pkl from ``kinsim extract`` (or refined).
         num_meth_types: Number of methylation states (default 4: none/m6A/m4C/m5C).
         kmer_size:      K-mer window size (default K=11).
     """

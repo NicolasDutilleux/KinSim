@@ -1,15 +1,17 @@
-"""Post-training evaluation and visualisation for the MLPPredictor.
+"""``kinsim evaluate`` — post-training calibration report.
 
-Commands
---------
-kinsim mlp evaluate <checkpoint_dir> <master_data.pkl>
-    Full calibration report over the entire dataset.
-    Prints per-metric numbers and saves evaluation_report.txt.
+Usage
+-----
+::
 
-kinsim mlp evaluate <checkpoint_dir> <master_data.pkl> \\
-    --kmer GATCGATCGAT --meth m6A --plot gatc_m6A.png
-    Plot the predicted N(μ, σ²) distribution vs actual observations for one
-    specific (k-mer, methylation) context.
+    kinsim evaluate <checkpoint_dir> <shard.pkl>
+        Full calibration report over the dataset. Prints per-metric numbers
+        and saves evaluation_report.txt.
+
+    kinsim evaluate <checkpoint_dir> <shard.pkl> \\
+        --kmer GATCGATCGAT --meth m6A --plot gatc_m6A.png
+        Plot predicted N(μ, σ²) vs actual observations for one specific
+        (kmer, methylation) context.
 
 Metrics
 -------
@@ -797,13 +799,13 @@ def main(argv=None) -> None:
     from .utils.config import setup_logging
 
     parser = argparse.ArgumentParser(
-        prog="kinsim mlp evaluate",
+        prog="kinsim evaluate",
         description=(
-            "Evaluate a trained MLP and inspect its predicted distributions.\n\n"
-            "Full report mode:\n"
-            "  kinsim mlp evaluate checkpoints_mlp/ master_data.pkl\n\n"
-            "Distribution plot for one k-mer:\n"
-            "  kinsim mlp evaluate checkpoints_mlp/ master_data.pkl \\\n"
+            "Evaluate a trained kinetic predictor and inspect its predicted distributions.\n\n"
+            "Full calibration report:\n"
+            "  kinsim evaluate checkpoints/ shard.pkl\n\n"
+            "Distribution plot for one (kmer, meth):\n"
+            "  kinsim evaluate checkpoints/ shard.pkl \\\n"
             "      --kmer GGATCCTGCAT --meth m6A --plot gatc_m6A.png"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -811,7 +813,7 @@ def main(argv=None) -> None:
     parser.add_argument(
         "checkpoint_dir", help="Directory with model_config.json and checkpoint_epoch*.pt"
     )
-    parser.add_argument("pkl", help="Merged master .pkl file (from kinsim merge)")
+    parser.add_argument("pkl", help="Shard .pkl from kinsim extract (or refined)")
     parser.add_argument("--kmer", default=None, help="11-mer string to inspect (e.g. GGATCCTGCAT)")
     parser.add_argument(
         "--meth",

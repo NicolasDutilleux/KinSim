@@ -1,7 +1,7 @@
 """Refine a KinSim master .pkl by filtering motif false-positive ``slowed`` samples.
 
 Input format: ``dict[kmer_id (int)] -> ndarray(N, 38)`` produced by
-``kinsim extract`` + ``kinsim merge``. Cols 35/36/37 carry CATEGORY,
+``kinsim extract``. Cols 35/36/37 carry CATEGORY,
 PARENT_METH and PARENT_OFFSET (see ``kinsim.utils.sample_layout``).
 
 Two methods are supported:
@@ -383,6 +383,7 @@ def _fit_gmms_per_bucket(
                 "n_in": n_TO,
                 "n_kept": n_TO,
                 "n_dropped": 0,
+                "p_fire": 1.0,
                 "skipped": True,
                 "reason": "too_few_samples",
             }
@@ -463,6 +464,7 @@ def _fit_gmms_per_bucket(
                 "n_in": n_TO,
                 "n_kept": n_TO,
                 "n_dropped": 0,
+                "p_fire": 1.0,
                 "skipped": True,
                 "reason": "baseline_validation_failed",
                 "n_components_used": n_components_used,
@@ -509,6 +511,7 @@ def _fit_gmms_per_bucket(
             "n_in": n_TO,
             "n_kept": n_kept,
             "n_dropped": drop_count,
+            "p_fire": n_kept / n_TO,
             "skipped": False,
             "n_components_used": n_components_used,
             "n_components_candidates": list(candidate_ks),
@@ -1137,7 +1140,7 @@ def main(argv=None):
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("input_pkl", help="Input master .pkl from `kinsim merge`")
+    ap.add_argument("input_pkl", help="Shard .pkl from `kinsim extract`, OR a directory of *_shard.pkl (sharded mode)")
     ap.add_argument("output_pkl", help="Output refined .pkl")
     ap.add_argument(
         "--method",

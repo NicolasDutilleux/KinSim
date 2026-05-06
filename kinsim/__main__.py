@@ -12,17 +12,12 @@ __version__ = "0.4.0"
 
 COMMANDS = [
     "extract",
-    "merge",
     "refine",
     "train",
     "generate",
     "evaluate",
     "verify-generate",
     "analyze",
-    "compare",
-    "inspect-model",
-    "sample",
-    "strip-kinetics",
 ]
 
 USAGE = """\
@@ -30,23 +25,26 @@ usage: kinsim [--version] <command> [<args>]
 
 KinSim — PacBio HiFi kinetic signal simulator.
 
-Commands:
-  extract          Extract per-kmer IPD/PW samples from a BAM file (-> .pkl shard)
-  merge            Merge per-sample shards into a master training .pkl
-  refine           Drop motif-FP slowed samples below the per-kmer baseline p95
-  train            Train the ConvPredictor / MLPPredictor model
-  generate         Generate synthetic kinetic signals for PBSIM3 reads
-  evaluate         Calibration report + per-kmer plots from a trained model
-  verify-generate  Compare per-kmer kinetic distributions: reference vs generated
-  analyze          Analyse a master / master_clean .pkl (txt + Plotly HTML)
-  compare          Compare per-kmer kinetics across datasets (Vega vs Revio, etc.)
-  inspect-model    Inspect an ipdSummary null model (.npz.gz)
-  sample           Subsample a .pkl for train/test splits
-  strip-kinetics   Copy a BAM and remove fi/fp/ri/rp tags
+Pipeline (one verb per stage; each consumes the previous stage's output):
+
+  extract          Aligned BAM + ref + motifs  →  shard.pkl
+                   Use ``kinsim extract --refine`` to chain refine in one step.
+  refine           Per-(meth, offset) GMM filter on slowed rows.
+  train            Train ConvPredictor on shards.
+  generate         Trained model + PBSIM3 reads  →  synthetic BAM with kinetics.
+  evaluate         Per-(kmer, meth) calibration report on a trained model.
+  verify-generate  Compare two shards (real vs simulated) per (kmer, meth).
+  analyze          Diagnostic dashboard for any shard or refined directory.
 
 Data preparation:
   Use 'kinsim-prep' for motif parsing, REBASE fetching, manifest tools,
   and .pkl filtering / balancing.
+
+Auxiliary scripts (not pipeline stages, run directly with python):
+  scripts/compare.py             Cross-dataset kinetic comparison.
+  scripts/inspect_null_model.py  Inspect an ipdSummary .npz.gz null model.
+  scripts/sample.py              Subsample a shard pkl.
+  scripts/strip_kinetics.py      Strip fi/fp/ri/rp from a BAM.
 
 Use 'kinsim <command> -h' for detailed help on a specific command.
 Use 'kinsim --version' to print the version number.
@@ -85,98 +83,53 @@ def main(argv=None):
 
     cmd, rest = args[0], args[1:]
 
-    # -- extract --
-    if cmd == "extract":
-        from .extract import main as run
+    # One verb per pipeline stage. Each command imports its own main()
+    # lazily so invoking one verb doesn't pull in unrelated deps.
+    DISPATCH = {
+        "extract":         "kinsim.extract",
+        "refine":          "kinsim.refine",
+        "train":           "kinsim.train",
+        "generate":        "kinsim.generate",
+        "evaluate":        "kinsim.evaluate",
+        "verify-generate": "kinsim.verify_generate",
+        "analyze":         "kinsim.analyze",
+    }
 
-        run(["extract", *rest])
+    if cmd in DISPATCH:
+        import importlib
 
-    # -- merge --
-    elif cmd == "merge":
-        from .extract import main as run
-
-        run(["merge", *rest])
-
-    # -- refine --
-    elif cmd == "refine":
-        from .refine import main as run
-
-        run(rest)
-
-    # -- verify-generate --
-    elif cmd == "verify-generate":
-        from .verify_generate import main as run
-
-        run(rest)
-
-    # -- train --
-    elif cmd == "train":
-        from .train import main as run
-
-        run(rest)
-
-    # -- generate --
-    elif cmd == "generate":
-        from .generate import main as run
-
-        run(rest)
-
-    # -- evaluate --
-    elif cmd == "evaluate":
-        from .evaluate import main as run
-
-        run(rest)
-
-    # -- analyze --
-    elif cmd == "analyze":
-        from .analyze import main as run
-
-        run(rest)
-
-    # -- compare --
-    elif cmd == "compare":
-        from .compare import main as run
-
-        run(rest)
-
-    # -- inspect-model --
-    elif cmd == "inspect-model":
-        from .inspect_null_model import main as run
-
-        run(rest)
-
-    # -- sample --
-    elif cmd == "sample":
-        from .sample import main as run
-
-        run(rest)
-
-    # -- strip-kinetics --
-    elif cmd == "strip-kinetics":
-        from .strip_kinetics import main as run
-
-        run(rest)
+        mod = importlib.import_module(DISPATCH[cmd])
+        # extract's argparser expects the verb as argv[0]; the others
+        # receive only the trailing args.
+        mod.main([cmd, *rest] if cmd == "extract" else rest)
+        return
 
     # -- unknown --
-    else:
-        msg = f"Unknown command: '{cmd}'"
-        hint = _suggest(cmd, COMMANDS)
-        if hint:
-            msg += f"\n\nDid you mean:  kinsim {hint[0]}"
-        # Hint for users who try prep commands on kinsim
-        prep_cmds = {"prep", "rebase", "manifest", "filter", "prepare", "parse", "motifs"}
-        if cmd in prep_cmds:
-            msg += "\n\nData prep commands live in 'kinsim-prep'.\n"
-            msg += f"  Try:  kinsim-prep {cmd} ..."
-        # Hint for users who try old model-based syntax
-        old_cmds = {"dictionary", "cgan", "mlp"}
-        if cmd in old_cmds:
-            msg += "\n\nThe --model flag has been removed. KinSim is now MLP-only.\n"
-            msg += "  Use:  kinsim train / kinsim generate / kinsim evaluate\n"
-            msg += "  Dictionary and cGAN code has been moved to archive/."
-        print(msg, file=sys.stderr)
-        print(USAGE)
-        sys.exit(1)
+    msg = f"Unknown command: '{cmd}'"
+    hint = _suggest(cmd, COMMANDS)
+    if hint:
+        msg += f"\n\nDid you mean:  kinsim {hint[0]}"
+    # Data prep commands live in a separate CLI.
+    prep_cmds = {"prep", "rebase", "manifest", "filter", "prepare", "parse", "motifs"}
+    if cmd in prep_cmds:
+        msg += f"\n\nData prep commands live in 'kinsim-prep'.\n  Try:  kinsim-prep {cmd} ..."
+    # Auxiliary scripts live in scripts/, not as kinsim subcommands.
+    legacy_tool_cmds = {"compare", "inspect-model", "sample", "strip-kinetics", "merge"}
+    if cmd in legacy_tool_cmds:
+        if cmd == "merge":
+            msg += (
+                "\n\n'kinsim merge' has been removed. Shards are the canonical training "
+                "format now — refine and train both consume the shards directory directly.\n"
+                "  kinsim refine shards/  refined/\n  kinsim train  refined/ checkpoints/"
+            )
+        else:
+            msg += (
+                f"\n\n'kinsim {cmd}' has been moved out of the main CLI. Run the standalone "
+                f"script directly:\n  python scripts/{cmd.replace('-', '_')}.py ..."
+            )
+    print(msg, file=sys.stderr)
+    print(USAGE)
+    sys.exit(1)
 
 
 if __name__ == "__main__":
