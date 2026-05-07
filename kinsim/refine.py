@@ -809,6 +809,65 @@ def _fit_gmms_per_bucket(
             "anchor_drift_pw": 0.0,
         }
 
+    # ── Sanity check: DROP component consistency across offsets ────────
+    # The DROP component represents unmethylated reads at motif sites
+    # (per-read partial methylation contamination). Different offsets of
+    # the same meth type sample the SAME population of reads at the
+    # SAME motif sites, so the DROP component's IPD mean should be
+    # statistically indistinguishable across offsets. A large divergence
+    # is diagnostic of either:
+    #   (a) GMM mis-clustering — real-meth rows leaked into DROP at one
+    #       offset but not another, or
+    #   (b) motif-kmer-context bias — different offsets land on
+    #       different kmer families, each with its own null kinetics.
+    # Threshold: > 2σ_baseline_IPD between any pair of DROPs = warning.
+    drop_means_by_T: dict[str, list[tuple[int, float]]] = {}
+    for label, st in per_bucket_stats.items():
+        if st.get("skipped"):
+            continue
+        if int(st.get("n_components_used", 0)) < 2:
+            continue
+        means = st.get("gmm_means")
+        if not means:
+            continue
+        # Component 0 is the baseline anchor (initialised at base_mu_ipd).
+        # The "DROP" components are those NOT in keep_idxs — typically
+        # comp 0, but EM can drift it. Find DROP comps by exclusion.
+        T_name = st["meth_type"]
+        off = st["offset"]
+        # Pick the DROP component with the largest weight (representative
+        # of the unmethylated population in this bucket).
+        weights = st.get("gmm_weights", [])
+        params = fit_params_by_TO.get(
+            (next((tid for tid, name in name_by_mid.items() if name == T_name), -1), off)
+        )
+        if params is None:
+            continue
+        keep_idxs_set = set(int(k) for k in params.get("keep_idxs", []))
+        drop_idxs = [j for j in range(len(means)) if j not in keep_idxs_set]
+        if not drop_idxs:
+            continue
+        # Largest-weight DROP component as the representative.
+        rep_idx = max(drop_idxs, key=lambda j: float(weights[j]) if j < len(weights) else 0.0)
+        rep_ipd = float(means[rep_idx][0])
+        drop_means_by_T.setdefault(T_name, []).append((off, rep_ipd))
+
+    warn_threshold = 2.0 * base_sigma_ipd
+    for T_name, lst in drop_means_by_T.items():
+        if len(lst) < 2:
+            continue
+        offs = [o for o, _ in lst]
+        ipds = [m for _, m in lst]
+        spread = max(ipds) - min(ipds)
+        if spread > warn_threshold:
+            pairs = ", ".join(f"@+{o}={m:.1f}" for o, m in sorted(lst))
+            log.warning(
+                "[refine.gmm] %s: DROP component IPD spreads %.1f units "
+                "across offsets (> %.1f = 2·σ_baseline). Possible mis-clustering "
+                "or motif-kmer-context bias. DROPs: %s",
+                T_name, spread, warn_threshold, pairs,
+            )
+
     return fit_params_by_TO, per_bucket_stats
 
 
