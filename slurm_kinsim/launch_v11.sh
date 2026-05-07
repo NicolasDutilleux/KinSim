@@ -34,6 +34,11 @@
 
 set -euo pipefail
 
+# Some cluster envs ship a TMPDIR pointing at a path that doesn't exist
+# yet (e.g. ~/tmp/) — mktemp then fails. Force /tmp here so the launcher
+# is portable across login-node configurations.
+export TMPDIR=/tmp
+
 # ── Config ────────────────────────────────────────────────────────────
 PREFIX=/data/projects/p774_MARSD/NDutilleux/runs/v11_strepto_vega_score25
 STREPTO=/data/projects/p774_MARSD/NDutilleux/training/Strepto
