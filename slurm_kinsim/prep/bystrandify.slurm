@@ -29,7 +29,6 @@ RAW_BAM=${1:?"Usage: sbatch $0 <raw_bam> <out_bam>"}
 OUT_BAM=${2:?"out_bam missing"}
 
 SMRT_SIF=/containers/apptainer/pacbio-smrt-tools-25.3.sif
-[ -f "$RAW_BAM" ] || { echo "ERROR: raw BAM missing: $RAW_BAM"; exit 1; }
 mkdir -p "$(dirname "$OUT_BAM")"
 
 echo "========================================================"
@@ -38,9 +37,13 @@ echo "========================================================"
 echo "Raw BAM: $RAW_BAM"
 echo "Out BAM: $OUT_BAM"
 
+# SKIP first — if the bystrandified output exists we don't need raw_bam.
+# (Datasets with archived raw BAMs may have only the bystrandified BAM
+# kept on disk.)
 if [ -s "$OUT_BAM" ]; then
     echo "SKIP — output BAM exists"
 else
+    [ -f "$RAW_BAM" ] || { echo "ERROR: raw BAM missing: $RAW_BAM"; exit 1; }
     T=$(date +%s)
     apptainer exec --bind /data "$SMRT_SIF" \
         ccs-kinetics-bystrandify "$RAW_BAM" "$OUT_BAM"

@@ -29,10 +29,19 @@ set -euo pipefail
 RAW_BAM=${1:?"Usage: sbatch $0 <raw_bam> <out_fasta>"}
 OUT_FASTA=${2:?"out_fasta missing"}
 
-[ -f "$RAW_BAM" ] || { echo "ERROR: raw BAM missing: $RAW_BAM"; exit 1; }
-
 OUTDIR=$(dirname "$OUT_FASTA")
 mkdir -p "$OUTDIR"
+
+# SKIP first — if the assembly already exists we don't need the raw BAM.
+# Vega/archived datasets often have the assembly + aligned BAM kept on
+# disk while the raw BAM has been moved/deleted to save space.
+if [ -s "$OUT_FASTA" ]; then
+    echo "SKIP — assembly exists ($(grep -c '^>' "$OUT_FASTA") contigs at $OUT_FASTA)"
+    exit 0
+fi
+
+# Only require raw BAM when we actually need to assemble it.
+[ -f "$RAW_BAM" ] || { echo "ERROR: raw BAM missing: $RAW_BAM"; exit 1; }
 
 ASM_PREFIX="${OUT_FASTA%_assembly.fasta}"
 [ "$ASM_PREFIX" = "$OUT_FASTA" ] && ASM_PREFIX="${OUT_FASTA%.fasta}"
@@ -44,11 +53,6 @@ echo "  prep/assembly_hifiasm — $(basename "$OUT_FASTA")"
 echo "========================================================"
 echo "Raw BAM:   $RAW_BAM"
 echo "Out FASTA: $OUT_FASTA"
-
-if [ -s "$OUT_FASTA" ]; then
-    echo "SKIP — assembly exists ($(grep -c '^>' "$OUT_FASTA") contigs)"
-    exit 0
-fi
 
 echo "=== BAM → FASTQ ==="
 samtools fastq "$RAW_BAM" > "$FASTQ"

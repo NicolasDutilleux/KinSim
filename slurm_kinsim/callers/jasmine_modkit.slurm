@@ -39,6 +39,15 @@ OUT_CSV=${3:?"out_motifs_csv missing"}
 WORK=${4:-$(dirname "$OUT_CSV")/jasmine_work}
 
 SMRT_SIF=/containers/apptainer/pacbio-smrt-tools-25.3.sif
+
+# SKIP first — if the per-strain motifs_jasmine.csv already exists we
+# don't need raw_bam, ref, or any compute. (Common case after the user
+# has run jasmine once and the raw BAMs have been archived.)
+if [ -s "$OUT_CSV" ]; then
+    echo "SKIP — $OUT_CSV exists ($(tail -n +2 "$OUT_CSV" | wc -l) motif rows)"
+    exit 0
+fi
+
 [ -f "$RAW_BAM" ]    || { echo "ERROR: raw BAM missing"; exit 1; }
 [ -f "$REF" ]        || { echo "ERROR: reference missing"; exit 1; }
 [ -f "${REF}.fai" ]  || samtools faidx "$REF"
