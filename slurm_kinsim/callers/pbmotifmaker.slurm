@@ -4,7 +4,7 @@
 #SBATCH --mem=16G
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
-#SBATCH --time=06:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/%x_%J.log
 #SBATCH --mail-user=nicolas.dutilleux@unifr.ch
 #SBATCH --mail-type=FAIL
