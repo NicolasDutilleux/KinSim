@@ -87,6 +87,17 @@ chain_one() {
     [ -f "$ref" ]         || { echo "  SKIP $sample_id — no reference" >&2; echo ""; return; }
     [ -s "$jm_csv" ]      || { echo "  SKIP $sample_id — no motifs_jasmine.csv" >&2; echo ""; return; }
 
+    # SKIP-first: if motifs_merged.csv already exists from a prior prep,
+    # don't re-run ipd+mm+merge. Saves hours of compute on re-launches.
+    # The merged.csv file is the only output the orchestrator/manifest
+    # actually consumes; intermediate gff/ipd_csv/mm_csv aren't needed
+    # downstream. Pass FORCE_PREP=1 to override (full wipe + re-run).
+    if [ -s "$merged_csv" ] && [ "${FORCE_PREP:-0}" != "1" ]; then
+        echo "  SKIP-PREP $sample_id — $merged_csv exists ($(wc -l < "$merged_csv") rows). Pass FORCE_PREP=1 to re-run." >&2
+        echo ""
+        return
+    fi
+
     # Wipe everything we're about to regenerate (keep aligned BAM, ref, jasmine).
     rm -f "$gff" "$ipd_csv" "$mm_csv" "$merged_csv"
 
