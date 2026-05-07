@@ -10,7 +10,14 @@
 #                          ↓
 #                       merge(thresh=0.7) ← jasmine (existing)
 #   4. After ALL merges done: build v11 manifest, then chain:
-#        extract → refine → train
+#        extract array
+#          ├─► analyze pre-refine array (parallel with refine)
+#          └─► refine (1D-IPD GMM, K∈{1,2,3})
+#                ├─► analyze post-refine array (parallel with train)
+#                └─► train (kmer-aware FiLM ConvPredictor)
+#      The two analyze branches add 130 per-strain HTML reports
+#      ($PREFIX/reports/{extract,refined}/) without extending the
+#      critical path.
 #
 # Dependencies are wired via SLURM afterok/afterany so the whole pipeline
 # is launched in one shot — the user can disconnect.

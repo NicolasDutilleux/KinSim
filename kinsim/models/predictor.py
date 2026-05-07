@@ -246,6 +246,7 @@ class ConvPredictor(nn.Module):
         head_dim: int = 128,
         dropout: float = 0.1,
         kmer_size: int = _DEFAULT_K,
+        kmer_aware_film: bool = True,
     ):
         super().__init__()
 
@@ -258,6 +259,12 @@ class ConvPredictor(nn.Module):
         self.head_dim = head_dim
         self.dropout_p = dropout
         self.kmer_size = kmer_size
+        # When True, FiLM (gamma, beta) is conditioned on
+        # ``concat(meth_proj, kmer_summary)`` instead of meth alone.
+        # Lets the methylation modulation depend on the surrounding
+        # sequence context (GC content, neighbour identities) — the
+        # kinetic effect of e.g. m6A varies by motif family.
+        self.kmer_aware_film = kmer_aware_film
 
         # --- Per-base embedding: A=0, C=1, G=2, T=3 ---
         self.base_embed = nn.Embedding(4, base_embed_dim)
@@ -280,11 +287,13 @@ class ConvPredictor(nn.Module):
             self._meth_positions * num_meth_types, meth_proj_dim, bias=False
         )
 
-        # --- FiLM conditioning: meth -> (gamma, beta) -> modulate base emb ---
+        # --- FiLM conditioning: (meth [, kmer_summary]) -> (gamma, beta) ---
         # x_modulated = (1 + gamma) * x_base + beta, broadcast over positions.
-        # Zero-init ensures identity when methylation context is empty.
-        self.film_gamma = nn.Linear(meth_proj_dim, base_embed_dim)
-        self.film_beta = nn.Linear(meth_proj_dim, base_embed_dim)
+        # Zero-init on FiLM heads ensures identity when methylation
+        # context is empty (and identity at start of training).
+        film_in_dim = meth_proj_dim + base_embed_dim if kmer_aware_film else meth_proj_dim
+        self.film_gamma = nn.Linear(film_in_dim, base_embed_dim)
+        self.film_beta = nn.Linear(film_in_dim, base_embed_dim)
 
         # --- Conv1d backbone ---
         # Learns local and medium-range spatial patterns.
@@ -408,12 +417,21 @@ class ConvPredictor(nn.Module):
 
         # FiLM conditioning: GLOBAL meth context (forward + rev_meth) modulates
         # the kmer uniformly. Flatten per-position meth (B, 14, M) → (B, 14*M),
-        # project to a single embedding, derive (gamma, beta), broadcast.
-        # When meth_full is all zeros -> meth_feat=0 -> gamma=0, beta=0 -> identity.
-        meth_flat = meth_full.reshape(meth_full.shape[0], -1)  # (B, 11*M)
+        # project to a single embedding. When ``kmer_aware_film`` is on,
+        # concatenate a global summary of the (pre-FiLM) kmer embedding so
+        # the modulation can depend on local sequence context. Derive
+        # (gamma, beta) from this conditioning vector and broadcast over
+        # the 11 positions.
+        # Zero-init on FiLM linears keeps modulation = identity at start.
+        meth_flat = meth_full.reshape(meth_full.shape[0], -1)  # (B, 14*M)
         meth_feat = self.meth_proj(meth_flat)  # (B, meth_proj_dim)
-        gamma = self.film_gamma(meth_feat).unsqueeze(1)  # (B, 1, base_embed_dim)
-        beta = self.film_beta(meth_feat).unsqueeze(1)  # (B, 1, base_embed_dim)
+        if self.kmer_aware_film:
+            kmer_summary = x.mean(dim=1)  # (B, base_embed_dim)
+            film_in = torch.cat([meth_feat, kmer_summary], dim=-1)
+        else:
+            film_in = meth_feat
+        gamma = self.film_gamma(film_in).unsqueeze(1)  # (B, 1, base_embed_dim)
+        beta = self.film_beta(film_in).unsqueeze(1)  # (B, 1, base_embed_dim)
         x = (1.0 + gamma) * x + beta
 
         # Conv1D expects (B, C, L)
@@ -507,6 +525,7 @@ class ConvPredictor(nn.Module):
             "kernel_size": self.kernel_size,
             "head_dim": self.head_dim,
             "dropout": self.dropout_p,
+            "kmer_aware_film": self.kmer_aware_film,
         }
 
 
@@ -551,6 +570,10 @@ def create_from_config(config: dict) -> nn.Module:
             head_dim=config.get("head_dim", 128),
             dropout=config.get("dropout", 0.1),
             kmer_size=kmer_size,
+            # Default False for backwards compatibility with checkpoints
+            # that pre-date the kmer-aware FiLM head — those have a
+            # smaller film_in_dim so we must respect the saved config.
+            kmer_aware_film=config.get("kmer_aware_film", False),
         )
     else:
         raise ValueError(

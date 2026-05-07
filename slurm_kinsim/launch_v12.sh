@@ -1,6 +1,17 @@
 #!/bin/bash
 # ============================================================
-# launch_v11_lean.sh — minimal relaunch (no bystrandify/align/index/jasmine).
+# launch_v12.sh — v12 lean relaunch (no bystrandify/align/index/jasmine).
+#
+# Architecture differences vs v11:
+#   - Refine: 1D-IPD GMM, K∈{1,2,3} (K=1 wins on parsimony when no
+#     separable contamination cluster exists; flags k1_null_signal).
+#   - Refine drop rule: similarity-margin tunable (0.0 = strict
+#     above-baseline, default for v12 first run).
+#   - Train: kmer-aware FiLM ConvPredictor — γ, β depend on
+#     concat(meth_proj, kmer_summary) so methylation modulation
+#     varies by sequence context.
+#   - 130 per-strain HTML reports written automatically
+#     ($PREFIX/reports/{extract,refined}/).
 #
 # Preconditions (already on disk, kept):
 #   - <strain>_aligned.bam  (per strain)
@@ -13,16 +24,12 @@
 #   3. merge_motifs     (--threshold 0.7, + jasmine)  afterok motifmaker
 #
 # Then ONE orchestrator job afterany on all 65 merges:
-#   4. Build v11 manifest from regenerated motifs_merged.csv
+#   4. Build v12 manifest from regenerated motifs_merged.csv
 #   5. extract array (per-strain, parallel)
 #   6. analyze pre-refine array (per-strain, runs in parallel with refine)
 #   7. refine (1D-IPD GMM, K∈{1,2,3}, similarity-margin=0.0)
 #   8. analyze post-refine array (per-strain, runs in parallel with train)
 #   9. train (kmer-aware FiLM ConvPredictor, GPU)
-#
-# Steps 6+8 add per-strain HTML reports under
-# $PREFIX/reports/{extract,refined}/<sample_id>/ without extending
-# the critical path (both run alongside refine/train respectively).
 #
 # Manifest excludes:
 #   strepto bc2080 (Strepto holdout)
@@ -32,7 +39,7 @@
 set -euo pipefail
 export TMPDIR=/tmp
 
-PREFIX=/data/projects/p774_MARSD/NDutilleux/runs/v11_strepto_vega_score25
+PREFIX=/data/projects/p774_MARSD/NDutilleux/runs/v12_strepto_vega
 STREPTO=/data/projects/p774_MARSD/NDutilleux/training/Strepto
 VEGA=/data/projects/p774_MARSD/NDutilleux/training/Vega
 HOLDOUT_STREPTO=bc2080
@@ -48,7 +55,7 @@ MERGE_THRESHOLD=${MERGE_THRESHOLD:-0.7}
 CALLERS="$REPO/slurm_kinsim/callers"
 
 echo "================================================================"
-echo "  KinSim v11 LEAN launcher (ipd + mm + merge → orchestrator)"
+echo "  KinSim v12 launcher (1D-IPD GMM + kmer-aware FiLM)"
 echo "  Orchestrator submits: extract → (analyze ‖ refine →"
 echo "                        (analyze ‖ train))"
 echo "  Refine: 1D-IPD GMM, K∈{1,2,3}, similarity-margin=0.0"
@@ -67,7 +74,7 @@ chain_one() {
     local pipe_dir=$1   # /pipeline/bcXXXX
     local aligned_bam=$2
     local ref=$3
-    local sample_id=$4  # e.g. strepto_bc2033 (for the v11 manifest)
+    local sample_id=$4  # e.g. strepto_bc2033 (for the v12 manifest)
 
     local bc=$(basename "$pipe_dir")
     local gff="$pipe_dir/${bc}_ipdSummary.gff"
@@ -132,14 +139,14 @@ echo "================================================================"
 echo "  Submitted $N strain chains (ipd + mm + merge)"
 echo "================================================================"
 
-# --- Orchestrator: builds v11 manifest then chains extract + refine + train ---
+# --- Orchestrator: builds v12 manifest then chains extract+analyze+refine+analyze+train ---
 J_ORCH=$(sbatch --parsable \
     --dependency=afterany:${DEPS} \
     --partition=pibu_el8 --account=p774 \
     --mem=4G --cpus-per-task=1 --time=00:30:00 \
-    --job-name=v11_orchestrator \
-    --output="$LOGDIR/v11_orchestrator_%J.log" \
-    --wrap="bash $REPO/slurm_kinsim/_v11_orchestrator.sh '$PREFIX' '$STREPTO' '$VEGA' '$HOLDOUT_STREPTO' '$HOLDOUT_VEGA'")
+    --job-name=v12_orchestrator \
+    --output="$LOGDIR/v12_orchestrator_%J.log" \
+    --wrap="bash $REPO/slurm_kinsim/_v12_orchestrator.sh '$PREFIX' '$STREPTO' '$VEGA' '$HOLDOUT_STREPTO' '$HOLDOUT_VEGA'")
 
 echo ""
 echo "  Orchestrator: $J_ORCH (after $N merges)"
@@ -151,7 +158,7 @@ echo "    → train"
 echo ""
 echo "Watch:"
 echo "  squeue -u \$USER | head -20"
-echo "  tail -f $LOGDIR/v11_orchestrator_${J_ORCH}.log"
+echo "  tail -f $LOGDIR/v12_orchestrator_${J_ORCH}.log"
 echo ""
 echo "Reports will land at:"
 echo "  $PREFIX/reports/extract/<sample_id>/  (pre-refine)"

@@ -1,10 +1,23 @@
 #!/bin/bash
 # ============================================================
-# _v11_orchestrator.sh — runs after prep finishes (Strepto + Vega).
+# _v12_orchestrator.sh — runs after prep finishes (Strepto + Vega).
 #
-# Builds the v11 manifest from regenerated motifs_merged.csv files,
-# then submits extract → refine → train chained on each other.
-# Called from launch_v11.sh as a sbatch --wrap job.
+# Builds the v12 manifest from regenerated motifs_merged.csv files,
+# then submits this chain (analyze branches run in parallel):
+#
+#   extract array  ──► analyze_pre  (parallel with refine)
+#                  └─► refine ──► analyze_post (parallel with train)
+#                              └─► train
+#
+# Architecture differences vs v11:
+#   - Refine: 1D-IPD GMM with K∈{1,2,3} (K=1 wins on parsimony when
+#     there is no separable structure), similarity-margin tunable.
+#   - Train: ConvPredictor with kmer-aware FiLM (γ, β depend on
+#     concat(meth_proj, kmer_summary) — modulation magnitude varies
+#     by sequence context).
+#   - 130 per-strain HTML reports written automatically.
+#
+# Called from launch_v12.sh as a sbatch --wrap job.
 #
 # Args:  PREFIX  STREPTO_DIR  VEGA_DIR  HOLDOUT_STREPTO  HOLDOUT_VEGA
 # ============================================================
@@ -23,13 +36,13 @@ REPO=/data/users/ndutilleux/KinSim
 MANIFEST=$PREFIX/manifest.csv
 LOGDIR=/data/projects/p774_MARSD/NDutilleux/logs
 
-echo "=== v11 orchestrator ==="
+echo "=== v12 orchestrator ==="
 echo "Date:     $(date)"
 echo "PREFIX:   $PREFIX"
 echo ""
 
-# ── Build v11 manifest ─────────────────────────────────────────
-echo "── Building v11 manifest ──"
+# ── Build v12 manifest ─────────────────────────────────────────
+echo "── Building v12 manifest ──"
 mkdir -p "$PREFIX"
 echo "sample_id,bam_path,motifs,ref_path" > "$MANIFEST"
 
@@ -86,8 +99,8 @@ J_EXTRACT=$(sbatch --parsable \
     --array=1-${N} \
     --partition=pibu_el8 --account=p774 \
     --mem=192G --cpus-per-task=1 --time=12:00:00 \
-    --job-name=v11_extract \
-    --output="$LOGDIR/ml_00_extract_v11_%A_%a.log" \
+    --job-name=v12_extract \
+    --output="$LOGDIR/ml_00_extract_v12_%A_%a.log" \
     "$REPO/slurm_kinsim/ml/00_extract.slurm" "$MANIFEST" "$PREFIX/shards")
 
 # Analyze pre-refine: one task per strain shard, runs in parallel with refine.
@@ -96,16 +109,16 @@ J_AN_EXTRACT=$(sbatch --parsable \
     --dependency=afterok:$J_EXTRACT \
     --partition=pibu_el8 --account=p774 \
     --mem=128G --cpus-per-task=4 --time=00:45:00 \
-    --job-name=v11_analyze_extract \
-    --output="$LOGDIR/ml_01_analyze_extract_v11_%A_%a.log" \
+    --job-name=v12_analyze_extract \
+    --output="$LOGDIR/ml_01_analyze_extract_v12_%A_%a.log" \
     --wrap="bash $REPO/slurm_kinsim/ml/01_analyze_array.sh '$PREFIX/shards' '$PREFIX/reports/extract'")
 
 J_REFINE=$(sbatch --parsable \
     --dependency=afterany:$J_EXTRACT \
     --partition=pibu_el8 --account=p774 \
     --mem=96G --cpus-per-task=4 --time=06:00:00 \
-    --job-name=v11_refine \
-    --output="$LOGDIR/ml_02_refine_v11_%J.log" \
+    --job-name=v12_refine \
+    --output="$LOGDIR/ml_02_refine_v12_%J.log" \
     "$REPO/slurm_kinsim/ml/02_refine.slurm" "$PREFIX/shards" "$PREFIX/refined")
 
 # Analyze post-refine: one task per refined shard, runs in parallel with train.
@@ -114,16 +127,16 @@ J_AN_REFINED=$(sbatch --parsable \
     --dependency=afterok:$J_REFINE \
     --partition=pibu_el8 --account=p774 \
     --mem=128G --cpus-per-task=4 --time=00:45:00 \
-    --job-name=v11_analyze_refined \
-    --output="$LOGDIR/ml_01_analyze_refined_v11_%A_%a.log" \
+    --job-name=v12_analyze_refined \
+    --output="$LOGDIR/ml_01_analyze_refined_v12_%A_%a.log" \
     --wrap="bash $REPO/slurm_kinsim/ml/01_analyze_array.sh '$PREFIX/refined' '$PREFIX/reports/refined'")
 
 J_TRAIN=$(sbatch --parsable \
     --dependency=afterok:$J_REFINE \
     --partition=pgpu --account=p774 \
     --gres=gpu:1 --mem=64G --cpus-per-task=4 --time=24:00:00 \
-    --job-name=v11_train \
-    --output="$LOGDIR/ml_03_train_v11_%J.log" \
+    --job-name=v12_train \
+    --output="$LOGDIR/ml_03_train_v12_%J.log" \
     "$REPO/slurm_kinsim/ml/03_train.slurm" "$PREFIX/refined" "$PREFIX/checkpoints")
 
 echo "  extract array       : $J_EXTRACT       ($N tasks)"
