@@ -14,11 +14,17 @@ import sys
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print(
-            "usage: python -m kinsim_baseline {build|generate} [options]\n"
+            "usage: python -m kinsim_baseline {build|calibrate|generate} [options]\n"
             "\n"
             "  build SHARDS_DIR OUTPUT_NPZ\n"
             "      Build per-kmer (IPD, PW) table from KinSim extract shards.\n"
             "      Filters BASELINE category only — clean unmodified kinetics.\n"
+            "\n"
+            "  calibrate BASELINE_NPZ MANIFEST_CSV OUTPUT_NPZ\n"
+            "      Walk real BAMs; for each kmer, identify positions whose\n"
+            "      observed IPD exceeds the kmer's baseline 99th percentile;\n"
+            "      accumulate modified-sample bank + per-kmer IPD ratio.\n"
+            "      Output extends the baseline .npz with modified data.\n"
             "\n"
             "  generate INPUT_BAM TABLE_NPZ OUTPUT_BAM\n"
             "      Sample fi/fp tags for every read in INPUT_BAM by drawing\n"
@@ -32,11 +38,13 @@ def main():
 
     if cmd == "build":
         from .build_table import main as cmd_main
+    elif cmd == "calibrate":
+        from .calibrate import main as cmd_main
     elif cmd == "generate":
         from .generate import main as cmd_main
     else:
         print(f"unknown command: {cmd}", file=sys.stderr)
-        print("expected: build, generate", file=sys.stderr)
+        print("expected: build, calibrate, generate", file=sys.stderr)
         sys.exit(1)
 
     cmd_main(rest)

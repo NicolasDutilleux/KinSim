@@ -33,7 +33,15 @@ NUM_KMERS = KMER_MASK + 1  # 4 ** 11 = 4 194 304
 
 
 class KmerDistribution:
-    """Per-kmer empirical (IPD, PW) bank with global-pool fallback."""
+    """Per-kmer empirical (IPD, PW) bank with global-pool fallback.
+
+    Optionally also carries a parallel **modified** sample bank populated by
+    :func:`kinsim_baseline.calibrate.calibrate_from_bams`. The modified
+    samples come from real BAM positions whose observed IPD exceeds the
+    kmer's baseline 99th percentile — i.e. candidate-methylation positions.
+    Per-kmer IPD ratio (modified mean / baseline mean) is computed
+    on-demand via :meth:`ipd_ratio`.
+    """
 
     def __init__(
         self,
@@ -42,6 +50,11 @@ class KmerDistribution:
         count: np.ndarray,
         global_ipd: Optional[np.ndarray] = None,
         global_pw: Optional[np.ndarray] = None,
+        # Optional modified bank (calibration output)
+        modified_ipd: Optional[np.ndarray] = None,
+        modified_pw: Optional[np.ndarray] = None,
+        modified_count: Optional[np.ndarray] = None,
+        threshold_percentile: Optional[float] = None,
     ):
         if ipd.shape != pw.shape:
             raise ValueError(f"ipd shape {ipd.shape} != pw shape {pw.shape}")
@@ -63,6 +76,11 @@ class KmerDistribution:
         self._global_pw = (
             global_pw if global_pw is not None and global_pw.size > 0 else None
         )
+        # Optional modified bank
+        self.modified_ipd = modified_ipd        # (NUM_KMERS, n_mod_per_kmer) or None
+        self.modified_pw = modified_pw
+        self.modified_count = modified_count    # (NUM_KMERS,) or None
+        self.threshold_percentile = threshold_percentile
 
     # ------------------------------------------------------------------
     # I/O
@@ -77,6 +95,14 @@ class KmerDistribution:
             count=d["count"],
             global_ipd=d["global_ipd"] if "global_ipd" in d.files else None,
             global_pw=d["global_pw"] if "global_pw" in d.files else None,
+            modified_ipd=d["modified_ipd"] if "modified_ipd" in d.files else None,
+            modified_pw=d["modified_pw"] if "modified_pw" in d.files else None,
+            modified_count=d["modified_count"] if "modified_count" in d.files else None,
+            threshold_percentile=(
+                float(d["threshold_percentile"])
+                if "threshold_percentile" in d.files
+                else None
+            ),
         )
 
     def save(self, path: str | Path) -> None:
@@ -84,6 +110,12 @@ class KmerDistribution:
         if self._global_ipd is not None:
             kw["global_ipd"] = self._global_ipd
             kw["global_pw"] = self._global_pw
+        if self.modified_ipd is not None:
+            kw["modified_ipd"] = self.modified_ipd
+            kw["modified_pw"] = self.modified_pw
+            kw["modified_count"] = self.modified_count
+        if self.threshold_percentile is not None:
+            kw["threshold_percentile"] = np.array(self.threshold_percentile)
         np.savez_compressed(str(path), **kw)
 
     # ------------------------------------------------------------------
@@ -172,3 +204,80 @@ class KmerDistribution:
             "pw_mean": float(pw.mean()),
             "pw_std": float(pw.std()),
         }
+
+    # ------------------------------------------------------------------
+    # Modified bank (populated by calibrate.py)
+    # ------------------------------------------------------------------
+
+    def has_modified(self) -> bool:
+        return self.modified_ipd is not None and self.modified_count is not None
+
+    def sample_modified(
+        self,
+        kmer_ids: np.ndarray,
+        rng: Optional[np.random.Generator] = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Sample (IPD, PW) from the modified bank.
+
+        Same API as :meth:`sample` but draws from the modified pool.
+        Falls back to the baseline pool when a kmer has no modified
+        samples (so that boundary positions, or kmers absent from the
+        calibration set, still get a reasonable kinetic value).
+        """
+        if not self.has_modified():
+            return self.sample(kmer_ids, rng=rng)
+        if rng is None:
+            rng = np.random.default_rng()
+        kmer_ids = np.asarray(kmer_ids, dtype=np.int64)
+        n = kmer_ids.shape[0]
+        out_ipd = np.empty(n, dtype=np.uint8)
+        out_pw = np.empty(n, dtype=np.uint8)
+
+        mod_counts = self.modified_count[kmer_ids]
+        seen = mod_counts > 0
+        if seen.any():
+            seen_kmers = kmer_ids[seen]
+            seen_counts = mod_counts[seen].astype(np.int64)
+            sample_idx = (rng.random(seen_counts.size) * seen_counts).astype(np.int64)
+            out_ipd[seen] = self.modified_ipd[seen_kmers, sample_idx]
+            out_pw[seen] = self.modified_pw[seen_kmers, sample_idx]
+        # Fallback: kmers with no modified samples → baseline.
+        if not seen.all():
+            fallback_kmers = kmer_ids[~seen]
+            fb_ipd, fb_pw = self.sample(fallback_kmers, rng=rng)
+            out_ipd[~seen] = fb_ipd
+            out_pw[~seen] = fb_pw
+        return out_ipd, out_pw
+
+    def ipd_ratio(self) -> np.ndarray:
+        """Per-kmer modified-mean / baseline-mean IPD ratio.
+
+        Returns a ``(NUM_KMERS,)`` float32 array. NaN where either side
+        has zero samples.
+        """
+        ratio = np.full(NUM_KMERS, np.nan, dtype=np.float32)
+        if not self.has_modified():
+            return ratio
+        # Vectorised mean per row (where count > 0).
+        # Baseline mean.
+        base_n = self.count.astype(np.int64)
+        base_seen = base_n > 0
+        if base_seen.any():
+            base_sum = self.ipd.astype(np.float32).sum(axis=1)
+            # Subtract zero-padding contribution (zeros add nothing, so sum is fine
+            # — but mean must divide by the actual count, not n_per_kmer).
+            base_mean = np.where(base_seen, base_sum / np.where(base_n == 0, 1, base_n), np.nan)
+        else:
+            base_mean = np.full(NUM_KMERS, np.nan, dtype=np.float32)
+
+        mod_n = self.modified_count.astype(np.int64)
+        mod_seen = mod_n > 0
+        mod_sum = self.modified_ipd.astype(np.float32).sum(axis=1)
+        mod_mean = np.where(mod_seen, mod_sum / np.where(mod_n == 0, 1, mod_n), np.nan)
+
+        valid = base_seen & mod_seen & (base_mean > 0)
+        ratio[valid] = mod_mean[valid] / base_mean[valid]
+        return ratio
+
+    def n_modified_pool(self) -> int:
+        return 0 if not self.has_modified() else int((self.modified_count > 0).sum())
