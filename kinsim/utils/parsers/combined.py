@@ -120,7 +120,16 @@ class CombinedParser(BaseOutputParser):
                     )
                     continue
 
-                entries.append(f"{mod_type},{motif_seq},{offset},{n_sites},{fraction:.6g}")
+                # Convert 0-based offset (Combined CSV convention) to 1-based
+                # before emitting the motif string. Downstream `parse_motifs`
+                # in kinsim.utils.motifs always does `int(pos) - 1`, treating
+                # the motif-string pos as 1-based (matching the PacBio
+                # motifs.csv `centerPos` convention). Without this +1, m5C
+                # offsets like 5 → C[5] become 4 → G[4] after the -1, and
+                # validation fails with "position points to G, not C".
+                entries.append(
+                    f"{mod_type},{motif_seq},{offset + 1},{n_sites},{fraction:.6g}"
+                )
 
         return ";".join(entries)
 
