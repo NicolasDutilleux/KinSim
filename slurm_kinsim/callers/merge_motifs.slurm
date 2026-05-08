@@ -66,17 +66,34 @@ def _f(d, *names, default=None):
     return default
 
 def parse_row(r, source_hint):
-    """Return (mod_type, motif, offset, frac, n_sites, source) or None."""
+    """Return (mod_type, motif, offset, frac, n_sites, source) or None.
+
+    Offset normalisation: PacBio's ``centerPos`` is 1-based; jasmine /
+    modkit / fibertools combined CSVs use 0-based ``offset``. KinSim's
+    ``parse_motifs`` always does ``int(pos) - 1`` (treats the motif-string
+    pos as 1-based, matching the PacBio convention). To produce a single
+    self-consistent merged.csv, we normalise everything to **1-based**
+    here: 0-based input columns get ``+1``, 1-based input columns pass
+    through. Without this, m5C offsets from jasmine end up off by one
+    after the downstream ``-1`` and motif validation fails ('position
+    points to G, not C').
+    """
     motif = _f(r, 'motifString', 'motif', 'sequence')
     if not motif:
         return None
-    offset = _f(r, 'centerPos', 'mod_offset', 'offset', 'position', 'mod_loc')
-    if offset is None:
+    # Try 1-based source first, fall back to 0-based and convert.
+    offset_raw = _f(r, 'centerPos')               # 1-based (PacBio)
+    is_one_based = offset_raw is not None
+    if not is_one_based:
+        offset_raw = _f(r, 'mod_offset', 'offset', 'position', 'mod_loc')   # 0-based
+    if offset_raw is None:
         return None
     try:
-        offset = int(offset)
+        offset = int(offset_raw)
     except (TypeError, ValueError):
         return None
+    if not is_one_based:
+        offset += 1   # 0-based → 1-based
     frac = _f(r, 'fraction', 'frac_mod', 'methylated_fraction', default=0.0)
     try:
         frac = float(frac)
