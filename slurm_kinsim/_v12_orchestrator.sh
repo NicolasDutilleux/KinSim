@@ -21,7 +21,6 @@
 #
 # Args:  PREFIX  STREPTO_DIR  VEGA_DIR  HOLDOUT_STREPTO  HOLDOUT_VEGA
 # ============================================================
-set -euo pipefail
 
 PREFIX=${1:?"PREFIX missing"}
 STREPTO=${2:?"STREPTO dir missing"}
@@ -29,8 +28,11 @@ VEGA=${3:?"VEGA dir missing"}
 HOLDOUT_STREPTO=${4:?"HOLDOUT_STREPTO missing"}
 HOLDOUT_VEGA=${5:?"HOLDOUT_VEGA missing"}
 
+# /etc/bashrc has unbound vars; toggle -u around bashrc/conda init.
+set +u
 source ~/.bashrc
 conda activate kinsim_env
+set -euo pipefail
 
 REPO=/data/users/ndutilleux/KinSim
 MANIFEST=$PREFIX/manifest.csv
