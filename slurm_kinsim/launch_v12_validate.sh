@@ -75,7 +75,6 @@ echo ""
 # Sanity checks
 [ -f "$ALIGNED_BAM" ]  || { echo "ERROR: missing $ALIGNED_BAM"; exit 1; }
 [ -f "$REF" ]          || { echo "ERROR: missing $REF"; exit 1; }
-[ -s "$JASMINE_CSV" ]  || { echo "ERROR: missing or empty $JASMINE_CSV"; exit 1; }
 [ -s "$GROUND_TRUTH_MOTIFS" ] || echo "WARN: ground-truth motifs file missing — comparison will be skipped"
 
 # ── Output paths ───────────────────────────────────────────────────────
@@ -84,6 +83,9 @@ SIM_BAM="$VAL_DIR/${HOLDOUT_VEGA}_simulated.bam"
 SIM_GFF="$VAL_DIR/${HOLDOUT_VEGA}_simulated.gff"
 SIM_IPD_CSV="$VAL_DIR/${HOLDOUT_VEGA}_simulated_ipdSummary.csv"
 SIM_MM_CSV="$VAL_DIR/${HOLDOUT_VEGA}_simulated_motifs_ipdsummary.csv"
+# Jasmine on the SIMULATED BAM (not the original) — true validation of
+# whether KinSim's generated kinetics produce detectable 5mC signals.
+SIM_JM_CSV="$VAL_DIR/${HOLDOUT_VEGA}_simulated_motifs_jasmine.csv"
 SIM_MERGED_CSV="$VAL_DIR/${HOLDOUT_VEGA}_simulated_motifs_merged.csv"
 
 # ── 1. Strip kinetics ─────────────────────────────────────────────────
@@ -125,22 +127,30 @@ J_MM=$(sbatch --parsable \
     --output="$LOGDIR/v12val_mm_${HOLDOUT_VEGA}_%J.log" \
     "$CALLERS/pbmotifmaker.slurm" "$REF" "$SIM_GFF" "$SIM_MM_CSV")
 
-# ── 5. merge with existing jasmine output ─────────────────────────────
-# Reuses the original jasmine call (from the real bc2046 BAM) — the
-# generated kinetics shouldn't change the 5mC modkit answer because
-# bc2046 is the E. coli holdout (Dam/Dcm only, no 5mC by design).
+# ── 4b. jasmine + modkit on the SIMULATED BAM (parallel with motifmaker) ──
+# True validation: re-detect 5mC from the simulated kinetics, not from
+# the original real BAM. If KinSim's generated kinetics are realistic
+# enough, jasmine should re-call the same Dcm-class methylations.
+J_JM=$(sbatch --parsable \
+    --dependency=afterok:$J_GEN \
+    --job-name=v12val_jasmine_${HOLDOUT_VEGA} \
+    --output="$LOGDIR/v12val_jasmine_${HOLDOUT_VEGA}_%J.log" \
+    "$CALLERS/jasmine_modkit.slurm" "$SIM_BAM" "$REF" "$SIM_JM_CSV")
+
+# ── 5. merge motifmaker + jasmine outputs (both from simulated BAM) ───
 J_MG=$(sbatch --parsable \
-    --dependency=afterok:$J_MM \
+    --dependency=afterok:${J_MM}:${J_JM} \
     --job-name=v12val_merge_${HOLDOUT_VEGA} \
     --output="$LOGDIR/v12val_merge_${HOLDOUT_VEGA}_%J.log" \
-    "$CALLERS/merge_motifs.slurm" "$SIM_MERGED_CSV" "$MERGE_THRESHOLD" "$SIM_MM_CSV" "$JASMINE_CSV")
+    "$CALLERS/merge_motifs.slurm" "$SIM_MERGED_CSV" "$MERGE_THRESHOLD" "$SIM_MM_CSV" "$SIM_JM_CSV")
 
 echo "── Validation chain submitted ──"
-printf '  %-25s : %s\n' "1. strip kinetics"     "$J_STRIP"
-printf '  %-25s : %s\n' "2. kinsim generate"    "$J_GEN  (after $J_STRIP)"
-printf '  %-25s : %s\n' "3. ipdSummary"         "$J_IPD  (after $J_GEN)"
-printf '  %-25s : %s\n' "4. pbmotifmaker"       "$J_MM   (after $J_IPD)"
-printf '  %-25s : %s\n' "5. merge motifs"       "$J_MG   (after $J_MM)"
+printf '  %-25s : %s\n' "1. strip kinetics"           "$J_STRIP"
+printf '  %-25s : %s\n' "2. kinsim generate"          "$J_GEN  (after $J_STRIP)"
+printf '  %-25s : %s\n' "3. ipdSummary"               "$J_IPD  (after $J_GEN)"
+printf '  %-25s : %s\n' "4. pbmotifmaker"             "$J_MM   (after $J_IPD)"
+printf '  %-25s : %s\n' "4b. jasmine on simulated"    "$J_JM   (after $J_GEN, parallel)"
+printf '  %-25s : %s\n' "5. merge motifs"             "$J_MG   (after $J_MM + $J_JM)"
 echo ""
 echo "Final output:"
 echo "  $SIM_MERGED_CSV"
