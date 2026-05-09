@@ -1,33 +1,31 @@
-"""kinsim_baseline — purely statistical per-kmer (IPD, PW) distribution.
+"""kinsim_baseline — per-(meth_type, offset) IPD/PW baseline + modified-ratio model.
 
-No neural network. No methylation conditioning. For every 11-mer that
-appears in the BASELINE category of a KinSim extract shard, this stores a
-small empirical sample of (IPD, PW) values from real PacBio data and
-generates kinetics by drawing from those samples directly.
+Biology-aware statistical "Plan B" comparison model. No neural network, no
+kmer specificity, no motif input. Reads ``kinsim_config.yaml`` to learn:
 
-This is the **null comparison baseline** for the meth-conditioned KinSim
-neural model. Same input shards, same BAM output format → side-by-side
-``kinsim verify-generate`` runs produce a clean apples-to-apples
-comparison: where does the neural conditioning actually win, and where
-does pure per-kmer empirical sampling already capture the kinetics?
+  - which base each methylation type sits on (``modified_base``: A for m6A,
+    C for m5C/m4C, ...) — generalisable to any new meth type added to YAML.
+  - which downstream offsets carry the kinetic signature
+    (``signal_offsets``: e.g. m6A → [0, 5]).
 
-Pipeline:
+Pipeline (two passes through the manifest's BAMs):
 
-    extract shards/ ──► kinsim_baseline build  ──► kmer_table.npz
-                                                         │
-    input.bam ────────► kinsim_baseline generate ◄──────┘
-                                 │
-                                 ▼
-                          output.bam (fi/fp tags)
+    Pass 1 (baseline) — for every base ``p`` in every read where
+        ``read[p] == modified_base[T]``, accumulate ``ipd[p+k]`` and
+        ``pw[p+k]`` into a per-``(T, k)`` running sum + count. Most A's
+        (or C's) in real DNA are unmethylated, so the per-``(T, k)``
+        mean is dominated by unmodified kinetics.
 
-Module layout:
+    Pass 2 (modified) — same walk; now record only positions where the
+        observed IPD exceeds ``threshold × baseline_mean[T, k]`` (default
+        threshold=1.3). Aggregate into a per-``(T, k)`` modified pool.
 
-    distribution.py   — KmerDistribution class (storage + sampling)
-    build_table.py    — build a table from a shards/ directory
-    generate.py       — produce a BAM with fi/fp tags from an input BAM
-    __main__.py       — ``python -m kinsim_baseline {build,generate}``
+    Output — per-``(T, k)`` baseline_mean, modified_mean, IPD ratio
+        (= modified_mean / baseline_mean) and PW ratio. Total ~30 numbers
+        for the typical m6A / m4C / m5C config.
+
+Usage::
+
+    python -m kinsim_baseline compute MANIFEST_CSV OUTPUT_TSV \\
+        [--threshold 1.3] [--output-json out.json]
 """
-
-from .distribution import KmerDistribution
-
-__all__ = ["KmerDistribution"]
