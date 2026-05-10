@@ -499,12 +499,19 @@ class KineticDataModule(L.LightningDataModule):
 
     def train_dataloader(self) -> DataLoader:
         # IterableDataset shuffles inside __iter__ — DataLoader must NOT.
+        # num_workers=0: single-process data loading. With multi-worker +
+        # IterableDataset on huge sharded data, per-worker shard buffers
+        # leaked memory across epochs (104 GB → 284 GB across two runs at
+        # 22 min vs 1:45 wall — not just "more headroom needed", actively
+        # accumulating). num_workers=0 eliminates the leak at the cost of
+        # ~10–20 % data-loading throughput. The training loop is GPU-bound
+        # so net wall-time impact is small.
         is_iter = isinstance(self._train_subset, IterableDataset)
         return DataLoader(
             self._train_subset,
             batch_size=self.batch_size,
             shuffle=not is_iter,
-            num_workers=4,
+            num_workers=0,
             pin_memory=True,
         )
 
@@ -513,7 +520,7 @@ class KineticDataModule(L.LightningDataModule):
             self._val_subset,
             batch_size=self.batch_size * 4,
             shuffle=False,
-            num_workers=2,
+            num_workers=0,
             pin_memory=True,
         )
 
@@ -524,7 +531,7 @@ class KineticDataModule(L.LightningDataModule):
             self._test_dataset,
             batch_size=self.batch_size * 4,
             shuffle=False,
-            num_workers=2,
+            num_workers=0,
             pin_memory=True,
         )
 
