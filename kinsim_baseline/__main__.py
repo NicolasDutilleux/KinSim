@@ -2,9 +2,16 @@
 
 Usage::
 
-    python -m kinsim_baseline compute MANIFEST_CSV OUTPUT_TSV [--threshold 1.3]
+    python -m kinsim_baseline compute MANIFEST_CSV OUTPUT_DIR [--threshold 1.3]
+        Build per-(meth_type, offset) IPD/PW histograms from the BAMs.
 
-See ``compute.py`` for the algorithm.
+    python -m kinsim_baseline analyze OUTPUT_DIR [--no-plot]
+        Read OUTPUT_DIR/baseline.json from a previous compute, fit a
+        2-component GMM per (T, k), write baseline_gmm.tsv +
+        baseline_gmm.json, and (by default) drop distribution plots into
+        OUTPUT_DIR/plots/.
+
+See ``compute.py`` and ``analyze.py`` for the algorithms.
 """
 
 from __future__ import annotations
@@ -15,7 +22,7 @@ import sys
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print(
-            "usage: python -m kinsim_baseline compute MANIFEST_CSV OUTPUT_DIR [options]\n"
+            "usage: python -m kinsim_baseline <command> [options]\n"
             "\n"
             "  compute MANIFEST_CSV OUTPUT_DIR [--threshold 1.3]\n"
             "      Single-pass walk over manifest BAMs.\n"
@@ -29,6 +36,17 @@ def main():
             "        baseline_summary.tsv  per-(T, k) mean / p50 / p95 / p99 + ratio\n"
             "        baseline.json         full histograms\n"
             "        run_info.json         manifest + per-BAM read counts + timing\n"
+            "\n"
+            "  analyze OUTPUT_DIR [--no-plot] [--max-samples N]\n"
+            "      Read OUTPUT_DIR/baseline.json (from a previous `compute`),\n"
+            "      fit a 2-component Gaussian mixture per (T, k) IPD and PW\n"
+            "      histogram, and write:\n"
+            "        baseline_gmm.tsv      summary with GMM columns\n"
+            "        baseline_gmm.json     full GMM parameters\n"
+            "        plots/all_IPD.png     panel of all (T, k) IPD distributions\n"
+            "        plots/all_PW.png      same for PW\n"
+            "        plots/<T>_off<k>_IPD.png  per-bucket detail plots\n"
+            "      Requires matplotlib + scipy (in the [plot] optional extra).\n"
         )
         sys.exit(0 if len(sys.argv) >= 2 else 1)
 
@@ -37,9 +55,11 @@ def main():
 
     if cmd == "compute":
         from .compute import main as cmd_main
+    elif cmd == "analyze":
+        from .analyze import main as cmd_main
     else:
         print(f"unknown command: {cmd}", file=sys.stderr)
-        print("expected: compute", file=sys.stderr)
+        print("expected: compute | analyze", file=sys.stderr)
         sys.exit(1)
 
     cmd_main(rest)
