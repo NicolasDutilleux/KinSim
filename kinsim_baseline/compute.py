@@ -1,23 +1,36 @@
-"""Per-(meth_type, offset) IPD/PW baseline + modified-ratio computation.
+"""Per-(meth_type, offset) IPD/PW distribution computation.
 
-See module docstring (``kinsim_baseline.__init__``) for the algorithm.
-This file implements the two-pass walk over a manifest's BAMs.
+Algorithm
+---------
+Single-pass walk over the manifest's BAMs. For each read:
 
-Output schema (TSV columns)
----------------------------
-    meth_type        e.g. m6A
-    offset           signed int, e.g. +0, +5
-    modified_base    target base from YAML (A / C / ...)
-    baseline_n       count of unmodified samples (positions p+k where
-                     read[p] == modified_base, regardless of methylation)
-    baseline_ipd     mean IPD over baseline_n
-    baseline_pw      mean PW over baseline_n
-    modified_n       count of "above-threshold" samples (candidate methylated)
-    modified_ipd     mean IPD over modified_n
-    modified_pw      mean PW over modified_n
-    ipd_ratio        modified_ipd / baseline_ipd (NaN if either is missing)
-    pw_ratio         modified_pw / baseline_pw
-    threshold        threshold multiplier used in pass 2 (e.g. 1.3)
+  1. Sequence array ``seq``, IPD ``ipd``, PW ``pw`` (uint8 in [0, 255]).
+  2. For each meth type T declared in ``kinsim_config.yaml``
+     (``modified_base[T]`` and ``signal_offsets[T]``):
+        - Find every position ``p`` where ``seq[p] == modified_base[T]``.
+        - For every offset ``k`` in ``signal_offsets[T]``:
+            * Look at ``ipd[p + k]`` and ``pw[p + k]``.
+            * Add into the running 256-bin histogram for ``(T, k)``.
+
+So for each ``(T, k)`` bucket we accumulate a **population** of IPD and
+PW values at the affected positions across the whole corpus. Because
+most A's (or C's) in real DNA are not methylated, the bulk of the
+histogram is unmodified kinetics — that's the baseline distribution.
+The high tail is the modified subset.
+
+Outputs (written into ``out_dir/``)
+------------------------------------
+    baseline_hist.tsv      long-form, columns:
+                           meth_type, offset, modified_base, metric, bin, count
+                           (metric ∈ {IPD, PW}; bin ∈ [0..255])
+    baseline_summary.tsv   per-(T, k) summary stats:
+                           n, ipd_mean, ipd_p50/p95/p99,
+                           pw_mean,  pw_p50/p95/p99,
+                           n_above, ipd_mean_above, ipd_ratio,
+                           pw_mean_above,  pw_ratio,
+                           threshold (× mean for the "modified" cut)
+    baseline.json          full histograms (per-(T, k) × {IPD,PW} → 256-bin list)
+    run_info.json          inputs, timestamps, n_reads per BAM
 """
 
 from __future__ import annotations
@@ -26,6 +39,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional
@@ -63,7 +77,7 @@ def load_signatures() -> dict:
             continue
         out[mtype] = {
             "modified_base": str(mb).upper()[:1],
-            "signal_offsets": list(int(k) for k in offsets),
+            "signal_offsets": [int(k) for k in offsets],
         }
     if not out:
         log.error("No usable entries in kinetic_signatures — aborting.")
@@ -76,7 +90,7 @@ def load_signatures() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Per-read accumulation primitives (vectorised)
+# Per-read accumulation
 # ---------------------------------------------------------------------------
 
 
@@ -100,18 +114,15 @@ def _read_kinetics(read) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
     return seq_arr, ipd, pw
 
 
-def _per_read_accumulate_baseline(
+def _accumulate_read(
     seq_arr: np.ndarray,
     ipd: np.ndarray,
     pw: np.ndarray,
     signatures: dict,
-    sums_ipd: dict,
-    sums_pw: dict,
-    counts: dict,
+    hist_ipd: dict,
+    hist_pw: dict,
 ) -> None:
-    """Pass 1: for each (T, k) bucket, sum ipd[p+k]+pw[p+k] over positions
-    p where seq[p] == modified_base[T].
-    """
+    """For each (T, k), bincount IPD/PW at positions p+k where seq[p]==target."""
     L = seq_arr.size
     for T, info in signatures.items():
         target_byte = ord(info["modified_base"])
@@ -119,85 +130,50 @@ def _per_read_accumulate_baseline(
         if positions.size == 0:
             continue
         for k in info["signal_offsets"]:
-            target_pos = positions + k
-            valid = (target_pos >= 0) & (target_pos < L)
-            target_pos = target_pos[valid]
-            if target_pos.size == 0:
+            tgt = positions + k
+            valid = (tgt >= 0) & (tgt < L)
+            tgt = tgt[valid]
+            if tgt.size == 0:
                 continue
-            sums_ipd[(T, k)] += ipd[target_pos].astype(np.float64).sum()
-            sums_pw[(T, k)] += pw[target_pos].astype(np.float64).sum()
-            counts[(T, k)] += int(target_pos.size)
-
-
-def _per_read_accumulate_modified(
-    seq_arr: np.ndarray,
-    ipd: np.ndarray,
-    pw: np.ndarray,
-    signatures: dict,
-    baseline_ipd_means: dict,
-    threshold: float,
-    sums_ipd: dict,
-    sums_pw: dict,
-    counts: dict,
-) -> None:
-    """Pass 2: same walk, but only accumulate positions where observed
-    IPD exceeds ``threshold × baseline_ipd_mean[T, k]``.
-    """
-    L = seq_arr.size
-    for T, info in signatures.items():
-        target_byte = ord(info["modified_base"])
-        positions = np.where(seq_arr == target_byte)[0]
-        if positions.size == 0:
-            continue
-        for k in info["signal_offsets"]:
-            base_ipd = baseline_ipd_means.get((T, k))
-            if base_ipd is None or base_ipd <= 0:
-                continue
-            cutoff = threshold * base_ipd
-            target_pos = positions + k
-            valid = (target_pos >= 0) & (target_pos < L)
-            target_pos = target_pos[valid]
-            if target_pos.size == 0:
-                continue
-            ipd_at = ipd[target_pos].astype(np.float64)
-            above = ipd_at > cutoff
-            if not above.any():
-                continue
-            sums_ipd[(T, k)] += ipd_at[above].sum()
-            sums_pw[(T, k)] += pw[target_pos][above].astype(np.float64).sum()
-            counts[(T, k)] += int(above.sum())
+            hist_ipd[(T, k)] += np.bincount(ipd[tgt], minlength=256).astype(np.int64)
+            hist_pw[(T, k)] += np.bincount(pw[tgt], minlength=256).astype(np.int64)
 
 
 # ---------------------------------------------------------------------------
-# Two-pass driver
+# Single-pass driver
 # ---------------------------------------------------------------------------
 
 
-def compute_ratios(
+def compute_histograms(
     bam_paths: list[Path],
-    threshold: float = 1.3,
     progress_every: int = 50_000,
-) -> dict:
-    """Two-pass per-(meth_type, offset) baseline + modified + ratio.
+) -> tuple[dict, dict, dict, dict]:
+    """Single pass: build per-(T, k) IPD and PW histograms.
 
-    Returns a dict keyed by ``(T, k)`` containing baseline / modified
-    counts, IPD means, PW means, IPD ratio, PW ratio.
+    Returns
+    -------
+    signatures : dict from kinsim_config.yaml (T -> {modified_base, signal_offsets})
+    hist_ipd   : dict (T, k) -> int64[256]
+    hist_pw    : dict (T, k) -> int64[256]
+    per_bam    : dict bam_path -> {"n_reads", "elapsed_s"}
     """
     import pysam  # heavy import here so the package import doesn't pay it
 
     signatures = load_signatures()
 
-    # ── Pass 1: baseline ────────────────────────────────────────────────
-    base_sum_ipd: dict = defaultdict(float)
-    base_sum_pw: dict = defaultdict(float)
-    base_count: dict = defaultdict(int)
+    hist_ipd: dict = defaultdict(lambda: np.zeros(256, dtype=np.int64))
+    hist_pw: dict = defaultdict(lambda: np.zeros(256, dtype=np.int64))
+    per_bam: dict = {}
 
-    log.info("PASS 1/2 — baseline accumulation across %d BAMs", len(bam_paths))
+    log.info("Single-pass histogram walk across %d BAMs", len(bam_paths))
     for bi, bam_path in enumerate(bam_paths, 1):
-        if not Path(bam_path).is_file():
+        bam_path = Path(bam_path)
+        if not bam_path.is_file():
             log.warning("[%d/%d] missing BAM: %s — skip", bi, len(bam_paths), bam_path)
+            per_bam[str(bam_path)] = {"n_reads": 0, "elapsed_s": 0.0, "skipped": True}
             continue
-        log.info("[%d/%d pass1] %s", bi, len(bam_paths), bam_path)
+        log.info("[%d/%d] %s", bi, len(bam_paths), bam_path)
+        t0 = time.time()
         n_reads = 0
         with pysam.AlignmentFile(str(bam_path), "rb", check_sq=False) as bam:
             for read in bam:
@@ -205,90 +181,49 @@ def compute_ratios(
                 if kin is None:
                     continue
                 seq_arr, ipd, pw = kin
-                _per_read_accumulate_baseline(
-                    seq_arr, ipd, pw, signatures,
-                    base_sum_ipd, base_sum_pw, base_count,
-                )
+                _accumulate_read(seq_arr, ipd, pw, signatures, hist_ipd, hist_pw)
                 n_reads += 1
                 if n_reads % progress_every == 0:
-                    log.info("    ... %d reads processed", n_reads)
-        log.info("    → %d reads", n_reads)
+                    log.info("    ... %d reads", n_reads)
+        dt = time.time() - t0
+        log.info("    → %d reads in %.1f s", n_reads, dt)
+        per_bam[str(bam_path)] = {"n_reads": n_reads, "elapsed_s": round(dt, 2)}
 
-    baseline_means_ipd: dict = {}
-    baseline_means_pw: dict = {}
-    for key, n in base_count.items():
-        if n > 0:
-            baseline_means_ipd[key] = base_sum_ipd[key] / n
-            baseline_means_pw[key] = base_sum_pw[key] / n
-
-    log.info("Baseline means (n / IPD / PW):")
-    for T, info in signatures.items():
-        for k in info["signal_offsets"]:
-            n = base_count.get((T, k), 0)
-            if n == 0:
-                log.info("  %s@%+d: NO DATA", T, k)
-                continue
-            log.info("  %s@%+d: n=%-12d IPD=%6.2f PW=%6.2f",
-                     T, k, n, baseline_means_ipd[(T, k)], baseline_means_pw[(T, k)])
-
-    # ── Pass 2: modified pool ───────────────────────────────────────────
-    mod_sum_ipd: dict = defaultdict(float)
-    mod_sum_pw: dict = defaultdict(float)
-    mod_count: dict = defaultdict(int)
-
-    log.info("PASS 2/2 — modified pool (threshold = %.2f × baseline)", threshold)
-    for bi, bam_path in enumerate(bam_paths, 1):
-        if not Path(bam_path).is_file():
-            continue
-        log.info("[%d/%d pass2] %s", bi, len(bam_paths), bam_path)
-        n_reads = 0
-        with pysam.AlignmentFile(str(bam_path), "rb", check_sq=False) as bam:
-            for read in bam:
-                kin = _read_kinetics(read)
-                if kin is None:
-                    continue
-                seq_arr, ipd, pw = kin
-                _per_read_accumulate_modified(
-                    seq_arr, ipd, pw, signatures,
-                    baseline_means_ipd, threshold,
-                    mod_sum_ipd, mod_sum_pw, mod_count,
-                )
-                n_reads += 1
-                if n_reads % progress_every == 0:
-                    log.info("    ... %d reads processed", n_reads)
-        log.info("    → %d reads", n_reads)
-
-    # ── Assemble results ────────────────────────────────────────────────
-    results: dict = {}
-    for T, info in signatures.items():
-        for k in info["signal_offsets"]:
-            base_n = base_count.get((T, k), 0)
-            mod_n = mod_count.get((T, k), 0)
-            base_ipd = baseline_means_ipd.get((T, k))
-            base_pw = baseline_means_pw.get((T, k))
-            mod_ipd = (mod_sum_ipd[(T, k)] / mod_n) if mod_n > 0 else None
-            mod_pw = (mod_sum_pw[(T, k)] / mod_n) if mod_n > 0 else None
-            ipd_ratio = (mod_ipd / base_ipd) if (mod_ipd and base_ipd and base_ipd > 0) else None
-            pw_ratio = (mod_pw / base_pw) if (mod_pw and base_pw and base_pw > 0) else None
-            results[(T, k)] = {
-                "meth_type": T,
-                "offset": k,
-                "modified_base": info["modified_base"],
-                "baseline_n": base_n,
-                "baseline_ipd": base_ipd,
-                "baseline_pw": base_pw,
-                "modified_n": mod_n,
-                "modified_ipd": mod_ipd,
-                "modified_pw": mod_pw,
-                "ipd_ratio": ipd_ratio,
-                "pw_ratio": pw_ratio,
-                "threshold": threshold,
-            }
-    return results
+    return signatures, dict(hist_ipd), dict(hist_pw), per_bam
 
 
 # ---------------------------------------------------------------------------
-# Output formatting
+# Histogram → summary stats
+# ---------------------------------------------------------------------------
+
+
+def _hist_stats(h: np.ndarray) -> dict:
+    """n, mean, p50, p95, p99 from a 256-bin histogram. ``None`` if empty."""
+    n = int(h.sum())
+    if n == 0:
+        return {"n": 0, "mean": None, "p50": None, "p95": None, "p99": None}
+    bins = np.arange(256, dtype=np.float64)
+    mean = float((bins * h).sum() / n)
+    cum = np.cumsum(h)
+    p50 = int(np.searchsorted(cum, n * 0.50))
+    p95 = int(np.searchsorted(cum, n * 0.95))
+    p99 = int(np.searchsorted(cum, n * 0.99))
+    return {"n": n, "mean": mean, "p50": p50, "p95": p95, "p99": p99}
+
+
+def _hist_above(h: np.ndarray, cutoff: float) -> dict:
+    """n and mean for the part of the histogram with bin > cutoff."""
+    bins = np.arange(256, dtype=np.float64)
+    mask = bins > cutoff
+    n = int(h[mask].sum())
+    if n == 0:
+        return {"n": 0, "mean": None}
+    mean = float((bins[mask] * h[mask]).sum() / n)
+    return {"n": n, "mean": mean}
+
+
+# ---------------------------------------------------------------------------
+# Output writers
 # ---------------------------------------------------------------------------
 
 
@@ -296,44 +231,110 @@ def _fmt(x, fmt="%.4f"):
     return fmt % x if x is not None else "NA"
 
 
-def write_tsv(results: dict, path: Path) -> None:
+def write_hist_tsv(hist_ipd: dict, hist_pw: dict, signatures: dict, path: Path) -> None:
+    """Long-form histogram TSV: one row per (T, k, metric, bin)."""
+    cols = ["meth_type", "offset", "modified_base", "metric", "bin", "count"]
+    with open(path, "w") as f:
+        f.write("\t".join(cols) + "\n")
+        for T, info in signatures.items():
+            mb = info["modified_base"]
+            for k in info["signal_offsets"]:
+                for metric, hist in (("IPD", hist_ipd), ("PW", hist_pw)):
+                    h = hist.get((T, k))
+                    if h is None:
+                        continue
+                    for b in range(256):
+                        if h[b] == 0:
+                            continue
+                        f.write(f"{T}\t{k:+d}\t{mb}\t{metric}\t{b}\t{int(h[b])}\n")
+
+
+def write_summary_tsv(
+    hist_ipd: dict, hist_pw: dict, signatures: dict, path: Path, threshold: float = 1.3,
+) -> None:
+    """Per-(T, k) summary: baseline (full histogram) + modified (above cutoff) + ratio."""
     cols = [
         "meth_type", "offset", "modified_base",
-        "baseline_n", "baseline_ipd", "baseline_pw",
-        "modified_n", "modified_ipd", "modified_pw",
-        "ipd_ratio", "pw_ratio", "threshold",
+        "n",
+        "ipd_mean", "ipd_p50", "ipd_p95", "ipd_p99",
+        "pw_mean",  "pw_p50",  "pw_p95",  "pw_p99",
+        "threshold", "n_above",
+        "ipd_mean_above", "ipd_ratio",
+        "pw_mean_above",  "pw_ratio",
     ]
     with open(path, "w") as f:
         f.write("\t".join(cols) + "\n")
-        for (T, k), r in sorted(results.items()):
-            row = [
-                r["meth_type"], f"{r['offset']:+d}", r["modified_base"],
-                str(r["baseline_n"]), _fmt(r["baseline_ipd"]), _fmt(r["baseline_pw"]),
-                str(r["modified_n"]), _fmt(r["modified_ipd"]), _fmt(r["modified_pw"]),
-                _fmt(r["ipd_ratio"]), _fmt(r["pw_ratio"]), _fmt(r["threshold"], "%.3f"),
-            ]
-            f.write("\t".join(row) + "\n")
+        for T, info in signatures.items():
+            for k in info["signal_offsets"]:
+                hi = hist_ipd.get((T, k), np.zeros(256, dtype=np.int64))
+                hp = hist_pw.get((T, k), np.zeros(256, dtype=np.int64))
+                s_i, s_p = _hist_stats(hi), _hist_stats(hp)
+                if s_i["mean"] is None:
+                    cutoff = float("inf")
+                    above_i = {"n": 0, "mean": None}
+                    above_p = {"n": 0, "mean": None}
+                    ipd_ratio = None
+                    pw_ratio = None
+                else:
+                    cutoff = threshold * s_i["mean"]
+                    above_i = _hist_above(hi, cutoff)
+                    above_p = _hist_above(hp, cutoff)
+                    ipd_ratio = (above_i["mean"] / s_i["mean"]) if above_i["mean"] else None
+                    pw_ratio = (above_p["mean"] / s_p["mean"]) if (above_p["mean"] and s_p["mean"]) else None
+                row = [
+                    T, f"{k:+d}", info["modified_base"],
+                    str(s_i["n"]),
+                    _fmt(s_i["mean"], "%.3f"), _fmt(s_i["p50"], "%d"),
+                    _fmt(s_i["p95"], "%d"),   _fmt(s_i["p99"], "%d"),
+                    _fmt(s_p["mean"], "%.3f"), _fmt(s_p["p50"], "%d"),
+                    _fmt(s_p["p95"], "%d"),   _fmt(s_p["p99"], "%d"),
+                    _fmt(threshold, "%.3f"), str(above_i["n"]),
+                    _fmt(above_i["mean"], "%.3f"), _fmt(ipd_ratio, "%.3f"),
+                    _fmt(above_p["mean"], "%.3f"), _fmt(pw_ratio,  "%.3f"),
+                ]
+                f.write("\t".join(row) + "\n")
 
 
-def write_json(results: dict, path: Path) -> None:
-    serialisable = {f"{T}@{k:+d}": v for (T, k), v in results.items()}
+def write_json(
+    hist_ipd: dict, hist_pw: dict, signatures: dict, path: Path,
+) -> None:
+    """Full histograms in JSON, keyed ``"T@+k"`` for IPD and PW."""
+    out = {"signatures": signatures, "ipd": {}, "pw": {}}
+    for T, info in signatures.items():
+        for k in info["signal_offsets"]:
+            key = f"{T}@{k:+d}"
+            hi = hist_ipd.get((T, k))
+            hp = hist_pw.get((T, k))
+            if hi is not None:
+                out["ipd"][key] = hi.tolist()
+            if hp is not None:
+                out["pw"][key] = hp.tolist()
     with open(path, "w") as f:
-        json.dump(serialisable, f, indent=2)
+        json.dump(out, f, indent=1)
 
 
-def log_summary(results: dict) -> None:
-    log.info("=" * 64)
-    log.info("PER-(meth_type, offset) IPD RATIO SUMMARY")
-    log.info("=" * 64)
-    log.info("%-6s %+5s  base_n     base_IPD  mod_n     mod_IPD   IPD_ratio  PW_ratio",
-             "meth", "off")
-    for (T, k), r in sorted(results.items()):
-        log.info(
-            "%-6s %+5d  %-10d %7s   %-9d %7s   %7s   %7s",
-            T, k, r["baseline_n"], _fmt(r["baseline_ipd"], "%.2f"),
-            r["modified_n"], _fmt(r["modified_ipd"], "%.2f"),
-            _fmt(r["ipd_ratio"], "%.3f"), _fmt(r["pw_ratio"], "%.3f"),
-        )
+def log_summary(hist_ipd: dict, signatures: dict, threshold: float) -> None:
+    log.info("=" * 72)
+    log.info("PER-(meth_type, offset) IPD DISTRIBUTION SUMMARY  (threshold=%.2f)", threshold)
+    log.info("=" * 72)
+    log.info("%-6s %5s  %-12s %7s %5s %5s %5s  %-10s %7s  %5s",
+             "meth", "off", "n", "ipd_mean", "p50", "p95", "p99",
+             "n_above", "mean_a", "ratio")
+    for T, info in signatures.items():
+        for k in info["signal_offsets"]:
+            h = hist_ipd.get((T, k), np.zeros(256, dtype=np.int64))
+            s = _hist_stats(h)
+            if s["mean"] is None:
+                log.info("  %-6s %+5d  NO DATA", T, k)
+                continue
+            cutoff = threshold * s["mean"]
+            ab = _hist_above(h, cutoff)
+            ratio = (ab["mean"] / s["mean"]) if ab["mean"] else None
+            log.info(
+                "%-6s %+5d  %-12d %7.3f %5d %5d %5d  %-10d %7s  %5s",
+                T, k, s["n"], s["mean"], s["p50"], s["p95"], s["p99"],
+                ab["n"], _fmt(ab["mean"], "%.3f"), _fmt(ratio, "%.3f"),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -350,29 +351,49 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("manifest_csv", help="KinSim manifest CSV (sample_id,bam_path,...)")
-    p.add_argument("output_tsv", help="Output TSV with per-(meth_type, offset) stats")
+    p.add_argument("output_dir",
+                   help="Output directory; baseline_hist.tsv / baseline_summary.tsv / "
+                        "baseline.json / run_info.json land inside.")
     p.add_argument("--threshold", type=float, default=1.3,
-                   help="Multiplier above baseline mean IPD to flag a position "
-                        "as candidate-modification in pass 2 (default 1.3).")
-    p.add_argument("--output-json", default=None,
-                   help="Optional path for the same results in JSON format.")
+                   help="Multiplier × baseline mean IPD used in the summary's "
+                        "'above-cutoff' / IPD-ratio columns (default 1.3).")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
     setup_logging(verbose=args.verbose)
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     entries = load_manifest(args.manifest_csv)
     bam_paths = [Path(e.bam_path) for e in entries]
     log.info("Loaded %d BAM paths from manifest %s", len(bam_paths), args.manifest_csv)
 
-    results = compute_ratios(bam_paths, threshold=args.threshold)
+    t0 = time.time()
+    signatures, hist_ipd, hist_pw, per_bam = compute_histograms(bam_paths)
+    elapsed = time.time() - t0
 
-    write_tsv(results, Path(args.output_tsv))
-    log.info("Saved TSV: %s", args.output_tsv)
-    if args.output_json:
-        write_json(results, Path(args.output_json))
-        log.info("Saved JSON: %s", args.output_json)
+    hist_path    = out_dir / "baseline_hist.tsv"
+    summary_path = out_dir / "baseline_summary.tsv"
+    json_path    = out_dir / "baseline.json"
+    info_path    = out_dir / "run_info.json"
 
-    log_summary(results)
+    write_hist_tsv(hist_ipd, hist_pw, signatures, hist_path)
+    write_summary_tsv(hist_ipd, hist_pw, signatures, summary_path, threshold=args.threshold)
+    write_json(hist_ipd, hist_pw, signatures, json_path)
+    with open(info_path, "w") as f:
+        json.dump({
+            "manifest_csv": str(args.manifest_csv),
+            "threshold":    args.threshold,
+            "elapsed_s":    round(elapsed, 2),
+            "per_bam":      per_bam,
+            "signatures":   signatures,
+        }, f, indent=2)
+
+    log.info("Saved: %s", hist_path)
+    log.info("Saved: %s", summary_path)
+    log.info("Saved: %s", json_path)
+    log.info("Saved: %s", info_path)
+    log_summary(hist_ipd, signatures, threshold=args.threshold)
 
 
 if __name__ == "__main__":
