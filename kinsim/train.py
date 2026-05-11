@@ -546,7 +546,7 @@ class KineticDataModule(L.LightningDataModule):
         batch_size: int = 4096,
         num_meth_types: int | None = None,
         seed: int = 42,
-        max_rows_per_shard: int | None = 2_000_000,
+        max_rows_per_shard: int | None = None,
         num_workers: int = 2,
     ) -> None:
         super().__init__()
