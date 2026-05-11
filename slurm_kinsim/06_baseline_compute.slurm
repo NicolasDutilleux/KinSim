@@ -42,7 +42,10 @@ THRESHOLD=${3:-1.3}
 
 mkdir -p "$OUT_DIR"
 
-REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+# Hardcoded — `readlink -f $0` resolves to /var/spool/slurmd inside a SLURM
+# job, so we can't recover the actual repo path from $0. Matches the
+# pattern used by _v12_orchestrator.sh.
+REPO=/data/users/ndutilleux/KinSim
 
 echo "================================================================"
 echo "  kinsim_baseline compute"
