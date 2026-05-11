@@ -101,6 +101,20 @@ def _gaussian_nll_loss(params: torch.Tensor, targets: torch.Tensor) -> torch.Ten
     return (0.5 * (log_sig * 2.0 + (targets - mu) ** 2 / var)).mean()
 
 
+def _per_sample_gaussian_nll(
+    mu: np.ndarray, sigma: np.ndarray, targets: np.ndarray,
+) -> np.ndarray:
+    """Per-sample GNLL on (IPD, PW) — same math as _gaussian_nll_loss but
+    returns a (N,) array (mean over the 2 dims). Used to bucket val/test
+    losses by (category, parent_meth, parent_offset).
+    """
+    sigma_safe = np.maximum(sigma, 1e-6)
+    log_sig = np.log(sigma_safe)
+    var = sigma_safe ** 2
+    nll = 0.5 * (log_sig * 2.0 + (targets - mu) ** 2 / var)
+    return nll.mean(axis=1)
+
+
 def _mse_loss(params: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """Plain MSE on the mean head only (μ_ipd, μ_pw)."""
     return nn.functional.mse_loss(params[:, :2], targets)
@@ -356,6 +370,138 @@ def _log_metrics(metrics: dict, prefix: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-(category, parent_meth, parent_offset) bucket metrics
+# ---------------------------------------------------------------------------
+
+
+def _bucket_keys_from_arrays(
+    categories: np.ndarray, parent_meths: np.ndarray, parent_offsets: np.ndarray,
+) -> np.ndarray:
+    """Map per-sample (category, parent_meth, parent_offset) → bucket key.
+
+    Compact view (9 buckets typical for m6A + m4C + m5C YAML):
+      CATEGORY=0 (BASELINE)  → 'BASELINE'
+      CATEGORY=1 (SLOWED)    → 'SLOWED/<meth_name>@<+offset>'
+      CATEGORY=2 (NEAR_METH) → 'NEAR_METH/<meth_name>'  (aggregated across offsets)
+
+    Aggregating NEAR_METH per meth type instead of per offset keeps the
+    log table readable (otherwise we'd have ~24 buckets — one per non-
+    signature offset per meth type, which is just noise control).
+    """
+    from .utils.encoding import get_meth_ids
+    names_by_id = {v: k for k, v in get_meth_ids().items()}
+
+    keys = np.empty(len(categories), dtype=object)
+    keys[:] = "OTHER"
+    keys[categories == 0] = "BASELINE"
+
+    for meth_id, name in names_by_id.items():
+        if meth_id == 0:
+            continue
+        slowed_mask = (categories == 1) & (parent_meths == meth_id)
+        if slowed_mask.any():
+            unique_offsets = np.unique(parent_offsets[slowed_mask])
+            for k in unique_offsets:
+                mask_k = slowed_mask & (parent_offsets == k)
+                keys[mask_k] = f"SLOWED/{name}@{int(k):+d}"
+        near_mask = (categories == 2) & (parent_meths == meth_id)
+        if near_mask.any():
+            keys[near_mask] = f"NEAR_METH/{name}"
+
+    return keys
+
+
+def _safe_key(s: str) -> str:
+    """Make a bucket key safe as a TensorBoard / CSV metric key."""
+    return (s.replace("/", "_").replace("@", "_at_")
+             .replace("+", "p").replace("-", "m"))
+
+
+def _compute_bucket_metrics(
+    all_mu: np.ndarray, all_sigma: np.ndarray, all_true: np.ndarray,
+    all_categories: np.ndarray, all_parent_meths: np.ndarray,
+    all_parent_offsets: np.ndarray, prefix: str,
+) -> dict:
+    """Per-bucket val/test metrics: loss, MAE, Pearson, 2σ calibration."""
+    bucket_keys = _bucket_keys_from_arrays(
+        all_categories, all_parent_meths, all_parent_offsets,
+    )
+    per_loss = _per_sample_gaussian_nll(all_mu, all_sigma, all_true)  # (N,)
+
+    result: dict = {}
+    by_bucket: dict = {}
+    for bk in np.unique(bucket_keys):
+        mask = bucket_keys == bk
+        n = int(mask.sum())
+        if n < 10:
+            continue
+        mu_b = all_mu[mask]
+        true_b = all_true[mask]
+        sig_b = all_sigma[mask]
+        diff_b = mu_b - true_b
+        rec = {
+            "n":           n,
+            "loss":        float(per_loss[mask].mean()),
+            "pearson_ipd": _pearson(mu_b[:, 0], true_b[:, 0]),
+            "pearson_pw":  _pearson(mu_b[:, 1], true_b[:, 1]),
+            "mae_ipd":     float(np.abs(diff_b[:, 0]).mean()),
+            "mae_pw":      float(np.abs(diff_b[:, 1]).mean()),
+            "calib_2sig":  float((np.abs(diff_b) <= 2.0 * sig_b).mean()),
+        }
+        by_bucket[bk] = rec
+        sk = _safe_key(bk)
+        result[f"{prefix}_bucket_loss_{sk}"]        = rec["loss"]
+        result[f"{prefix}_bucket_pearson_ipd_{sk}"] = rec["pearson_ipd"]
+        result[f"{prefix}_bucket_pearson_pw_{sk}"]  = rec["pearson_pw"]
+        result[f"{prefix}_bucket_mae_ipd_{sk}"]     = rec["mae_ipd"]
+        result[f"{prefix}_bucket_calib2_{sk}"]      = rec["calib_2sig"]
+    result["_by_bucket"] = by_bucket
+    return result
+
+
+def _bucket_sort_key(bk: str) -> tuple:
+    """Sort: BASELINE, then SLOWED grouped by meth then offset, then NEAR_METH."""
+    if bk == "BASELINE":
+        return (0, "", 0)
+    if bk.startswith("SLOWED/"):
+        rest = bk[len("SLOWED/"):]   # e.g. m6A@+0
+        if "@" in rest:
+            T, off = rest.split("@")
+            try:
+                return (1, T, int(off))
+            except ValueError:
+                return (1, T, 0)
+        return (1, rest, 0)
+    if bk.startswith("NEAR_METH/"):
+        return (2, bk[len("NEAR_METH/"):], 0)
+    return (9, bk, 0)
+
+
+def _log_bucket_metrics(bucket_metrics: dict, prefix: str) -> None:
+    """Pretty-print per-bucket metrics to the INFO log."""
+    by_bucket = bucket_metrics.get("_by_bucket", {})
+    if not by_bucket:
+        return
+    W = 88
+    log.info("─" * W)
+    log.info("  %s  per-(category, parent_meth, parent_offset) breakdown", prefix.upper())
+    log.info("─" * W)
+    log.info(
+        "    %-26s  %12s  %8s  %8s  %8s  %6s",
+        "bucket", "n", "loss", "pIPD", "pPW", "2σ%",
+    )
+    for bk in sorted(by_bucket.keys(), key=_bucket_sort_key):
+        r = by_bucket[bk]
+        log.info(
+            "    %-26s  %12d  %+8.4f  %8.3f  %8.3f  %5.1f%%",
+            bk, r["n"], r["loss"],
+            r["pearson_ipd"], r["pearson_pw"],
+            r["calib_2sig"] * 100,
+        )
+    log.info("─" * W)
+
+
+# ---------------------------------------------------------------------------
 # KineticDataModule
 # ---------------------------------------------------------------------------
 
@@ -400,6 +546,8 @@ class KineticDataModule(L.LightningDataModule):
         batch_size: int = 4096,
         num_meth_types: int | None = None,
         seed: int = 42,
+        max_rows_per_shard: int | None = 2_000_000,
+        num_workers: int = 4,
     ) -> None:
         super().__init__()
         self.input_path = str(input_path)
@@ -416,6 +564,13 @@ class KineticDataModule(L.LightningDataModule):
             num_meth_types = max(get_meth_ids().values()) + 1
         self.num_meth_types = int(num_meth_types)
         self.seed = seed
+        # ``max_rows_per_shard``: cap yielded rows per shard per worker pass.
+        # Forces visiting all shards per epoch (with limit_train_batches active)
+        # instead of one big shard hogging the budget. 2M rows/shard × 49 shards
+        # / 2 workers ≈ 50M rows/epoch — fits the 50k batches × 1024 budget below
+        # while guaranteeing each shard is seen at least once.
+        self.max_rows_per_shard = max_rows_per_shard
+        self.num_workers = int(num_workers)
         # populated in setup()
         self._train_subset = None
         self._val_subset = None
@@ -483,6 +638,9 @@ class KineticDataModule(L.LightningDataModule):
                 num_meth_types=self.num_meth_types,
                 seed=self.seed,
             )
+            # Per-shard cap on train so every shard is visited per epoch
+            # (rather than burning the full budget on one big shard).
+            self._train_subset._max_rows_per_shard = self.max_rows_per_shard
             self._val_subset = ShardedSignalDataset(
                 val_shards,
                 shuffle=False,
@@ -499,18 +657,24 @@ class KineticDataModule(L.LightningDataModule):
 
     def train_dataloader(self) -> DataLoader:
         # IterableDataset shuffles inside __iter__ — DataLoader must NOT.
-        # num_workers=2 is the compromise: 2 workers give parallel prefetch
-        # (vs single-process at 6.58 it/s = GPU starved), but only 2× shard
-        # memory + leak amplification (vs 4×). Budget ~150 GB peak with
-        # 2 workers, vs ~280 GB observed with 4. Pair with --mem=192G.
-        # If memory creeps again, drop to num_workers=1.
+        #
+        # ``persistent_workers=True`` keeps workers alive across epochs
+        # (avoids re-spawn cost AND the per-epoch memory ramp the older
+        # implementation showed). Combined with the pre-built meth_full
+        # in _flatten_data_dict, peak RAM per worker drops below the
+        # previous level — we can safely bump workers to 4.
+        #
+        # ``prefetch_factor=4`` keeps the GPU fed: 4 batches queued per
+        # worker.
         is_iter = isinstance(self._train_subset, IterableDataset)
         return DataLoader(
             self._train_subset,
             batch_size=self.batch_size,
             shuffle=not is_iter,
-            num_workers=2,
+            num_workers=self.num_workers,
             pin_memory=True,
+            prefetch_factor=4,
+            persistent_workers=True,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -518,8 +682,10 @@ class KineticDataModule(L.LightningDataModule):
             self._val_subset,
             batch_size=self.batch_size * 4,
             shuffle=False,
-            num_workers=1,
+            num_workers=max(1, self.num_workers // 2),
             pin_memory=True,
+            prefetch_factor=4,
+            persistent_workers=True,
         )
 
     def test_dataloader(self) -> DataLoader | None:
@@ -529,8 +695,10 @@ class KineticDataModule(L.LightningDataModule):
             self._test_dataset,
             batch_size=self.batch_size * 4,
             shuffle=False,
-            num_workers=1,
+            num_workers=max(1, self.num_workers // 2),
             pin_memory=True,
+            prefetch_factor=4,
+            persistent_workers=True,
         )
 
 
@@ -573,22 +741,30 @@ class KineticPredictor(L.LightningModule):
         self._val_sigma: list[torch.Tensor] = []
         self._val_true: list[torch.Tensor] = []
         self._val_meth_ids: list[torch.Tensor] = []
+        self._val_parent_meths:   list[torch.Tensor] = []
+        self._val_parent_offsets: list[torch.Tensor] = []
+        self._val_categories:     list[torch.Tensor] = []
         self._test_mu: list[torch.Tensor] = []
         self._test_sigma: list[torch.Tensor] = []
         self._test_true: list[torch.Tensor] = []
         self._test_meth_ids: list[torch.Tensor] = []
+        self._test_parent_meths:   list[torch.Tensor] = []
+        self._test_parent_offsets: list[torch.Tensor] = []
+        self._test_categories:     list[torch.Tensor] = []
 
     def forward(self, kmer_ids: torch.Tensor, meth_probs: torch.Tensor) -> torch.Tensor:
         return self.model(kmer_ids, meth_probs)
 
     def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
-        kmer_ids, meth_probs, signals, _meth_ids = batch
+        # 7-tuple now; training ignores parent_meth / parent_offset / category.
+        kmer_ids, meth_probs, signals, *_extras = batch
         loss = self._loss_fn(self.model(kmer_ids, meth_probs), signals)
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
-        kmer_ids, meth_probs, signals, meth_ids = batch
+        (kmer_ids, meth_probs, signals, meth_ids,
+         parent_meths, parent_offsets, categories) = batch
         params = self.model(kmer_ids, meth_probs)
         loss = self._loss_fn(params, signals)
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
@@ -599,6 +775,9 @@ class KineticPredictor(L.LightningModule):
         self._val_sigma.append(sigma.detach().cpu())
         self._val_true.append(signals.detach().cpu())
         self._val_meth_ids.append(meth_ids.detach().cpu())
+        self._val_parent_meths.append(parent_meths.detach().cpu())
+        self._val_parent_offsets.append(parent_offsets.detach().cpu())
+        self._val_categories.append(categories.detach().cpu())
         return loss
 
     def on_validation_epoch_end(self) -> None:
@@ -608,6 +787,9 @@ class KineticPredictor(L.LightningModule):
         all_sigma = torch.cat(self._val_sigma).numpy()  # (N, 2)
         all_true = torch.cat(self._val_true).numpy()  # (N, 2)
         all_meth_ids = torch.cat(self._val_meth_ids).numpy()  # (N,)
+        all_pm  = torch.cat(self._val_parent_meths).numpy()    # (N,)
+        all_po  = torch.cat(self._val_parent_offsets).numpy()  # (N,)
+        all_cat = torch.cat(self._val_categories).numpy()      # (N,)
 
         val_loss = self.trainer.callback_metrics.get("val_loss", float("nan"))
         gnll_grade = _grade(float(val_loss), 1.0, 1.5, higher_is_better=False)
@@ -618,19 +800,28 @@ class KineticPredictor(L.LightningModule):
             gnll_grade,
         )
         metrics = _compute_metrics(all_mu, all_sigma, all_true, all_meth_ids, prefix="val")
+        bucket_metrics = _compute_bucket_metrics(
+            all_mu, all_sigma, all_true, all_cat, all_pm, all_po, prefix="val",
+        )
+        metrics.update(bucket_metrics)
         self.log_dict(
             {k: v for k, v in metrics.items() if isinstance(v, float)},
             on_epoch=True,
         )
         _log_metrics(metrics, prefix="val")
+        _log_bucket_metrics(bucket_metrics, prefix="val")
 
         self._val_mu.clear()
         self._val_sigma.clear()
         self._val_true.clear()
         self._val_meth_ids.clear()
+        self._val_parent_meths.clear()
+        self._val_parent_offsets.clear()
+        self._val_categories.clear()
 
     def test_step(self, batch: tuple, batch_idx: int) -> None:
-        kmer_ids, meth_probs, signals, meth_ids = batch
+        (kmer_ids, meth_probs, signals, meth_ids,
+         parent_meths, parent_offsets, categories) = batch
         params = self.model(kmer_ids, meth_probs)
         mu = params[:, :2]
         log_sig = torch.clamp(params[:, 2:], -6.0, 3.0)
@@ -639,6 +830,9 @@ class KineticPredictor(L.LightningModule):
         self._test_sigma.append(sigma.detach().cpu())
         self._test_true.append(signals.detach().cpu())
         self._test_meth_ids.append(meth_ids.detach().cpu())
+        self._test_parent_meths.append(parent_meths.detach().cpu())
+        self._test_parent_offsets.append(parent_offsets.detach().cpu())
+        self._test_categories.append(categories.detach().cpu())
 
     def on_test_epoch_end(self) -> None:
         if not self._test_mu:
@@ -647,17 +841,28 @@ class KineticPredictor(L.LightningModule):
         all_sigma = torch.cat(self._test_sigma).numpy()
         all_true = torch.cat(self._test_true).numpy()
         all_meth_ids = torch.cat(self._test_meth_ids).numpy()
+        all_pm  = torch.cat(self._test_parent_meths).numpy()
+        all_po  = torch.cat(self._test_parent_offsets).numpy()
+        all_cat = torch.cat(self._test_categories).numpy()
 
         metrics = _compute_metrics(all_mu, all_sigma, all_true, all_meth_ids, prefix="test")
+        bucket_metrics = _compute_bucket_metrics(
+            all_mu, all_sigma, all_true, all_cat, all_pm, all_po, prefix="test",
+        )
+        metrics.update(bucket_metrics)
         self.log_dict(
             {k: v for k, v in metrics.items() if isinstance(v, float)},
         )
         _log_metrics(metrics, prefix="test")
+        _log_bucket_metrics(bucket_metrics, prefix="test")
 
         self._test_mu.clear()
         self._test_sigma.clear()
         self._test_true.clear()
         self._test_meth_ids.clear()
+        self._test_parent_meths.clear()
+        self._test_parent_offsets.clear()
+        self._test_categories.clear()
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.lr)
@@ -1340,7 +1545,11 @@ def train_mlp(
     # num_workers=1 on val (worker leak avoidance) that's the dominant slowdown.
     # 2 000 batches × 2048 ≈ 4 M val rows — enough for a stable val_loss
     # while keeping val under ~20 min/epoch.
-    trainer = L.Trainer(
+    # ``precision="bf16-mixed"`` enables BF16 mixed-precision on GPU.
+    # BF16 has the same dynamic range as FP32 (less risk of NaN than FP16)
+    # and roughly doubles training throughput on Ampere+ GPUs.
+    # Safe with Gaussian NLL because we clamp log_sigma to [-6, 3].
+    trainer_kwargs = dict(
         max_epochs=epochs,
         limit_train_batches=50_000,
         limit_val_batches=2_000,
@@ -1353,6 +1562,9 @@ def train_mlp(
         enable_progress_bar=True,
         enable_model_summary=True,
     )
+    if accelerator == "gpu":
+        trainer_kwargs["precision"] = "bf16-mixed"
+    trainer = L.Trainer(**trainer_kwargs)
 
     trainer.fit(lm, datamodule=dm)
     log.info("Training complete. Outputs in: %s", output_dir)

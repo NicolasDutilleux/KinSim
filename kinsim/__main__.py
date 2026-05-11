@@ -18,6 +18,7 @@ COMMANDS = [
     "evaluate",
     "verify-generate",
     "analyze",
+    "predict-kmers",
 ]
 
 USAGE = """\
@@ -35,6 +36,7 @@ Pipeline (one verb per stage; each consumes the previous stage's output):
   evaluate         Per-(kmer, meth) calibration report on a trained model.
   verify-generate  Compare two shards (real vs simulated) per (kmer, meth).
   analyze          Diagnostic dashboard for any shard or refined directory.
+  predict-kmers    Dump (μ, σ) for every kmer × every YAML methylation scenario.
 
 Data preparation:
   Use 'kinsim-prep' for motif parsing, REBASE fetching, manifest tools,
@@ -93,6 +95,7 @@ def main(argv=None):
         "evaluate":        "kinsim.evaluate",
         "verify-generate": "kinsim.verify_generate",
         "analyze":         "kinsim.analyze",
+        "predict-kmers":   "kinsim.predict_kmers",
     }
 
     if cmd in DISPATCH:

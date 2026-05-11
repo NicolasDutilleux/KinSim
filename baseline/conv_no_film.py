@@ -260,7 +260,7 @@ def fit(pkl_path: str, output_dir: str, epochs: int = 50,
         # --- Train ---
         model.train()
         train_losses = []
-        for kmer_ids, meth_probs, targets, _meth_ids in train_loader:
+        for kmer_ids, meth_probs, targets, _meth_ids, *_extras in train_loader:
             kmer_ids = kmer_ids.to(device)
             meth_probs = meth_probs.to(device)
             targets = targets.to(device)
@@ -279,7 +279,7 @@ def fit(pkl_path: str, output_dir: str, epochs: int = 50,
         model.eval()
         val_losses = []
         with torch.no_grad():
-            for kmer_ids, meth_probs, targets, _meth_ids in val_loader:
+            for kmer_ids, meth_probs, targets, _meth_ids, *_extras in val_loader:
                 kmer_ids = kmer_ids.to(device)
                 meth_probs = meth_probs.to(device)
                 targets = targets.to(device)
@@ -421,7 +421,7 @@ def evaluate(model_dir: str, test_pkl: str, device_str: str = "auto"):
     all_meth_ids = []
 
     with torch.no_grad():
-        for kmer_ids, meth_probs, targets, meth_ids in loader:
+        for kmer_ids, meth_probs, targets, meth_ids, *_extras in loader:
             kmer_ids = kmer_ids.to(device)
             meth_probs = meth_probs.to(device)
 

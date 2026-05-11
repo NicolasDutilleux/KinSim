@@ -894,7 +894,8 @@ def test_split_shards_unknown_test_strain_raises():
 
 def test_sharded_signal_dataset_iterates_all_rows():
     """Two synthetic shards → ShardedSignalDataset yields every row exactly once
-    (per epoch). Yields are (kmer_id, meth_full, log_signal, meth_id) tuples."""
+    (per epoch). Yields are (kmer_id, meth_full, log_signal, meth_id,
+    parent_meth, parent_offset, category) 7-tuples."""
     if not HAS_TORCH:
         return
     from kinsim.data.dataset import ShardedSignalDataset
@@ -920,15 +921,19 @@ def test_sharded_signal_dataset_iterates_all_rows():
         )
         items = list(ds)
         assert len(items) == 8  # 5 + 3
-        # Spot-check first emit shape: kmer_id (Long), meth_full (K, 4),
-        # log_signal (2,), meth_id (Long).
-        kmer_id, meth_full, log_signal, meth_id = items[0]
+        # Spot-check first emit shape: 7-tuple with kmer_id (Long),
+        # meth_full (K, 4), log_signal (2,), meth_id (Long), then
+        # parent_meth, parent_offset, category (all Long scalars).
+        kmer_id, meth_full, log_signal, meth_id, parent_meth, parent_offset, category = items[0]
         import torch as _torch
 
         assert isinstance(kmer_id, _torch.Tensor) and kmer_id.dtype == _torch.long
         assert meth_full.shape == (11, 4)
         assert log_signal.shape == (2,)
         assert isinstance(meth_id, _torch.Tensor)
+        assert isinstance(parent_meth,   _torch.Tensor) and parent_meth.dtype   == _torch.long
+        assert isinstance(parent_offset, _torch.Tensor) and parent_offset.dtype == _torch.long
+        assert isinstance(category,      _torch.Tensor) and category.dtype      == _torch.long
 
 
 def test_sharded_refine_writes_per_shard_clean_pkls():

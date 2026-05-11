@@ -149,7 +149,7 @@ def evaluate(
     all_true = []
     all_meth_ids = []
 
-    for kmer_ids, meth_probs, signals, meth_ids in loader:
+    for kmer_ids, meth_probs, signals, meth_ids, *_extras in loader:
         kmer_ids = kmer_ids.to(device)
         meth_probs = meth_probs.to(device)
 
@@ -709,7 +709,7 @@ def evaluate_baselines(
         cnf_meth_list = []
 
         with torch.no_grad():
-            for kmer_ids, meth_probs, signals, m_ids in loader:
+            for kmer_ids, meth_probs, signals, m_ids, *_extras in loader:
                 kmer_ids = kmer_ids.to(device)
                 meth_probs = meth_probs.to(device)
                 params = cnf_model(kmer_ids, meth_probs)
