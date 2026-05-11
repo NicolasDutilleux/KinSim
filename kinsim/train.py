@@ -657,15 +657,10 @@ class KineticDataModule(L.LightningDataModule):
 
     def train_dataloader(self) -> DataLoader:
         # IterableDataset shuffles inside __iter__ — DataLoader must NOT.
-        #
-        # ``persistent_workers=True`` keeps workers alive across epochs
-        # (avoids re-spawn cost AND the per-epoch memory ramp the older
-        # implementation showed). Combined with the pre-built meth_full
-        # in _flatten_data_dict, peak RAM per worker drops below the
-        # previous level — we can safely bump workers to 4.
-        #
-        # ``prefetch_factor=4`` keeps the GPU fed: 4 batches queued per
-        # worker.
+        # Keep the DataLoader config minimal and identical to the
+        # known-working v6 baseline: 2 workers, pin_memory, no
+        # persistent_workers (caused steady-state slowdown on this
+        # cluster's IPC), no prefetch_factor override.
         is_iter = isinstance(self._train_subset, IterableDataset)
         return DataLoader(
             self._train_subset,
@@ -673,8 +668,6 @@ class KineticDataModule(L.LightningDataModule):
             shuffle=not is_iter,
             num_workers=self.num_workers,
             pin_memory=True,
-            prefetch_factor=4,
-            persistent_workers=True,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -684,8 +677,6 @@ class KineticDataModule(L.LightningDataModule):
             shuffle=False,
             num_workers=max(1, self.num_workers // 2),
             pin_memory=True,
-            prefetch_factor=4,
-            persistent_workers=True,
         )
 
     def test_dataloader(self) -> DataLoader | None:
@@ -697,8 +688,6 @@ class KineticDataModule(L.LightningDataModule):
             shuffle=False,
             num_workers=max(1, self.num_workers // 2),
             pin_memory=True,
-            prefetch_factor=4,
-            persistent_workers=True,
         )
 
 
@@ -1549,11 +1538,11 @@ def train_mlp(
     # num_workers=1 on val (worker leak avoidance) that's the dominant slowdown.
     # 2 000 batches × 2048 ≈ 4 M val rows — enough for a stable val_loss
     # while keeping val under ~20 min/epoch.
-    # ``precision="bf16-mixed"`` enables BF16 mixed-precision on GPU.
-    # BF16 has the same dynamic range as FP32 (less risk of NaN than FP16)
-    # and roughly doubles training throughput on Ampere+ GPUs.
-    # Safe with Gaussian NLL because we clamp log_sigma to [-6, 3].
-    trainer_kwargs = dict(
+    # Note: bf16-mixed was tried but caused 10-20× slowdown on this
+    # cluster's GPUs (likely older Ampere without efficient bf16 + slow
+    # autocast). Stay on default fp32 — the data path is already
+    # CPU-bound, GPU precision isn't the bottleneck.
+    trainer = L.Trainer(
         max_epochs=epochs,
         limit_train_batches=50_000,
         limit_val_batches=2_000,
@@ -1566,9 +1555,6 @@ def train_mlp(
         enable_progress_bar=True,
         enable_model_summary=True,
     )
-    if accelerator == "gpu":
-        trainer_kwargs["precision"] = "bf16-mixed"
-    trainer = L.Trainer(**trainer_kwargs)
 
     trainer.fit(lm, datamodule=dm)
     log.info("Training complete. Outputs in: %s", output_dir)
