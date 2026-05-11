@@ -175,17 +175,22 @@ def _flatten_data_dict(
             "meth_counts": dict(n_meth_counts),
         }
 
-    kmer_ids       = np.concatenate(kmer_ids_list)
-    meth_ids       = np.concatenate(meth_ids_list)
+    # Concatenate and *immediately* drop the per-key lists so we don't
+    # hold both the lists AND the merged arrays at the same time
+    # (each was ~half of peak memory before this fix).
+    kmer_ids       = np.concatenate(kmer_ids_list);     kmer_ids_list = None
+    meth_ids       = np.concatenate(meth_ids_list);     meth_ids_list = None
     fractions      = np.concatenate(fractions_list).astype(np.float32)
-    meth_ctx       = np.concatenate(meth_ctx_list)
-    rev_meth       = np.concatenate(rev_meth_list)
-    parent_meths   = np.concatenate(parent_meth_list)
-    parent_offsets = np.concatenate(parent_offset_list)
-    categories     = np.concatenate(category_list)
+    fractions_list = None
+    meth_ctx       = np.concatenate(meth_ctx_list);     meth_ctx_list = None
+    rev_meth       = np.concatenate(rev_meth_list);     rev_meth_list = None
+    parent_meths   = np.concatenate(parent_meth_list);  parent_meth_list = None
+    parent_offsets = np.concatenate(parent_offset_list); parent_offset_list = None
+    categories     = np.concatenate(category_list);     category_list = None
     signals_log    = log_transform(
         torch.from_numpy(np.concatenate(signals_list, axis=0)).float()
     )
+    signals_list   = None
 
     # ── Vectorised meth_full construction (the big speedup) ────────────────
     # meth_full[i, pos, m] = 1.0 if mc/rev has meth m at pos, else 0.0
@@ -194,7 +199,6 @@ def _flatten_data_dict(
     meth_full = np.zeros((n_rows, total_pos, num_meth_types), dtype=np.float32)
 
     # Forward block: scatter meth_ctx → meth_full[:, 0:kmer_size, :]
-    # build row / col index arrays for positions where mc > 0
     rows_idx, cols_idx = np.where(meth_ctx > 0)
     if rows_idx.size:
         m_ids = meth_ctx[rows_idx, cols_idx].astype(np.int64)
@@ -214,6 +218,9 @@ def _flatten_data_dict(
         rev_m_ids = rev_meth[rev_rows, rev_cols].astype(np.int64)
         rev_m_ids = np.clip(rev_m_ids, 0, num_meth_types - 1)
         meth_full[rev_rows, kmer_size + rev_cols, rev_m_ids] = 1.0
+
+    # Free the source arrays now that meth_full holds the same info.
+    del meth_ctx, rev_meth, fractions, rows_idx, cols_idx
 
     return {
         "kmer_ids":       kmer_ids,

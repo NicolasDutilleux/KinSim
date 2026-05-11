@@ -547,7 +547,7 @@ class KineticDataModule(L.LightningDataModule):
         num_meth_types: int | None = None,
         seed: int = 42,
         max_rows_per_shard: int | None = 2_000_000,
-        num_workers: int = 4,
+        num_workers: int = 2,
     ) -> None:
         super().__init__()
         self.input_path = str(input_path)
