@@ -1333,10 +1333,17 @@ def train_mlp(
     # size 2048 ≈ 100 M rows/epoch ≈ 1 h/epoch on GPU with num_workers=2.
     # That gives ~50 h max for the full 50-epoch budget — but
     # ``early_stop`` will usually cut it off after 10–20 epochs once val_loss
-    # plateaus. ``val_check_interval`` keeps validation snappy.
+    # plateaus.
+    #
+    # ``limit_val_batches`` is symmetric for val: val IterableDataset has no
+    # __len__, so unbounded val iterates the whole holdout per epoch. With
+    # num_workers=1 on val (worker leak avoidance) that's the dominant slowdown.
+    # 2 000 batches × 2048 ≈ 4 M val rows — enough for a stable val_loss
+    # while keeping val under ~20 min/epoch.
     trainer = L.Trainer(
         max_epochs=epochs,
         limit_train_batches=50_000,
+        limit_val_batches=2_000,
         accelerator=accelerator,
         devices=1,
         gradient_clip_val=0.5,
