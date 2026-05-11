@@ -507,6 +507,15 @@ class ShardedSignalDataset(IterableDataset):
                     categories_t[i],
                 )
 
+            # Explicit cleanup before loading next shard. Tensors built
+            # via torch.from_numpy share memory with the numpy arrays in
+            # ``flat`` — without explicit del, Python would hold BOTH
+            # the old and the new shard's arrays in RAM during the
+            # transition (2× shard peak). On a 20 GB shard with 2
+            # workers that's an extra ~40 GB peak.
+            del kmer_ids_t, meth_ids_t, parent_meths_t, parent_offsets_t
+            del categories_t, meth_full_t, signals_t, flat
+
 
 # ---------------------------------------------------------------------------
 # Train/test split helpers

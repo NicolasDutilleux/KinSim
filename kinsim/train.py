@@ -771,9 +771,12 @@ class KineticPredictor(L.LightningModule):
         mu = params[:, :2]
         log_sig = torch.clamp(params[:, 2:], -6.0, 3.0)
         sigma = torch.exp(log_sig)
-        self._val_mu.append(mu.detach().cpu())
-        self._val_sigma.append(sigma.detach().cpu())
-        self._val_true.append(signals.detach().cpu())
+        # ``.float()`` upcasts bf16 → fp32 so ``.numpy()`` works at epoch end
+        # (numpy has no native BFloat16 dtype). Without this, bf16-mixed
+        # precision crashes in on_validation_epoch_end.
+        self._val_mu.append(mu.detach().float().cpu())
+        self._val_sigma.append(sigma.detach().float().cpu())
+        self._val_true.append(signals.detach().float().cpu())
         self._val_meth_ids.append(meth_ids.detach().cpu())
         self._val_parent_meths.append(parent_meths.detach().cpu())
         self._val_parent_offsets.append(parent_offsets.detach().cpu())
@@ -826,9 +829,10 @@ class KineticPredictor(L.LightningModule):
         mu = params[:, :2]
         log_sig = torch.clamp(params[:, 2:], -6.0, 3.0)
         sigma = torch.exp(log_sig)
-        self._test_mu.append(mu.detach().cpu())
-        self._test_sigma.append(sigma.detach().cpu())
-        self._test_true.append(signals.detach().cpu())
+        # ``.float()`` upcasts bf16 → fp32 so ``.numpy()`` works at epoch end.
+        self._test_mu.append(mu.detach().float().cpu())
+        self._test_sigma.append(sigma.detach().float().cpu())
+        self._test_true.append(signals.detach().float().cpu())
         self._test_meth_ids.append(meth_ids.detach().cpu())
         self._test_parent_meths.append(parent_meths.detach().cpu())
         self._test_parent_offsets.append(parent_offsets.detach().cpu())
