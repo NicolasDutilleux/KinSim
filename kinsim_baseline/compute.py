@@ -121,8 +121,15 @@ def _accumulate_read(
     signatures: dict,
     hist_ipd: dict,
     hist_pw: dict,
+    hist_joint: dict,
 ) -> None:
-    """For each (T, k), bincount IPD/PW at positions p+k where seq[p]==target."""
+    """For each (T, k), bincount IPD/PW (1D) and IPD×PW (2D) at positions p+k
+    where ``seq[p] == modified_base[T]``.
+
+    The 2D joint histogram lets the analyser produce IPD×PW heatmaps so the
+    user can see whether IPD and PW move together at methylated positions
+    (they do, but the correlation is not 1).
+    """
     L = seq_arr.size
     for T, info in signatures.items():
         target_byte = ord(info["modified_base"])
@@ -135,8 +142,13 @@ def _accumulate_read(
             tgt = tgt[valid]
             if tgt.size == 0:
                 continue
-            hist_ipd[(T, k)] += np.bincount(ipd[tgt], minlength=256).astype(np.int64)
-            hist_pw[(T, k)] += np.bincount(pw[tgt], minlength=256).astype(np.int64)
+            ipd_vals = ipd[tgt]
+            pw_vals  = pw[tgt]
+            hist_ipd[(T, k)] += np.bincount(ipd_vals, minlength=256).astype(np.int64)
+            hist_pw[(T, k)]  += np.bincount(pw_vals,  minlength=256).astype(np.int64)
+            # 2D: linearise (ipd, pw) → flat index in [0, 65536), bincount, reshape.
+            flat = ipd_vals.astype(np.int32) * 256 + pw_vals.astype(np.int32)
+            hist_joint[(T, k)] += np.bincount(flat, minlength=65536).astype(np.int64).reshape(256, 256)
 
 
 # ---------------------------------------------------------------------------
@@ -147,22 +159,24 @@ def _accumulate_read(
 def compute_histograms(
     bam_paths: list[Path],
     progress_every: int = 50_000,
-) -> tuple[dict, dict, dict, dict]:
-    """Single pass: build per-(T, k) IPD and PW histograms.
+) -> tuple[dict, dict, dict, dict, dict]:
+    """Single pass: build per-(T, k) IPD/PW 1D histograms + IPD×PW 2D joint.
 
     Returns
     -------
     signatures : dict from kinsim_config.yaml (T -> {modified_base, signal_offsets})
-    hist_ipd   : dict (T, k) -> int64[256]
-    hist_pw    : dict (T, k) -> int64[256]
+    hist_ipd   : dict (T, k) -> int64[256]            1D IPD histogram
+    hist_pw    : dict (T, k) -> int64[256]            1D PW  histogram
+    hist_joint : dict (T, k) -> int64[256, 256]       joint IPD×PW heatmap
     per_bam    : dict bam_path -> {"n_reads", "elapsed_s"}
     """
     import pysam  # heavy import here so the package import doesn't pay it
 
     signatures = load_signatures()
 
-    hist_ipd: dict = defaultdict(lambda: np.zeros(256, dtype=np.int64))
-    hist_pw: dict = defaultdict(lambda: np.zeros(256, dtype=np.int64))
+    hist_ipd:   dict = defaultdict(lambda: np.zeros(256, dtype=np.int64))
+    hist_pw:    dict = defaultdict(lambda: np.zeros(256, dtype=np.int64))
+    hist_joint: dict = defaultdict(lambda: np.zeros((256, 256), dtype=np.int64))
     per_bam: dict = {}
 
     log.info("Single-pass histogram walk across %d BAMs", len(bam_paths))
@@ -181,7 +195,8 @@ def compute_histograms(
                 if kin is None:
                     continue
                 seq_arr, ipd, pw = kin
-                _accumulate_read(seq_arr, ipd, pw, signatures, hist_ipd, hist_pw)
+                _accumulate_read(seq_arr, ipd, pw, signatures,
+                                 hist_ipd, hist_pw, hist_joint)
                 n_reads += 1
                 if n_reads % progress_every == 0:
                     log.info("    ... %d reads", n_reads)
@@ -189,7 +204,7 @@ def compute_histograms(
         log.info("    → %d reads in %.1f s", n_reads, dt)
         per_bam[str(bam_path)] = {"n_reads": n_reads, "elapsed_s": round(dt, 2)}
 
-    return signatures, dict(hist_ipd), dict(hist_pw), per_bam
+    return signatures, dict(hist_ipd), dict(hist_pw), dict(hist_joint), per_bam
 
 
 # ---------------------------------------------------------------------------
@@ -296,19 +311,36 @@ def write_summary_tsv(
 
 
 def write_json(
-    hist_ipd: dict, hist_pw: dict, signatures: dict, path: Path,
+    hist_ipd: dict, hist_pw: dict, hist_joint: dict,
+    signatures: dict, path: Path,
 ) -> None:
-    """Full histograms in JSON, keyed ``"T@+k"`` for IPD and PW."""
-    out = {"signatures": signatures, "ipd": {}, "pw": {}}
+    """Full histograms in JSON: 1D IPD, 1D PW, and the 2D joint IPD×PW.
+
+    The joint is stored sparsely as a list of ``[ipd_bin, pw_bin, count]``
+    triples (skipping zero bins) — keeps the JSON size manageable even
+    though the dense matrix is 65 536 cells.
+    """
+    out = {"signatures": signatures, "ipd": {}, "pw": {}, "joint": {}}
     for T, info in signatures.items():
         for k in info["signal_offsets"]:
             key = f"{T}@{k:+d}"
             hi = hist_ipd.get((T, k))
             hp = hist_pw.get((T, k))
+            hj = hist_joint.get((T, k))
             if hi is not None:
                 out["ipd"][key] = hi.tolist()
             if hp is not None:
                 out["pw"][key] = hp.tolist()
+            if hj is not None:
+                nz = np.argwhere(hj > 0)
+                if nz.size:
+                    counts = hj[nz[:, 0], nz[:, 1]]
+                    out["joint"][key] = [
+                        [int(i), int(j), int(c)]
+                        for (i, j), c in zip(nz, counts)
+                    ]
+                else:
+                    out["joint"][key] = []
     with open(path, "w") as f:
         json.dump(out, f, indent=1)
 
@@ -369,7 +401,7 @@ def main(argv=None):
     log.info("Loaded %d BAM paths from manifest %s", len(bam_paths), args.manifest_csv)
 
     t0 = time.time()
-    signatures, hist_ipd, hist_pw, per_bam = compute_histograms(bam_paths)
+    signatures, hist_ipd, hist_pw, hist_joint, per_bam = compute_histograms(bam_paths)
     elapsed = time.time() - t0
 
     hist_path    = out_dir / "baseline_hist.tsv"
@@ -379,7 +411,7 @@ def main(argv=None):
 
     write_hist_tsv(hist_ipd, hist_pw, signatures, hist_path)
     write_summary_tsv(hist_ipd, hist_pw, signatures, summary_path, threshold=args.threshold)
-    write_json(hist_ipd, hist_pw, signatures, json_path)
+    write_json(hist_ipd, hist_pw, hist_joint, signatures, json_path)
     with open(info_path, "w") as f:
         json.dump({
             "manifest_csv": str(args.manifest_csv),
