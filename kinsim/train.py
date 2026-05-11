@@ -499,19 +499,17 @@ class KineticDataModule(L.LightningDataModule):
 
     def train_dataloader(self) -> DataLoader:
         # IterableDataset shuffles inside __iter__ — DataLoader must NOT.
-        # num_workers=0: single-process data loading. With multi-worker +
-        # IterableDataset on huge sharded data, per-worker shard buffers
-        # leaked memory across epochs (104 GB → 284 GB across two runs at
-        # 22 min vs 1:45 wall — not just "more headroom needed", actively
-        # accumulating). num_workers=0 eliminates the leak at the cost of
-        # ~10–20 % data-loading throughput. The training loop is GPU-bound
-        # so net wall-time impact is small.
+        # num_workers=2 is the compromise: 2 workers give parallel prefetch
+        # (vs single-process at 6.58 it/s = GPU starved), but only 2× shard
+        # memory + leak amplification (vs 4×). Budget ~150 GB peak with
+        # 2 workers, vs ~280 GB observed with 4. Pair with --mem=192G.
+        # If memory creeps again, drop to num_workers=1.
         is_iter = isinstance(self._train_subset, IterableDataset)
         return DataLoader(
             self._train_subset,
             batch_size=self.batch_size,
             shuffle=not is_iter,
-            num_workers=0,
+            num_workers=2,
             pin_memory=True,
         )
 
@@ -520,7 +518,7 @@ class KineticDataModule(L.LightningDataModule):
             self._val_subset,
             batch_size=self.batch_size * 4,
             shuffle=False,
-            num_workers=0,
+            num_workers=1,
             pin_memory=True,
         )
 
@@ -531,7 +529,7 @@ class KineticDataModule(L.LightningDataModule):
             self._test_dataset,
             batch_size=self.batch_size * 4,
             shuffle=False,
-            num_workers=0,
+            num_workers=1,
             pin_memory=True,
         )
 
@@ -1329,14 +1327,22 @@ def train_mlp(
         log.warning("TensorBoard not available — CSV logger only.")
 
     # ── Trainer ───────────────────────────────────────────────────────────
+    # ``limit_train_batches`` caps per-epoch iterations. Without it, Lightning
+    # iterates the FULL IterableDataset per epoch (~2.5 B rows on a 49-strain
+    # corpus → ~50 h/epoch × 50 epochs = unusable). 50 000 batches at batch
+    # size 2048 ≈ 100 M rows/epoch ≈ 1 h/epoch on GPU with num_workers=2.
+    # That gives ~50 h max for the full 50-epoch budget — but
+    # ``early_stop`` will usually cut it off after 10–20 epochs once val_loss
+    # plateaus. ``val_check_interval`` keeps validation snappy.
     trainer = L.Trainer(
         max_epochs=epochs,
+        limit_train_batches=50_000,
         accelerator=accelerator,
         devices=1,
         gradient_clip_val=0.5,
         callbacks=[early_stop, lightning_ckpt, legacy_ckpt],
         logger=loggers,
-        log_every_n_steps=1,
+        log_every_n_steps=50,
         enable_progress_bar=True,
         enable_model_summary=True,
     )
