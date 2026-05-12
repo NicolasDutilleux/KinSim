@@ -264,10 +264,20 @@ def _ratio_bar_figure(signatures: dict, hist_ipd: dict, threshold_factor: float 
 def _gaussian_vs_empirical_figure(
     signatures: dict, hist_ipd: dict, stats_by_key: dict, smooth: int,
 ):
-    """One subplot per (T, k) showing empirical density + Gaussian fit.
+    """One subplot per (T, k) showing empirical density + 3 fitted curves.
 
-    Highlights that σ > μ ⇒ a vraie Gaussienne aurait masse à IPD < 0
-    ⇒ pas un bon modèle pour ces distributions.
+    Three overlays:
+
+      - **Gaussian (moments)** (red dashed): μ = mean, σ = std. The
+        canonical moment-based fit. For right-skewed data this gives
+        σ > μ, so the Gaussian is too wide and flat — bad fit.
+      - **Gaussian (robust)** (orange dashed): μ = median (p50),
+        σ = IQR / 1.349 (the constant 1.349 makes IQR-based σ equal
+        the true σ for a real Gaussian). Insensitive to the heavy tail,
+        so the curve actually fits the peak.
+      - **Log-normal** (green dashed): the correct family for this
+        right-skewed shape. Fit on log(IPD + 1): μ_log, σ_log are the
+        sample moments in log space.
     """
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
@@ -280,51 +290,107 @@ def _gaussian_vs_empirical_figure(
     if n == 0:
         return go.Figure()
 
+    # Pre-compute log-normal params per bucket from the histogram.
+    lognormal_params: dict[str, tuple[float, float]] = {}
+    log_centres = np.log(FRAME_CENTRES + 1.0)
+    for T, k in buckets:
+        key = f"{T}@{k:+d}"
+        h = np.asarray(hist_ipd[key], dtype=np.float64)
+        n_h = h.sum()
+        if n_h <= 0:
+            continue
+        mu_log = float((log_centres * h).sum() / n_h)
+        var_log = float(((log_centres - mu_log) ** 2 * h).sum() / n_h)
+        sigma_log = float(np.sqrt(max(var_log, 1e-12)))
+        lognormal_params[key] = (mu_log, sigma_log)
+
     titles = []
     for T, k in buckets:
         s = stats_by_key[f"{T}@{k:+d}"]
+        iqr = max(s["p75"] - s["p25"], 1e-6)
+        sigma_robust = iqr / 1.349
+        mu_log, sigma_log = lognormal_params.get(f"{T}@{k:+d}", (0.0, 0.0))
         titles.append(
-            f"{T}@{k:+d}   N(μ={s['mean']:.1f}, σ={s['sigma']:.1f}²)  "
-            f"— σ > μ : Gaussienne irréaliste"
+            f"{T}@{k:+d}    "
+            f"N(μ={s['mean']:.1f}, σ²={s['sigma']:.1f}²)   moments=large    "
+            f"N(p50={s['p50']:.1f}, σ_iqr²={sigma_robust:.1f}²)   robust    "
+            f"LogN(μ_log={mu_log:.2f}, σ_log={sigma_log:.2f})"
         )
 
     fig = make_subplots(
         rows=(n + 1) // 2, cols=2,
-        subplot_titles=titles, vertical_spacing=0.16, horizontal_spacing=0.08,
+        subplot_titles=titles, vertical_spacing=0.18, horizontal_spacing=0.08,
     )
 
-    x_dense = np.linspace(0, 300, 400)
+    x_dense = np.linspace(0.001, 300, 600)
     for i, (T, k) in enumerate(buckets):
         row = i // 2 + 1
         col = i % 2 + 1
         key = f"{T}@{k:+d}"
         h = np.asarray(hist_ipd[key], dtype=np.float64)
         s = stats_by_key[key]
-        color = _color_for(T, info=0) if False else "#34495e"
         emp = _to_frame_density(h, smooth=smooth)
+
+        # Empirical
         fig.add_trace(go.Scatter(
-            x=FRAMES_X, y=emp, mode="lines", name="empirique" if i == 0 else None,
+            x=FRAMES_X, y=emp, mode="lines",
+            name="empirique" if i == 0 else None,
             line={"color": "#34495e", "width": 2}, showlegend=(i == 0),
         ), row=row, col=col)
-        sigma = max(s["sigma"], 1e-6)
-        gauss = np.exp(-0.5 * ((x_dense - s["mean"]) / sigma) ** 2) / (sigma * np.sqrt(2 * np.pi))
+
+        # Gaussian (moments) — bad fit, included for reference
+        sigma_m = max(s["sigma"], 1e-6)
+        gauss_m = np.exp(-0.5 * ((x_dense - s["mean"]) / sigma_m) ** 2) / (
+            sigma_m * np.sqrt(2 * np.pi))
         fig.add_trace(go.Scatter(
-            x=x_dense, y=gauss, mode="lines",
-            name="Gaussienne fit" if i == 0 else None,
-            line={"color": "#e74c3c", "width": 1.5, "dash": "dash"},
+            x=x_dense, y=gauss_m, mode="lines",
+            name="N(moments) — large car σ>μ" if i == 0 else None,
+            line={"color": "#e74c3c", "width": 1.2, "dash": "dash"},
             showlegend=(i == 0),
         ), row=row, col=col)
-        fig.update_xaxes(range=[0, 200], title_text="IPD (frames)" if row == (n + 1) // 2 else None,
-                         row=row, col=col)
-        fig.update_yaxes(title_text="density per frame" if col == 1 else None, row=row, col=col)
+
+        # Gaussian (robust, IQR-based σ)
+        iqr = max(s["p75"] - s["p25"], 1e-6)
+        sigma_r = max(iqr / 1.349, 1e-6)
+        gauss_r = np.exp(-0.5 * ((x_dense - s["p50"]) / sigma_r) ** 2) / (
+            sigma_r * np.sqrt(2 * np.pi))
+        fig.add_trace(go.Scatter(
+            x=x_dense, y=gauss_r, mode="lines",
+            name="N(robust IQR) — fit le peak" if i == 0 else None,
+            line={"color": "#f39c12", "width": 1.5, "dash": "dash"},
+            showlegend=(i == 0),
+        ), row=row, col=col)
+
+        # Log-normal
+        mu_log, sigma_log = lognormal_params.get(key, (0.0, 0.0))
+        sigma_log = max(sigma_log, 1e-6)
+        log_x = np.log(x_dense + 1.0)
+        logn = np.exp(-0.5 * ((log_x - mu_log) / sigma_log) ** 2) / (
+            (x_dense + 1.0) * sigma_log * np.sqrt(2 * np.pi))
+        fig.add_trace(go.Scatter(
+            x=x_dense, y=logn, mode="lines",
+            name="Log-normale (vrai bon fit)" if i == 0 else None,
+            line={"color": "#27ae60", "width": 1.8, "dash": "dot"},
+            showlegend=(i == 0),
+        ), row=row, col=col)
+
+        fig.update_xaxes(
+            range=[0, 200],
+            title_text="IPD (frames)" if row == (n + 1) // 2 else None,
+            row=row, col=col,
+        )
+        fig.update_yaxes(
+            title_text="density per frame" if col == 1 else None,
+            row=row, col=col,
+        )
 
     fig.update_layout(
-        height=320 * ((n + 1) // 2),
+        height=340 * ((n + 1) // 2),
         template="plotly_white",
-        margin={"t": 70, "b": 60, "l": 70, "r": 30},
+        margin={"t": 80, "b": 60, "l": 70, "r": 30},
     )
     for ann in fig["layout"]["annotations"]:
-        ann["font"] = {"size": 11, "color": "#444"}
+        ann["font"] = {"size": 10, "color": "#444"}
     return fig
 
 
@@ -574,11 +640,17 @@ def _build_html(
   </div>
 
   <div class="section">
-    <h2>Empirique vs Gaussienne fittée</h2>
+    <h2>Empirique vs 3 fits (Gaussienne moments / Gaussienne robuste / Log-normale)</h2>
     {_figure_div(fig_gauss, "fig_gauss")}
-    <p class="figure-caption">Gris: density empirique. Rouge pointillé:
-       N(μ, σ²) fittée sur frames. La Gaussienne sous-estime le pic et
-       sur-estime la queue car σ &gt; μ.</p>
+    <p class="figure-caption">Trois overlays sur la density empirique (gris):
+       <span style="color:#e74c3c">Rouge dashed</span> = Gaussienne
+       <code>N(μ=moyenne, σ=stddev)</code> — trop large car la queue gonfle σ.
+       <span style="color:#f39c12">Orange dashed</span> = Gaussienne
+       <code>N(μ=p50, σ=IQR/1.349)</code> — σ robuste insensible à la queue,
+       fit le peak.
+       <span style="color:#27ae60">Vert pointillé</span> =
+       <b>Log-normale</b> sur <code>log(IPD+1)</code> — fit complet incluant
+       la queue. C'est le vrai bon modèle pour ces distributions.</p>
   </div>
 
   <div class="section">
@@ -636,16 +708,32 @@ NLL(θ; x) = 0.5 · (2·log σ + (x - μ)² / σ²)
     <p>Le modèle prédit (μ, log σ) directement; cette forme est numériquement
        stable.</p>
 
-    <h3>7. Log-normale (mieux pour ces données)</h3>
-    <p>Si <code>X = exp(Y)</code> avec <code>Y ~ N(μ_log, σ_log²)</code>:</p>
+    <h3>7. Log-normale (le vrai bon fit pour ces données)</h3>
+    <p>Si <code>X+1 = exp(Y)</code> avec <code>Y ~ N(μ_log, σ_log²)</code>:</p>
     <pre style="background:#edf2f7;padding:14px;border-radius:6px">
-pdf(x) = (1 / (x·σ_log·√(2π))) · exp(-(ln(x) - μ_log)² / (2σ_log²))
-mean(X)   = exp(μ_log + σ_log²/2)
-median(X) = exp(μ_log)
+Y = ln(X + 1)
+μ_log = Σ Y[bin] · count[bin] / N
+σ_log = √( Σ (Y[bin] - μ_log)² · count[bin] / N )
+
+pdf(x) = (1 / ((x+1)·σ_log·√(2π))) · exp(-(ln(x+1) - μ_log)² / (2σ_log²))
+
+mean(X)   ≈ exp(μ_log + σ_log²/2) - 1
+median(X) ≈ exp(μ_log) - 1
 var(X)    = (exp(σ_log²) - 1) · exp(2μ_log + σ_log²)</pre>
-    <p>Fit pratique: prendre <code>ln(IPD + 1)</code> et fitter une Gaussienne
-       dessus → c'est aussi ce que <code>kinsim train</code> fait
-       (cf. <code>log_transform</code>).</p>
+    <p>C'est aussi ce que <code>kinsim train</code> fait (cf.
+       <code>log_transform</code>) — entraînement directement en
+       <code>ln(IPD + 1)</code> où la distribution est approximativement
+       Gaussienne et la loss GNLL est bien comportée.</p>
+
+    <h3>7b. Gaussienne robuste (sigma depuis IQR)</h3>
+    <p>Sur des distributions right-skewed, σ-moments est dominée par la queue
+       et donne un fit Gaussien trop large. Alternative robuste:</p>
+    <pre style="background:#edf2f7;padding:14px;border-radius:6px">
+μ_robust = p50 (médiane)
+σ_robust = IQR / 1.349    où IQR = p75 - p25
+
+(le facteur 1.349 est choisi pour que σ_robust = σ_vrai pour une vraie Gaussienne;
+ c'est l'écart interquartile divisé par l'écart-type d'une N(0,1) standard.)</pre>
 
     <h3>8. Modèle de mélange (dilution)</h3>
     <pre style="background:#edf2f7;padding:14px;border-radius:6px">
