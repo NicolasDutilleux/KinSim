@@ -83,6 +83,190 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Lookup-table mode (model distillation)
+# ---------------------------------------------------------------------------
+#
+# Instead of running the model.forward() per position, pre-compute (μ, σ)
+# in log-space for every (kmer, scenario) and consume that table at
+# inference time. The table is produced by ``kinsim predict-kmers`` —
+# loaded once and shared across all reads. Pure-numpy, no GPU, trivially
+# parallelisable.
+#
+# Scenario detection (per row):
+#   For each k_pos in [0, K) where meth_ctx[k_pos] != 0:
+#     offset = KMER_PRED_IDX - k_pos      # offset of the meth from pred pos
+#     scenario = (meth_id, offset) IF that pair appears in signal_offsets,
+#                else "none"
+#   First match wins (signal_offsets[T] is small and ordered).
+#
+# The meth_ctx[k_pos] convention is the same as the asymmetric kmer window:
+#   k_pos = 0  → 7 bases upstream of pred (offset +7)
+#   k_pos = 7  → pred position (offset 0)
+#   k_pos = 10 → 3 bases downstream of pred (offset -3)
+
+
+def _load_lookup_table(npz_path: str) -> dict:
+    """Load a ``predict-kmers``-produced LUT.
+
+    Returns a dict with:
+        ``lut_log``        (N_scenarios, N_kmers, 4) float32 — log-space
+                           (mu_ipd, mu_pw, sigma_ipd, sigma_pw).
+        ``scenario_matrix`` (N_meth, K) int64 — scenario_idx for each
+                           (meth_id, k_pos); 0 = none/fallback.
+        ``scenario_labels`` list[str] for logging.
+    """
+    from .utils.encoding import K as _K, KMER_PRED_IDX as _PI, get_meth_ids
+    from .utils.config import load_kinsim_config
+
+    data = np.load(npz_path, allow_pickle=False)
+    required = {"scenarios_label", "scenarios_meth_id", "scenarios_offset"}
+    if not required.issubset(set(data.files)):
+        raise ValueError(
+            f"{npz_path} missing scenario metadata — re-run kinsim predict-kmers "
+            f"(needs scenarios_{{label,meth_id,offset}} arrays)."
+        )
+
+    labels  = [str(s) for s in data["scenarios_label"].tolist()]
+    m_ids   = data["scenarios_meth_id"].astype(np.int64)
+    offsets = data["scenarios_offset"].astype(np.int64)
+
+    # Find a "none" scenario (meth_id == 0). predict-kmers always emits it.
+    none_idx = next(
+        (i for i, mid in enumerate(m_ids) if int(mid) == 0),
+        None,
+    )
+    if none_idx is None:
+        raise ValueError(f"{npz_path} has no 'none' scenario — re-run predict-kmers.")
+
+    # Build (N_scenarios, N_kmers, 4) array of log-space μ/σ.
+    n_kmers = int(data["kmer_id"].shape[0])
+    n_scenarios = len(labels)
+    lut_log = np.empty((n_scenarios, n_kmers, 4), dtype=np.float32)
+    for i, label in enumerate(labels):
+        sk = label.replace("@", "_at_").replace("+", "p").replace("-", "m")
+        for k_log_field, slot in (("mu_ipd_log", 0), ("mu_pw_log", 1),
+                                   ("sigma_ipd_log", 2), ("sigma_pw_log", 3)):
+            key = f"{sk}__{k_log_field}"
+            if key not in data.files:
+                raise KeyError(
+                    f"{npz_path} missing '{key}' — re-run predict-kmers with "
+                    "log-space output (recent change)."
+                )
+            lut_log[i, :, slot] = data[key].astype(np.float32)
+
+    # Build scenario_matrix: scenario_matrix[meth_id, k_pos] -> scenario_idx
+    # (0 = none-fallback). meth_id ranges over user-declared types.
+    meth_ids_map = get_meth_ids()
+    num_m = max(meth_ids_map.values()) + 1
+    scenario_matrix = np.zeros((num_m, _K), dtype=np.int64)  # default → none_idx
+    scenario_matrix.fill(int(none_idx))
+    # For each non-none scenario: place into the (meth_id, k_pos) cell.
+    for i, (mid, off) in enumerate(zip(m_ids, offsets)):
+        if int(mid) == 0:
+            continue
+        k_pos = _PI - int(off)
+        if 0 <= k_pos < _K and int(mid) < num_m:
+            scenario_matrix[int(mid), k_pos] = i
+
+    log.info(
+        "LUT loaded from %s: %d scenarios × %d kmers × 4 outputs (%.0f MB log-space)",
+        npz_path, n_scenarios, n_kmers, lut_log.nbytes / 1e6,
+    )
+    log.info("  scenarios: %s", labels)
+
+    return {
+        "lut_log":         lut_log,
+        "scenario_matrix": scenario_matrix,
+        "scenario_labels": labels,
+        "none_idx":        int(none_idx),
+        "pred_idx":        _PI,
+        "K":               _K,
+        "n_kmers":         n_kmers,
+    }
+
+
+@torch.no_grad()
+def generate_signals_lookup(
+    lut: dict,
+    kmer_ids,
+    meth_contexts,
+    deterministic: bool = False,
+) -> np.ndarray:
+    """Pure-numpy LUT-based signal generation.
+
+    Replaces ``generate_signals_batch`` when the model has been distilled
+    into a (kmer, scenario) lookup table. Sampling is done in **log1p
+    space** (same as training) then ``inv_log_transform``-ed back to
+    uint8-equivalent units — bit-equivalent semantics with the model
+    path for any row whose meth_ctx matches a known scenario.
+
+    Args
+    ----
+    lut             dict from :func:`_load_lookup_table`.
+    kmer_ids        array-like (N,) of 22-bit kmer IDs.
+    meth_contexts   array-like (N, K) int64 meth context windows.
+    deterministic   if True, return the mean (no sampling).
+
+    Returns
+    -------
+    np.ndarray (N, 2) — IPD and PW in [0, 255], float32.
+    """
+    K_ = lut["K"]
+    pred_idx = lut["pred_idx"]
+    scenario_matrix = lut["scenario_matrix"]
+    lut_log = lut["lut_log"]
+    none_idx = lut["none_idx"]
+
+    kmer_arr = np.asarray(kmer_ids, dtype=np.int64)
+    ctx = np.asarray(meth_contexts, dtype=np.int64)
+    if ctx.ndim == 1:
+        ctx = ctx.reshape(1, -1)
+    N = kmer_arr.shape[0]
+
+    # Identify scenario per row:
+    #   scenarios_per_pos[i, k] = scenario_matrix[ctx[i, k], k]  (none_idx by default)
+    # Then pick the FIRST non-none scenario across k_pos in [0, K).
+    col_idx = np.broadcast_to(np.arange(K_)[None, :], ctx.shape)
+    nonzero_mask = ctx > 0
+    if nonzero_mask.any():
+        # Default everyone to none, then overwrite for valid scenarios.
+        scenarios_per_pos = np.full(ctx.shape, none_idx, dtype=np.int64)
+        scenarios_per_pos[nonzero_mask] = scenario_matrix[
+            ctx[nonzero_mask], col_idx[nonzero_mask]
+        ]
+        # First non-none wins — pick the smallest k_pos where scenario != none_idx.
+        is_real = scenarios_per_pos != none_idx        # (N, K)
+        any_real = is_real.any(axis=1)                  # (N,)
+        first_real_kpos = np.argmax(is_real, axis=1)    # 0 if no real (we'll mask)
+        scenario_idx = np.where(
+            any_real,
+            scenarios_per_pos[np.arange(N), first_real_kpos],
+            none_idx,
+        )
+    else:
+        scenario_idx = np.full(N, none_idx, dtype=np.int64)
+
+    # LUT lookup: rows of (mu_ipd_log, mu_pw_log, sigma_ipd_log, sigma_pw_log).
+    rows = lut_log[scenario_idx, kmer_arr]              # (N, 4)
+    mu_ipd_log    = rows[:, 0]
+    mu_pw_log     = rows[:, 1]
+    sigma_ipd_log = rows[:, 2]
+    sigma_pw_log  = rows[:, 3]
+
+    if deterministic:
+        ipd_log = mu_ipd_log
+        pw_log  = mu_pw_log
+    else:
+        ipd_log = mu_ipd_log + sigma_ipd_log * np.random.randn(N).astype(np.float32)
+        pw_log  = mu_pw_log  + sigma_pw_log  * np.random.randn(N).astype(np.float32)
+
+    # inv_log_transform: expm1 clamped to [0, 255]
+    ipd = np.clip(np.expm1(ipd_log), 0.0, 255.0).astype(np.float32)
+    pw  = np.clip(np.expm1(pw_log),  0.0, 255.0).astype(np.float32)
+    return np.stack([ipd, pw], axis=1)
+
+
 def _rc_kmer_vec(kmer_ids: np.ndarray) -> np.ndarray:
     """Vectorised reverse complement of 11-mer IDs (matches scalar _rc_kmer)."""
     rc = np.zeros_like(kmer_ids, dtype=np.int64)
@@ -729,6 +913,7 @@ def _process_batch(
     circular,
     bam_out,
     header,
+    lookup_table=None,
 ):
     """Process a batch of reads with batched MLP inference.
 
@@ -883,20 +1068,27 @@ def _process_batch(
         flat_meth_ctx = np.empty((0, _CTX_LEN), dtype=np.int64)
         flat_is_n = np.empty(0, dtype=bool)
 
-    # Batched MLP inference:
-    #   Pass 1 — forward kmers  → fi (IPD) and fp (PW)
-    #   Pass 2 — RC kmers       → ri (IPD) and rp (PW)
-    # Same meth_ids/fractions for both: the meth_map (built with revcomp=True)
-    # encodes both-strand methylation at each reference position.
+    # Inference — dispatch on whether a lookup table is provided.
+    #   LUT mode (no GPU)  : ~1 μs/position via numpy fancy index + log-space sampling
+    #   Model mode (GPU)   : ~1 ms/position amortised via batched model.forward
+    # Both produce uint8-equivalent IPD/PW in physical units.
     if flat_kmer.size > 0:
-        all_signals = generate_signals_batch(
-            model, flat_kmer, flat_meth_id, flat_frac, flat_meth_ctx,
-            device, deterministic,
-        )
-        all_rc_signals = generate_signals_batch(
-            model, flat_rc_kmer, flat_meth_id, flat_frac, flat_meth_ctx,
-            device, deterministic,
-        )
+        if lookup_table is not None:
+            all_signals = generate_signals_lookup(
+                lookup_table, flat_kmer, flat_meth_ctx, deterministic,
+            )
+            all_rc_signals = generate_signals_lookup(
+                lookup_table, flat_rc_kmer, flat_meth_ctx, deterministic,
+            )
+        else:
+            all_signals = generate_signals_batch(
+                model, flat_kmer, flat_meth_id, flat_frac, flat_meth_ctx,
+                device, deterministic,
+            )
+            all_rc_signals = generate_signals_batch(
+                model, flat_rc_kmer, flat_meth_id, flat_frac, flat_meth_ctx,
+                device, deterministic,
+            )
     else:
         all_signals = np.zeros((0, 2), dtype=np.float32)
         all_rc_signals = np.zeros((0, 2), dtype=np.float32)
@@ -1027,6 +1219,8 @@ def generate_from_bam(
     batch_reads: int = 1000,
     no_fuzznuc: bool = False,
     deterministic: bool = False,
+    region: str | None = None,
+    use_lookup: str | None = None,
 ) -> None:
     """Generate kinetic signals for reads from an existing (aligned) BAM file.
 
@@ -1052,8 +1246,15 @@ def generate_from_bam(
     frac_map = build_reference_frac_map(ref_seqs, motif_string, revcomp=revcomp)
     fallback_motifs = parse_motifs(motif_string, revcomp=revcomp)
 
-    log.info("Loading checkpoint: %s", checkpoint_path)
-    model = _load_model(checkpoint_path, device_obj)
+    # Either load the trained model (default) or a pre-computed lookup table.
+    lookup_table = None
+    if use_lookup:
+        log.info("Loading lookup table: %s", use_lookup)
+        lookup_table = _load_lookup_table(use_lookup)
+        model = None  # not needed in LUT mode
+    else:
+        log.info("Loading checkpoint: %s", checkpoint_path)
+        model = _load_model(checkpoint_path, device_obj)
     p_eff_lookup = _load_p_efficiency(checkpoint_path)
     sig_offsets = _build_sig_offsets_by_meth_id()
     if p_eff_lookup:
@@ -1090,11 +1291,26 @@ def generate_from_bam(
     # decompression (input) and parallel compression (output). Single biggest
     # I/O win since pysam defaults to 1 thread. Use 4 to match the SLURM
     # --cpus-per-task=4 we typically request for generate.
+    #
+    # ``region`` (chr:start-end) routes through pysam.fetch() for parallel
+    # array-job execution. Requires the input BAM to be indexed (.bai).
     with (
         pysam.AlignmentFile(input_bam, "rb", check_sq=False, threads=4) as bam_in,
         pysam.AlignmentFile(output_bam, "wb", header=header_out, threads=4) as bam_out,
     ):
-        for read in bam_in:
+        if region:
+            log.info("Fetching reads from region: %s", region)
+            try:
+                reads_iter = bam_in.fetch(region=region)
+            except (ValueError, OSError) as e:
+                log.error(
+                    "Cannot fetch region '%s' — input BAM must be indexed "
+                    "(samtools index ...). Underlying error: %s", region, e,
+                )
+                sys.exit(1)
+        else:
+            reads_iter = bam_in
+        for read in reads_iter:
             if read.query_sequence is None:
                 continue
 
@@ -1150,6 +1366,7 @@ def generate_from_bam(
                     circular,
                     bam_out,
                     header_out,
+                    lookup_table=lookup_table,
                 )
                 n_mapped += n_m
                 n_unmapped += n_u
@@ -1174,6 +1391,7 @@ def generate_from_bam(
                 circular,
                 bam_out,
                 header_out,
+                lookup_table=lookup_table,
             )
             n_mapped += n_m
             n_unmapped += n_u
@@ -1224,6 +1442,24 @@ def _main_from_bam(argv):
         "before generation. Default: use the checkpoint's "
         "training alphabet. 'all' disables the filter.",
     )
+    parser.add_argument(
+        "--region",
+        default=None,
+        help="Process only reads overlapping this region (e.g. 'chr1:1-460000'). "
+             "Enables array-job parallelism: launch N tasks, each with a different "
+             "region, then samtools merge the outputs. Input BAM must be indexed.",
+    )
+    parser.add_argument(
+        "--use-lookup",
+        default=None,
+        metavar="PATH_TO_NPZ",
+        help="Use a pre-computed lookup table (from `kinsim predict-kmers`) instead "
+             "of running the model on the GPU. The LUT distils the trained model "
+             "into a (kmer, scenario) → (μ, σ) table — pure-numpy inference, no GPU "
+             "needed, ~1000× faster per-position. The checkpoint is still loaded "
+             "(only for p_fire metadata); pass the same checkpoint that produced the "
+             "LUT to keep firing semantics consistent.",
+    )
     args = parser.parse_args(argv)
 
     motif_string = load_motif_string(
@@ -1251,6 +1487,8 @@ def _main_from_bam(argv):
         batch_reads=args.batch_reads,
         no_fuzznuc=args.no_fuzznuc,
         deterministic=args.deterministic,
+        region=args.region,
+        use_lookup=args.use_lookup,
     )
 
 

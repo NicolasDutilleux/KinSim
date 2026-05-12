@@ -293,17 +293,57 @@ def _write_npz(
     output_npz: Path, scenarios: list[tuple[str, int, int]],
     raw_preds: dict[str, np.ndarray],
 ) -> None:
-    """Compact binary output. One array per scenario in physical units."""
-    bundle: dict[str, np.ndarray] = {"kmer_id": np.arange(next(iter(raw_preds.values())).shape[0])}
-    for label, _, _ in scenarios:
+    """Compact binary output. Writes both **physical** (uint8-comparable) and
+    **log-space** (model native) arrays per scenario.
+
+    Physical arrays are for inspection/plotting and comparison with empirical
+    BAM kinetics. Log-space arrays (``mu_*_log``, ``sigma_*_log``) are what
+    ``kinsim generate --use-lookup`` consumes — sampling is done in log1p
+    space exactly like at training time, then ``inv_log_transform``-ed back
+    to uint8. Plus a small ``scenarios`` ledger so generate can build its
+    ``(meth_id, offset) → scenario_idx`` lookup table without recomputing
+    anything from the YAML.
+    """
+    n_kmers = next(iter(raw_preds.values())).shape[0]
+    bundle: dict[str, np.ndarray] = {"kmer_id": np.arange(n_kmers)}
+
+    # Per-scenario metadata: arrays of (label, meth_id, k_offset) — saved as
+    # 1D string/int arrays so the LUT consumer can iterate without parsing.
+    labels  = []
+    m_ids   = []
+    offsets = []
+
+    for label, m_id, k_off in scenarios:
         if label not in raw_preds:
             continue
-        mu_ipd, mu_pw, sig_ipd, sig_pw = _to_physical(raw_preds[label])
+        labels.append(label)
+        m_ids.append(m_id)
+        offsets.append(k_off)
+
+        preds = raw_preds[label]
         sk = label.replace("@", "_at_").replace("+", "p").replace("-", "m")
+
+        # Log-space (model native — for sampling in generate)
+        mu_ipd_log  = preds[:, 0].astype(np.float32)
+        mu_pw_log   = preds[:, 1].astype(np.float32)
+        sigma_ipd_log = np.exp(np.clip(preds[:, 2], -6.0, 3.0)).astype(np.float32)
+        sigma_pw_log  = np.exp(np.clip(preds[:, 3], -6.0, 3.0)).astype(np.float32)
+        bundle[f"{sk}__mu_ipd_log"]    = mu_ipd_log
+        bundle[f"{sk}__mu_pw_log"]     = mu_pw_log
+        bundle[f"{sk}__sigma_ipd_log"] = sigma_ipd_log
+        bundle[f"{sk}__sigma_pw_log"]  = sigma_pw_log
+
+        # Physical (uint8-comparable — for inspection & legacy consumers)
+        mu_ipd, mu_pw, sig_ipd, sig_pw = _to_physical(preds)
         bundle[f"{sk}__mu_ipd"]    = mu_ipd
         bundle[f"{sk}__mu_pw"]     = mu_pw
         bundle[f"{sk}__sigma_ipd"] = sig_ipd
         bundle[f"{sk}__sigma_pw"]  = sig_pw
+
+    bundle["scenarios_label"]    = np.asarray(labels)
+    bundle["scenarios_meth_id"]  = np.asarray(m_ids,   dtype=np.int64)
+    bundle["scenarios_offset"]   = np.asarray(offsets, dtype=np.int64)
+
     log.info("Writing %s ... (%d arrays)", output_npz, len(bundle))
     np.savez_compressed(output_npz, **bundle)
 
