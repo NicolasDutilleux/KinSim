@@ -646,7 +646,7 @@ def generate_signals(
     open_func = gzip.open if fastq_path.endswith(".gz") else open
 
     with (
-        pysam.AlignmentFile(output_bam, "wb", header=header) as bam_out,
+        pysam.AlignmentFile(output_bam, "wb", header=header, threads=4) as bam_out,
         open_func(fastq_path, "rt") as fq,
     ):
         batch = []
@@ -1086,9 +1086,13 @@ def generate_from_bam(
             out_dict["RG"] = [{"ID": "00000001", "PL": "PACBIO", "DS": "READTYPE=CCS"}]
         header_out = pysam.AlignmentHeader.from_dict(out_dict)
 
+    # Multi-threaded BGZF I/O — htslib uses these threads for parallel
+    # decompression (input) and parallel compression (output). Single biggest
+    # I/O win since pysam defaults to 1 thread. Use 4 to match the SLURM
+    # --cpus-per-task=4 we typically request for generate.
     with (
-        pysam.AlignmentFile(input_bam, "rb", check_sq=False) as bam_in,
-        pysam.AlignmentFile(output_bam, "wb", header=header_out) as bam_out,
+        pysam.AlignmentFile(input_bam, "rb", check_sq=False, threads=4) as bam_in,
+        pysam.AlignmentFile(output_bam, "wb", header=header_out, threads=4) as bam_out,
     ):
         for read in bam_in:
             if read.query_sequence is None:
