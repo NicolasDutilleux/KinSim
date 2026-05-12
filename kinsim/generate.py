@@ -248,19 +248,25 @@ def generate_signals_batch(
     meth_ids_bin = np.asarray(meth_ids, dtype=np.int64)
     fractions_bin = np.asarray(fractions, dtype=np.float32)
 
-    from .utils.sample_layout import METH_CTX_LEFT, METH_CTX_LEN
+    from .utils.sample_layout import METH_CTX_LEFT, METH_CTX_LEN, REV_METH_LEN
 
     K_SIZE = METH_CTX_LEN
     PRED_IDX = METH_CTX_LEFT
+    TOTAL_POS = K_SIZE + REV_METH_LEN  # forward context + rev_meth positions
     # Number of methylation states is set by the trained model — read it
     # from the model's config rather than hard-coding 4. Adding a new mod
     # type to kinsim_config.yaml widens this automatically once the model
     # is retrained; the saved checkpoint carries the correct value.
     NUM_M = int(model.get_config().get("num_meth_types", 4))
     ctx_np = np.asarray(meth_contexts, dtype=np.int64)
-    meth_full_np = np.zeros((N, K_SIZE, NUM_M), dtype=np.float32)
+    # meth_full layout matches the trained dataset:
+    #   positions [0, K_SIZE)          → forward meth context (offsets [-7..+3])
+    #   positions [K_SIZE, TOTAL_POS)  → rev_meth at active-site neighbours
+    # Generate has no complementary-strand methylation information, so the
+    # rev_meth block stays zero (the most common training distribution case).
+    meth_full_np = np.zeros((N, TOTAL_POS, NUM_M), dtype=np.float32)
 
-    # Non-prediction positions — hard one-hot from the (already mutated) mc
+    # Non-prediction forward positions — hard one-hot from the (already mutated) mc
     for pos in range(K_SIZE):
         if pos == PRED_IDX:
             continue

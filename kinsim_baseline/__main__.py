@@ -10,7 +10,16 @@ Usage::
         Plot per-(meth_type, offset) IPD distributions from a previous
         compute run. Writes a single interactive HTML (linear + log y).
 
-See ``compute.py`` and ``analyze.py`` for the algorithms.
+    python -m kinsim_baseline per-kmer PREDICT_NPZ MANIFEST_CSV OUTPUT_DIR
+        Use the AI model's per-kmer predictions (from `kinsim predict-kmers`,
+        'none' scenario) as the null baseline. Walks the BAMs and flags
+        every observed IPD/PW exceeding μ_pred + N·σ_pred per kmer.
+
+    python -m kinsim_baseline plot-per-kmer OUTPUT_DIR
+        3-panel HTML: scatter μ_pred vs μ_obs, above-rate distribution,
+        and top-K kmers detail (AI baseline vs above-threshold population).
+
+See ``compute.py``, ``analyze.py``, ``per_kmer.py``, ``plot_kmer.py``.
 """
 
 from __future__ import annotations
@@ -44,6 +53,23 @@ def main():
             "      Output:\n"
             "        ipd_distributions.html\n"
             "      Requires plotly (in the [plot] optional extra).\n"
+            "\n"
+            "  per-kmer MANIFEST_CSV OUTPUT_DIR\n"
+            "      Walk manifest BAMs and accumulate per-11-mer (μ_IPD, σ_IPD,\n"
+            "      μ_PW, σ_PW, n) using vectorised np.add.at. Skips any window\n"
+            "      with a non-ACGT base. KMER_PRED_IDX=7 centres the window\n"
+            "      asymmetrically (offsets -7..+3).\n"
+            "      Outputs (in OUTPUT_DIR):\n"
+            "        per_kmer.npz         raw moments (sum, sum2, count) ×4M kmers\n"
+            "        per_kmer_stats.npz   derived μ, σ\n"
+            "\n"
+            "  plot-per-kmer OUTPUT_DIR [--threshold 2.0]\n"
+            "      4-panel plotly HTML from per_kmer_stats.npz:\n"
+            "        - scatter μ vs σ (subsampled to 100k, log-coloured by n)\n"
+            "        - μ histogram across kmers\n"
+            "        - σ histogram across kmers (informs outlier threshold)\n"
+            "        - coverage histogram (log y)\n"
+            "      Output: per_kmer_dashboard.html + per_kmer_summary.tsv\n"
         )
         sys.exit(0 if len(sys.argv) >= 2 else 1)
 
@@ -54,9 +80,13 @@ def main():
         from .compute import main as cmd_main
     elif cmd == "analyze":
         from .analyze import main as cmd_main
+    elif cmd == "per-kmer":
+        from .per_kmer import main as cmd_main
+    elif cmd == "plot-per-kmer":
+        from .plot_kmer import main as cmd_main
     else:
         print(f"unknown command: {cmd}", file=sys.stderr)
-        print("expected: compute | analyze", file=sys.stderr)
+        print("expected: compute | analyze | per-kmer | plot-per-kmer", file=sys.stderr)
         sys.exit(1)
 
     cmd_main(rest)
