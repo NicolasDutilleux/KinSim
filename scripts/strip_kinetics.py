@@ -74,3 +74,11 @@ def main(argv=None):
     log.info("Stripping kinetic tags from: %s", args.input_bam)
     log.info("Writing stripped copy to:    %s", args.output_bam)
     strip_kinetics(args.input_bam, args.output_bam)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
+    )
+    main()
