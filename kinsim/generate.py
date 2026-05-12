@@ -1100,9 +1100,16 @@ def generate_from_bam(
                 }
             )
 
-            # Build maf_mapping entry from BAM alignment — same fields parse_maf returns
+            # Build maf_mapping entry from BAM alignment — same fields parse_maf returns.
+            # Gated by KINSIM_USE_REF_CTX (default off): the mapped-path inner
+            # loop is unvectorised and ~50× slower than the unmapped path. For
+            # whole-genome motif validation the edge-accuracy gain from
+            # reference-context padding is statistically negligible, so we
+            # default to the fast unmapped path. Set KINSIM_USE_REF_CTX=1 to
+            # re-enable the (slow) mapped path.
             if (
-                not read.is_unmapped
+                os.environ.get("KINSIM_USE_REF_CTX") == "1"
+                and not read.is_unmapped
                 and read.reference_name is not None
                 and read.reference_name in ref_seqs
             ):
