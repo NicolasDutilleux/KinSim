@@ -154,6 +154,7 @@ def _accumulate_read(
     sum_above_ipd: np.ndarray, sum2_above_ipd: np.ndarray,
     sum_obs_pw: np.ndarray, sum2_obs_pw: np.ndarray,
     sum_above_pw: np.ndarray, sum2_above_pw: np.ndarray,
+    hist_ipd: np.ndarray | None = None, hist_n_bins: int = 64,
 ) -> int:
     """For each valid 11-mer window, compare its centre IPD/PW against the
     AI's per-kmer threshold and update the running accumulators.
@@ -210,6 +211,18 @@ def _accumulate_read(
         np.add.at(sum_above_pw,  kp, op)
         np.add.at(sum2_above_pw, kp, op * op)
 
+    # Per-kmer observed IPD histogram — 64-bin (each bin = 4 IPD units).
+    # Stored as uint16 (max 65535 per bin); rare overflow gets clamped on
+    # save. ``hist_ipd`` shape: (N_KMERS, hist_n_bins).
+    if hist_ipd is not None:
+        bin_idx = (obs_ipd.astype(np.int32) // (256 // hist_n_bins)).clip(
+            0, hist_n_bins - 1,
+        )
+        # Flatten (kmer_id, bin_idx) → linear idx for one np.add.at
+        flat = kmer_ids * hist_n_bins + bin_idx
+        # We add into a flat view of hist_ipd to keep one scatter
+        np.add.at(hist_ipd.reshape(-1), flat, 1)
+
     return int(kmer_ids.size)
 
 
@@ -225,6 +238,8 @@ def accumulate_per_kmer(
     threshold_factor: float,
     max_reads_per_bam: int | None = None,
     progress_every: int = 50_000,
+    collect_hist: bool = True,
+    hist_n_bins: int = 64,
 ) -> dict:
     """Walk all BAMs, return per-kmer outlier accumulators (size N_KMERS each)."""
     import pysam
@@ -243,12 +258,20 @@ def accumulate_per_kmer(
     sum2_obs_pw   = np.zeros(N_KMERS, dtype=np.float64)
     sum_above_pw  = np.zeros(N_KMERS, dtype=np.float64)
     sum2_above_pw = np.zeros(N_KMERS, dtype=np.float64)
+    # Per-kmer observed IPD histogram (~1 GB for 4.2M × 64 × uint32). uint32
+    # to avoid silent overflow on np.add.at; we can compress when saving.
+    hist_ipd = (
+        np.zeros((N_KMERS, hist_n_bins), dtype=np.uint32) if collect_hist else None
+    )
     per_bam: dict = {}
 
     log.info(
         "Walking %d BAMs with threshold = μ_pred + %.2f · σ_pred (per kmer)",
         len(bam_paths), threshold_factor,
     )
+    if collect_hist:
+        log.info("  Collecting per-kmer IPD histogram (%d bins × %d kmers ≈ %.0f MB)",
+                 hist_n_bins, N_KMERS, hist_ipd.nbytes / 1e6)
     log.info("  IPD threshold: min=%.2f mean=%.2f max=%.2f",
              float(thr_ipd.min()), float(thr_ipd.mean()), float(thr_ipd.max()))
 
@@ -275,6 +298,7 @@ def accumulate_per_kmer(
                     n_total, n_above_ipd, n_above_pw,
                     sum_obs_ipd, sum2_obs_ipd, sum_above_ipd, sum2_above_ipd,
                     sum_obs_pw,  sum2_obs_pw,  sum_above_pw,  sum2_above_pw,
+                    hist_ipd=hist_ipd, hist_n_bins=hist_n_bins,
                 )
                 n_reads += 1
                 if n_reads % progress_every == 0:
@@ -292,6 +316,8 @@ def accumulate_per_kmer(
         "sum_above_ipd": sum_above_ipd, "sum2_above_ipd": sum2_above_ipd,
         "sum_obs_pw": sum_obs_pw, "sum2_obs_pw": sum2_obs_pw,
         "sum_above_pw": sum_above_pw, "sum2_above_pw": sum2_above_pw,
+        "hist_ipd": hist_ipd,        # (N_KMERS, hist_n_bins) uint32 or None
+        "hist_n_bins": hist_n_bins,
         "per_bam": per_bam,
     }
 
@@ -350,18 +376,24 @@ def main(argv=None):
              above_total_pw,  100 * above_total_pw  / max(obs_total, 1))
 
     out_path = out_dir / "per_kmer_observed.npz"
-    np.savez_compressed(
-        out_path,
-        n_total=out["n_total"],
-        n_above_ipd=out["n_above_ipd"], n_above_pw=out["n_above_pw"],
-        sum_obs_ipd=out["sum_obs_ipd"], sum2_obs_ipd=out["sum2_obs_ipd"],
-        sum_above_ipd=out["sum_above_ipd"], sum2_above_ipd=out["sum2_above_ipd"],
-        sum_obs_pw=out["sum_obs_pw"],   sum2_obs_pw=out["sum2_obs_pw"],
-        sum_above_pw=out["sum_above_pw"], sum2_above_pw=out["sum2_above_pw"],
-        mu_pred_ipd=mu_ipd, sigma_pred_ipd=sigma_ipd,
-        mu_pred_pw=mu_pw,   sigma_pred_pw=sigma_pw,
-        threshold_factor=np.float32(args.threshold),
-    )
+    save_kwargs = {
+        "n_total": out["n_total"],
+        "n_above_ipd": out["n_above_ipd"], "n_above_pw": out["n_above_pw"],
+        "sum_obs_ipd": out["sum_obs_ipd"], "sum2_obs_ipd": out["sum2_obs_ipd"],
+        "sum_above_ipd": out["sum_above_ipd"], "sum2_above_ipd": out["sum2_above_ipd"],
+        "sum_obs_pw": out["sum_obs_pw"],   "sum2_obs_pw": out["sum2_obs_pw"],
+        "sum_above_pw": out["sum_above_pw"], "sum2_above_pw": out["sum2_above_pw"],
+        "mu_pred_ipd": mu_ipd, "sigma_pred_ipd": sigma_ipd,
+        "mu_pred_pw": mu_pw,   "sigma_pred_pw": sigma_pw,
+        "threshold_factor": np.float32(args.threshold),
+    }
+    if out["hist_ipd"] is not None:
+        # Clip to uint16 max (65535) to halve the disk size at the cost of
+        # losing exact counts for the ~0.01% of bins that overflow.
+        clipped = np.clip(out["hist_ipd"], 0, 65535).astype(np.uint16)
+        save_kwargs["hist_ipd"] = clipped
+        save_kwargs["hist_n_bins"] = np.int32(out["hist_n_bins"])
+    np.savez_compressed(out_path, **save_kwargs)
     log.info("Saved: %s", out_path)
 
     info_path = out_dir / "per_kmer_observed_info.json"

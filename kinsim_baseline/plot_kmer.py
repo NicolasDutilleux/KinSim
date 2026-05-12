@@ -54,6 +54,99 @@ def _load(out_dir: Path) -> dict:
     return {k: data[k] for k in data.files}
 
 
+def _build_per_kmer_hist_figure(
+    d: dict, derived: dict, top_idx: np.ndarray,
+):
+    """Multi-subplot figure: for each top kmer, plot the empirical IPD
+    histogram (from the observed BAM data) overlaid with the AI's predicted
+    Gaussian. This is the "smoking gun" view — bimodal distributions visible
+    here imply the kmer carries methylation events in the corpus.
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    if "hist_ipd" not in d or top_idx.size == 0:
+        return None
+
+    hist_ipd = d["hist_ipd"]                                  # (N_KMERS, n_bins)
+    n_bins = int(d.get("hist_n_bins", hist_ipd.shape[1]))
+    bin_width = 256 / n_bins
+    bin_centers = (np.arange(n_bins) + 0.5) * bin_width       # IPD-value at bin centre
+
+    mu_pred = d["mu_pred_ipd"]
+    sigma_pred = d["sigma_pred_ipd"]
+    mu_obs = derived["mu_obs"]
+    sigma_obs = derived["sigma_obs"]
+    n_total = derived["n_total"]
+    above_rate = derived["above_rate"]
+
+    # Pretty-print up to 12 kmers in a 3×4 grid
+    n_panels = min(top_idx.size, 12)
+    idx = top_idx[:n_panels]
+    rows = int(np.ceil(n_panels / 3))
+    titles = [
+        f"{decode_kmer(int(k))}  n={int(n_total[k])}  above={above_rate[k]*100:.2f}%"
+        for k in idx
+    ]
+
+    fig = make_subplots(rows=rows, cols=3, subplot_titles=titles,
+                        horizontal_spacing=0.06, vertical_spacing=0.12)
+    x_smooth = np.linspace(0, 255, 512)
+    for j, k in enumerate(idx):
+        r = j // 3 + 1
+        c = j % 3 + 1
+        h = hist_ipd[k].astype(np.float64)
+        if h.sum() == 0:
+            continue
+        # Empirical density (so it overlays cleanly with the Gaussian PDF)
+        h_density = h / (h.sum() * bin_width)
+        fig.add_trace(go.Bar(
+            x=bin_centers, y=h_density, width=bin_width * 0.95,
+            marker={"color": "#7f8c8d"}, name="observed",
+            showlegend=(j == 0),
+        ), row=r, col=c)
+
+        # Predicted Gaussian density
+        mu_p = float(mu_pred[k])
+        sg_p = max(float(sigma_pred[k]), 1e-3)
+        y_pred = (
+            1.0 / (sg_p * np.sqrt(2 * np.pi))
+            * np.exp(-0.5 * ((x_smooth - mu_p) / sg_p) ** 2)
+        )
+        fig.add_trace(go.Scatter(
+            x=x_smooth, y=y_pred, mode="lines",
+            line={"color": "#3498db", "width": 2}, name="AI predicted",
+            showlegend=(j == 0),
+        ), row=r, col=c)
+
+        # Empirical Gaussian (μ_obs, σ_obs) — to make the spread comparison obvious
+        mu_o = float(mu_obs[k])
+        sg_o = max(float(sigma_obs[k]), 1e-3)
+        y_obs = (
+            1.0 / (sg_o * np.sqrt(2 * np.pi))
+            * np.exp(-0.5 * ((x_smooth - mu_o) / sg_o) ** 2)
+        )
+        fig.add_trace(go.Scatter(
+            x=x_smooth, y=y_obs, mode="lines",
+            line={"color": "#e74c3c", "width": 2, "dash": "dash"},
+            name="empirical Gaussian", showlegend=(j == 0),
+        ), row=r, col=c)
+
+        fig.update_xaxes(title_text="IPD" if r == rows else "",
+                         range=[0, max(60, mu_p + sg_p * 5)], row=r, col=c)
+        fig.update_yaxes(title_text="density" if c == 1 else "", row=r, col=c)
+
+    fig.update_layout(
+        height=320 * rows, template="plotly_white",
+        title={"text": "Per-kmer empirical IPD vs AI prediction",
+               "x": 0.5, "xanchor": "center"},
+        bargap=0.0, margin={"t": 80, "b": 40, "l": 60, "r": 30},
+        legend={"orientation": "h", "yanchor": "bottom", "y": -0.08,
+                "xanchor": "center", "x": 0.5},
+    )
+    return fig
+
+
 def _derive(d: dict) -> dict:
     """Compute μ/σ (all obs) and μ/σ (above-threshold) per kmer."""
     n = d["n_total"].astype(np.float64)
@@ -348,6 +441,28 @@ def main(argv=None):
         config={"responsive": True, "displayModeBar": True},
     )
     log.info("Saved: %s", out_html)
+
+    # Additional per-kmer histogram view (top-12 kmers) — only when the
+    # observed histogram was collected. Visual "smoking gun" view.
+    if "hist_ipd" in d:
+        n_total = derived["n_total"]
+        above_rate = derived["above_rate"]
+        cand = np.where(n_total >= args.min_obs)[0]
+        if args.pattern:
+            cand = _filter_pattern(cand, args.pattern)
+        if cand.size:
+            order = np.argsort(-above_rate[cand])
+            top_idx_hist = cand[order[:12]]
+            fig_hist = _build_per_kmer_hist_figure(d, derived, top_idx_hist)
+            if fig_hist is not None:
+                hist_suffix = f"_{args.pattern}" if args.pattern else ""
+                hist_html = out_dir / f"per_kmer_histograms{hist_suffix}.html"
+                pio.write_html(
+                    fig_hist, str(hist_html),
+                    include_plotlyjs="cdn", full_html=True,
+                    config={"responsive": True, "displayModeBar": True},
+                )
+                log.info("Saved: %s", hist_html)
 
     write_top_tsv(
         d, derived, out_dir,
