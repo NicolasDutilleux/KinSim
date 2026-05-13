@@ -80,16 +80,46 @@ kinetic_signatures:
   #   description: "..."
 
 # ─────────────────────────────────────────────────────────────────────────
-# Methylation-context window — input to the model's FiLM conditioner
+# Extraction window — kmer geometry AND methylation context
 # ─────────────────────────────────────────────────────────────────────────
-# Around each prediction position Y, KinSim feeds the model a window of
-# meth_id values at offsets [-left, +right] (`mc_0..mc_10` columns of the
-# stored sample). The window is asymmetric (more upstream than downstream)
-# because PacBio kinetic signatures sit DOWNSTREAM of the modification:
-# to predict IPD/PW at Y, the model must see any methylation that is
-# upstream of Y whose footprint extends to Y. Window length = left+1+right.
-# Inspired by Feng et al. 2013 (kineticsTools, [-7, +2] for unmodified DNA),
-# widened by one to keep K=11 = left + 1 + right.
+# The same window drives BOTH the kmer the model sees AND the methylation
+# context fed to FiLM — they are linked by design (a kmer of length K at
+# position p inherently means "meth context [-upstream, +downstream] from
+# p"). Editing this block re-shapes every shard, every model dimension,
+# every checkpoint produced downstream.
+#
+# Constraint (enforced at config load, error otherwise):
+#     upstream + 1 + downstream == kmer_size
+#
+# To run a wider symmetric context (e.g. 21 bp with the active site at the
+# centre), change to:
+#     kmer_size: 21
+#     upstream:  10
+#     downstream: 10
+# That single change propagates through extract, refine, train, generate.
+# The shards carry these params in `__meta__["extraction_params"]` so
+# `kinsim train` refuses to mix shards built with different geometries
+# (and refuses to train a model whose YAML disagrees with the shards).
+#
+# Default (K=11, upstream-heavy [-7, +3]) is inspired by Feng et al. 2013
+# (kineticsTools / ipdSummary, [-7, +2] for unmodified DNA), widened by
+# one. PacBio kinetic signatures sit DOWNSTREAM of the modification, so
+# the asymmetric layout puts more bases on the upstream side where the
+# polymerase has already passed.
+extraction:
+  kmer_size:        11           # total window length (must equal upstream + 1 + downstream)
+  upstream:         7            # bases of context BEFORE the prediction position
+  downstream:       3            # bases of context AFTER the prediction position
+  # Complementary-strand methylation captured at the active-site footprint
+  # (offsets are RELATIVE to the active site, NOT to the kmer start).
+  # Used by FiLM to disambiguate bilateral / palindromic motifs.
+  # Most setups can leave this at [-1, 0, +1] regardless of kmer_size.
+  rev_meth_offsets: [-1, 0, 1]
+
+# Legacy alias — kept for backward compatibility with older YAMLs. If you
+# delete the `extraction:` block above, KinSim falls back to reading
+# `meth_context.left/right` and assumes K = left + 1 + right. Prefer the
+# `extraction:` block for new configs.
 meth_context:
   left:  7      # bases of meth context BEFORE the prediction position
   right: 3      # bases AFTER the prediction position
@@ -142,3 +172,47 @@ extract:
 refine:
   slowed_split:
     secondary_percentile: 95   # p95 of per-kmer baseline mean → drop SLOWED below this
+
+# ─────────────────────────────────────────────────────────────────────────
+# Model defaults
+# ─────────────────────────────────────────────────────────────────────────
+# Architecture knobs for `kinsim train`. CLI flags override these; the
+# YAML is the project-wide default. Every key here corresponds to an
+# argument on `ConvPredictor.__init__` (kinsim/models/predictor.py).
+#
+# Precedence (high → low):
+#     CLI flag  >  this YAML  >  hardcoded defaults in train.py
+#
+# Defaults below match the current production model. To experiment, edit
+# values here and re-train — no code change needed. For a 21 bp window,
+# typically widen the receptive field by raising n_conv_layers (e.g. 5)
+# and/or conv_kernel_size (e.g. 5).
+model:
+  architecture:       conv      # "conv" (default, ~140K params) | "mlp" (legacy, ~268M params, K<=12 only)
+  base_embed_dim:     16        # per-base embedding width
+  n_conv_layers:      3         # depth of 1D conv backbone (try 5 for K=21)
+  conv_channels:      128       # conv channel width (= conv_dim)
+  conv_kernel_size:   3         # conv kernel; try 5 for wider receptive field
+  head_hidden_dim:    128       # head MLP width (= head_dim)
+  head_dropout:       0.1       # head dropout
+  meth_proj_dim:      8         # methylation projection width before FiLM
+  kmer_aware_film:    true      # condition FiLM on (meth_proj + kmer_summary)
+  biology_mask:       true      # zero impossible (base, meth_id) pairs before FiLM
+  log_sigma_clamp_max: 1.5      # upper clamp on log σ (legacy was 3.0)
+
+# ─────────────────────────────────────────────────────────────────────────
+# Training defaults
+# ─────────────────────────────────────────────────────────────────────────
+# Optimisation + loss + augmentation defaults. Same precedence rules as
+# `model:` above.
+training:
+  epochs:             50
+  batch_size:         4096
+  lr:                 0.001
+  loss:               betanll   # "gnll" | "betanll" (β=0.5) | "betanll_0.3/0.5/1.0" | "mse" | "huber"
+  lr_schedule:        cosine    # "cosine" (linear warmup + cosine decay) | "plateau" (legacy)
+  warmup_epochs:      3
+  augment:            true      # paired-positive augmentation (real baseline of same kmer)
+  balance_kmers:      true      # per-(kmer, category) inverse-freq sampling
+  val_fraction:       0.10
+  checkpoint_every:   10

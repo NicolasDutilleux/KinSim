@@ -141,9 +141,20 @@ def _check_v4_input(data: dict) -> None:
 
 
 def _detect_kmer_size(data: dict, meta: dict) -> int:
-    """Infer kmer size from __meta__ or from the largest int key."""
-    if meta and "kmer_size" in meta:
-        return int(meta["kmer_size"])
+    """Infer kmer size, preferring the source of truth in ``__meta__``.
+
+    Resolution order:
+      1. ``meta["extraction_params"]["kmer_size"]`` (post-v0.5 shards).
+      2. ``meta["kmer_size"]`` (legacy direct field, kept for back-compat).
+      3. Bit-length of the largest int key (fallback for unannotated shards).
+      4. ``11`` if the shard is otherwise empty.
+    """
+    if meta:
+        ext = meta.get("extraction_params") or {}
+        if "kmer_size" in ext:
+            return int(ext["kmer_size"])
+        if "kmer_size" in meta:
+            return int(meta["kmer_size"])
     max_kmer = 0
     for k in data:
         if k == "__meta__":
@@ -166,7 +177,11 @@ def compute_category_distributions(data: dict) -> dict:
 
     Returns ``dict[category_name] -> {n, ipd_mean, ipd_std, ipd_quantiles,
     ipd_max, pw_mean, pw_std, pw_quantiles, ipd_hist, ipd_hist_edges}``.
+
+    Resolves column indices from the shard's ``__meta__["extraction_params"]``
+    when present; falls back to the legacy K=11 layout otherwise.
     """
+    from .data.dataset import read_shard_extraction_params  # noqa: PLC0415
     from .utils.sample_layout import (
         CATEGORY_BASELINE,
         CATEGORY_NAMES,
@@ -175,19 +190,26 @@ def compute_category_distributions(data: dict) -> dict:
         COL_CATEGORY,
         COL_IPD,
         COL_PW,
+        get_sample_layout,
     )
+
+    params = read_shard_extraction_params(data)
+    layout = get_sample_layout(params) if params is not None else None
+    col_cat = layout.col_category if layout else COL_CATEGORY
+    col_ipd = layout.col_ipd if layout else COL_IPD
+    col_pw = layout.col_pw if layout else COL_PW
 
     by_cat: dict[int, list] = {0: [], 1: [], 2: []}
     for kid, arr in data.items():
         if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
             continue
-        if arr.shape[1] <= COL_CATEGORY:
+        if arr.shape[1] <= col_cat:
             continue
-        cats = arr[:, COL_CATEGORY].astype(np.int8)
+        cats = arr[:, col_cat].astype(np.int8)
         for cat_id in (CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH):
             mask = cats == cat_id
             if mask.any():
-                by_cat[cat_id].append(arr[mask][:, [COL_IPD, COL_PW]])
+                by_cat[cat_id].append(arr[mask][:, [col_ipd, col_pw]])
 
     bins = np.array([0, 16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 256], dtype=np.float32)
     qs = (5, 25, 50, 75, 90, 95, 99)
@@ -232,6 +254,7 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
     dropped: with PARENT_OFFSET written at extract time, comparing the
     mean IPD across buckets is the cleaner diagnostic.
     """
+    from .data.dataset import read_shard_extraction_params  # noqa: PLC0415
     from .utils.encoding import get_meth_ids
     from .utils.sample_layout import (
         CATEGORY_BASELINE,
@@ -242,7 +265,18 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
         COL_PARENT_METH,
         COL_PARENT_OFFSET,
         COL_PW,
+        get_sample_layout,
     )
+
+    # Resolve column layout from shard meta (new shards) or fall back to
+    # the legacy K=11 module constants. Same pattern as verify_generate.py.
+    params = read_shard_extraction_params(data)
+    layout = get_sample_layout(params) if params is not None else None
+    col_cat = layout.col_category if layout else COL_CATEGORY
+    col_ipd = layout.col_ipd if layout else COL_IPD
+    col_pw = layout.col_pw if layout else COL_PW
+    col_parent_meth = layout.col_parent_meth if layout else COL_PARENT_METH
+    col_parent_offset = layout.col_parent_offset if layout else COL_PARENT_OFFSET
 
     meth_ids = get_meth_ids()
     name_by_mid = {v: k for k, v in meth_ids.items()}
@@ -254,13 +288,13 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
     for kid, v in data.items():
         if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
             continue
-        if v.shape[1] <= COL_PARENT_OFFSET:
+        if v.shape[1] <= col_parent_offset:
             continue
-        cats = v[:, COL_CATEGORY].astype(np.int8)
-        parent = v[:, COL_PARENT_METH].astype(np.int8)
-        offset = v[:, COL_PARENT_OFFSET].astype(np.int8)
-        ipd = v[:, COL_IPD]
-        pw = v[:, COL_PW]
+        cats = v[:, col_cat].astype(np.int8)
+        parent = v[:, col_parent_meth].astype(np.int8)
+        offset = v[:, col_parent_offset].astype(np.int8)
+        ipd = v[:, col_ipd]
+        pw = v[:, col_pw]
 
         base_m = cats == CATEGORY_BASELINE
         if base_m.any():

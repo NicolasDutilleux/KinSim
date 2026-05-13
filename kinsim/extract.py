@@ -66,8 +66,12 @@ from pathlib import Path
 import numpy as np
 import pysam
 
-from .utils.config import load_kinsim_config
-from .utils.encoding import KMER_LEFT_PAD, K, get_meth_ids
+from .utils.config import (
+    ExtractionParams,
+    get_extraction_params,
+    load_kinsim_config,
+)
+from .utils.encoding import get_meth_ids
 from .utils.io import atomic_write_pickle, load_reference
 from .utils.motifs import (
     filter_motif_string_by_types,
@@ -78,7 +82,8 @@ from .utils.sample_layout import (
     CATEGORY_BASELINE,
     CATEGORY_NEAR_METH,
     CATEGORY_SLOWED,
-    METH_CTX_LEFT,
+    SampleLayout,
+    get_sample_layout,
 )
 
 try:
@@ -253,6 +258,7 @@ def _build_contig_arrays(
     fwd_meth: dict,
     rev_meth: dict,
     baseline_min_dist: int,
+    params: ExtractionParams,
 ) -> dict:
     """Materialise per-position lookup arrays for one contig.
 
@@ -260,7 +266,21 @@ def _build_contig_arrays(
     O(1) array indexing. Memory is ~14 bytes per ref base — negligible
     for bacterial genomes — and reads of millions of positions become
     measurably faster.
+
+    Args:
+        contig:             Contig name (used to filter the per-strand meth dicts).
+        seq:                The contig sequence as a plain string.
+        fwd_slowed/...:     Pre-built meth-state dicts (see :func:`_build_strand_maps`).
+        baseline_min_dist:  Minimum distance (bases) from any meth to flag a
+                            position as a baseline candidate.
+        params:             Window geometry. Drives the kmer-encoding shift loop,
+                            the boundary mask, and the inner-slice padding so the
+                            same code handles arbitrary ``kmer_size``.
     """
+    kmer_size = params.kmer_size
+    upstream = params.upstream
+    downstream = params.downstream
+
     n = len(seq)
     base_int = np.full(n, -1, dtype=np.int8)  # -1 → non-ACGT
     base_int[np.frombuffer(seq.encode("ascii"), dtype=np.uint8) == ord("A")] = 0
@@ -269,42 +289,41 @@ def _build_contig_arrays(
     base_int[np.frombuffer(seq.encode("ascii"), dtype=np.uint8) == ord("T")] = 3
     valid_base = base_int >= 0
 
-    # Sliding 11-mer encoding on the + strand. window[i] covers ref
-    # positions i-LEFT .. i+(K-LEFT)-1; out-of-range → invalid.
-    # Start the accumulator at 0 (not -1) — left-shifting a negative
-    # number leaves the sign bit set forever, so every kmer would come
-    # out negative and the inner loop would skip every position.
-    LEFT = KMER_LEFT_PAD
-    RIGHT = K - LEFT
+    # Sliding kmer encoding on the + strand. window[i] covers ref positions
+    # i-upstream .. i+downstream; out-of-range → invalid.
+    # Start the accumulator at 0 (not -1) — left-shifting a negative number
+    # leaves the sign bit set forever, so every kmer would come out negative
+    # and the inner loop would skip every position. int64 accommodates K up
+    # to 31 (2K bits), enforced by ExtractionParams.
     kmer_fwd = np.zeros(n, dtype=np.int64)
     kmer_window_valid = np.ones(n, dtype=bool)
-    for j in range(K):
+    for j in range(kmer_size):
         # In + strand 5'→3' frame: the j-th base of the kmer at ref_pos i
-        # sits at ref position (i - LEFT + j).
-        offset = j - LEFT
+        # sits at ref position (i - upstream + j).
+        offset = j - upstream
         # roll() gives wrap-around; we mask out boundary positions below.
         rolled = np.roll(base_int, -offset)
         kmer_window_valid &= np.roll(valid_base, -offset)
         kmer_fwd = (kmer_fwd << 2) | (rolled.astype(np.int64) & 3)
-    # Boundary mask: any position whose 11-mer reaches outside [0, n) is
-    # invalid. The kmer at ref_pos i needs positions [i-LEFT, i+RIGHT-1].
+    # Boundary mask: any position whose kmer reaches outside [0, n) is invalid.
+    # The kmer at ref_pos i needs positions [i-upstream, i+downstream].
     edge_invalid = np.zeros(n, dtype=bool)
-    edge_invalid[:LEFT] = True
-    if RIGHT > 0:
-        edge_invalid[n - RIGHT + 1:] = True
+    edge_invalid[:upstream] = True
+    if downstream > 0:
+        edge_invalid[n - downstream:] = True
     kmer_fwd[edge_invalid | ~kmer_window_valid] = -1
 
-    # Reverse-complement kmer at the same ref position: the polymerase
-    # reading the − strand sees a different 11-mer here. Bit-reverse pairs
-    # of the + strand kmer and complement them (XOR with 0b1111... pattern).
-    # XOR pattern over K bases: each 2-bit unit XORs with 3 (A↔T, C↔G).
+    # Reverse-complement kmer at the same ref position: the polymerase reading
+    # the − strand sees a different kmer here. Bit-reverse pairs of the +
+    # strand kmer and complement them (XOR with 0b1111... pattern over kmer
+    # bases). Each 2-bit unit XORs with 3 (A↔T, C↔G).
     xor_mask = np.int64(0)
-    for _ in range(K):
+    for _ in range(kmer_size):
         xor_mask = (xor_mask << 2) | 3
-    # Bit-reverse the K base-pairs:
+    # Bit-reverse the kmer base-pairs:
     src = kmer_fwd.copy()
     kmer_rev = np.zeros_like(src)
-    for _ in range(K):
+    for _ in range(kmer_size):
         kmer_rev = (kmer_rev << 2) | (src & 3)
         src >>= 2
     kmer_rev ^= xor_mask
@@ -346,21 +365,25 @@ def _build_contig_arrays(
         excluded[:-d] |= meth_present[d:]
         excluded[d:] |= meth_present[:-d]
 
-    # Pre-pad meth arrays so the inner-loop meth_context slice never
-    # needs bounds-checking. PAD=METH_CTX_LEFT covers all offsets the
-    # hot path ever touches (mc up to ±7, rev_meth up to ±1). With
-    # padding, mc becomes a single numpy slice — no np.where, no np.clip.
-    PAD = METH_CTX_LEFT  # = 7
-    fwd_meth_padded = np.zeros(n + 2 * PAD, dtype=np.int8)
-    fwd_meth_padded[PAD:PAD + n] = fwd_meth_arr
-    rev_meth_padded = np.zeros(n + 2 * PAD, dtype=np.int8)
-    rev_meth_padded[PAD:PAD + n] = rev_meth_arr
+    # Pre-pad meth arrays so the inner-loop meth_context slice never needs
+    # bounds-checking. PAD must cover the widest offset the hot path will
+    # ever touch — the forward meth-context window reaches ±max(upstream,
+    # downstream), and the rev_meth window reaches max(|off|) for off in
+    # rev_meth_offsets. Taking the max of all three keeps the slice safe
+    # under arbitrary geometries.
+    rev_max_abs = max((abs(int(o)) for o in params.rev_meth_offsets), default=0)
+    pad = max(upstream, downstream, rev_max_abs)
+    fwd_meth_padded = np.zeros(n + 2 * pad, dtype=np.int8)
+    fwd_meth_padded[pad:pad + n] = fwd_meth_arr
+    rev_meth_padded = np.zeros(n + 2 * pad, dtype=np.int8)
+    rev_meth_padded[pad:pad + n] = rev_meth_arr
 
     return {
         "kmer_fwd": kmer_fwd,
         "kmer_rev": kmer_rev,
         "fwd_meth_padded": fwd_meth_padded,
         "rev_meth_padded": rev_meth_padded,
+        "pad": pad,
         "fwd_slowed_T": fwd_slowed_T,
         "fwd_slowed_off": fwd_slowed_off,
         "fwd_slowed_frac": fwd_slowed_frac,
@@ -447,8 +470,22 @@ def _extract_one_bam(
     near_max_dist: int,
     seed: int,
     max_reads: int,
+    params: ExtractionParams,
 ) -> dict:
-    """Run orientation-aware extraction. Returns dict[kmer_id] → ndarray(N, 20)."""
+    """Run orientation-aware extraction.
+
+    Args:
+        params: Window-geometry record. The forward meth-context slice has
+            length ``params.kmer_size`` and runs from ``-upstream`` to
+            ``+downstream`` around each aligned position; ``rev_meth`` is
+            gathered at the offsets in ``params.rev_meth_offsets``. All
+            inner-loop slice indices are precomputed from ``params`` once,
+            outside the read loop, so the hot path stays a fixed-width
+            numpy slice regardless of the configured geometry.
+
+    Returns:
+        ``dict[kmer_id (int)] -> np.ndarray(N, params.sample_ncols)``.
+    """
 
     _check_bystrandified(bam_path)
 
@@ -489,7 +526,7 @@ def _extract_one_bam(
     contig_arrs = {
         contig: _build_contig_arrays(
             contig, seq, fwd_slowed, rev_slowed, fwd_near, rev_near,
-            fwd_meth, rev_meth, baseline_min_dist_to_meth,
+            fwd_meth, rev_meth, baseline_min_dist_to_meth, params,
         )
         for contig, seq in ref_seqs.items()
     }
@@ -500,8 +537,19 @@ def _extract_one_bam(
     n_slowed = n_near = n_baseline_seen = n_baseline_kept = 0
     n_reads_processed = n_reads_used = 0
 
-    # PAD on each meth_padded array: the inner-loop slice doesn't bounds-check.
-    PAD = METH_CTX_LEFT  # = 7
+    # Pad on each meth_padded array (matches the value computed in
+    # _build_contig_arrays). All inner-loop slices index into the padded
+    # arrays so no per-row bounds-checking is needed.
+    rev_max_abs = max((abs(int(o)) for o in params.rev_meth_offsets), default=0)
+    pad = max(params.upstream, params.downstream, rev_max_abs)
+    upstream = params.upstream
+    downstream = params.downstream
+    # rev_meth offsets in the polymerase 5'→3' frame. For + strand reads
+    # (pol_reverse_slice=True), the polymerase reads the reference backward,
+    # so we gather at ``ppos - off``; for − strand reads we gather at
+    # ``ppos + off``. Both arrays are int64 numpy so the fancy index is fast.
+    rev_offsets_fwd = np.array(params.rev_meth_offsets, dtype=np.int64)   # − strand pol
+    rev_offsets_rev = -rev_offsets_fwd                                    # + strand pol
 
     with pysam.AlignmentFile(bam_path, "rb", check_sq=True) as bam:
         bam_contigs = set(bam.references)
@@ -602,13 +650,23 @@ def _extract_one_bam(
                         frac = 0.0
 
                 # Padded slices — no np.where, no np.clip per row.
-                ppos = ref_pos + PAD
+                # Forward meth-context in polymerase frame:
+                #   * + strand polymerase (pol_reverse_slice=True): the
+                #     polymerase reads the reference 3'→5', so context
+                #     [-upstream, +downstream] in the polymerase frame
+                #     maps to ref positions [ppos - downstream, ppos +
+                #     upstream] read in reverse.
+                #   * − strand polymerase (pol_reverse_slice=False):
+                #     context is read forward, [ppos - upstream, ppos +
+                #     downstream].
+                # Length of both slices is always ``params.kmer_size``.
+                ppos = ref_pos + pad
                 if pol_reverse_slice:
-                    mc = pol_padded[ppos - 3:ppos + 8][::-1]
-                    rev = opp_padded[ppos - 1:ppos + 2][::-1]
+                    mc = pol_padded[ppos - downstream:ppos + upstream + 1][::-1]
+                    rev = opp_padded[ppos + rev_offsets_rev]
                 else:
-                    mc = pol_padded[ppos - 7:ppos + 4]
-                    rev = opp_padded[ppos - 1:ppos + 2]
+                    mc = pol_padded[ppos - upstream:ppos + downstream + 1]
+                    rev = opp_padded[ppos + rev_offsets_fwd]
 
                 row = (
                     float(ipd[read_pos]), float(pw[read_pos]), frac,
@@ -671,25 +729,75 @@ def extract_to_shard(
     near_max_dist: int | None = None,
     seed: int = 42,
     max_reads: int = -1,
+    extraction_params: ExtractionParams | None = None,
 ) -> None:
     """Extract a shard from an aligned bystrandified BAM with strand-aware kinetics.
 
-    The output pkl is a dict[kmer_id (int) -> ndarray(N, 20)] following
-    the layout in :mod:`kinsim.utils.sample_layout`. Refine, train,
-    analyze operate identically on the resulting shards.
+    The output pkl is a dict ``{kmer_id (int) -> ndarray(N, sample_ncols)}``
+    following the layout in :mod:`kinsim.utils.sample_layout`. Refine, train
+    and analyze operate identically on the resulting shards.
+
+    Args:
+        bam_path:           Path to a bystrandified, aligned BAM with ip/pw tags.
+        ref_path:           Reference FASTA the BAM was aligned against.
+        motif_string:       KinSim motif string (e.g. ``"m6A,GATC,1;..."``).
+        output_path:        Destination shard pkl (written atomically).
+        meth_types:         Optional whitelist of meth-type names to keep.
+        n_baseline_per_kmer: Reservoir cap on baseline rows per kmer.
+        baseline_min_dist_to_meth: Required ≥ ``kmer_size`` so the
+                            meth-context window of a baseline never overlaps
+                            a methylation. If ``None``, read from the YAML.
+        baseline_sample_rate: Front-end skip probability for baseline candidates.
+        near_max_dist:      Range scanned for NEAR_METH labelling.
+        seed:               PRNG seed.
+        max_reads:          Stop after this many reads (debug; -1 = all).
+        extraction_params:  Window geometry to extract with. If ``None``, read
+                            from ``kinsim_config.yaml`` via
+                            :func:`~kinsim.utils.config.get_extraction_params`.
+                            The resolved params are written into the shard's
+                            ``__meta__["extraction_params"]`` block so
+                            downstream consumers can validate compatibility.
+
+    Raises:
+        ValueError: If ``baseline_min_dist_to_meth < params.kmer_size`` (the
+            baseline window would overlap motif positions), or if any other
+            invariant is violated.
     """
     cfg = load_kinsim_config()
     extract_cfg = cfg.get("extract") or {}
+    params = extraction_params or get_extraction_params()
+
     if baseline_min_dist_to_meth is None:
-        baseline_min_dist_to_meth = int(extract_cfg.get("baseline_min_dist_to_meth", K))
+        baseline_min_dist_to_meth = int(extract_cfg.get("baseline_min_dist_to_meth", params.kmer_size))
     if baseline_sample_rate is None:
         baseline_sample_rate = float(extract_cfg.get("baseline_sample_rate", 0.10))
     if near_max_dist is None:
         near_max_dist = int(extract_cfg.get("near_meth_max_dist", 7))
 
+    # Hard invariant — the meth_context window of a baseline candidate must
+    # never overlap a methylation; otherwise BASELINE rows contain hidden
+    # meth context, training learns a confounded signal, downstream metrics
+    # become meaningless. Catching it here costs nothing and the alternative
+    # is a silently corrupt corpus.
+    if baseline_min_dist_to_meth < params.kmer_size:
+        raise ValueError(
+            f"extract: baseline_min_dist_to_meth ({baseline_min_dist_to_meth}) "
+            f"is smaller than kmer_size ({params.kmer_size}). A baseline "
+            f"position must be at least kmer_size bases away from any "
+            f"methylation, otherwise its meth_context window would carry "
+            f"hidden meth signal. Raise the value in `extract:` of "
+            f"kinsim_config.yaml (typical: == kmer_size) and re-run."
+        )
+
     log.info("[extract] BAM: %s", bam_path)
     log.info("[extract] REF: %s", ref_path)
     log.info("[extract] motifs: %s", motif_string)
+    log.info(
+        "[extract] window: kmer_size=%d  upstream=%d  downstream=%d  "
+        "rev_meth_offsets=%s  sample_ncols=%d",
+        params.kmer_size, params.upstream, params.downstream,
+        list(params.rev_meth_offsets), params.sample_ncols,
+    )
     log.info(
         "[extract] knobs: n_baseline_per_kmer=%d  baseline_min_dist=%d  "
         "near_max_dist=%d  baseline_sample_rate=%.2f  seed=%d",
@@ -716,6 +824,7 @@ def extract_to_shard(
         near_max_dist=near_max_dist,
         seed=seed,
         max_reads=max_reads,
+        params=params,
     )
 
     samples["__meta__"] = {
@@ -730,6 +839,10 @@ def extract_to_shard(
         # whatever kinsim_config.yaml looks like at train time, which may
         # have been edited or be missing.
         "meth_id_map": get_meth_ids(),
+        # Window geometry — pinned at extraction time. The dataset compares
+        # this against the active YAML on load and refuses to mix layouts.
+        # Single source of truth for every consumer (refine, train, analyze).
+        "extraction_params": params.to_dict(),
         "n_baseline_per_kmer": n_baseline_per_kmer,
         "baseline_min_dist_to_meth": baseline_min_dist_to_meth,
         "baseline_sample_rate": baseline_sample_rate,

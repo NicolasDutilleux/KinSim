@@ -301,11 +301,6 @@ research software and aligns with the spirit of academic honesty for
 master-level work. The author can explain and defend every design
 decision and every line of code in this repository.
 
-For implementation-level details of where AI was used, the development
-log [`CHANGELOG_TFE.md`](CHANGELOG_TFE.md) (kept locally, not committed)
-breaks down each improvement with its rationale and the corresponding
-academic reference.
-
 ---
 
 ## License

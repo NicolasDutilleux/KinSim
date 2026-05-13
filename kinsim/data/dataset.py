@@ -45,7 +45,9 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, IterableDataset
 
+from ..utils.config import ExtractionParams, get_extraction_params
 from ..utils.encoding import K
+from ..utils.sample_layout import SampleLayout, get_sample_layout
 
 log = logging.getLogger(__name__)
 
@@ -87,41 +89,93 @@ def inv_log_transform(x: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def _flatten_data_dict(
-    data_dict: dict, kmer_size: int, num_meth_types: int = 4,
-) -> dict:
-    """Flatten one ``dict[kmer_id] -> ndarray(N, SAMPLE_NCOLS)`` into per-row arrays.
+def _peek_shard_extraction_params(shard_path: str) -> ExtractionParams | None:
+    """Load only enough of a shard pkl to recover its ``ExtractionParams``.
 
-    **Performance**: this is the hot path for shard loading. We
-    vectorise the meth_full construction (forward block + rev_meth
-    block) on the full shard at once via fancy-indexing instead of the
-    per-row Python loop used in older code — ~50–100× faster on big
-    shards.
+    Loading a 20 GB shard just to read its 200-byte meta block is wasteful;
+    this helper unpickles the full dict but discards everything except the
+    parsed :class:`ExtractionParams`. Used at dataset-construction time to
+    resolve the column geometry without paying the full flatten cost.
 
-    Returns a dict with:
-      ``kmer_ids``       int32 (N,)
-      ``meth_ids``       int8  (N,)        meth at the prediction position
-      ``signals_log``    float32 tensor (N, 2)  already log1p
-      ``meth_full``      float32 (N, kmer_size + REV_METH_LEN, num_meth_types)
-                         pre-built so __iter__ just slices it
-      ``parent_meths``   int8  (N,)        PARENT_METH (col 18)
-      ``parent_offsets`` int8  (N,)        PARENT_OFFSET (col 19)
-      ``categories``     int8  (N,)        CATEGORY (col 17)
-      ``n_keys``, ``meth_counts``
+    Args:
+        shard_path: Path to the shard pkl.
+
+    Returns:
+        The shard's :class:`ExtractionParams` if recorded in its
+        ``__meta__["extraction_params"]`` block, otherwise ``None`` (legacy
+        shards built before v0.5).
+
+    Raises:
+        FileNotFoundError: If ``shard_path`` does not exist.
     """
-    from ..utils.encoding import KMER_PRED_IDX
-    from ..utils.sample_layout import (
-        COL_CATEGORY,
-        COL_METH_CTX_START,
-        COL_PARENT_METH,
-        COL_PARENT_OFFSET,
-        COL_REV_METH,
-        REV_METH_LEN,
-        SAMPLE_NCOLS,
-    )
+    path = Path(shard_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Shard not found: {shard_path}")
+    with open(path, "rb") as f:
+        data_dict = pickle.load(f)
+    out = read_shard_extraction_params(data_dict)
+    del data_dict
+    return out
 
-    pred_idx = KMER_PRED_IDX
-    total_pos = kmer_size + REV_METH_LEN
+
+def read_shard_extraction_params(data_dict: dict) -> ExtractionParams | None:
+    """Return the :class:`ExtractionParams` recorded in a shard's ``__meta__``.
+
+    New shards (post v0.5) carry ``__meta__["extraction_params"]``; legacy
+    shards do not. The legacy fallback returns ``None`` so the caller can
+    decide whether to assume the historical K=11 layout (back-compat) or
+    refuse to load the shard.
+    """
+    meta = data_dict.get("__meta__")
+    if not isinstance(meta, dict):
+        return None
+    raw = meta.get("extraction_params")
+    if not raw:
+        return None
+    try:
+        return ExtractionParams.from_dict(raw)
+    except Exception as exc:  # noqa: BLE001 — caller logs a clearer message
+        log.warning("shard __meta__.extraction_params failed to parse: %s", exc)
+        return None
+
+
+def _flatten_data_dict(
+    data_dict: dict,
+    layout: SampleLayout,
+    num_meth_types: int = 4,
+) -> dict:
+    """Flatten one ``dict[kmer_id -> ndarray(N, layout.n_cols)]`` into per-row arrays.
+
+    **Performance**: this is the hot path for shard loading. We vectorise the
+    meth_full construction (forward block + rev_meth block) on the full shard
+    at once via fancy-indexing instead of the per-row Python loop used in
+    older code — ~50–100× faster on big shards.
+
+    Args:
+        data_dict:      The pickled shard dict.
+        layout:         The :class:`SampleLayout` matching the shard's
+                        geometry (validated by the caller via
+                        :func:`read_shard_extraction_params`).
+        num_meth_types: Number of methylation states (= max meth_id + 1).
+
+    Returns:
+        A dict with:
+
+        - ``kmer_ids``       int64 (N,)  — int64 so it accommodates K up to 31
+        - ``meth_ids``       int8  (N,)   meth at the prediction position
+        - ``signals_log``    float32 tensor (N, 2) — already log1p
+        - ``meth_full``      float32 (N, layout.total_meth_positions, num_meth_types)
+                              pre-built so ``__iter__`` just slices it
+        - ``parent_meths``   int8  (N,)   PARENT_METH
+        - ``parent_offsets`` int8  (N,)   PARENT_OFFSET
+        - ``categories``     int8  (N,)   CATEGORY
+        - ``n_keys``, ``meth_counts``
+    """
+    kmer_size = layout.kmer_size
+    n_rev_meth = layout.n_rev_meth
+    pred_idx = layout.active_site_index
+    total_pos = layout.total_meth_positions
+    expected_ncols = layout.n_cols
 
     kmer_ids_list: list = []
     meth_ids_list: list = []
@@ -142,29 +196,35 @@ def _flatten_data_dict(
             continue
         if not isinstance(samples, np.ndarray) or samples.ndim != 2:
             continue
-        if samples.shape[1] < SAMPLE_NCOLS:
-            continue
+        if samples.shape[1] != expected_ncols:
+            raise ValueError(
+                f"Shard row width mismatch — shard has {samples.shape[1]} "
+                f"columns but the active SampleLayout expects "
+                f"{expected_ncols} (kmer_size={kmer_size}, n_rev_meth="
+                f"{n_rev_meth}). Re-extract under a matching geometry or "
+                f"point training at the right shards."
+            )
         kmer_id = int(key)
-        ctx = samples[:, COL_METH_CTX_START : COL_METH_CTX_START + kmer_size].astype(np.uint8)
-        rev = samples[:, COL_REV_METH : COL_REV_METH + REV_METH_LEN].astype(np.uint8)
+        ctx = samples[:, layout.col_meth_ctx_start:layout.col_meth_ctx_end].astype(np.uint8)
+        rev = samples[:, layout.col_rev_meth:layout.col_category].astype(np.uint8)
         meth_at_center = ctx[:, pred_idx].astype(np.int8)
         n = len(samples)
-        kmer_ids_list.append(np.full(n, kmer_id, dtype=np.int32))
+        kmer_ids_list.append(np.full(n, kmer_id, dtype=np.int64))
         meth_ids_list.append(meth_at_center)
         signals_list.append(samples[:, :2].astype(np.float32))
-        fractions_list.append(samples[:, 2].astype(np.float32))
+        fractions_list.append(samples[:, layout.col_fraction].astype(np.float32))
         meth_ctx_list.append(ctx)
         rev_meth_list.append(rev)
-        parent_meth_list.append(samples[:, COL_PARENT_METH].astype(np.int8))
-        parent_offset_list.append(samples[:, COL_PARENT_OFFSET].astype(np.int8))
-        category_list.append(samples[:, COL_CATEGORY].astype(np.int8))
+        parent_meth_list.append(samples[:, layout.col_parent_meth].astype(np.int8))
+        parent_offset_list.append(samples[:, layout.col_parent_offset].astype(np.int8))
+        category_list.append(samples[:, layout.col_category].astype(np.int8))
         for mid in np.unique(meth_at_center):
             n_meth_counts[int(mid)] += int((meth_at_center == mid).sum())
         n_keys += 1
 
     if not kmer_ids_list:
         return {
-            "kmer_ids": np.empty(0, dtype=np.int32),
+            "kmer_ids": np.empty(0, dtype=np.int64),
             "meth_ids": np.empty(0, dtype=np.int8),
             "signals_log": torch.empty(0, 2, dtype=torch.float32),
             "meth_full": np.empty((0, total_pos, num_meth_types), dtype=np.float32),
@@ -176,8 +236,8 @@ def _flatten_data_dict(
         }
 
     # Concatenate and *immediately* drop the per-key lists so we don't
-    # hold both the lists AND the merged arrays at the same time
-    # (each was ~half of peak memory before this fix).
+    # hold both the lists AND the merged arrays at the same time (each
+    # was ~half of peak memory before this fix).
     kmer_ids       = np.concatenate(kmer_ids_list);     kmer_ids_list = None
     meth_ids       = np.concatenate(meth_ids_list);     meth_ids_list = None
     fractions      = np.concatenate(fractions_list).astype(np.float32)
@@ -202,17 +262,17 @@ def _flatten_data_dict(
     rows_idx, cols_idx = np.where(meth_ctx > 0)
     if rows_idx.size:
         m_ids = meth_ctx[rows_idx, cols_idx].astype(np.int64)
-        # clamp to valid meth_id range to avoid IndexError on corrupted shards
+        # Clamp to valid meth_id range to avoid IndexError on corrupted shards.
         m_ids = np.clip(m_ids, 0, num_meth_types - 1)
         meth_full[rows_idx, cols_idx, m_ids] = 1.0
-        # Overwrite pred_idx position with fraction (per-row stoichiometry)
+        # Overwrite pred_idx position with fraction (per-row stoichiometry).
         pred_mask = cols_idx == pred_idx
         if pred_mask.any():
             pred_rows = rows_idx[pred_mask]
             pred_m = m_ids[pred_mask]
             meth_full[pred_rows, pred_idx, pred_m] = fractions[pred_rows]
 
-    # Rev_meth block: positions [kmer_size, kmer_size + REV_METH_LEN)
+    # Rev_meth block: positions [kmer_size, kmer_size + n_rev_meth).
     rev_rows, rev_cols = np.where(rev_meth > 0)
     if rev_rows.size:
         rev_m_ids = rev_meth[rev_rows, rev_cols].astype(np.int64)
@@ -401,10 +461,28 @@ class MLPSignalDataset(Dataset):
         self,
         pkl_path: str,
         num_meth_types: int = 4,
-        kmer_size: int = K,
+        kmer_size: int | None = None,
         augment: bool = False,
         augment_seed: int = 42,
+        params: ExtractionParams | None = None,
     ) -> None:
+        """Args:
+            pkl_path:       Single shard pkl to load fully into RAM.
+            num_meth_types: Number of methylation states (default 4).
+            kmer_size:      *Deprecated* — pass ``params`` instead. If both are
+                            given, ``params.kmer_size`` wins.
+            augment:        Enable offline paired-positive augmentation.
+            augment_seed:   PRNG seed for the augmentation pair picker.
+            params:         Window-geometry record. If ``None``, it is read
+                            from the shard's ``__meta__["extraction_params"]``
+                            when present, otherwise from
+                            ``kinsim_config.yaml`` (legacy K=11 default for
+                            shards built before v0.5).
+
+        Raises:
+            ValueError: If the shard is empty, its layout disagrees with the
+                resolved ``params``, or any other invariant is violated.
+        """
         log.info("Loading training data from %s ...", pkl_path)
         with open(pkl_path, "rb") as f:
             data_dict = pickle.load(f)
@@ -414,7 +492,25 @@ class MLPSignalDataset(Dataset):
         if len(data_dict) == 0:
             raise ValueError(f"The .pkl file is empty: {pkl_path}")
 
-        flat = _flatten_data_dict(data_dict, kmer_size)
+        # Resolve the geometry: explicit ``params`` > shard meta > YAML.
+        shard_params = read_shard_extraction_params(data_dict)
+        if params is not None:
+            if shard_params is not None:
+                params.assert_compatible(shard_params, where=f"shard {pkl_path}")
+            resolved = params
+        elif shard_params is not None:
+            resolved = shard_params
+        else:
+            resolved = get_extraction_params()
+        if kmer_size is not None and kmer_size != resolved.kmer_size:
+            raise ValueError(
+                f"MLPSignalDataset: explicit kmer_size={kmer_size} disagrees "
+                f"with the resolved ExtractionParams.kmer_size="
+                f"{resolved.kmer_size}. Pass `params=` instead of kmer_size "
+                f"(or drop the kmer_size argument)."
+            )
+        layout = get_sample_layout(resolved)
+        flat = _flatten_data_dict(data_dict, layout, num_meth_types=num_meth_types)
         if flat["n_keys"] == 0:
             raise ValueError(f"No int-keyed kmer data found in {pkl_path}")
 
@@ -422,12 +518,14 @@ class MLPSignalDataset(Dataset):
             flat = _expand_with_pairs(flat, augment_seed=augment_seed)
 
         self._num_meth_types = num_meth_types
-        self._kmer_size = kmer_size
+        self._params = resolved
+        self._layout = layout
+        self._kmer_size = resolved.kmer_size
         self._augment = augment
         self._kmer_ids = flat["kmer_ids"]
         self._meth_ids = flat["meth_ids"]
         self._signals = flat["signals_log"]
-        self._meth_full = flat["meth_full"]        # pre-built (N, 14, 4) float32
+        self._meth_full = flat["meth_full"]   # pre-built (N, total_meth_positions, M) float32
         self._parent_meths   = flat["parent_meths"]
         self._parent_offsets = flat["parent_offsets"]
         self._categories     = flat["categories"]
@@ -514,25 +612,70 @@ class ShardedSignalDataset(IterableDataset):
         self,
         shard_paths,
         num_meth_types: int = 4,
-        kmer_size: int = K,
+        kmer_size: int | None = None,
         shuffle: bool = True,
         seed: int = 42,
         augment: bool = False,
+        balance_kmers: bool = False,
+        params: ExtractionParams | None = None,
     ) -> None:
+        """Args:
+            shard_paths:    List of shard pkls to iterate over.
+            num_meth_types: Number of methylation states.
+            kmer_size:      *Deprecated*. Pass ``params`` instead.
+            shuffle:        Shuffle shard order per epoch and rows within shard.
+            seed:           PRNG seed (combined with worker_id and epoch).
+            augment:        Enable paired-positive augmentation at iter time.
+            balance_kmers:  Enable per-(kmer, category) inverse-frequency draw.
+            params:         Window-geometry record. If ``None``, the geometry
+                            is inferred from the FIRST shard's meta; every
+                            subsequent shard is then required to match.
+
+        Raises:
+            ValueError: If ``shard_paths`` is empty, or (at iter time) a shard
+                disagrees with the resolved geometry.
+        """
         super().__init__()
         self._shard_paths = [str(Path(p)) for p in shard_paths]
         if not self._shard_paths:
             raise ValueError("shard_paths is empty")
         self._num_meth_types = num_meth_types
-        self._kmer_size = kmer_size
+        # Resolve geometry once at construction time so the column layout
+        # is fixed for the lifetime of the dataset. If `params` was not
+        # given, peek at the first shard's __meta__. Falls back to the
+        # active YAML if the shard is pre-v0.5.
+        if params is None:
+            params = _peek_shard_extraction_params(self._shard_paths[0])
+            if params is None:
+                params = get_extraction_params()
+        if kmer_size is not None and kmer_size != params.kmer_size:
+            raise ValueError(
+                f"ShardedSignalDataset: explicit kmer_size={kmer_size} "
+                f"disagrees with the resolved ExtractionParams.kmer_size="
+                f"{params.kmer_size}. Drop the kmer_size argument and pass "
+                f"`params=` instead."
+            )
+        self._params = params
+        self._layout = get_sample_layout(params)
+        self._kmer_size = params.kmer_size
         self._shuffle = shuffle
         self._seed = int(seed)
         self._epoch = 0
         self._augment = bool(augment)
+        # When ``balance_kmers`` is on, each shard is sub-sampled by a
+        # per-(kmer_id, category) weighted draw before yielding. This
+        # equalises the influence of rare kmers / rare categories in the
+        # gradient — see He+Garcia 2009, Cui+ 2019. ``shuffle`` must be
+        # True for balancing to do anything useful.
+        self._balance_kmers = bool(balance_kmers)
         log.info(
-            "ShardedSignalDataset ready: %d shards (shuffle=%s, augment=%s)",
+            "ShardedSignalDataset ready: %d shards  geometry=(K=%d, "
+            "upstream=%d, downstream=%d, rev_meth=%s)  shuffle=%s  "
+            "augment=%s  balance_kmers=%s",
             len(self._shard_paths),
-            shuffle, self._augment,
+            params.kmer_size, params.upstream, params.downstream,
+            list(params.rev_meth_offsets),
+            shuffle, self._augment, self._balance_kmers,
         )
 
     def set_epoch(self, epoch: int) -> None:
@@ -586,21 +729,45 @@ class ShardedSignalDataset(IterableDataset):
         my_shards, rng = self._worker_shards_and_rng()
         cap = getattr(self, "_max_rows_per_shard", None)
         augment = bool(getattr(self, "_augment", False))
+        balance_kmers = bool(getattr(self, "_balance_kmers", False))
         for shard_path in my_shards:
             with open(shard_path, "rb") as f:
                 data_dict = pickle.load(f)
+            # Re-verify each shard against the dataset's resolved geometry.
+            # Per-shard check (rather than just the first) catches mixed
+            # corpora — e.g. an old K=11 shard accidentally left in a K=21
+            # refined/ directory.
+            shard_params = read_shard_extraction_params(data_dict)
+            if shard_params is not None:
+                self._params.assert_compatible(shard_params, where=f"shard {shard_path}")
             flat = _flatten_data_dict(
-                data_dict, self._kmer_size, num_meth_types=self._num_meth_types,
+                data_dict, self._layout, num_meth_types=self._num_meth_types,
             )
             del data_dict  # release the loaded shard before iterating
             n = len(flat["kmer_ids"])
             if n == 0:
                 continue
-            order = np.arange(n)
-            if self._shuffle:
-                rng.shuffle(order)
-            if cap is not None and 0 < cap < n:
-                order = order[:cap]
+
+            if balance_kmers and n > 1:
+                # Per-(kmer_id, category) inverse-frequency draw.
+                # composite key = kmer_id * 4 + category — covers all
+                # categories cleanly (BASELINE=0, SLOWED=1, NEAR_METH=2).
+                N_CATS = 4
+                composite = (
+                    flat["kmer_ids"].astype(np.int64) * N_CATS
+                    + flat["categories"].astype(np.int64)
+                )
+                counts = np.bincount(composite)
+                row_w = 1.0 / np.maximum(counts[composite], 1).astype(np.float64)
+                row_w /= row_w.sum()
+                target_size = min(cap, n) if (cap is not None and cap > 0) else n
+                order = rng.choice(n, size=target_size, replace=False, p=row_w)
+            else:
+                order = np.arange(n)
+                if self._shuffle:
+                    rng.shuffle(order)
+                if cap is not None and 0 < cap < n:
+                    order = order[:cap]
 
             # Build per-shard baseline index for augment lookups
             baseline_idx_by_kmer = (
