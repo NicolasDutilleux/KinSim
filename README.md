@@ -266,6 +266,48 @@ The output is single-read-per-molecule (raw HiFi format). Pass it through `ccs-k
 
 ---
 
+## Acknowledgements — Tooling
+
+The author (Nicolas Dutilleux) developed this project during a stage de
+master at the University of Fribourg (February – May 2026). The code,
+the scientific approach, the architectural decisions, the validation
+methodology, and the interpretation of results are the author's
+contribution and responsibility.
+
+**Tooling used during development:**
+**Claude (Anthropic)**, accessed via the **Claude Code** CLI, was used
+as a coding assistant — similar in role to an IDE, an autocomplete, or
+a documentation lookup. The AI accelerated tasks like vectorising
+numpy loops, scaffolding CLI options and SLURM submission scripts,
+drafting helper utilities, surfacing potential failure modes in code
+review, and producing first-draft docstrings.
+
+**Review and validation:**
+Every block of AI-suggested code was read, validated, and integrated
+by the author before being committed. AI suggestions that did not match
+the intended design were rejected or rewritten. Issues identified
+during review and debug iterations on the cluster were diagnosed and
+fixed by the author.
+
+**Residual bugs:**
+Like any software project of this scope developed under stage-de-master
+time constraints, residual bugs may remain. Reviewers and re-users
+of this code are encouraged to read critically, run their own
+validations, and open issues on the tracker for anything that looks
+suspicious.
+
+This disclosure follows current best practice (2026) for AI-assisted
+research software and aligns with the spirit of academic honesty for
+master-level work. The author can explain and defend every design
+decision and every line of code in this repository.
+
+For implementation-level details of where AI was used, the development
+log [`CHANGELOG_TFE.md`](CHANGELOG_TFE.md) (kept locally, not committed)
+breaks down each improvement with its rationale and the corresponding
+academic reference.
+
+---
+
 ## License
 
 MIT — see `LICENSE`.
