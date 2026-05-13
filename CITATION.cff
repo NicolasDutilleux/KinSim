@@ -25,3 +25,11 @@ abstract: >
   Output BAMs carry standard PacBio fi/fp tags, usable by any downstream
   tool that consumes kinetic information (modkit, ipdSummary, jasmine,
   motif callers).
+references:
+  - type: software
+    title: "Claude (Anthropic) — AI coding assistant via Claude Code CLI"
+    notes: >
+      Used throughout development for code vectorisation, CLI scaffolding,
+      and architecture review. Scientific decisions and final integration
+      by the author. See README "Acknowledgements" section for details.
+    url: "https://www.anthropic.com/claude"
