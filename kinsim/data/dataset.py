@@ -236,76 +236,30 @@ def _flatten_data_dict(
 
 
 # ---------------------------------------------------------------------------
-# Triplet augmentation (paired contrastive training)
+# Paired-positive augmentation (contrastive training — no fake labels)
 # ---------------------------------------------------------------------------
 #
-# For each non-baseline row, we synthesise two extra rows with the same kmer:
+# For each non-baseline row, we also yield a REAL baseline row of the same
+# kmer (signal = real baseline IPD/PW). Pure data augmentation — same kmer,
+# real data, real labels. Forces the model to see the contrast (meth /
+# no-meth) on the same sequence, eliminating the "meth flag present → boost"
+# shortcut without ever introducing mislabelled synthetic data.
 #
-#   (1) A real baseline row of the same kmer (signal = real baseline IPD/PW).
-#       Forces the model to learn the meth vs no-meth contrast on the same
-#       sequence rather than relying on "meth flag present → boost" shortcut.
+# Biology-rule constraints (e.g. "m5C cannot occur on A") are enforced at
+# the model architecture level by the biology_mask in ConvPredictor — NOT
+# by faking baseline-labelled impossible inputs (which would dampen real
+# signal). See predictor.py::_forward_conv for the mask.
 #
-#   (2) A "biological-negative" row: a baseline row whose meth_full has a
-#       biologically impossible meth flag injected at the prediction position
-#       (e.g. m5C on A, m6A on C). Target stays = baseline signal — the model
-#       learns to ignore impossible flags and fall back to baseline.
-#
-# Inspired by SimCLR-style supervised contrastive learning (Khosla 2020) and
-# counterfactual data augmentation (Kaushik 2020).
+# Inspired by SimCLR-style supervised contrastive pairing (Khosla 2020).
 
 
-# meth_id 0=none, 1=m6A, 2=m4C, 3=m5C
-# Compatibility: which meth_ids are *impossible* given the centre base.
-_INCOMPATIBLE_METH_BY_BASE = {
-    0: (2, 3),       # A → m4C/m5C impossible
-    1: (1,),         # C → m6A impossible
-    2: (1, 2, 3),    # G → all meth types impossible
-    3: (1, 2, 3),    # T → all meth types impossible
-}
-
-
-def _decode_centre_base(kmer_id: int) -> int:
-    """Return the base id (0=A, 1=C, 2=G, 3=T) at ``KMER_PRED_IDX``.
-
-    Bit-packing convention (see :func:`kinsim.utils.encoding.encode_kmer`):
-    seq[0] occupies the top 2 bits, seq[K-1] the bottom 2 bits.
-    """
-    from ..utils.encoding import K, KMER_PRED_IDX
-
-    shift = 2 * (K - 1 - KMER_PRED_IDX)
-    return (int(kmer_id) >> shift) & 3
-
-
-def _make_fake_negative_meth_full(
-    src_meth_full: np.ndarray,
-    kmer_id: int,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Return a copy of ``src_meth_full`` with a biologically impossible meth
-    flag set at the prediction position. Returns the source unchanged when
-    the centre base is G/T and all meth types are impossible (still useful as
-    a fake-neg because the resulting flag is impossible too).
-    """
-    from ..utils.encoding import KMER_PRED_IDX
-
-    centre_base = _decode_centre_base(kmer_id)
-    incompat = _INCOMPATIBLE_METH_BY_BASE.get(centre_base, ())
-    if not incompat:
-        return src_meth_full.copy()
-    fake_meth_id = int(rng.choice(np.asarray(incompat)))
-    out = src_meth_full.copy()
-    out[KMER_PRED_IDX, :] = 0.0
-    out[KMER_PRED_IDX, fake_meth_id] = 1.0
-    return out
-
-
-def _expand_with_triplets(flat: dict, augment_seed: int = 42) -> dict:
+def _expand_with_pairs(flat: dict, augment_seed: int = 42) -> dict:
     """Return a new flat-dict where every non-baseline row is followed by
-    two synthetic rows for the same kmer: (baseline_pair, fake_neg).
+    one paired baseline row for the same kmer.
 
     Used by :class:`MLPSignalDataset` (in-memory, expand-once-at-init).
-    For :class:`ShardedSignalDataset` we do the same logic at iter time
-    so the random pair/neg differ per epoch.
+    :class:`ShardedSignalDataset` does the same pairing at iter time so
+    the random pair differs per epoch.
     """
     from ..utils.sample_layout import CATEGORY_BASELINE
 
@@ -317,7 +271,6 @@ def _expand_with_triplets(flat: dict, augment_seed: int = 42) -> dict:
     non_baseline_mask = cats != CATEGORY_BASELINE
     non_baseline_idx = np.where(non_baseline_mask)[0]
 
-    # Filter: only rows whose kmer has at least one baseline pair available.
     augmentable = np.array(
         [int(flat["kmer_ids"][i]) in baseline_idx_by_kmer for i in non_baseline_idx],
         dtype=bool,
@@ -328,33 +281,16 @@ def _expand_with_triplets(flat: dict, augment_seed: int = 42) -> dict:
                     "baseline AND non-baseline observations). Returning original.")
         return flat
 
-    # Build the augmented order: for each original idx (in 0..n-1), if it's
-    # augmentable, emit (idx, paired_baseline_idx, fake_neg_idx_marker).
-    # We'll materialise the fake_neg's meth_full into a new array.
-    log.info("Triplet augmentation: %d original rows + %d × 2 augmented = %d total",
-             n, aug_src.size, n + 2 * aug_src.size)
+    log.info("Paired-positive augmentation: %d original rows + %d paired baselines = %d total",
+             n, aug_src.size, n + aug_src.size)
 
-    # Pre-pick the baseline pairs (one per augmentable row).
+    # Pre-pick a baseline pair for each augmentable row.
     paired_baseline = np.empty(aug_src.size, dtype=np.int64)
     for j, src in enumerate(aug_src):
         pool = baseline_idx_by_kmer[int(flat["kmer_ids"][src])]
         paired_baseline[j] = int(rng.choice(pool))
 
-    # Build fake_neg meth_full array (one row per augmentable).
-    fake_meth_full = np.empty(
-        (aug_src.size, flat["meth_full"].shape[1], flat["meth_full"].shape[2]),
-        dtype=flat["meth_full"].dtype,
-    )
-    for j, base_idx in enumerate(paired_baseline):
-        fake_meth_full[j] = _make_fake_negative_meth_full(
-            flat["meth_full"][base_idx],
-            int(flat["kmer_ids"][aug_src[j]]),
-            rng,
-        )
-
-    # Now build the augmented arrays by concatenation.
-    # Order: ORIGINAL rows first, then PAIRS, then FAKE_NEGS.
-    # (Training will shuffle anyway — no need to interleave at this stage.)
+    # Concatenate: ORIGINAL rows first, then PAIRS.
     out = {}
     out["n_keys"] = flat["n_keys"]
     out["meth_counts"] = dict(flat["meth_counts"])
@@ -367,19 +303,14 @@ def _expand_with_triplets(flat: dict, augment_seed: int = 42) -> dict:
     ]:
         original  = flat[k]
         from_pair = original[paired_baseline]
-        # fake_neg shares kmer/meth_id/parent fields with the baseline pair
-        # (only meth_full differs) — same array slice works.
-        out[k] = np.concatenate([original, from_pair, from_pair]).astype(src_dtype)
+        out[k] = np.concatenate([original, from_pair]).astype(src_dtype)
 
-    # signals_log is a torch tensor — concat via torch.
     sig = flat["signals_log"]
     sig_pair = sig[paired_baseline]
-    out["signals_log"] = torch.cat([sig, sig_pair, sig_pair], dim=0)
+    out["signals_log"] = torch.cat([sig, sig_pair], dim=0)
 
-    # meth_full: original + baseline_pair + fake_neg_synthesised
     pair_mf = flat["meth_full"][paired_baseline]
-    out["meth_full"] = np.concatenate([flat["meth_full"], pair_mf, fake_meth_full], axis=0)
-
+    out["meth_full"] = np.concatenate([flat["meth_full"], pair_mf], axis=0)
     return out
 
 
@@ -488,7 +419,7 @@ class MLPSignalDataset(Dataset):
             raise ValueError(f"No int-keyed kmer data found in {pkl_path}")
 
         if augment:
-            flat = _expand_with_triplets(flat, augment_seed=augment_seed)
+            flat = _expand_with_pairs(flat, augment_seed=augment_seed)
 
         self._num_meth_types = num_meth_types
         self._kmer_size = kmer_size
@@ -698,34 +629,23 @@ class ShardedSignalDataset(IterableDataset):
                     categories_t[i],
                 )
 
-                # 2. + 3. Triplet augmentation: for non-baseline rows, yield
-                # a paired baseline row (same kmer) and a synthesised
-                # fake-negative (baseline copy + biologically impossible
-                # meth flag at the centre). Random pair per epoch.
+                # 2. Paired-positive augmentation: for non-baseline rows,
+                # also yield a REAL baseline row of the same kmer (real
+                # data + real label). Forces meth/no-meth contrast on the
+                # same sequence — no mislabelled synthetic data. Random
+                # pair per epoch keeps the signal diverse.
+                #
+                # Biology constraints (impossible base × meth_id combos)
+                # are handled by the biology_mask in ConvPredictor — NOT
+                # by faking baseline labels on impossible inputs.
                 if augment and int(categories_t[i].item()) != CATEGORY_BASELINE:
                     kmer = int(kmer_ids_t[i].item())
                     pool = baseline_idx_by_kmer.get(kmer)
                     if pool is not None and len(pool) > 0:
                         pair_idx = int(rng.choice(pool))
-                        # Paired baseline
                         yield (
                             kmer_ids_t[pair_idx],
                             meth_full_t[pair_idx],
-                            signals_t[pair_idx],
-                            meth_ids_t[pair_idx],
-                            parent_meths_t[pair_idx],
-                            parent_offsets_t[pair_idx],
-                            categories_t[pair_idx],
-                        )
-                        # Fake-negative: same kmer, baseline target, but
-                        # meth_full has an impossible meth flag at centre.
-                        fake_mf_np = _make_fake_negative_meth_full(
-                            flat["meth_full"][pair_idx], kmer, rng,
-                        )
-                        fake_mf_t = torch.from_numpy(fake_mf_np)
-                        yield (
-                            kmer_ids_t[pair_idx],
-                            fake_mf_t,
                             signals_t[pair_idx],
                             meth_ids_t[pair_idx],
                             parent_meths_t[pair_idx],
