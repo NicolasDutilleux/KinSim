@@ -41,6 +41,8 @@ Use ``create_from_config(config_dict)`` to reconstruct a model from a
 saved model_config.json.
 """
 
+from __future__ import annotations
+
 import logging
 
 import torch
