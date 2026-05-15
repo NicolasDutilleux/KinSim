@@ -778,8 +778,8 @@ _MODEL_FALLBACK = {
     "head_dropout":         0.1,
     "meth_proj_dim":        8,
     "kmer_aware_film":      True,
-    "biology_mask":         True,
-    "log_sigma_clamp_max":  1.5,
+    "biology_mask":         False,   # off by default; see kinsim_config.yaml
+    "log_sigma_clamp_max":  3.0,
 }
 
 _TRAINING_FALLBACK = {

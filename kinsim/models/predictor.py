@@ -538,9 +538,22 @@ class ConvPredictor(nn.Module):
         # Architectural biology gate: zero out impossible (base, meth_id)
         # pairs at the kmer positions BEFORE FiLM sees them. The rev_meth
         # tail positions are left untouched (different strand context).
+        #
+        # SUBTLETY — kmer bases vs methylation base:
+        # ``bases`` encodes the SYNTHESIZED-strand kmer (the read sequence
+        # the polymerase produced). The methylation, however, sits on the
+        # TEMPLATE strand the polymerase was reading. Template base at a
+        # given position is the complement of the synthesized base
+        # (A↔T, C↔G). We must check compatibility against the template
+        # base, otherwise reads from the reverse strand systematically
+        # have their (correct) meth flags zeroed — A is methylated on the
+        # template, the polymerase synthesises T, and a naive
+        # compat[T, m6A]=0 would wipe out half the m6A training signal.
+        # 2-bit encoding (A=0, C=1, G=2, T=3) makes complement = bases ^ 3.
         if self.biology_mask:
             kmer_len = bases.shape[1]
-            compat_at_pos = self._meth_compat[bases]  # (B, kmer_len, M)
+            template_bases = bases ^ 3                                    # A↔T, C↔G
+            compat_at_pos = self._meth_compat[template_bases]              # (B, kmer_len, M)
             # Out-of-place: meth_full is shared across yields in IterableDataset
             meth_full = meth_full.clone()
             meth_full[:, :kmer_len, :] = meth_full[:, :kmer_len, :] * compat_at_pos

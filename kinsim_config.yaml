@@ -197,8 +197,10 @@ model:
   head_dropout:       0.1       # head dropout
   meth_proj_dim:      8         # methylation projection width before FiLM
   kmer_aware_film:    true      # condition FiLM on (meth_proj + kmer_summary)
-  biology_mask:       true      # zero impossible (base, meth_id) pairs before FiLM
-  log_sigma_clamp_max: 1.5      # upper clamp on log σ (legacy was 3.0)
+  biology_mask:       false     # off by default — extract already enforces base/meth chemistry,
+                                # the mask is a redundant safety net and introduced a
+                                # subtle synthesized-vs-template-strand bug in v0.5.0
+  log_sigma_clamp_max: 3.0      # upper clamp on log σ (legacy value, safe default)
 
 # ─────────────────────────────────────────────────────────────────────────
 # Training defaults

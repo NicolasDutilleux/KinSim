@@ -1414,11 +1414,11 @@ def train_mlp(
     run_optuna: bool = False,
     n_trials: int = 20,
     optuna_epochs: int = 20,
-    # Accuracy improvements (all ON by default)
+    # Accuracy improvements (defaults reflect what's actually safe and known to help)
     augment: bool = True,
     balance_kmers: bool = True,
-    biology_mask: bool = True,
-    log_sigma_clamp_max: float = 1.5,
+    biology_mask: bool = False,   # off — see kinsim_config.yaml notes
+    log_sigma_clamp_max: float = 3.0,
     lr_schedule: str = "cosine",
     warmup_epochs: int = 3,
 ) -> None:
@@ -2069,8 +2069,8 @@ def main(argv: list[str] | None = None) -> None:
         # Accuracy improvements (all ON by default; `--no-X` opts out).
         augment=_get(args.augment, "augment", True),
         balance_kmers=_get(args.balance_kmers, "balance_kmers", True),
-        biology_mask=_get(args.biology_mask, "biology_mask", True),
-        log_sigma_clamp_max=_get(args.log_sigma_clamp_max, "log_sigma_clamp_max", 1.5),
+        biology_mask=_get(args.biology_mask, "biology_mask", False),
+        log_sigma_clamp_max=_get(args.log_sigma_clamp_max, "log_sigma_clamp_max", 3.0),
         lr_schedule=_get(args.lr_schedule, "lr_schedule", "cosine"),
         warmup_epochs=_get(args.warmup_epochs, "warmup_epochs", 3),
     )

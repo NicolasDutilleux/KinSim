@@ -164,7 +164,7 @@ def _flatten_data_dict(
         - ``kmer_ids``       int64 (N,)  — int64 so it accommodates K up to 31
         - ``meth_ids``       int8  (N,)   meth at the prediction position
         - ``signals_log``    float32 tensor (N, 2) — already log1p
-        - ``meth_full``      float32 (N, layout.total_meth_positions, num_meth_types)
+        - ``meth_full``      float32 (N, layout.params.total_meth_positions, num_meth_types)
                               pre-built so ``__iter__`` just slices it
         - ``parent_meths``   int8  (N,)   PARENT_METH
         - ``parent_offsets`` int8  (N,)   PARENT_OFFSET
@@ -174,7 +174,7 @@ def _flatten_data_dict(
     kmer_size = layout.kmer_size
     n_rev_meth = layout.n_rev_meth
     pred_idx = layout.active_site_index
-    total_pos = layout.total_meth_positions
+    total_pos = layout.params.total_meth_positions
     expected_ncols = layout.n_cols
 
     kmer_ids_list: list = []
@@ -749,19 +749,31 @@ class ShardedSignalDataset(IterableDataset):
                 continue
 
             if balance_kmers and n > 1:
-                # Per-(kmer_id, category) inverse-frequency draw.
-                # composite key = kmer_id * 4 + category — covers all
-                # categories cleanly (BASELINE=0, SLOWED=1, NEAR_METH=2).
-                N_CATS = 4
+                # Per-(kmer_id, category) inverse-frequency draw — rare
+                # (kmer, category) groups (m4C/m5C, rare kmers) get more
+                # exposure than common ones (baseline of common kmers).
+                #
+                # Two non-trivial choices below:
+                # * `1/sqrt(count)` (not raw `1/count`) — softens the
+                #   weighting so a singleton group doesn't get 1000×
+                #   weight and dominate the batch gradient.
+                # * `replace=True` — with `replace=False` and
+                #   `size = n`, `np.random.choice` ignores `p` and just
+                #   returns a permutation. With replacement the weights
+                #   actually bias every draw, so rare rows ARE seen more
+                #   per epoch. Some common rows are skipped (random) and
+                #   re-visited in later epochs — fine for training.
                 composite = (
-                    flat["kmer_ids"].astype(np.int64) * N_CATS
+                    flat["kmer_ids"].astype(np.int64) * 4
                     + flat["categories"].astype(np.int64)
                 )
                 counts = np.bincount(composite)
-                row_w = 1.0 / np.maximum(counts[composite], 1).astype(np.float64)
+                row_w = 1.0 / np.sqrt(
+                    np.maximum(counts[composite], 1).astype(np.float64)
+                )
                 row_w /= row_w.sum()
                 target_size = min(cap, n) if (cap is not None and cap > 0) else n
-                order = rng.choice(n, size=target_size, replace=False, p=row_w)
+                order = rng.choice(n, size=target_size, replace=True, p=row_w)
             else:
                 order = np.arange(n)
                 if self._shuffle:
