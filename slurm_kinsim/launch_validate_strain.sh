@@ -31,6 +31,15 @@
 #   MOTIFMAKER_MIN_SCORE Min score for motifmaker (default 25)
 #   VAL_LABEL            Label suffix appended to validate_<HOLDOUT>_<VAL_LABEL>
 #                        Default: <CKPT_DIR_basename> (e.g. v12_run3)
+#   DEPENDS_ON           Optional SLURM job ID — the first job of this run
+#                        (the generate array) waits for that job to complete
+#                        successfully (--dependency=afterok). Use this to
+#                        manually serialise multiple strain runs on the same
+#                        shared GPU node:
+#                          JID=$(... bash launch_validate_strain.sh A | grep -oP 'FINAL_JOB=\K[0-9]+')
+#                          DEPENDS_ON=$JID bash launch_validate_strain.sh B
+#                        The script prints `FINAL_JOB=<id>` on its last line
+#                        for easy capture.
 #
 # Example:
 #   # Validate v12_run3 model on E. coli bc2046 (m6A + m5C):
@@ -158,8 +167,18 @@ N_REGIONS=$(awk '{print $1}' "$REGIONS_FILE" | sort -u | wc -l)
 ARRAY_MAX=$((N_REGIONS - 1))
 echo "Submitting array job 0-${ARRAY_MAX} on $N_REGIONS regions"
 
+# Optional --dependency on a previous run's terminal job, for manual
+# serialisation across strains on a shared GPU node. Empty string ⇒ no
+# dependency; the array job goes straight into the queue.
+GEN_DEP=""
+if [ -n "${DEPENDS_ON:-}" ]; then
+  GEN_DEP="--dependency=afterok:${DEPENDS_ON}"
+  echo "Chaining: first generate array waits for job $DEPENDS_ON"
+fi
+
 # ── 1. Array job — N parallel `kinsim generate` tasks ─────────────
 J_GEN=$(sbatch --parsable \
+  $GEN_DEP \
   --array=0-${ARRAY_MAX} \
   --partition=pgpu --account=p774 \
   --gres=gpu:1 --mem=24G --cpus-per-task=4 --time=01:00:00 \
@@ -221,3 +240,7 @@ printf '  %-25s : %s\n' "5. final merge"         "$J_FINAL (after $J_MM + $J_JM)
 echo ""
 echo "Output: $SIM_MERGED_CSV"
 echo "Compare against: $GROUND_TRUTH_MOTIFS"
+
+# Machine-parseable line for caller chaining (used by DEPENDS_ON pattern).
+# Must be on its own line as the LAST line; downstream consumers grep for it.
+echo "FINAL_JOB=${J_FINAL}"
