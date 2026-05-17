@@ -221,7 +221,7 @@ J_GEN=$(sbatch --parsable \
           TMP_OUTS=(); \
           CKPT=\$(ls -t '$CKPT_DIR'/checkpoint_epoch*.pt 2>/dev/null | head -1); \
           for R in \$(echo \$REGION | tr ',' ' '); do \
-            OUT='$SHARD_DIR'/shard_\$(printf %03d \$SLURM_ARRAY_TASK_ID)_\$(echo \$R | tr ':-' '_').bam; \
+            OUT='$SHARD_DIR'/shard_\$(printf %03d \$SLURM_ARRAY_TASK_ID)_\$(echo \$R | tr ':-/' '___').bam; \
             kinsim generate '$STRIPPED_BAM' '$REF' \"\$CKPT\" '$GROUND_TRUTH_MOTIFS' \"\$OUT\" --region \"\$R\"; \
             TMP_OUTS+=(\"\$OUT\"); \
           done; \
