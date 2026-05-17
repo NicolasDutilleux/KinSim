@@ -102,21 +102,7 @@ ls "$CKPT_DIR"/checkpoint_epoch*.pt 2>/dev/null >/dev/null || {
   exit 1
 }
 
-# The stripped BAM is the input KinSim generate consumes. If it's not
-# yet present, the user must produce it from the real aligned BAM via
-# `kinsim strip-kinetics` (or scripts/strip_kinetics.py).
-if [ ! -f "$STRIPPED_BAM" ]; then
-  REAL_BAM="$PIPE_DIR/${HOLDOUT}_aligned.bam"
-  if [ -f "$REAL_BAM" ]; then
-    echo "INFO: stripped BAM missing — auto-stripping from $REAL_BAM"
-    srun --partition=pibu_el8 --mem=8G --time=00:30:00 --cpus-per-task=4 \
-         python "$REPO/scripts/strip_kinetics.py" "$REAL_BAM" "$STRIPPED_BAM"
-  else
-    echo "ERROR: stripped BAM missing AND no aligned BAM found at $REAL_BAM" >&2
-    echo "Provide $STRIPPED_BAM manually, or fix the aligned BAM path." >&2
-    exit 1
-  fi
-fi
+REAL_BAM="$PIPE_DIR/${HOLDOUT}_aligned.bam"
 
 echo "── Validation config ───────────────────────────────────────────"
 echo "  HOLDOUT            : $HOLDOUT"
@@ -128,22 +114,51 @@ echo "  VAL_DIR            : $VAL_DIR"
 echo "  N_SHARDS           : $N_SHARDS"
 echo "────────────────────────────────────────────────────────────────"
 
-# ── 0. Index stripped BAM ──────────────────────────────────────────
-[ -f "${STRIPPED_BAM}.bai" ] || {
-  echo "Indexing $STRIPPED_BAM ..."
-  srun --partition=pibu_el8 --mem=4G --time=00:15:00 \
-       samtools index -@ 4 "$STRIPPED_BAM"
-}
-
-# Build N approximately equal regions across all contigs in the reference.
 REGIONS_FILE="$SHARD_DIR/regions.txt"
-python3 -c "
+
+# ── 0. PREP — strip BAM (if missing) + index + write regions file ──
+# Single sbatch step so the whole chain is non-blocking. Everything that
+# the generate array needs ($STRIPPED_BAM, ${STRIPPED_BAM}.bai,
+# $REGIONS_FILE) is produced here. The array waits for this job via
+# --dependency=afterok and reads its assigned region(s) from $REGIONS_FILE
+# at runtime. If both stripped BAM and index already exist AND the
+# regions file is already there, no prep job is submitted and the array
+# goes straight in (saves ~30 min on re-runs).
+PREP_DEP=""
+PREP_NEEDED=0
+[ -f "$STRIPPED_BAM" ]      || PREP_NEEDED=1
+[ -f "${STRIPPED_BAM}.bai" ] || PREP_NEEDED=1
+[ -f "$REGIONS_FILE" ]      || PREP_NEEDED=1
+
+if [ "$PREP_NEEDED" = "1" ]; then
+  if [ ! -f "$STRIPPED_BAM" ] && [ ! -f "$REAL_BAM" ]; then
+    echo "ERROR: stripped BAM missing AND no aligned BAM found at $REAL_BAM" >&2
+    echo "Place $STRIPPED_BAM manually, or fix the aligned BAM path." >&2
+    exit 1
+  fi
+  echo "Submitting prep job (strip if needed → index → write regions file) ..."
+  J_PREP=$(sbatch --parsable \
+    --partition=pibu_el8 --account=p774 \
+    --mem=16G --cpus-per-task=4 --time=01:00:00 \
+    --job-name=val_prep_${HOLDOUT}_${VAL_LABEL} \
+    --output="$LOGDIR/val_prep_${HOLDOUT}_${VAL_LABEL}_%J.log" \
+    --wrap="set +u; source ~/.bashrc; conda activate kinsim_env; set -euo pipefail; \
+            if [ ! -f '$STRIPPED_BAM' ]; then \
+              echo Stripping $REAL_BAM ...; \
+              python '$REPO/scripts/strip_kinetics.py' '$REAL_BAM' '$STRIPPED_BAM'; \
+            fi; \
+            if [ ! -f '${STRIPPED_BAM}.bai' ]; then \
+              echo Indexing $STRIPPED_BAM ...; \
+              samtools index -@ 4 '$STRIPPED_BAM'; \
+            fi; \
+            echo Writing regions file ...; \
+            python3 -c \"
 import pysam, math
 N = $N_SHARDS
 bam = pysam.AlignmentFile('$STRIPPED_BAM', 'rb')
 contigs = list(zip(bam.references, bam.lengths))
 total = sum(L for _, L in contigs)
-per_shard = math.ceil(total / N)
+per_shard = max(1, math.ceil(total / N))
 out = open('$REGIONS_FILE', 'w')
 shard = 0
 cursor = 0
@@ -161,20 +176,31 @@ for name, L in contigs:
             cursor = 0
 out.close()
 print(f'Wrote {shard+1} regions to $REGIONS_FILE')
-"
-
-N_REGIONS=$(awk '{print $1}' "$REGIONS_FILE" | sort -u | wc -l)
-ARRAY_MAX=$((N_REGIONS - 1))
-echo "Submitting array job 0-${ARRAY_MAX} on $N_REGIONS regions"
+\"")
+  PREP_DEP="--dependency=afterok:${J_PREP}"
+  echo "  prep job: $J_PREP"
+else
+  echo "Prep already done — skipping (stripped BAM + .bai + regions.txt all present)."
+fi
 
 # Optional --dependency on a previous run's terminal job, for manual
-# serialisation across strains on a shared GPU node. Empty string ⇒ no
-# dependency; the array job goes straight into the queue.
-GEN_DEP=""
+# serialisation across strains on a shared GPU node. Combined with prep
+# dependency below if both are active.
+GEN_DEP="$PREP_DEP"
 if [ -n "${DEPENDS_ON:-}" ]; then
-  GEN_DEP="--dependency=afterok:${DEPENDS_ON}"
+  if [ -n "$GEN_DEP" ]; then
+    GEN_DEP="--dependency=afterok:${J_PREP}:${DEPENDS_ON}"
+  else
+    GEN_DEP="--dependency=afterok:${DEPENDS_ON}"
+  fi
   echo "Chaining: first generate array waits for job $DEPENDS_ON"
 fi
+
+# Array size: N_SHARDS upper bound. If the genome was too small to fill
+# all N regions, the prep job wrote fewer lines — the surplus array
+# tasks exit cleanly (no region for their task id, see ARRAY_GUARD below).
+ARRAY_MAX=$((N_SHARDS - 1))
+echo "Submitting array job 0-${ARRAY_MAX} (up to $N_SHARDS regions)"
 
 # ── 1. Array job — N parallel `kinsim generate` tasks ─────────────
 J_GEN=$(sbatch --parsable \
@@ -186,6 +212,10 @@ J_GEN=$(sbatch --parsable \
   --output="$LOGDIR/val_gen_${HOLDOUT}_${VAL_LABEL}_%A_%a.log" \
   --wrap="set +u; source ~/.bashrc; conda activate kinsim_env; set -euo pipefail; \
           REGION=\$(awk -v t=\$SLURM_ARRAY_TASK_ID '\$1==t {print \$2}' '$REGIONS_FILE' | paste -sd,); \
+          if [ -z \"\$REGION\" ]; then \
+            echo \"ARRAY_GUARD: no region for task \$SLURM_ARRAY_TASK_ID (genome too small for $N_SHARDS shards) — skipping cleanly\"; \
+            exit 0; \
+          fi; \
           echo \"Shard \$SLURM_ARRAY_TASK_ID region(s): \$REGION\"; \
           SHARD_OUT='$SHARD_DIR'/shard_\$(printf %03d \$SLURM_ARRAY_TASK_ID).bam; \
           TMP_OUTS=(); \
@@ -231,12 +261,15 @@ J_FINAL=$(sbatch --parsable --dependency=afterok:${J_MM}:${J_JM} \
   "$CALLERS/merge_motifs.slurm" "$SIM_MERGED_CSV" "$MERGE_THRESHOLD" "$SIM_MM_CSV" "$SIM_JM_CSV")
 
 echo "── Validation chain submitted ──"
-printf '  %-25s : %s\n' "1. generate (array×$N_REGIONS)" "$J_GEN"
-printf '  %-25s : %s\n' "2. merge shards"        "$J_MERGE (after $J_GEN)"
-printf '  %-25s : %s\n' "3. ipdSummary"          "$J_IPD   (after $J_MERGE)"
-printf '  %-25s : %s\n' "4. motifmaker"          "$J_MM    (after $J_IPD)"
-printf '  %-25s : %s\n' "4b. jasmine"            "$J_JM    (after $J_MERGE)"
-printf '  %-25s : %s\n' "5. final merge"         "$J_FINAL (after $J_MM + $J_JM)"
+if [ -n "${J_PREP:-}" ]; then
+  printf '  %-30s : %s\n' "0. prep (strip+index+regions)" "$J_PREP"
+fi
+printf '  %-30s : %s\n' "1. generate (array, ≤$N_SHARDS tasks)" "$J_GEN"
+printf '  %-30s : %s\n' "2. merge shards"        "$J_MERGE (after $J_GEN)"
+printf '  %-30s : %s\n' "3. ipdSummary"          "$J_IPD   (after $J_MERGE)"
+printf '  %-30s : %s\n' "4. motifmaker"          "$J_MM    (after $J_IPD)"
+printf '  %-30s : %s\n' "4b. jasmine"            "$J_JM    (after $J_MERGE)"
+printf '  %-30s : %s\n' "5. final merge"         "$J_FINAL (after $J_MM + $J_JM)"
 echo ""
 echo "Output: $SIM_MERGED_CSV"
 echo "Compare against: $GROUND_TRUTH_MOTIFS"
