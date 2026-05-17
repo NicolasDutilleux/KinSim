@@ -1780,8 +1780,16 @@ def train_mlp(
     trainer.fit(lm, datamodule=dm)
     log.info("Training complete. Outputs in: %s", output_dir)
 
-    if test_pkl:
-        log.info("Running evaluation on held-out test set: %s", test_pkl)
+    # Run final test pass when EITHER a separate test pkl OR a sharded-mode
+    # holdout (test_strains / test_fraction) was provided. Before this fix,
+    # `trainer.test()` only ran for ``test_pkl`` which silently dropped the
+    # `--test-strains` holdout — leaving users with no per-meth-type test
+    # metrics when they used the sharded mode.
+    has_test_set = bool(test_pkl) or bool(test_strains) or (
+        test_fraction is not None and test_fraction > 0
+    )
+    if has_test_set:
+        log.info("Running evaluation on held-out test set")
         trainer.test(lm, datamodule=dm)
 
 
