@@ -1349,8 +1349,12 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
             png_path = export_dir / f"{i:02d}_{slug}.png"
             try:
                 fig.write_image(str(png_path), scale=3)
-            except Exception:
-                pass
+            except Exception as exc:
+                # PNG export is best-effort (kaleido has flaky dependencies
+                # on some container images), HTML is still valid. Surface
+                # the failure so the user knows they only have HTMLs,
+                # rather than silently shipping a partial report.
+                log.warning("PNG export failed for %s: %s — HTML only", slug, exc)
     log.info("Individual figures exported to: %s/", export_dir)
 
 

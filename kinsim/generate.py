@@ -1313,9 +1313,23 @@ def generate_from_bam(
 
     # Build a clean unaligned header (no SQ entries) so pbmm2 treats
     # the output as unaligned and properly converts fi/fp/ri/rp → ip/pw.
+    #
+    # CRITICAL: copy the PacBio `pb:` tag from the source @HD line if it
+    # exists, otherwise add a sane default. Downstream PacBio tools
+    # (pbindex, ipdSummary) read this tag at startup and KeyError'd in a
+    # previous incident when it was missing — the resulting silent
+    # absence of a .pbi file then poisons the whole validation chain.
     with pysam.AlignmentFile(input_bam, "rb", check_sq=False) as bam_in:
         in_dict = bam_in.header.to_dict()
-        out_dict = {"HD": {"VN": "1.6", "SO": "unknown"}}
+        hd = {"VN": "1.6", "SO": "unknown"}
+        in_hd = in_dict.get("HD", {})
+        if "pb" in in_hd:
+            hd["pb"] = in_hd["pb"]
+        else:
+            # SMRT-Tools 25.x default. Matches the version used by ipdSummary
+            # in slurm_kinsim/callers/ipdsummary.slurm.
+            hd["pb"] = "3.0.7"
+        out_dict = {"HD": hd}
         if "RG" in in_dict:
             out_dict["RG"] = in_dict["RG"]
         else:

@@ -239,8 +239,10 @@ J_MERGE=$(sbatch --parsable \
   --wrap="set +u; source ~/.bashrc; conda activate kinsim_env; set -euo pipefail; \
           ls '$SHARD_DIR'/shard_*.bam; \
           samtools merge -@ 4 -f '$SIM_BAM' '$SHARD_DIR'/shard_*.bam; \
-          apptainer exec --bind /data /containers/apptainer/pacbio-smrt-tools-25.3.sif pbindex '$SIM_BAM' || true; \
-          echo Merged: '$SIM_BAM'")
+          echo Running pbindex (required by ipdSummary downstream) ...; \
+          apptainer exec --bind /data /containers/apptainer/pacbio-smrt-tools-25.3.sif pbindex '$SIM_BAM'; \
+          [ -f '${SIM_BAM}.pbi' ] || { echo 'ERROR: pbindex ran but did not produce ${SIM_BAM}.pbi'; exit 1; }; \
+          echo Merged + indexed: '$SIM_BAM'")
 
 # ── 3. Downstream chain ────────────────────────────────────────────
 J_IPD=$(sbatch --parsable --dependency=afterok:$J_MERGE \

@@ -69,7 +69,16 @@ def get_meth_ids() -> dict:
         from .config import load_kinsim_config
 
         cfg = load_kinsim_config()
-    except Exception:
+    except Exception as exc:
+        # Fall back to the hardcoded baseline alphabet so the module stays
+        # importable in any state (pre-YAML bootstrap, tests, etc.), but
+        # surface what went wrong — silent falls hid YAML typos in the
+        # past, leading to extract running with a stale meth_id_map.
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "get_meth_ids: could not load kinsim_config.yaml (%s) — "
+            "falling back to the built-in METH_IDS=%s", exc, METH_IDS,
+        )
         return dict(METH_IDS)
 
     user_types = list(cfg.get("kinetic_signatures") or {})
