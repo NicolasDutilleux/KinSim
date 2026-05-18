@@ -1,0 +1,217 @@
+========================================================================
+KinSim — Training Data Analysis Report
+========================================================================
+File          : /data/projects/p774_MARSD/NDutilleux/runs/v12_strepto_vega/refined/strepto_bc2039_shard_clean.pkl
+K-mer size    : 11  (4^11 = 4,194,304 possible)
+File size     : 5670.8 MB
+Total keys    : 1,820,934
+Total samples : 73,591,855
+Coverage      : 43.41%
+
+------------------------------------------------------------------------
+Per-methylation-state coverage  (partitioned by meth_id at centre)
+------------------------------------------------------------------------
+
+  Unmethylated:
+    Unique 11-mers : 1,820,346 / 4,194,304  (43.40%)
+    Total samples  : 73,281,224
+    Samples/key    : mean=40.3  median=33.0  p5=8  p25=14  p75=50  p95=50
+                     min=1  max=41731
+
+  Methylated (m6A):
+    Unique 11-mers : 227 / 4,194,304  (0.01%)
+    Total samples  : 25,099
+    Samples/key    : mean=110.6  median=44.0  p5=26  p25=35  p75=116  p95=378
+                     min=21  max=1219
+    Meth fraction  : mean=1.000  median=1.000  p5=1.000  p95=1.000
+
+  Methylated (m5C):
+    Unique 11-mers : 361 / 4,194,304  (0.01%)
+    Total samples  : 285,532
+    Samples/key    : mean=790.9  median=218.0  p5=94  p25=111  p75=569  p95=2762
+                     min=8  max=21607
+    Meth fraction  : mean=1.000  median=1.000  p5=1.000  p95=1.000
+
+------------------------------------------------------------------------
+Signal statistics  (distribution of per-key means and sigmas)
+------------------------------------------------------------------------
+
+  Unmethylated:
+    IPD mean   : mean=35.449  std=10.366  median=34.040  p5=22.296  p95=53.000
+    IPD sigma  : mean=25.668  std=8.609  median=25.014
+    PW mean   : mean=25.222  std=6.501  median=24.520  p5=16.020  p95=36.600
+    PW sigma  : mean=11.816  std=4.296  median=11.637
+
+  Methylated (m6A):
+    IPD mean   : mean=89.958  std=28.060  median=73.485  p5=64.130  p95=140.206
+    IPD sigma  : mean=31.790  std=6.562  median=32.471
+    PW mean   : mean=22.432  std=5.859  median=24.220  p5=13.515  p95=30.074
+    PW sigma  : mean=11.897  std=4.387  median=12.451
+
+  Methylated (m5C):
+    IPD mean   : mean=48.675  std=20.093  median=41.449  p5=30.079  p95=90.546
+    IPD sigma  : mean=31.127  std=7.205  median=29.922
+    PW mean   : mean=28.063  std=7.238  median=26.352  p5=17.442  p95=42.047
+    PW sigma  : mean=11.589  std=2.758  median=11.411
+
+------------------------------------------------------------------------
+Per-bucket IPD/PW means  (one value per (category, meth, offset) bucket)
+------------------------------------------------------------------------
+Each line is the mean of the centre row's IPD/PW across all samples in
+that bucket. SLOWED buckets should have higher IPD than baseline;
+NEAR_METH should look baseline-like (meth in mc context, but no slowing).
+  baseline  [reference]
+    n=57,985,073   IPD= 35.66   PW= 25.29
+  slowed_by_m5C_at_+2  [should be HIGHER than baseline]
+    n=1,120,440   IPD= 76.33   PW= 27.76   Δ_IPD=+40.67   ratio= 2.14x
+  slowed_by_m5C_at_+6  [should be HIGHER than baseline]
+    n=940,818   IPD= 69.71   PW= 27.29   Δ_IPD=+34.04   ratio= 1.95x
+  slowed_by_m6A_at_+0  [should be HIGHER than baseline]
+    n=25,099   IPD=111.47   PW= 18.46   Δ_IPD=+75.80   ratio= 3.13x
+  slowed_by_m6A_at_+5  [should be HIGHER than baseline]
+    n=15,285   IPD= 67.52   PW= 29.70   Δ_IPD=+31.86   ratio= 1.89x
+  near_meth_by_m5C_at_+1  [should look baseline-like]
+    n=2,769,392   IPD= 33.46   PW= 24.21   Δ_IPD= -2.20   ratio= 0.94x
+  near_meth_by_m5C_at_+3  [should look baseline-like]
+    n=2,766,734   IPD= 39.22   PW= 24.83   Δ_IPD= +3.55   ratio= 1.10x
+  near_meth_by_m5C_at_+4  [should look baseline-like]
+    n=2,767,347   IPD= 39.10   PW= 25.72   Δ_IPD= +3.44   ratio= 1.10x
+  near_meth_by_m5C_at_+5  [should look baseline-like]
+    n=2,487,789   IPD= 37.51   PW= 26.07   Δ_IPD= +1.84   ratio= 1.05x
+  near_meth_by_m5C_at_+7  [should look baseline-like]
+    n=2,487,598   IPD= 37.67   PW= 25.15   Δ_IPD= +2.01   ratio= 1.06x
+  near_meth_by_m6A_at_+1  [should look baseline-like]
+    n=37,721   IPD= 35.68   PW= 23.34   Δ_IPD= +0.01   ratio= 1.00x
+  near_meth_by_m6A_at_+2  [should look baseline-like]
+    n=37,710   IPD= 35.00   PW= 28.79   Δ_IPD= -0.66   ratio= 0.98x
+  near_meth_by_m6A_at_+3  [should look baseline-like]
+    n=37,724   IPD= 33.48   PW= 24.06   Δ_IPD= -2.18   ratio= 0.94x
+  near_meth_by_m6A_at_+4  [should look baseline-like]
+    n=37,716   IPD= 33.69   PW= 26.19   Δ_IPD= -1.97   ratio= 0.94x
+  near_meth_by_m6A_at_+6  [should look baseline-like]
+    n=37,700   IPD= 33.74   PW= 22.67   Δ_IPD= -1.92   ratio= 0.95x
+  near_meth_by_m6A_at_+7  [should look baseline-like]
+    n=37,709   IPD= 34.42   PW= 25.09   Δ_IPD= -1.24   ratio= 0.97x
+
+------------------------------------------------------------------------
+IPD distribution per category  (raw uint8 from PacBio fi/fp tags)
+------------------------------------------------------------------------
+
+  category                n    mean     std    p5   p25   p50   p75   p90   p95   p99   max
+  baseline       57,985,073   35.66   29.12     8    16    26    46    73    92   145   255
+  slowed          2,101,642   73.72   33.98    40    49    65    85   124   146   195   255
+  near_meth      13,505,140   37.33   30.13     8    17    28    48    75    96   149   255
+
+  Baseline IPD histogram  (where the threshold sits)
+    [    0-   16)  ################################                    23.38% (13,555,158)
+    [   16-   32)  ##################################################  35.52% (20,594,415)
+    [   32-   48)  ########################                            17.42% (10,101,736)
+    [   48-   64)  ############                                         8.60% ( 4,986,951)
+    [   64-   80)  ##########                                           7.42% ( 4,299,939)
+    [   80-   96)  ####                                                 3.15% ( 1,823,823)
+    [   96-  112)  ##                                                   1.59% (   923,285)
+    [  112-  128)  #                                                    0.92% (   533,922)
+    [  128-  160)  ##                                                   1.42% (   824,032)
+    [  160-  192)                                                       0.39% (   228,879)
+    [  192-  256)                                                       0.19% (   112,933)
+
+  PW distribution per category (mean / median / p95):
+    baseline     mean= 25.3  median= 22.0  p95= 54.0  std=14.16
+    slowed       mean= 27.5  median= 24.0  p95= 56.0  std=14.32
+    near_meth    mean= 25.2  median= 22.0  p95= 53.0  std=13.88
+
+
+------------------------------------------------------------------------
+Methylation context distribution  (which meth_id sits at each offset
+around the prediction position, per bucket)
+------------------------------------------------------------------------
+Centre [C] sits at meth_context index 7 (offset 0).
+
+  baseline  (n=57,985,073 samples)
+    mc_pos       -7     -6     -5     -4     -3     -2     -1  +0[C]     +1     +2     +3
+    none (id=0)    100    100    100    100    100    100    100    100    100    100    100
+
+  slowed_by_m5C_at_+2  (n=1,120,440 samples)
+    mc_pos       -7     -6     -5     -4     -3     -2     -1  +0[C]     +1     +2     +3
+    none (id=0)    100  89.6   99.9     100    100      .    100    100  99.9   86.7     100
+    m5C (id=3)      .  10.4    0.1       .      .    100      .      .   0.1   13.3       .
+
+  slowed_by_m5C_at_+6  (n=940,818 samples)
+    mc_pos       -7     -6     -5     -4     -3     -2     -1  +0[C]     +1     +2     +3
+    none (id=0)    100      .    100    100  99.9     100    100    100  99.9   99.3   99.9 
+    m5C (id=3)      .    100      .      .   0.1       .      .      .   0.1    0.7    0.1 
+
+  slowed_by_m6A_at_+0  (n=25,099 samples)
+    mc_pos       -7     -6     -5     -4     -3     -2     -1  +0[C]     +1     +2     +3
+    none (id=0)  99.6     100    100    100    100    100    100      .    100    100    100
+    m6A (id=1)      .      .      .      .      .      .      .    100      .      .      .
+    m5C (id=3)   0.4       .      .      .      .      .      .      .      .      .      .
+
+  slowed_by_m6A_at_+5  (n=15,285 samples)
+    mc_pos       -7     -6     -5     -4     -3     -2     -1  +0[C]     +1     +2     +3
+    none (id=0)    100    100      .    100    100    100    100    100    100    100    100
+    m6A (id=1)      .      .    100      .      .      .      .      .      .      .      .
+
+  near_meth_by_m5C_at_+1  (n=2,769,392 samples)
+    mc_pos       -7     -6     -5     -4     -3     -2     -1  +0[C]     +1     +2     +3
+    none (id=0)    100    100  89.9   99.9     100    100      .    100    100  99.9   89.9 
+    m5C (id=3)      .      .  10.1    0.1       .      .    100      .      .   0.1   10.1 
+
+  near_meth_by_m5C_at_+3  (n=2,766,734 samples)
+    mc_pos       -7     -6     -5     -4     -3     -2     -1  +0[C]     +1     +2     +3
+    none (id=0)  89.9     100    100    100      .    100    100  99.9   89.9     100    100
+    m5C (id=3)  10.1       .      .      .    100      .      .   0.1   10.1       .      .
+
+  near_meth_by_m5C_at_+4  (n=2,767,347 samples)
+    mc_pos       -7     -6     -5     -4     -3     -2     -1  +0[C]     +1     +2     +3
+    none (id=0)  99.9     100    100      .    100    100    100  89.9     100    100  99.9 
+    m5C (id=3)   0.1       .      .    100      .      .      .  10.1       .      .   0.1 
+
+  near_meth_by_m5C_at_+5  (n=2,487,789 samples)
+    mc_pos       -7     -6     -5     -4     -3     -2     -1  +0[C]     +1     +2     +3
+    none (id=0)    100    100      .    100    100    100    100    100    100  99.9   99.3 
+    m5C (id=3)      .      .    100      .      .      .      .      .      .   0.1    0.7 
+
+  near_meth_by_m5C_at_+7  (n=2,487,598 samples)
+    mc_pos       -7     -6     -5     -4     -3     -2     -1  +0[C]     +1     +2     +3
+    none (id=0)      .    100    100    100    100    100    100  99.9   99.3   99.9   99.9 
+    m5C (id=3)    100      .      .      .      .      .      .   0.1    0.7    0.1    0.1 
+
+  near_meth_by_m6A_at_+1  (n=37,721 samples)
+    mc_pos       -7     -6     -5     -4     -3     -2     -1  +0[C]     +1     +2     +3
+    none (id=0)    100    100    100    100    100    100      .    100    100    100    100
+    m6A (id=1)      .      .      .      .      .      .    100      .      .      .      .
+
+  near_meth_by_m6A_at_+2  (n=37,710 samples)
+    mc_pos       -7     -6     -5     -4     -3     -2     -1  +0[C]     +1     +2     +3
+    none (id=0)    100    100    100    100    100      .    100    100    100    100    100
+    m6A (id=1)      .      .      .      .      .    100      .      .      .      .      .
+
+  near_meth_by_m6A_at_+3  (n=37,724 samples)
+    mc_pos       -7     -6     -5     -4     -3     -2     -1  +0[C]     +1     +2     +3
+    none (id=0)    100    100    100    100      .    100    100    100    100    100    100
+    m6A (id=1)      .      .      .      .    100      .      .      .      .      .      .
+
+  near_meth_by_m6A_at_+4  (n=37,716 samples)
+    mc_pos       -7     -6     -5     -4     -3     -2     -1  +0[C]     +1     +2     +3
+    none (id=0)    100    100    100      .    100    100    100    100    100    100    100
+    m6A (id=1)      .      .      .    100      .      .      .      .      .      .      .
+
+  near_meth_by_m6A_at_+6  (n=37,700 samples)
+    mc_pos       -7     -6     -5     -4     -3     -2     -1  +0[C]     +1     +2     +3
+    none (id=0)    100      .    100    100    100    100    100    100    100    100    100
+    m6A (id=1)      .    100      .      .      .      .      .      .      .      .      .
+
+  near_meth_by_m6A_at_+7  (n=37,709 samples)
+    mc_pos       -7     -6     -5     -4     -3     -2     -1  +0[C]     +1     +2     +3
+    none (id=0)      .    100    100    100    100    100    100    100    100    100    100
+    m6A (id=1)    100      .      .      .      .      .      .      .      .      .      .
+
+------------------------------------------------------------------------
+Low-coverage keys  (keys with few samples — less reliable signals)
+------------------------------------------------------------------------
+  Unmethylated                    n<5: 7,747 (0.43%)   n<10: 177,536 (9.75%)   n<50: 1,099,915 (60.42%)
+  Methylated (m6A)                n<5: 0 (0.00%)   n<10: 0 (0.00%)   n<50: 122 (53.74%)
+  Methylated (m5C)                n<5: 0 (0.00%)   n<10: 1 (0.28%)   n<50: 4 (1.11%)
+
+========================================================================
