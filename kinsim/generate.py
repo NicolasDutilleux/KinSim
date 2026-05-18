@@ -835,6 +835,12 @@ def generate_signals(
     # Per-position fraction (target-genome occupancy) — pairs with p_efficiency
     # so the per-site Bernoulli rate at generate is target_frac × p_efficiency.
     frac_map = build_reference_frac_map(ref_seqs, motif_string, revcomp=revcomp)
+    from .utils.config import load_kinsim_config
+    use_motif_fraction = bool(
+        (load_kinsim_config().get("generation") or {}).get("use_motif_fraction", False)
+    )
+    log.info("Per-site motif fraction at generate: %s (false => p_fire alone)",
+             use_motif_fraction)
 
     # Keep regex motifs for the fallback path (unmapped reads)
     fallback_motifs = parse_motifs(motif_string, revcomp=revcomp)
@@ -913,6 +919,7 @@ def generate_signals(
                     rev_meth_map=rev_meth_map,
                     fwd_meth_map=fwd_meth_map,
                     rev_meth_offsets=rev_meth_offsets,
+                    use_motif_fraction=use_motif_fraction,
                 )
                 n_mapped += n_m
                 n_unmapped += n_u
@@ -937,6 +944,7 @@ def generate_signals(
                 rev_meth_map=rev_meth_map,
                 fwd_meth_map=fwd_meth_map,
                 rev_meth_offsets=rev_meth_offsets,
+                use_motif_fraction=use_motif_fraction,
             )
             n_mapped += n_m
             n_unmapped += n_u
@@ -966,6 +974,7 @@ def _process_batch(
     rev_meth_map=None,
     fwd_meth_map=None,
     rev_meth_offsets=(),
+    use_motif_fraction: bool = False,
 ):
     """Process a batch of reads with batched MLP inference.
 
@@ -1043,7 +1052,12 @@ def _process_batch(
             ref_meth = meth_map[ref_name]  # combined, used as legacy/non-strand-aware fallback
             ref_fwd_meth = fwd_meth_map[ref_name] if _STRAND_AWARE else None
             ref_rev_meth = rev_meth_map[ref_name] if _DO_REV else None
-            ref_frac = frac_map.get(ref_name) if frac_map else None
+            # p_fire from refine already absorbs corpus occupancy + CCS-noise
+            # non-firing into one rate. Re-applying the motif fraction on top
+            # would double-count what p_fire learned. Default: fraction=1.0,
+            # p_fire alone drives per-read firing. Set use_motif_fraction=True
+            # to recover the legacy decomposition behaviour.
+            ref_frac = frac_map.get(ref_name) if (use_motif_fraction and frac_map) else None
 
             ext_context = get_extended_context(ref_seq, ref_start, read_len, circular)
             current_kmer = 0
@@ -1437,6 +1451,12 @@ def generate_from_bam(
     )
     rev_meth_offsets = tuple(int(o) for o in get_extraction_params().rev_meth_offsets)
     frac_map = build_reference_frac_map(ref_seqs, motif_string, revcomp=revcomp)
+    from .utils.config import load_kinsim_config
+    use_motif_fraction = bool(
+        (load_kinsim_config().get("generation") or {}).get("use_motif_fraction", False)
+    )
+    log.info("Per-site motif fraction at generate: %s (false => p_fire alone)",
+             use_motif_fraction)
     fallback_motifs = parse_motifs(motif_string, revcomp=revcomp)
 
     # Either load the trained model (default) or a pre-computed lookup table.
@@ -1587,6 +1607,7 @@ def generate_from_bam(
                     rev_meth_map=rev_meth_map,
                     fwd_meth_map=fwd_meth_map,
                     rev_meth_offsets=rev_meth_offsets,
+                    use_motif_fraction=use_motif_fraction,
                 )
                 n_mapped += n_m
                 n_unmapped += n_u
@@ -1615,6 +1636,7 @@ def generate_from_bam(
                 rev_meth_map=rev_meth_map,
                 fwd_meth_map=fwd_meth_map,
                 rev_meth_offsets=rev_meth_offsets,
+                use_motif_fraction=use_motif_fraction,
             )
             n_mapped += n_m
             n_unmapped += n_u

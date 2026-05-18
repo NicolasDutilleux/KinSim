@@ -154,6 +154,18 @@ extract:
   near_meth_max_dist:         7     # bases downstream of the motif centre (1..K-1)
 
 # ─────────────────────────────────────────────────────────────────────────
+# Generation
+# ─────────────────────────────────────────────────────────────────────────
+# Per-read firing at generate time. extract marks all motif sites SLOWED;
+# refine learns p_fire from what survives the GMM (absorbs both unmethylated
+# sites AND CCS-noise non-firing reads). At generate, p_fire alone drives
+# the per-read Bernoulli — multiplying by the per-site motif fraction would
+# double-count what p_fire already captured. Set use_motif_fraction: true
+# to recover the legacy decomposition.
+generation:
+  use_motif_fraction: false
+
+# ─────────────────────────────────────────────────────────────────────────
 # Model defaults
 # ─────────────────────────────────────────────────────────────────────────
 # Architecture knobs for `kinsim train`. CLI flags override these; the
