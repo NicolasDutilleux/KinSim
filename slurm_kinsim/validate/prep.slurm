@@ -13,8 +13,10 @@
 # Usage:
 #   sbatch slurm_kinsim/validate/prep.slurm \
 #          <REAL_BAM> <STRIPPED_BAM> <REGIONS_FILE> <N_SHARDS>
+set +u
+source ~/.bashrc
+conda activate kinsim_env
 set -euo pipefail
-source ~/.bashrc; conda activate kinsim_env
 
 REAL_BAM=${1:?aligned BAM required}
 STRIPPED_BAM=${2:?stripped BAM path required}

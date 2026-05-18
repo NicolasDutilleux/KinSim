@@ -17,8 +17,10 @@
 #   sbatch --array=0-9 slurm_kinsim/validate/generate.slurm \
 #          <STRIPPED_BAM> <REF> <CKPT_DIR> <MOTIFS_CSV> \
 #          <REGIONS_FILE> <SHARD_DIR>
+set +u
+source ~/.bashrc
+conda activate kinsim_env
 set -euo pipefail
-source ~/.bashrc; conda activate kinsim_env
 
 STRIPPED_BAM=${1:?stripped BAM required}
 REF=${2:?reference required}

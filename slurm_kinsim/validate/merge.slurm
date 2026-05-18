@@ -12,8 +12,10 @@
 #
 # Usage:
 #   sbatch slurm_kinsim/validate/merge.slurm <SHARD_DIR> <OUT_BAM>
+set +u
+source ~/.bashrc
+conda activate kinsim_env
 set -euo pipefail
-source ~/.bashrc; conda activate kinsim_env
 
 SHARD_DIR=${1:?shard dir required}
 OUT_BAM=${2:?output BAM required}
