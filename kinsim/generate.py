@@ -817,7 +817,7 @@ def generate_signals(
     # matching how `kinsim extract` builds training data.
     from .utils.motifs import build_reference_meth_map_per_strand
     from .utils.config import get_extraction_params
-    _fwd_meth_map, rev_meth_map = build_reference_meth_map_per_strand(
+    fwd_meth_map, rev_meth_map = build_reference_meth_map_per_strand(
         ref_seqs, motif_string,
     )
     rev_meth_offsets = tuple(int(o) for o in get_extraction_params().rev_meth_offsets)
@@ -901,6 +901,7 @@ def generate_signals(
                     bam_out,
                     header,
                     rev_meth_map=rev_meth_map,
+                    fwd_meth_map=fwd_meth_map,
                     rev_meth_offsets=rev_meth_offsets,
                 )
                 n_mapped += n_m
@@ -924,6 +925,7 @@ def generate_signals(
                 bam_out,
                 header,
                 rev_meth_map=rev_meth_map,
+                fwd_meth_map=fwd_meth_map,
                 rev_meth_offsets=rev_meth_offsets,
             )
             n_mapped += n_m
@@ -952,6 +954,7 @@ def _process_batch(
     header,
     lookup_table=None,
     rev_meth_map=None,
+    fwd_meth_map=None,
     rev_meth_offsets=(),
 ):
     """Process a batch of reads with batched MLP inference.
@@ -972,19 +975,38 @@ def _process_batch(
     # single flat tensor before model inference. The previous per-position
     # Python list-append pattern was the dominant cost (~95 % of wall time)
     # — see _process_read_unmapped_vec for the unmapped path's vectorisation.
-    all_kmer_ids: list[np.ndarray] = []      # each entry: (L_i,) int64
-    all_meth_ids: list[np.ndarray] = []
-    all_fractions: list[np.ndarray] = []     # each entry: (L_i,) float32
+    # Per-pass meth context accumulators — fi-pass and ri-pass see
+    # DIFFERENT templates (extract.py routes pol_padded/opp_padded by
+    # read.is_reverse). For + strand reads (the implicit assumption in
+    # the mapped path — strand routing for − strand reads is the next
+    # bug to fix): fi reads the − strand template, ri reads the + strand
+    # template. So:
+    #     mc_fi    ← rev_meth_map   |   mc_ri    ← fwd_meth_map
+    #     rev_fi   ← fwd_meth_map   |   rev_ri   ← rev_meth_map
+    # The previous one-combined-map behaviour summed both strands into
+    # mc at every position — for palindromic motifs (e.g. m6A on both
+    # strands of GATC) that fed the model TWO m6A entries at neighbouring
+    # positions when training only ever showed ONE.
+    all_kmer_ids: list[np.ndarray] = []
     all_rc_kmer_ids: list[np.ndarray] = []
-    all_meth_ctxs: list[np.ndarray] = []     # each entry: (L_i, 11) int64
-    all_rev_meth_ctxs: list[np.ndarray] = []  # each entry: (L_i, n_rev_meth) int64
-    is_n_context: list[np.ndarray] = []      # each entry: (L_i,) bool
-    read_offsets = [0]                       # cumulative POSITION counts
+    all_meth_id_fi: list[np.ndarray] = []
+    all_meth_id_ri: list[np.ndarray] = []
+    all_frac_fi: list[np.ndarray] = []
+    all_frac_ri: list[np.ndarray] = []
+    all_meth_ctx_fi: list[np.ndarray] = []
+    all_meth_ctx_ri: list[np.ndarray] = []
+    all_rev_ctx_fi: list[np.ndarray] = []
+    all_rev_ctx_ri: list[np.ndarray] = []
+    is_n_context: list[np.ndarray] = []
+    read_offsets = [0]
     n_positions = 0
     _N_REV = len(rev_meth_offsets)
     _REV_OFFSETS = np.asarray(rev_meth_offsets, dtype=np.int64)
     _ZERO_REV = np.zeros(_N_REV, dtype=np.int64)
     _DO_REV = rev_meth_map is not None and _N_REV > 0
+    _STRAND_AWARE = (
+        rev_meth_map is not None and fwd_meth_map is not None and _N_REV > 0
+    )
     _K = K
     # Window geometry comes from the trained model's config. ``_load_model``
     # already refuses non-K=11 checkpoints (hot path is K=11-specific), but
@@ -1010,24 +1032,26 @@ def _process_batch(
             ref_name, ref_start, _ref_strand, _ref_src_size = maf_info
             ref_seq = ref_seqs[ref_name]
             ref_len = len(ref_seq)
-            ref_meth = meth_map[ref_name]
+            ref_meth = meth_map[ref_name]    # combined, used as legacy/non-strand-aware fallback
+            ref_fwd_meth = fwd_meth_map[ref_name] if _STRAND_AWARE else None
             ref_rev_meth = rev_meth_map[ref_name] if _DO_REV else None
             ref_frac = frac_map.get(ref_name) if frac_map else None
 
-            # Extended context pads K//2 bases on each side from the reference,
-            # ensuring accurate 11-mer encoding at the read edges.
             ext_context = get_extended_context(ref_seq, ref_start, read_len, circular)
             current_kmer = 0
 
-            # Per-read local accumulators — converted to numpy arrays at the
-            # end of the read and appended once to the per-batch list (keeps
-            # accumulator format consistent with the vectorised unmapped path).
+            # Per-read accumulators. fi-pass and ri-pass keep separate meth
+            # contexts because each polymerase pass reads a different template.
             r_kmer: list = []
             r_rc_kmer: list = []
-            r_meth_id: list = []
-            r_frac: list = []
-            r_meth_ctx: list = []
-            r_rev_meth_ctx: list = []
+            r_meth_id_fi: list = []
+            r_meth_id_ri: list = []
+            r_frac_fi: list = []
+            r_frac_ri: list = []
+            r_mc_fi: list = []
+            r_mc_ri: list = []
+            r_rev_fi: list = []
+            r_rev_ri: list = []
             r_is_n: list = []
 
             for i in range(len(ext_context)):
@@ -1044,51 +1068,90 @@ def _process_batch(
                         if has_n:
                             r_kmer.append(0)
                             r_rc_kmer.append(0)
-                            r_meth_id.append(0)
-                            r_frac.append(0.0)
-                            r_meth_ctx.append(_ZERO_CTX)
+                            r_meth_id_fi.append(0)
+                            r_meth_id_ri.append(0)
+                            r_frac_fi.append(0.0)
+                            r_frac_ri.append(0.0)
+                            r_mc_fi.append(_ZERO_CTX)
+                            r_mc_ri.append(_ZERO_CTX)
                             if _DO_REV:
-                                r_rev_meth_ctx.append(_ZERO_REV)
+                                r_rev_fi.append(_ZERO_REV)
+                                r_rev_ri.append(_ZERO_REV)
                         else:
                             ref_pos = ref_start + read_pos
-                            ctx = np.zeros(_CTX_LEN, dtype=np.int64)
+                            # Strand-aware path: fi sees rev-strand template,
+                            # ri sees fwd-strand template (matches extract.py's
+                            # pol_padded/opp_padded for + strand reads).
+                            # Fallback: combined map for both passes when the
+                            # caller doesn't supply per-strand maps.
+                            mc_fi = np.zeros(_CTX_LEN, dtype=np.int64)
+                            mc_ri = np.zeros(_CTX_LEN, dtype=np.int64)
+                            fi_src = ref_rev_meth if _STRAND_AWARE else ref_meth
+                            ri_src = ref_fwd_meth if _STRAND_AWARE else ref_meth
                             for k_pos in range(_CTX_LEN):
                                 rp_k = ref_pos + k_pos - _LEFT
                                 if circular:
-                                    ctx[k_pos] = int(ref_meth[rp_k % ref_len])
+                                    idx = rp_k % ref_len
+                                    mc_fi[k_pos] = int(fi_src[idx])
+                                    mc_ri[k_pos] = int(ri_src[idx])
                                 elif 0 <= rp_k < ref_len:
-                                    ctx[k_pos] = int(ref_meth[rp_k])
+                                    mc_fi[k_pos] = int(fi_src[rp_k])
+                                    mc_ri[k_pos] = int(ri_src[rp_k])
+                            # Apply per-site Bernoulli firing on each pass
+                            # independently — each polymerase pass is a
+                            # separate event in the BAM record.
                             _apply_p_fire_to_mc(
-                                ctx, p_eff_lookup, sig_offsets, _PRED_IDX,
+                                mc_fi, p_eff_lookup, sig_offsets, _PRED_IDX,
                                 ref_pos, ref_frac,
                             )
-                            meth_id = int(ctx[_PRED_IDX])
+                            _apply_p_fire_to_mc(
+                                mc_ri, p_eff_lookup, sig_offsets, _PRED_IDX,
+                                ref_pos, ref_frac,
+                            )
+                            mid_fi = int(mc_fi[_PRED_IDX])
+                            mid_ri = int(mc_ri[_PRED_IDX])
                             r_kmer.append(current_kmer)
                             r_rc_kmer.append(_rc_kmer(current_kmer))
-                            r_meth_id.append(meth_id)
-                            r_frac.append(1.0 if meth_id else 0.0)
-                            r_meth_ctx.append(ctx)
+                            r_meth_id_fi.append(mid_fi)
+                            r_meth_id_ri.append(mid_ri)
+                            r_frac_fi.append(1.0 if mid_fi else 0.0)
+                            r_frac_ri.append(1.0 if mid_ri else 0.0)
+                            r_mc_fi.append(mc_fi)
+                            r_mc_ri.append(mc_ri)
                             if _DO_REV:
-                                # rev_meth at active-site neighbours from the
-                                # complementary-strand meth map (forward coords).
-                                rev_ctx = np.zeros(_N_REV, dtype=np.int64)
+                                # rev_meth = synthesized-strand neighbours
+                                # (opposite of the polymerase's template).
+                                # For + strand reads: fi template = rev, so
+                                # rev_meth for fi = fwd; ri's template = fwd,
+                                # so rev_meth for ri = rev.
+                                rev_fi = np.zeros(_N_REV, dtype=np.int64)
+                                rev_ri = np.zeros(_N_REV, dtype=np.int64)
+                                fi_rev_src = ref_fwd_meth if _STRAND_AWARE else ref_rev_meth
+                                ri_rev_src = ref_rev_meth if _STRAND_AWARE else ref_rev_meth
                                 for j, off in enumerate(_REV_OFFSETS):
                                     tgt = ref_pos + int(off)
                                     if circular:
-                                        rev_ctx[j] = int(ref_rev_meth[tgt % ref_len])
+                                        idx = tgt % ref_len
+                                        rev_fi[j] = int(fi_rev_src[idx])
+                                        rev_ri[j] = int(ri_rev_src[idx])
                                     elif 0 <= tgt < ref_len:
-                                        rev_ctx[j] = int(ref_rev_meth[tgt])
-                                r_rev_meth_ctx.append(rev_ctx)
+                                        rev_fi[j] = int(fi_rev_src[tgt])
+                                        rev_ri[j] = int(ri_rev_src[tgt])
+                                r_rev_fi.append(rev_fi)
+                                r_rev_ri.append(rev_ri)
 
-            # End of mapped read — convert per-read lists to arrays and push.
             if r_kmer:
                 all_kmer_ids.append(np.asarray(r_kmer, dtype=np.int64))
                 all_rc_kmer_ids.append(np.asarray(r_rc_kmer, dtype=np.int64))
-                all_meth_ids.append(np.asarray(r_meth_id, dtype=np.int64))
-                all_fractions.append(np.asarray(r_frac, dtype=np.float32))
-                all_meth_ctxs.append(np.stack(r_meth_ctx, axis=0).astype(np.int64))
+                all_meth_id_fi.append(np.asarray(r_meth_id_fi, dtype=np.int64))
+                all_meth_id_ri.append(np.asarray(r_meth_id_ri, dtype=np.int64))
+                all_frac_fi.append(np.asarray(r_frac_fi, dtype=np.float32))
+                all_frac_ri.append(np.asarray(r_frac_ri, dtype=np.float32))
+                all_meth_ctx_fi.append(np.stack(r_mc_fi, axis=0).astype(np.int64))
+                all_meth_ctx_ri.append(np.stack(r_mc_ri, axis=0).astype(np.int64))
                 if _DO_REV:
-                    all_rev_meth_ctxs.append(np.stack(r_rev_meth_ctx, axis=0).astype(np.int64))
+                    all_rev_ctx_fi.append(np.stack(r_rev_fi, axis=0).astype(np.int64))
+                    all_rev_ctx_ri.append(np.stack(r_rev_ri, axis=0).astype(np.int64))
                 is_n_context.append(np.asarray(r_is_n, dtype=bool))
                 n_positions += len(r_kmer)
 
@@ -1105,15 +1168,22 @@ def _process_batch(
                     _PRED_IDX, _CTX_LEN,
                 )
             )
+            # Unmapped path: no reference info → strand-aware context not
+            # available. Use the motif-scanned context (combined map) for
+            # both passes — same row of data feeds fi and ri.
             all_kmer_ids.append(kmer_ids_r)
             all_rc_kmer_ids.append(rc_kmer_ids_r)
-            all_meth_ids.append(meth_ids_r)
-            all_fractions.append(fractions_r)
-            all_meth_ctxs.append(meth_ctxs_r)
+            all_meth_id_fi.append(meth_ids_r)
+            all_meth_id_ri.append(meth_ids_r)
+            all_frac_fi.append(fractions_r)
+            all_frac_ri.append(fractions_r)
+            all_meth_ctx_fi.append(meth_ctxs_r)
+            all_meth_ctx_ri.append(meth_ctxs_r)
             if _DO_REV:
-                # Unmapped reads have no reference position → no rev_meth info.
-                # Pad with zeros so the per-batch concat stays aligned.
-                all_rev_meth_ctxs.append(np.zeros((kmer_ids_r.size, _N_REV), dtype=np.int64))
+                # No ref → rev_meth stays zero on the unmapped path.
+                zero_rev = np.zeros((kmer_ids_r.size, _N_REV), dtype=np.int64)
+                all_rev_ctx_fi.append(zero_rev)
+                all_rev_ctx_ri.append(zero_rev)
             is_n_context.append(is_n_r)
             n_positions += kmer_ids_r.size
 
@@ -1125,16 +1195,21 @@ def _process_batch(
     if all_kmer_ids:
         flat_kmer    = np.concatenate(all_kmer_ids)
         flat_rc_kmer = np.concatenate(all_rc_kmer_ids)
-        flat_meth_id = np.concatenate(all_meth_ids)
-        flat_frac    = np.concatenate(all_fractions)
-        flat_meth_ctx = np.concatenate(all_meth_ctxs, axis=0)
-        flat_rev_meth_ctx = np.concatenate(all_rev_meth_ctxs, axis=0) if _DO_REV else None
+        flat_mid_fi  = np.concatenate(all_meth_id_fi)
+        flat_mid_ri  = np.concatenate(all_meth_id_ri)
+        flat_frac_fi = np.concatenate(all_frac_fi)
+        flat_frac_ri = np.concatenate(all_frac_ri)
+        flat_mc_fi   = np.concatenate(all_meth_ctx_fi, axis=0)
+        flat_mc_ri   = np.concatenate(all_meth_ctx_ri, axis=0)
+        flat_rev_fi  = np.concatenate(all_rev_ctx_fi, axis=0) if _DO_REV else None
+        flat_rev_ri  = np.concatenate(all_rev_ctx_ri, axis=0) if _DO_REV else None
         flat_is_n    = np.concatenate(is_n_context)
     else:
-        flat_kmer = flat_rc_kmer = flat_meth_id = np.empty(0, dtype=np.int64)
-        flat_frac = np.empty(0, dtype=np.float32)
-        flat_meth_ctx = np.empty((0, _CTX_LEN), dtype=np.int64)
-        flat_rev_meth_ctx = np.empty((0, _N_REV), dtype=np.int64) if _DO_REV else None
+        flat_kmer = flat_rc_kmer = flat_mid_fi = flat_mid_ri = np.empty(0, dtype=np.int64)
+        flat_frac_fi = flat_frac_ri = np.empty(0, dtype=np.float32)
+        flat_mc_fi = flat_mc_ri = np.empty((0, _CTX_LEN), dtype=np.int64)
+        flat_rev_fi = np.empty((0, _N_REV), dtype=np.int64) if _DO_REV else None
+        flat_rev_ri = np.empty((0, _N_REV), dtype=np.int64) if _DO_REV else None
         flat_is_n = np.empty(0, dtype=bool)
 
     # Inference — dispatch on whether a lookup table is provided.
@@ -1144,21 +1219,23 @@ def _process_batch(
     if flat_kmer.size > 0:
         if lookup_table is not None:
             all_signals = generate_signals_lookup(
-                lookup_table, flat_kmer, flat_meth_ctx, deterministic,
+                lookup_table, flat_kmer, flat_mc_fi, deterministic,
             )
             all_rc_signals = generate_signals_lookup(
-                lookup_table, flat_rc_kmer, flat_meth_ctx, deterministic,
+                lookup_table, flat_rc_kmer, flat_mc_ri, deterministic,
             )
         else:
+            # fi pass: rev-strand template context.
             all_signals = generate_signals_batch(
-                model, flat_kmer, flat_meth_id, flat_frac, flat_meth_ctx,
+                model, flat_kmer, flat_mid_fi, flat_frac_fi, flat_mc_fi,
                 device, deterministic,
-                rev_meth_contexts=flat_rev_meth_ctx,
+                rev_meth_contexts=flat_rev_fi,
             )
+            # ri pass: fwd-strand template context.
             all_rc_signals = generate_signals_batch(
-                model, flat_rc_kmer, flat_meth_id, flat_frac, flat_meth_ctx,
+                model, flat_rc_kmer, flat_mid_ri, flat_frac_ri, flat_mc_ri,
                 device, deterministic,
-                rev_meth_contexts=flat_rev_meth_ctx,
+                rev_meth_contexts=flat_rev_ri,
             )
     else:
         all_signals = np.zeros((0, 2), dtype=np.float32)
@@ -1316,7 +1393,7 @@ def generate_from_bam(
     )
     from .utils.motifs import build_reference_meth_map_per_strand
     from .utils.config import get_extraction_params
-    _fwd_meth_map, rev_meth_map = build_reference_meth_map_per_strand(
+    fwd_meth_map, rev_meth_map = build_reference_meth_map_per_strand(
         ref_seqs, motif_string,
     )
     rev_meth_offsets = tuple(int(o) for o in get_extraction_params().rev_meth_offsets)
@@ -1459,6 +1536,7 @@ def generate_from_bam(
                     header_out,
                     lookup_table=lookup_table,
                     rev_meth_map=rev_meth_map,
+                    fwd_meth_map=fwd_meth_map,
                     rev_meth_offsets=rev_meth_offsets,
                 )
                 n_mapped += n_m
@@ -1486,6 +1564,7 @@ def generate_from_bam(
                 header_out,
                 lookup_table=lookup_table,
                 rev_meth_map=rev_meth_map,
+                fwd_meth_map=fwd_meth_map,
                 rev_meth_offsets=rev_meth_offsets,
             )
             n_mapped += n_m

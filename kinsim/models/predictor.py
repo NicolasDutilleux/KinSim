@@ -314,7 +314,14 @@ class ConvPredictor(nn.Module):
 
 
 def create_from_config(config: dict) -> nn.Module:
-    """Reconstruct a ConvPredictor from a model_config.json dict."""
+    """Reconstruct a ConvPredictor from a model_config.json dict.
+
+    Defaults for missing fields match the current ``kinsim_config.yaml``
+    defaults so loading an older checkpoint without these keys does NOT
+    silently flip behaviour at inference (the previous defaults flipped
+    ``biology_mask`` True at load even when the YAML / training run had it
+    False — a hidden train/inference mismatch).
+    """
     return ConvPredictor(
         base_embed_dim=config.get("base_embed_dim", 16),
         num_meth_types=config.get("num_meth_types", 4),
@@ -326,7 +333,7 @@ def create_from_config(config: dict) -> nn.Module:
         dropout=config.get("dropout", 0.1),
         kmer_size=config.get("kmer_size", _DEFAULT_K),
         kmer_aware_film=config.get("kmer_aware_film", True),
-        biology_mask=config.get("biology_mask", True),
+        biology_mask=config.get("biology_mask", False),
         log_sigma_clamp_min=config.get("log_sigma_clamp_min", -6.0),
         log_sigma_clamp_max=config.get("log_sigma_clamp_max", 1.5),
         active_site_index=config.get("active_site_index", KMER_PRED_IDX),
