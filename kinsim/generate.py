@@ -51,7 +51,11 @@ import pysam
 import torch
 import torch.nn as nn
 
-from .models.predictor import MLPPredictor, create_from_config
+from .models.predictor import (
+    ConvPredictor,
+    create_from_config,
+    load_state_dict_from_ckpt,
+)
 from .utils.encoding import (
     BASE_MAP,
     KMER_MASK,
@@ -515,7 +519,7 @@ def _apply_p_fire_to_mc(
 
 @torch.no_grad()
 def generate_signals_batch(
-    model: MLPPredictor,
+    model: ConvPredictor,
     kmer_ids: list,
     meth_ids: list,
     fractions: list,
@@ -694,35 +698,12 @@ def _apply_meth_types(
 
 
 def _load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
-    """Load a trained model from a checkpoint file.
-
-    Reads ``model_config.json`` from the same directory as the checkpoint
-    to reconstruct the exact architecture used during training. Supports
-    both ConvPredictor (``architecture="conv"``) and MLPPredictor
-    (``architecture="mlp"``).
-
-    Args:
-        checkpoint_path: Path to the .pt checkpoint file.
-        device:          Torch device to load the model onto.
-
-    Returns:
-        Model in eval mode, ready for inference.
-
-    Raises:
-        SystemExit: If ``model_config.json`` is missing OR if the model was
-            trained with a window geometry the generate.py hot path does not
-            yet support (currently K=11 only — the numpy kmer-encoding and
-            N-context helpers are K=11-specific). A clear message points the
-            user at the parameters they need to set to widen the path.
-    """
-    ckpt = torch.load(checkpoint_path, map_location=device)
-
+    """Load a trained ConvPredictor from a checkpoint file."""
     config_path = os.path.join(os.path.dirname(checkpoint_path), "model_config.json")
     if not os.path.exists(config_path):
         log.error(
             "model_config.json not found in %s. "
-            "This file is written by 'kinsim train' at the start of training. "
-            "Ensure the checkpoint directory contains model_config.json.",
+            "This file is written by 'kinsim train' at the start of training.",
             os.path.dirname(checkpoint_path),
         )
         sys.exit(1)
@@ -730,42 +711,30 @@ def _load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
     with open(config_path) as f:
         config = json.load(f)
 
-    # Geometry guard — the numpy hot path (sliding_window_view, _KMER_POWERS,
-    # is_n_context, ref-scan slices) is K=11-specific. Reject other geometries
-    # with an actionable error rather than silently producing garbage.
+    # Geometry guard — the numpy hot path is K=11-specific.
     ckpt_kmer_size = int(config.get("kmer_size", K))
     ckpt_active_idx = int(config.get("active_site_index", config.get("KMER_PRED_IDX", 7)))
     if ckpt_kmer_size != K:
         log.error(
-            "Checkpoint was trained with kmer_size=%d but generate.py currently "
-            "only supports K=%d (the numpy encoding helpers are hardcoded). "
-            "To widen the inference path, replace the module-level `K` / "
-            "`KMER_PRED_IDX` / `_KMER_POWERS` constants in kinsim/generate.py "
-            "with values derived from the checkpoint, then re-run.",
+            "Checkpoint kmer_size=%d but generate.py only supports K=%d.",
             ckpt_kmer_size, K,
         )
         sys.exit(1)
     if ckpt_active_idx != KMER_PRED_IDX:
         log.error(
-            "Checkpoint active_site_index=%d but generate.py expects %d. "
-            "Same fix path as the kmer_size mismatch above.",
+            "Checkpoint active_site_index=%d but generate.py expects %d.",
             ckpt_active_idx, KMER_PRED_IDX,
         )
         sys.exit(1)
 
     model = create_from_config(config).to(device)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(load_state_dict_from_ckpt(checkpoint_path))
     model.eval()
 
-    arch = config.get("architecture", "mlp")
     n_params = sum(p.numel() for p in model.parameters())
     log.info(
-        "Model loaded: architecture=%s  K=%d  active_site_index=%d  "
-        "params=%s  checkpoint=%s",
-        arch,
-        ckpt_kmer_size,
-        ckpt_active_idx,
-        f"{n_params:,}",
+        "Model loaded: K=%d  active_site_index=%d  params=%s  checkpoint=%s",
+        ckpt_kmer_size, ckpt_active_idx, f"{n_params:,}",
         os.path.basename(checkpoint_path),
     )
     return model
@@ -795,7 +764,7 @@ def generate_signals(
     Pipeline:
       1. Load reference genome
       2. Pre-scan reference for methylation sites (fuzznuc primary, regex fallback)
-      3. Load trained MLPPredictor from checkpoint
+      3. Load trained ConvPredictor from checkpoint
       4. Parse .maf alignment mapping
       5. For batches of reads in .fq.gz:
          a. Collect all (kmer_id, meth_id) contexts using the pre-computed map

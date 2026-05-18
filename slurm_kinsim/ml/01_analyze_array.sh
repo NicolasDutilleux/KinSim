@@ -2,9 +2,9 @@
 # ============================================================
 # 01_analyze_array.sh — array-task helper for `kinsim analyze`.
 #
-# Submitted by _v11_orchestrator.sh as a SLURM array. Each task
-# picks one .pkl from <input_dir> by SLURM_ARRAY_TASK_ID and writes
-# its report to <output_root>/<sample_id>/.
+# Submitted as a SLURM array. Each task picks one .pkl from
+# <input_dir> by SLURM_ARRAY_TASK_ID and writes its report to
+# <output_root>/<sample_id>/.
 #
 # Args:
 #   $1  Input directory (extract shards/ or refined refined/)

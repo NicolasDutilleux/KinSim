@@ -289,15 +289,11 @@ _DEFAULT_KINSIM_CONFIG = {
         "downstream": 3,
         "rev_meth_offsets": [-1, 0, 1],
     },
-    "meth_context": {"left": 7, "right": 3},  # legacy alias, kept for back-compat
     "extract": {
         "n_baseline_per_kmer": 50,
         "baseline_min_dist_to_meth": 11,
         "baseline_sample_rate": 0.10,
         "near_meth_max_dist": 7,
-    },
-    "refine": {
-        "slowed_split": {"secondary_percentile": 95},
     },
 }
 
@@ -461,25 +457,19 @@ def get_meth_alias_map() -> dict[str, str]:
 # The first three are bound by the rule  ``upstream + 1 + downstream == kmer_size``.
 # Violating it = silent shape mismatch later; we refuse to start instead.
 #
-# These values come from `kinsim_config.yaml`, the `extraction:` block, with
-# the legacy `meth_context: {left, right}` block as a backward-compat fallback.
+# These values come from `kinsim_config.yaml`, the `extraction:` block.
 
 
-# Hardcoded fallbacks — used only if both `extraction:` and `meth_context:` are
-# missing from the YAML. Match the historical defaults so legacy runs are
-# bit-for-bit reproducible.
+# Hardcoded fallbacks — used only if `extraction:` is missing from the YAML.
+# Match the historical K=11 defaults.
 _FALLBACK_KMER_SIZE = 11
 _FALLBACK_UPSTREAM = 7
 _FALLBACK_DOWNSTREAM = 3
 _FALLBACK_REV_METH_OFFSETS = (-1, 0, 1)
 
-# Practical limits — guard against typos and unreasonable values. Above 16
-# the packed kmer-id integer no longer fits efficiently into the legacy
-# MLPPredictor's embedding table (4^17 ≈ 1.7e10 rows). Above 31 the encoding
-# overflows int64.
+# Practical limits — kmer_size > 31 overflows int64 in the packed encoding.
 _KMER_SIZE_MIN = 3
 _KMER_SIZE_MAX = 31
-_MLP_KMER_SIZE_MAX = 12  # 4^13 × 64 dim float32 ≈ 17 GB embedding — refused
 
 KINSIM_LAYOUT_VERSION = 1
 """Bump when the sample-vector column layout changes in a non-back-compatible way.
@@ -611,26 +601,11 @@ class ExtractionParams:
 
     @classmethod
     def from_dict(cls, raw: dict) -> "ExtractionParams":
-        """Reconstruct from a dict (e.g. from shard meta or a checkpoint).
-
-        Accepts dicts written either by the new ``to_dict()`` or by the
-        legacy ``meth_context: {left, right}`` block; missing fields fall
-        back to historical defaults so old shards stay readable.
-        """
+        """Reconstruct from a dict written by :meth:`to_dict`."""
         if not isinstance(raw, dict):
             raise ValueError(
                 f"ExtractionParams.from_dict expected a dict, got "
                 f"{type(raw).__name__}."
-            )
-        # Legacy alias: meth_context.left/right
-        if "kmer_size" not in raw and ("left" in raw or "right" in raw):
-            left = int(raw.get("left", _FALLBACK_UPSTREAM))
-            right = int(raw.get("right", _FALLBACK_DOWNSTREAM))
-            return cls(
-                kmer_size=left + 1 + right,
-                upstream=left,
-                downstream=right,
-                rev_meth_offsets=tuple(raw.get("rev_meth_offsets", _FALLBACK_REV_METH_OFFSETS)),
             )
         kmer_size = int(raw.get("kmer_size", _FALLBACK_KMER_SIZE))
         upstream = int(raw.get("upstream", raw.get("active_site_index", _FALLBACK_UPSTREAM)))
@@ -675,90 +650,34 @@ class ExtractionParams:
             )
 
 
-def get_extraction_params(overrides: dict | None = None) -> ExtractionParams:
+def get_extraction_params() -> ExtractionParams:
     """Load and validate the project-wide window geometry.
 
-    Resolution order (high → low priority):
-        1. ``overrides`` dict — e.g. from CLI flags passed by ``kinsim extract``.
-        2. ``extraction:`` block in ``kinsim_config.yaml``.
-        3. Legacy ``meth_context: {left, right}`` block (backward-compat).
-        4. Hardcoded defaults: kmer_size=11, upstream=7, downstream=3.
-
-    Args:
-        overrides: Optional partial dict overlaying YAML values.
-
-    Returns:
-        Validated :class:`ExtractionParams`.
+    Reads the ``extraction:`` block from ``kinsim_config.yaml``; missing
+    fields fall back to the hardcoded defaults (kmer_size=11, upstream=7,
+    downstream=3, rev_meth_offsets=[-1, 0, 1]).
 
     Raises:
-        ValueError: If the resolved values violate the window invariant or
-            any other validation rule.
+        ValueError: If the resolved values violate the window invariant.
     """
     cfg = load_kinsim_config()
     raw_ext = dict(cfg.get("extraction") or {})
-    raw_meth = dict(cfg.get("meth_context") or {})
 
-    # Layer 1: hardcoded fallbacks.
-    kmer_size = _FALLBACK_KMER_SIZE
-    upstream = _FALLBACK_UPSTREAM
-    downstream = _FALLBACK_DOWNSTREAM
-    rev_meth: tuple[int, ...] = _FALLBACK_REV_METH_OFFSETS
-
-    # Layer 2: legacy meth_context.left/right.
-    if "left" in raw_meth or "right" in raw_meth:
-        left = int(raw_meth.get("left", _FALLBACK_UPSTREAM))
-        right = int(raw_meth.get("right", _FALLBACK_DOWNSTREAM))
-        upstream = left
-        downstream = right
-        kmer_size = left + 1 + right
-
-    # Layer 3: explicit `extraction:` block wins over the legacy alias.
-    if "kmer_size" in raw_ext:
-        kmer_size = int(raw_ext["kmer_size"])
-    if "upstream" in raw_ext:
-        upstream = int(raw_ext["upstream"])
+    kmer_size = int(raw_ext.get("kmer_size", _FALLBACK_KMER_SIZE))
+    upstream = int(raw_ext.get("upstream", raw_ext.get("active_site_index", _FALLBACK_UPSTREAM)))
     if "downstream" in raw_ext:
         downstream = int(raw_ext["downstream"])
-    if "active_site_index" in raw_ext and "upstream" not in raw_ext:
-        upstream = int(raw_ext["active_site_index"])
+    else:
         downstream = kmer_size - upstream - 1
-    if "rev_meth_offsets" in raw_ext:
-        rev_meth = tuple(int(x) for x in raw_ext["rev_meth_offsets"])
-
-    # Layer 4: caller overrides (CLI flags).
-    if overrides:
-        if "kmer_size" in overrides and overrides["kmer_size"] is not None:
-            kmer_size = int(overrides["kmer_size"])
-        if "upstream" in overrides and overrides["upstream"] is not None:
-            upstream = int(overrides["upstream"])
-        if "downstream" in overrides and overrides["downstream"] is not None:
-            downstream = int(overrides["downstream"])
-        if "rev_meth_offsets" in overrides and overrides["rev_meth_offsets"] is not None:
-            rev_meth = tuple(int(x) for x in overrides["rev_meth_offsets"])
-
+    rev_meth = tuple(
+        int(x) for x in raw_ext.get("rev_meth_offsets", _FALLBACK_REV_METH_OFFSETS)
+    )
     return ExtractionParams(
         kmer_size=kmer_size,
         upstream=upstream,
         downstream=downstream,
         rev_meth_offsets=rev_meth,
     )
-
-
-# Convenience scalar accessors — preferred when a single value is needed.
-
-def get_kmer_size() -> int:
-    """Return the current kmer window size (`extraction.kmer_size`)."""
-    return get_extraction_params().kmer_size
-
-
-def get_active_site_index() -> int:
-    """Return the active-site index inside the kmer window."""
-    return get_extraction_params().active_site_index
-
-
-def get_rev_meth_offsets() -> tuple[int, ...]:
-    """Return complementary-strand offsets captured at the active-site footprint."""
-    return get_extraction_params().rev_meth_offsets
 
 
 # ---------------------------------------------------------------------------

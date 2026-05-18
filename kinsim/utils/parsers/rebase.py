@@ -959,14 +959,14 @@ def main(argv=None):
         try:
             entries = fetch_rebase_org(args.org_num, args.output)
         except RuntimeError as e:
-            print(f"ERROR: {e}", file=sys.stderr)
+            log.error("REBASE fetch failed: %s", e)
             sys.exit(1)
-        print(f"Wrote {len(entries)} motifs to {args.output}")
+        log.info("Wrote %d motifs to %s", len(entries), args.output)
 
     elif args.command == "parse":
         result = parse_rebase_file(args.input)
         if not result:
-            print("No motifs found in the REBASE file.", file=sys.stderr)
+            log.error("No motifs found in the REBASE file.")
             sys.exit(1)
 
         if getattr(args, "output_csv", None) is not None:

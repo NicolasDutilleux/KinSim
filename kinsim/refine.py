@@ -54,17 +54,10 @@ component (raw IPD ~90 for m6A) sits well above baseline (~26),
 whereas log1p compresses them to log 4.5 vs 3.3 and harder-to-separate
 intermediate components appear.
 
-Legacy method — ``--method p95``
---------------------------------
-Single global threshold = ``secondary_percentile`` of the per-kmer
-baseline-mean distribution. Drops ``slowed`` rows below the threshold.
-Kept for comparison; not recommended.
-
 Usage::
 
     kinsim refine in.pkl out.pkl                  # default anchored GMM
     kinsim refine shards/ refined/                # sharded directory mode
-    kinsim refine in.pkl out.pkl --method p95     # legacy fallback
     kinsim refine in.pkl out.pkl --n-components 3 # force K=3
 """
 
@@ -82,162 +75,7 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# p95 method (legacy) — single global threshold
-# ---------------------------------------------------------------------------
-
-# Min baseline samples per kmer required for that kmer to contribute a
-# mean to the p95 threshold computation. Below this the per-kmer mean is
-# too noisy to trust.
-MIN_BASELINE_PER_KMER_FOR_THRESHOLD = 5
-
-
-def slowed_split(
-    data: dict,
-    secondary_pct: float,
-) -> tuple[dict, dict]:
-    """Drop CATEGORY_SLOWED samples whose IPD falls below the
-    ``secondary_pct`` percentile of the per-kmer baseline mean
-    distribution.
-
-    Args:
-        data: dict[kmer_id -> ndarray(N, 20)]. Col 17 carries the
-            category enum (0=baseline, 1=slowed, 2=near_meth).
-        secondary_pct: percentile of the per-kmer baseline mean used as
-            the lower threshold for slowed samples (typically 95).
-
-    Returns:
-        (new_data, stats) where new_data is a fresh dict with the same
-        kmer keys and surviving rows, and stats is a small dict with
-        in/out counts per category, the threshold used, and the
-        baseline-distribution summary statistics.
-    """
-    from .utils.sample_layout import (
-        CATEGORY_BASELINE,
-        CATEGORY_NEAR_METH,
-        CATEGORY_SLOWED,
-        COL_CATEGORY,
-        COL_IPD,
-    )
-
-    # 1. Threshold = percentile of per-kmer baseline means.
-    kmer_baseline_means: list = []
-    pooled_for_stats: list = []  # for diagnostics only
-    for kid, arr in data.items():
-        if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
-            continue
-        if arr.shape[1] <= COL_CATEGORY:
-            continue
-        cats = arr[:, COL_CATEGORY].astype(np.int8)
-        m = cats == CATEGORY_BASELINE
-        n_b = int(m.sum())
-        if n_b == 0:
-            continue
-        ipds = arr[m, COL_IPD]
-        pooled_for_stats.append(ipds)
-        if n_b >= MIN_BASELINE_PER_KMER_FOR_THRESHOLD:
-            kmer_baseline_means.append(float(ipds.mean()))
-
-    if pooled_for_stats and kmer_baseline_means:
-        pooled = np.concatenate(pooled_for_stats)
-        kmer_means = np.array(kmer_baseline_means, dtype=np.float32)
-        threshold = float(np.percentile(kmer_means, secondary_pct))
-
-        log.info(
-            "[refine.p95] baseline IPD per-sample:  n=%d  mean=%.2f  std=%.2f",
-            len(pooled),
-            float(pooled.mean()),
-            float(pooled.std()),
-        )
-        log.info(
-            "[refine.p95]   per-sample quantiles:    "
-            "p5=%.0f  p50=%.0f  p75=%.0f  p90=%.0f  p95=%.0f  p99=%.0f  max=%.0f",
-            float(np.percentile(pooled, 5)),
-            float(np.percentile(pooled, 50)),
-            float(np.percentile(pooled, 75)),
-            float(np.percentile(pooled, 90)),
-            float(np.percentile(pooled, 95)),
-            float(np.percentile(pooled, 99)),
-            float(pooled.max()),
-        )
-        log.info(
-            "[refine.p95] baseline PER-KMER MEAN: n_kmers=%d (>= %d samples each)  "
-            "mean=%.2f  std=%.2f",
-            len(kmer_means),
-            MIN_BASELINE_PER_KMER_FOR_THRESHOLD,
-            float(kmer_means.mean()),
-            float(kmer_means.std()),
-        )
-        log.info(
-            "[refine.p95] threshold = p%g(baseline PER-KMER MEAN) = %.2f",
-            secondary_pct,
-            threshold,
-        )
-    else:
-        threshold = 0.0
-        log.warning("[refine.p95] no baseline samples — threshold=0 (no FP filter)")
-
-    # 2. Filter slowed by IPD >= threshold; baseline + near_meth pass through.
-    new_data: dict = {}
-    n_baseline_in = n_baseline_out = 0
-    n_near_in = n_near_out = 0
-    n_slowed_in = n_slowed_kept = n_slowed_dropped = 0
-    for kid, arr in data.items():
-        if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
-            continue
-        if arr.shape[1] <= COL_CATEGORY:
-            continue
-        cats = arr[:, COL_CATEGORY].astype(np.int8)
-        base_m = cats == CATEGORY_BASELINE
-        slow_m = cats == CATEGORY_SLOWED
-        near_m = cats == CATEGORY_NEAR_METH
-        n_baseline_in += int(base_m.sum())
-        n_near_in += int(near_m.sum())
-        n_slowed_in += int(slow_m.sum())
-        slow_keep_mask = slow_m & (arr[:, COL_IPD] >= threshold)
-        n_slowed_kept += int(slow_keep_mask.sum())
-        n_slowed_dropped += int(slow_m.sum() - slow_keep_mask.sum())
-        keep_rows = base_m | near_m | slow_keep_mask
-        if keep_rows.any():
-            new_data[int(kid)] = arr[keep_rows].copy()
-            n_baseline_out += int(base_m.sum())
-            n_near_out += int(near_m.sum())
-
-    log.info(
-        "[refine.p95] baseline:  %d in -> %d kept (pass-through)",
-        n_baseline_in,
-        n_baseline_out,
-    )
-    log.info(
-        "[refine.p95] near_meth: %d in -> %d kept (pass-through)",
-        n_near_in,
-        n_near_out,
-    )
-    log.info(
-        "[refine.p95] slowed:    %d in -> %d kept, %d dropped (IPD < %.2f)  survival = %.2f%%",
-        n_slowed_in,
-        n_slowed_kept,
-        n_slowed_dropped,
-        threshold,
-        100.0 * n_slowed_kept / max(n_slowed_in, 1),
-    )
-
-    stats = {
-        "method": "p95_per_kmer_baseline_mean",
-        "secondary_percentile": secondary_pct,
-        "threshold": threshold,
-        "n_baseline_in": n_baseline_in,
-        "n_baseline_out": n_baseline_out,
-        "n_near_in": n_near_in,
-        "n_near_out": n_near_out,
-        "n_slowed_in": n_slowed_in,
-        "n_slowed_kept": n_slowed_kept,
-        "n_slowed_dropped": n_slowed_dropped,
-    }
-    return new_data, stats
-
-
-# ---------------------------------------------------------------------------
-# GMM method (default) — per-meth-type 2-component mixture
+# GMM method — per-meth-type 2-component mixture (default and only method)
 # ---------------------------------------------------------------------------
 
 
@@ -1359,8 +1197,6 @@ def _passthrough(data: dict, method: str) -> tuple[dict, dict]:
 def refine_pkl(
     in_path: Path,
     out_path: Path,
-    method: str = "gmm",
-    secondary_percentile: float | None = None,
     min_samples_for_gmm: int = 100,
     n_components: int | tuple[int, ...] = (1, 2, 3),
     strict_bic_nats_per_sample: float = 1.0,
@@ -1371,28 +1207,18 @@ def refine_pkl(
 ) -> dict:
     """Refine one master .pkl OR a directory of shards (auto-detected).
 
-    If ``in_path`` is a directory, the **sharded** refine path is used:
-    pool harvest across shards → fit anchored GMM once globally → apply
-    per-shard and write to ``out_path/`` (which must be a directory).
-    Peak RAM is bounded by one shard, not the full corpus.
+    If ``in_path`` is a directory, the **sharded** path is used: pool
+    harvest across shards → fit anchored GMM globally → apply per-shard
+    and write to ``out_path/``. Peak RAM is bounded by one shard.
 
-    If ``in_path`` is a file, the in-memory ``slowed_split_gmm`` /
-    ``slowed_split`` path is used: load, fit, filter, atomic write.
-
-    Args:
-        method: ``"gmm"`` (default; baseline-anchored, log1p) or
-            ``"p95"`` (legacy single global threshold).
-        secondary_percentile: percentile for the ``p95`` method.
-        min_samples_for_gmm / n_components / seed: knobs for ``gmm``.
+    If ``in_path`` is a file, the in-memory path is used: load, fit,
+    filter, atomic write.
     """
     in_path = Path(in_path)
     out_path = Path(out_path)
 
     # ── Sharded mode: in_path is a directory of *_shard.pkl files. ──────
     if in_path.is_dir():
-        if method != "gmm":
-            log.error("Sharded refine only supports method=gmm (got %r)", method)
-            sys.exit(1)
         from .utils.sample_layout import SAMPLE_NCOLS
 
         # Quick layout sanity check on the first shard.
@@ -1464,43 +1290,28 @@ def refine_pkl(
         )
         sys.exit(1)
 
-    if method == "gmm":
-        n_comp_summary = (
-            f"{n_components}"
-            if isinstance(n_components, int)
-            else "auto-BIC over " + ",".join(str(k) for k in n_components)
-        )
-        log.info(
-            "Refine: method=gmm (anchored)  n_components=%s  "
-            "strict_bic=%.2f nats/sample  min_samples_for_gmm=%d",
-            n_comp_summary,
-            strict_bic_nats_per_sample,
-            min_samples_for_gmm,
-        )
-        new_data, stats = slowed_split_gmm(
-            int_keyed,
-            min_samples_for_gmm=min_samples_for_gmm,
-            n_components=n_components,
-            strict_bic_nats_per_sample=strict_bic_nats_per_sample,
-            similarity_sigma_margin=similarity_sigma_margin,
-            max_baseline_pool=max_baseline_pool,
-            max_slowed_per_bucket=max_slowed_per_bucket,
-            seed=seed,
-        )
-    elif method == "p95":
-        if secondary_percentile is None:
-            from .utils.config import load_kinsim_config
-
-            cfg = load_kinsim_config()
-            secondary_percentile = float(
-                ((cfg.get("refine") or {}).get("slowed_split") or {}).get(
-                    "secondary_percentile", 95.0
-                )
-            )
-        log.info("Refine: method=p95  secondary_percentile=%g", secondary_percentile)
-        new_data, stats = slowed_split(int_keyed, secondary_percentile)
-    else:
-        raise ValueError(f"Unknown refine method: {method!r} (use 'gmm' or 'p95')")
+    n_comp_summary = (
+        f"{n_components}"
+        if isinstance(n_components, int)
+        else "auto-BIC over " + ",".join(str(k) for k in n_components)
+    )
+    log.info(
+        "Refine: method=gmm (anchored)  n_components=%s  "
+        "strict_bic=%.2f nats/sample  min_samples_for_gmm=%d",
+        n_comp_summary,
+        strict_bic_nats_per_sample,
+        min_samples_for_gmm,
+    )
+    new_data, stats = slowed_split_gmm(
+        int_keyed,
+        min_samples_for_gmm=min_samples_for_gmm,
+        n_components=n_components,
+        strict_bic_nats_per_sample=strict_bic_nats_per_sample,
+        similarity_sigma_margin=similarity_sigma_margin,
+        max_baseline_pool=max_baseline_pool,
+        max_slowed_per_bucket=max_slowed_per_bucket,
+        seed=seed,
+    )
 
     new_data["__meta__"] = {
         "refined_from": str(in_path),
@@ -1525,13 +1336,6 @@ def main(argv=None):
     )
     ap.add_argument("input_pkl", help="Shard .pkl from `kinsim extract`, OR a directory of *_shard.pkl (sharded mode)")
     ap.add_argument("output_pkl", help="Output refined .pkl")
-    ap.add_argument(
-        "--method",
-        choices=("gmm", "p95"),
-        default="gmm",
-        help="Filter method (default: gmm — per-meth-type 2-component "
-        "Gaussian Mixture; p95 — legacy global per-kmer-mean p95).",
-    )
     # GMM knobs
     ap.add_argument(
         "--min-samples-for-gmm",
@@ -1601,15 +1405,6 @@ def main(argv=None):
         default=42,
         help="Random seed for GMM init and baseline subsampling.",
     )
-    # p95 knob (legacy)
-    ap.add_argument(
-        "--secondary-percentile",
-        type=float,
-        default=None,
-        help="p95 method only. Percentile of per-kmer baseline mean used "
-        "as the lower IPD threshold. Overrides "
-        "kinsim_config.yaml refine.slowed_split.secondary_percentile.",
-    )
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -1618,7 +1413,7 @@ def main(argv=None):
     in_p = Path(args.input_pkl)
     out_p = Path(args.output_pkl)
     if not in_p.exists():
-        print(f"ERROR: {in_p} not found", file=sys.stderr)
+        log.error("input not found: %s", in_p)
         sys.exit(1)
     out_p.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1626,15 +1421,13 @@ def main(argv=None):
     raw = args.n_components.strip()
     parsed = tuple(int(p.strip()) for p in raw.split(",") if p.strip())
     if not parsed:
-        print("ERROR: --n-components must contain at least one integer", file=sys.stderr)
+        log.error("--n-components must contain at least one integer")
         sys.exit(1)
     n_components_arg = parsed[0] if len(parsed) == 1 else parsed
 
     refine_pkl(
         in_p,
         out_p,
-        method=args.method,
-        secondary_percentile=args.secondary_percentile,
         min_samples_for_gmm=args.min_samples_for_gmm,
         n_components=n_components_arg,
         strict_bic_nats_per_sample=args.strict_bic,

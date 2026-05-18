@@ -13,7 +13,7 @@ This module provides:
 
     log_transform(x)        map raw [0, 255] signals into log1p space for training
     inv_log_transform(x)    recover raw uint8 [0, 255] from log1p (inference)
-    MLPSignalDataset        loads a single shard into RAM (small datasets / debugging)
+    SignalDataset           loads a single shard into RAM (small datasets / debugging)
     ShardedSignalDataset    PyTorch ``IterableDataset`` over a list of shard
                             pkls. Memory bounded by one shard regardless of
                             corpus size. Worker-aware (partitions shards across
@@ -85,7 +85,7 @@ def inv_log_transform(x: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers (used by both MLPSignalDataset and ShardedSignalDataset)
+# Shared helpers (used by both SignalDataset and ShardedSignalDataset)
 # ---------------------------------------------------------------------------
 
 
@@ -253,24 +253,53 @@ def _flatten_data_dict(
     signals_list   = None
 
     # ── Vectorised meth_full construction (the big speedup) ────────────────
-    # meth_full[i, pos, m] = 1.0 if mc/rev has meth m at pos, else 0.0
-    # except: meth_full[i, pred_idx, m] = fractions[i] (stoichiometry).
+    # meth_full[i, pos, m] = 1.0 if mc/rev has meth m at pos, else 0.0.
+    # except: at the PARENT meth position the value is replaced by the
+    # per-row motif occupancy ``fractions[i]`` so the model can tell a
+    # fully-methylated site (frac=1.0) from a partial one (frac=0.5).
+    #
+    # The parent position inside the kmer is ``pred_idx - parent_offset``:
+    #   * SLOWED/m6A@+0 row: parent_offset = 0 → parent_pos = pred_idx
+    #     (the methylation IS at the active site)
+    #   * SLOWED/m6A@+5 row: parent_offset = 5 → parent_pos = pred_idx - 5
+    #     (the methylation is 5 bases upstream of the active site)
+    #   * NEAR_METH/m5C@+1 row: parent_offset = 1 → parent_pos = pred_idx - 1
+    #
+    # Before this fix, frac was applied only at pred_idx, so SLOWED rows
+    # at non-zero offsets (m6A@+5, m5C@+2, m5C@+6, m4C@+0 when polymerase
+    # is offset, NEAR_METH at any +k) ignored the occupancy entirely —
+    # the model couldn't tell a real-methylation context from a half-
+    # methylated motif. Fixing this is mostly a win for m5C/m4C which
+    # have non-zero signal offsets and are typically partially methylated.
     n_rows = kmer_ids.shape[0]
     meth_full = np.zeros((n_rows, total_pos, num_meth_types), dtype=np.float32)
 
-    # Forward block: scatter meth_ctx → meth_full[:, 0:kmer_size, :]
+    # Forward block: scatter meth_ctx → meth_full[:, 0:kmer_size, :] as 1.0.
     rows_idx, cols_idx = np.where(meth_ctx > 0)
     if rows_idx.size:
         m_ids = meth_ctx[rows_idx, cols_idx].astype(np.int64)
         # Clamp to valid meth_id range to avoid IndexError on corrupted shards.
         m_ids = np.clip(m_ids, 0, num_meth_types - 1)
         meth_full[rows_idx, cols_idx, m_ids] = 1.0
-        # Overwrite pred_idx position with fraction (per-row stoichiometry).
-        pred_mask = cols_idx == pred_idx
-        if pred_mask.any():
-            pred_rows = rows_idx[pred_mask]
-            pred_m = m_ids[pred_mask]
-            meth_full[pred_rows, pred_idx, pred_m] = fractions[pred_rows]
+
+    # Overwrite the PARENT meth position with the per-row fraction. Only
+    # applies to non-baseline rows (baselines have parent_meths == 0 and
+    # carry no occupancy info).
+    non_baseline = parent_meths > 0
+    if non_baseline.any():
+        nb_rows = np.where(non_baseline)[0]
+        parent_kmer_pos = pred_idx - parent_offsets[nb_rows].astype(np.int64)
+        # Guard against rows where the parent fell outside the kmer window
+        # (shouldn't happen with extract's parent_offset ∈ [0, K-1], but
+        # cheap insurance against corrupted shards).
+        valid = (parent_kmer_pos >= 0) & (parent_kmer_pos < kmer_size)
+        if valid.any():
+            nb_valid = nb_rows[valid]
+            pp_valid = parent_kmer_pos[valid]
+            pm_valid = np.clip(
+                parent_meths[nb_valid].astype(np.int64), 0, num_meth_types - 1
+            )
+            meth_full[nb_valid, pp_valid, pm_valid] = fractions[nb_valid]
 
     # Rev_meth block: positions [kmer_size, kmer_size + n_rev_meth).
     rev_rows, rev_cols = np.where(rev_meth > 0)
@@ -317,7 +346,7 @@ def _expand_with_pairs(flat: dict, augment_seed: int = 42) -> dict:
     """Return a new flat-dict where every non-baseline row is followed by
     one paired baseline row for the same kmer.
 
-    Used by :class:`MLPSignalDataset` (in-memory, expand-once-at-init).
+    Used by :class:`SignalDataset` (in-memory, expand-once-at-init).
     :class:`ShardedSignalDataset` does the same pairing at iter time so
     the random pair differs per epoch.
     """
@@ -400,39 +429,10 @@ def _build_baseline_index(flat: dict) -> dict[int, np.ndarray]:
     }
 
 
-def _build_meth_full(
-    ctx_ids: np.ndarray,
-    rev_ids: np.ndarray,
-    frac: float,
-    pred_idx: int,
-    kmer_size: int,
-    num_meth_types: int,
-) -> torch.Tensor:
-    """Build the per-row ``meth_full`` Float[kmer_size + REV_METH_LEN, M] tensor.
-
-    Layout:
-      positions [0, kmer_size)         forward meth context (offsets [-7..+3])
-      positions [kmer_size, ...)       rev_meth at active-site neighbours [-1, 0, +1]
-
-    Encoding within the forward block:
-      - prediction position, meth_id m: ``meth_full[pred_idx, m] = frac``
-      - any other position, meth_id m: ``meth_full[pos, m] = 1.0``
-    Rev_meth positions are always one-hot (no frac mixing — they describe
-    a different strand's methylation status, not this row's stoichiometry).
-    """
-    from ..utils.sample_layout import REV_METH_LEN
-
-    total_pos = kmer_size + REV_METH_LEN
-    meth_full = torch.zeros(total_pos, num_meth_types, dtype=torch.float32)
-    for pos in range(kmer_size):
-        m = int(ctx_ids[pos])
-        if m > 0:
-            meth_full[pos, m] = frac if pos == pred_idx else 1.0
-    for k in range(REV_METH_LEN):
-        m = int(rev_ids[k])
-        if m > 0:
-            meth_full[kmer_size + k, m] = 1.0
-    return meth_full
+# NOTE: the per-row Python builder ``_build_meth_full`` used to live here.
+# Removed in v0.5 — it was a relic of the pre-v0.4 in-loop dataset and
+# has been replaced by the vectorised ``_flatten_data_dict`` block above
+# which builds the entire shard's meth_full tensor in one pass.
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +440,7 @@ def _build_meth_full(
 # ---------------------------------------------------------------------------
 
 
-class MLPSignalDataset(Dataset):
+class SignalDataset(Dataset):
     """Flat-sample dataset for KinSim training, in-memory.
 
     Loads a single merged .pkl entirely into RAM, partitions every kmer's
@@ -452,37 +452,22 @@ class MLPSignalDataset(Dataset):
     :class:`ShardedSignalDataset`.
 
     Args:
-        pkl_path:       Path to a single shard .pkl from ``kinsim extract`` (or refined).
-        num_meth_types: Number of methylation states (default 4: none/m6A/m4C/m5C).
-        kmer_size:      K-mer window size (default K=11).
+        pkl_path:       Single shard pkl to load fully into RAM.
+        num_meth_types: Number of methylation states (default 4).
+        augment:        Enable offline paired-positive augmentation.
+        augment_seed:   PRNG seed for the augmentation pair picker.
+        params:         Window-geometry record. If ``None``, read from
+                        shard meta then YAML.
     """
 
     def __init__(
         self,
         pkl_path: str,
         num_meth_types: int = 4,
-        kmer_size: int | None = None,
         augment: bool = False,
         augment_seed: int = 42,
         params: ExtractionParams | None = None,
     ) -> None:
-        """Args:
-            pkl_path:       Single shard pkl to load fully into RAM.
-            num_meth_types: Number of methylation states (default 4).
-            kmer_size:      *Deprecated* — pass ``params`` instead. If both are
-                            given, ``params.kmer_size`` wins.
-            augment:        Enable offline paired-positive augmentation.
-            augment_seed:   PRNG seed for the augmentation pair picker.
-            params:         Window-geometry record. If ``None``, it is read
-                            from the shard's ``__meta__["extraction_params"]``
-                            when present, otherwise from
-                            ``kinsim_config.yaml`` (legacy K=11 default for
-                            shards built before v0.5).
-
-        Raises:
-            ValueError: If the shard is empty, its layout disagrees with the
-                resolved ``params``, or any other invariant is violated.
-        """
         log.info("Loading training data from %s ...", pkl_path)
         with open(pkl_path, "rb") as f:
             data_dict = pickle.load(f)
@@ -492,7 +477,6 @@ class MLPSignalDataset(Dataset):
         if len(data_dict) == 0:
             raise ValueError(f"The .pkl file is empty: {pkl_path}")
 
-        # Resolve the geometry: explicit ``params`` > shard meta > YAML.
         shard_params = read_shard_extraction_params(data_dict)
         if params is not None:
             if shard_params is not None:
@@ -502,13 +486,7 @@ class MLPSignalDataset(Dataset):
             resolved = shard_params
         else:
             resolved = get_extraction_params()
-        if kmer_size is not None and kmer_size != resolved.kmer_size:
-            raise ValueError(
-                f"MLPSignalDataset: explicit kmer_size={kmer_size} disagrees "
-                f"with the resolved ExtractionParams.kmer_size="
-                f"{resolved.kmer_size}. Pass `params=` instead of kmer_size "
-                f"(or drop the kmer_size argument)."
-            )
+
         layout = get_sample_layout(resolved)
         flat = _flatten_data_dict(data_dict, layout, num_meth_types=num_meth_types)
         if flat["n_keys"] == 0:
@@ -525,15 +503,12 @@ class MLPSignalDataset(Dataset):
         self._kmer_ids = flat["kmer_ids"]
         self._meth_ids = flat["meth_ids"]
         self._signals = flat["signals_log"]
-        self._meth_full = flat["meth_full"]   # pre-built (N, total_meth_positions, M) float32
+        self._meth_full = flat["meth_full"]
         self._parent_meths   = flat["parent_meths"]
         self._parent_offsets = flat["parent_offsets"]
         self._categories     = flat["categories"]
 
         n_total = len(self._kmer_ids)
-        # Derive id→name from the YAML so adding a new methylation type
-        # only requires editing kinsim_config.yaml; "0" stays "unmeth"
-        # in this log line because the canonical name "none" reads worse.
         from ..utils.encoding import get_meth_ids
 
         _name_by_id = {v: k for k, v in get_meth_ids().items()}
@@ -544,7 +519,7 @@ class MLPSignalDataset(Dataset):
             if flat["meth_counts"][m] > 0
         )
         log.info(
-            "MLPSignalDataset ready: %s unique kmers, %s samples [%s]",
+            "SignalDataset ready: %s unique kmers, %s samples [%s]",
             f"{flat['n_keys']:,}",
             f"{n_total:,}",
             meth_summary,
@@ -591,7 +566,7 @@ class ShardedSignalDataset(IterableDataset):
     subset). This parallelises shard I/O and EM-flatten cost without RAM
     pressure.
 
-    Output rows are identical to :class:`MLPSignalDataset` —
+    Output rows are identical to :class:`SignalDataset` —
     ``(kmer_id, meth_full, log_signal, meth_id, parent_meth,
     parent_offset, category)`` — so the model code
     is the same regardless of dataset class.
@@ -612,49 +587,22 @@ class ShardedSignalDataset(IterableDataset):
         self,
         shard_paths,
         num_meth_types: int = 4,
-        kmer_size: int | None = None,
         shuffle: bool = True,
         seed: int = 42,
         augment: bool = False,
         balance_kmers: bool = False,
         params: ExtractionParams | None = None,
     ) -> None:
-        """Args:
-            shard_paths:    List of shard pkls to iterate over.
-            num_meth_types: Number of methylation states.
-            kmer_size:      *Deprecated*. Pass ``params`` instead.
-            shuffle:        Shuffle shard order per epoch and rows within shard.
-            seed:           PRNG seed (combined with worker_id and epoch).
-            augment:        Enable paired-positive augmentation at iter time.
-            balance_kmers:  Enable per-(kmer, category) inverse-frequency draw.
-            params:         Window-geometry record. If ``None``, the geometry
-                            is inferred from the FIRST shard's meta; every
-                            subsequent shard is then required to match.
-
-        Raises:
-            ValueError: If ``shard_paths`` is empty, or (at iter time) a shard
-                disagrees with the resolved geometry.
-        """
         super().__init__()
         self._shard_paths = [str(Path(p)) for p in shard_paths]
         if not self._shard_paths:
             raise ValueError("shard_paths is empty")
         self._num_meth_types = num_meth_types
-        # Resolve geometry once at construction time so the column layout
-        # is fixed for the lifetime of the dataset. If `params` was not
-        # given, peek at the first shard's __meta__. Falls back to the
-        # active YAML if the shard is pre-v0.5.
+        # Resolve geometry once: explicit `params` > first shard's meta > YAML.
         if params is None:
             params = _peek_shard_extraction_params(self._shard_paths[0])
             if params is None:
                 params = get_extraction_params()
-        if kmer_size is not None and kmer_size != params.kmer_size:
-            raise ValueError(
-                f"ShardedSignalDataset: explicit kmer_size={kmer_size} "
-                f"disagrees with the resolved ExtractionParams.kmer_size="
-                f"{params.kmer_size}. Drop the kmer_size argument and pass "
-                f"`params=` instead."
-            )
         self._params = params
         self._layout = get_sample_layout(params)
         self._kmer_size = params.kmer_size

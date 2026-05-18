@@ -69,17 +69,6 @@ def atomic_write_text(text: str, path: str | Path, encoding: str = "utf-8") -> N
     os.replace(tmp, path)
 
 
-# Asymmetric padding around each prediction position. With kmer covering
-# [-KMER_LEFT_PAD, +KMER_RIGHT_PAD] from the prediction position, the
-# extended context needs KMER_LEFT_PAD bases on the left side and
-# KMER_RIGHT_PAD on the right of the read.
-#
-# `MID` is no longer a single value — kept temporarily as KMER_LEFT_PAD for
-# any external import; new code should explicitly use KMER_LEFT_PAD or
-# KMER_RIGHT_PAD depending on intent.
-MID = KMER_LEFT_PAD
-
-
 # ---------------------------------------------------------------------------
 # Reference loader
 # ---------------------------------------------------------------------------

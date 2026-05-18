@@ -45,7 +45,7 @@ import numpy as np
 import torch
 
 from .data.dataset import inv_log_transform
-from .models.predictor import create_from_config
+from .models.predictor import create_from_config, load_state_dict_from_ckpt
 from .utils.config import load_kinsim_config, setup_logging
 from .utils.encoding import K, KMER_PRED_IDX, decode_kmer, get_meth_ids
 from .utils.sample_layout import REV_METH_LEN
@@ -118,23 +118,8 @@ def _load_model(ckpt_dir: Path, device: torch.device) -> tuple[torch.nn.Module, 
 
     ckpt_path = _find_checkpoint(ckpt_dir)
     log.info("Loading checkpoint: %s", ckpt_path)
-    state = torch.load(str(ckpt_path), map_location=device)
-
     model = create_from_config(config).to(device)
-
-    # Handle both legacy ('model' key) and Lightning ('state_dict' with 'model.' prefix).
-    if isinstance(state, dict) and "model" in state:
-        model.load_state_dict(state["model"])
-    elif isinstance(state, dict) and "state_dict" in state:
-        sd = {
-            k.replace("model.", "", 1): v
-            for k, v in state["state_dict"].items()
-            if k.startswith("model.")
-        }
-        model.load_state_dict(sd)
-    else:
-        model.load_state_dict(state)
-
+    model.load_state_dict(load_state_dict_from_ckpt(ckpt_path))
     model.eval()
     return model, config
 
