@@ -162,7 +162,9 @@ def load_manifest(manifest_path: str) -> list[SampleEntry]:
     n_aligned = sum(1 for e in entries if e.ref_path)
     log.info(
         "Loaded %d samples from manifest: %s (%d with ref_path → aligned extract path)",
-        len(entries), manifest_path, n_aligned,
+        len(entries),
+        manifest_path,
+        n_aligned,
     )
     return entries
 
@@ -409,7 +411,7 @@ def get_modified_base_map() -> dict[str, str]:
     """
     cfg = load_kinsim_config()
     out: dict[str, str] = {}
-    for mname in (cfg.get("kinetic_signatures") or {}):
+    for mname in cfg.get("kinetic_signatures") or {}:
         out[mname] = get_modified_base(mname)
     return out
 
@@ -591,21 +593,20 @@ class ExtractionParams:
     def to_dict(self) -> dict:
         """Return a plain dict suitable for shard ``__meta__`` and JSON dumps."""
         return {
-            "kmer_size":         self.kmer_size,
-            "upstream":          self.upstream,
-            "downstream":        self.downstream,
+            "kmer_size": self.kmer_size,
+            "upstream": self.upstream,
+            "downstream": self.downstream,
             "active_site_index": self.active_site_index,
-            "rev_meth_offsets":  list(self.rev_meth_offsets),
-            "layout_version":    KINSIM_LAYOUT_VERSION,
+            "rev_meth_offsets": list(self.rev_meth_offsets),
+            "layout_version": KINSIM_LAYOUT_VERSION,
         }
 
     @classmethod
-    def from_dict(cls, raw: dict) -> "ExtractionParams":
+    def from_dict(cls, raw: dict) -> ExtractionParams:
         """Reconstruct from a dict written by :meth:`to_dict`."""
         if not isinstance(raw, dict):
             raise ValueError(
-                f"ExtractionParams.from_dict expected a dict, got "
-                f"{type(raw).__name__}."
+                f"ExtractionParams.from_dict expected a dict, got {type(raw).__name__}."
             )
         kmer_size = int(raw.get("kmer_size", _FALLBACK_KMER_SIZE))
         upstream = int(raw.get("upstream", raw.get("active_site_index", _FALLBACK_UPSTREAM)))
@@ -622,7 +623,7 @@ class ExtractionParams:
     # Compatibility check — used by `kinsim train` to refuse mismatched shards
     # ------------------------------------------------------------------
 
-    def assert_compatible(self, other: "ExtractionParams", *, where: str) -> None:
+    def assert_compatible(self, other: ExtractionParams, *, where: str) -> None:
         """Raise ``ValueError`` if the two records disagree on geometry.
 
         Args:
@@ -669,9 +670,7 @@ def get_extraction_params() -> ExtractionParams:
         downstream = int(raw_ext["downstream"])
     else:
         downstream = kmer_size - upstream - 1
-    rev_meth = tuple(
-        int(x) for x in raw_ext.get("rev_meth_offsets", _FALLBACK_REV_METH_OFFSETS)
-    )
+    rev_meth = tuple(int(x) for x in raw_ext.get("rev_meth_offsets", _FALLBACK_REV_METH_OFFSETS))
     return ExtractionParams(
         kmer_size=kmer_size,
         upstream=upstream,
@@ -688,30 +687,30 @@ def get_extraction_params() -> ExtractionParams:
 # Hardcoded fallbacks — used only when the YAML is missing the relevant block.
 # Kept in lockstep with the defaults documented in `kinsim_config.yaml`.
 _MODEL_FALLBACK = {
-    "architecture":         "conv",
-    "base_embed_dim":       16,
-    "n_conv_layers":        3,
-    "conv_channels":        128,
-    "conv_kernel_size":     3,
-    "head_hidden_dim":      128,
-    "head_dropout":         0.1,
-    "meth_proj_dim":        8,
-    "kmer_aware_film":      True,
-    "biology_mask":         False,   # off by default; see kinsim_config.yaml
-    "log_sigma_clamp_max":  3.0,
+    "architecture": "conv",
+    "base_embed_dim": 16,
+    "n_conv_layers": 3,
+    "conv_channels": 128,
+    "conv_kernel_size": 3,
+    "head_hidden_dim": 128,
+    "head_dropout": 0.1,
+    "meth_proj_dim": 8,
+    "kmer_aware_film": True,
+    "biology_mask": False,  # off by default; see kinsim_config.yaml
+    "log_sigma_clamp_max": 3.0,
 }
 
 _TRAINING_FALLBACK = {
-    "epochs":            50,
-    "batch_size":        4096,
-    "lr":                1e-3,
-    "loss":              "betanll",
-    "lr_schedule":       "cosine",
-    "warmup_epochs":     3,
-    "augment":           True,
-    "balance_kmers":     True,
-    "val_fraction":      0.10,
-    "checkpoint_every":  10,
+    "epochs": 50,
+    "batch_size": 4096,
+    "lr": 1e-3,
+    "loss": "betanll",
+    "lr_schedule": "cosine",
+    "warmup_epochs": 3,
+    "augment": True,
+    "balance_kmers": True,
+    "val_fraction": 0.10,
+    "checkpoint_every": 10,
 }
 
 

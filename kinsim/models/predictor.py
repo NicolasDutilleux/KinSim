@@ -63,8 +63,11 @@ def _build_meth_compat_buffer(num_meth_types: int) -> torch.Tensor:
             if mid > 0 and 0 <= mid < num_meth_types and bid is not None:
                 compat[bid, mid] = 1.0
     except Exception as exc:  # pragma: no cover — defensive
-        log.warning("biology_mask: could not build from YAML (%s) — "
-                    "falling back to all-ones (no constraint).", exc)
+        log.warning(
+            "biology_mask: could not build from YAML (%s) — "
+            "falling back to all-ones (no constraint).",
+            exc,
+        )
         compat.fill_(1.0)
     return compat
 
@@ -140,9 +143,7 @@ class ConvPredictor(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, kmer_size, base_embed_dim))
 
         self._meth_positions = kmer_size + self.n_rev_meth
-        self.meth_proj = nn.Linear(
-            self._meth_positions * num_meth_types, meth_proj_dim, bias=False
-        )
+        self.meth_proj = nn.Linear(self._meth_positions * num_meth_types, meth_proj_dim, bias=False)
 
         film_in_dim = meth_proj_dim + base_embed_dim if kmer_aware_film else meth_proj_dim
         self.film_gamma = nn.Linear(film_in_dim, base_embed_dim)
@@ -151,11 +152,13 @@ class ConvPredictor(nn.Module):
         conv_layers: list[nn.Module] = []
         in_ch = base_embed_dim
         for _ in range(n_conv_layers):
-            conv_layers.extend([
-                nn.Conv1d(in_ch, conv_dim, kernel_size, padding=kernel_size // 2),
-                nn.BatchNorm1d(conv_dim),
-                nn.GELU(),
-            ])
+            conv_layers.extend(
+                [
+                    nn.Conv1d(in_ch, conv_dim, kernel_size, padding=kernel_size // 2),
+                    nn.BatchNorm1d(conv_dim),
+                    nn.GELU(),
+                ]
+            )
             in_ch = conv_dim
         self.conv = nn.Sequential(*conv_layers)
 
@@ -280,7 +283,9 @@ class ConvPredictor(nn.Module):
         params = self.forward(kmer_ids, meth_probs)
         mu = params[:, :2]
         log_sig = torch.clamp(
-            params[:, 2:], self.log_sigma_clamp_min, self.log_sigma_clamp_max,
+            params[:, 2:],
+            self.log_sigma_clamp_min,
+            self.log_sigma_clamp_max,
         )
         sigma = torch.exp(log_sig)
         z = torch.randn_like(mu)
@@ -295,21 +300,21 @@ class ConvPredictor(nn.Module):
     def get_config(self) -> dict:
         """Return architecture config for model_config.json."""
         return {
-            "kmer_size":            self.kmer_size,
-            "active_site_index":    self.active_site_index,
-            "n_rev_meth":           self.n_rev_meth,
-            "base_embed_dim":       self.base_embed_dim,
-            "num_meth_types":       self.num_meth_types,
-            "meth_proj_dim":        self.meth_proj_dim,
-            "conv_dim":             self.conv_dim,
-            "n_conv_layers":        self.n_conv_layers,
-            "kernel_size":          self.kernel_size,
-            "head_dim":             self.head_dim,
-            "dropout":              self.dropout_p,
-            "kmer_aware_film":      self.kmer_aware_film,
-            "biology_mask":         self.biology_mask,
-            "log_sigma_clamp_min":  self.log_sigma_clamp_min,
-            "log_sigma_clamp_max":  self.log_sigma_clamp_max,
+            "kmer_size": self.kmer_size,
+            "active_site_index": self.active_site_index,
+            "n_rev_meth": self.n_rev_meth,
+            "base_embed_dim": self.base_embed_dim,
+            "num_meth_types": self.num_meth_types,
+            "meth_proj_dim": self.meth_proj_dim,
+            "conv_dim": self.conv_dim,
+            "n_conv_layers": self.n_conv_layers,
+            "kernel_size": self.kernel_size,
+            "head_dim": self.head_dim,
+            "dropout": self.dropout_p,
+            "kmer_aware_film": self.kmer_aware_film,
+            "biology_mask": self.biology_mask,
+            "log_sigma_clamp_min": self.log_sigma_clamp_min,
+            "log_sigma_clamp_max": self.log_sigma_clamp_max,
         }
 
 
@@ -355,9 +360,7 @@ def load_state_dict_from_ckpt(ckpt_path) -> dict:
     ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
     if "state_dict" in ckpt:
         return {
-            k[len("model."):]: v
-            for k, v in ckpt["state_dict"].items()
-            if k.startswith("model.")
+            k[len("model.") :]: v for k, v in ckpt["state_dict"].items() if k.startswith("model.")
         }
     if "model" in ckpt:
         return ckpt["model"]

@@ -45,24 +45,24 @@ log = logging.getLogger(__name__)
 def _code_to_frames_lut() -> np.ndarray:
     frames = np.zeros(256, dtype=np.int64)
     codes = np.arange(256)
-    frames[:64]     = codes[:64]
-    frames[64:128]  = 64  + (codes[64:128]  - 64)  * 2
+    frames[:64] = codes[:64]
+    frames[64:128] = 64 + (codes[64:128] - 64) * 2
     frames[128:192] = 192 + (codes[128:192] - 128) * 4
     frames[192:255] = 448 + (codes[192:255] - 192) * 8
-    frames[255]     = 952
+    frames[255] = 952
     return frames
 
 
 def _bin_widths_frames() -> np.ndarray:
     w = np.ones(256, dtype=np.float64)
-    w[64:128]  = 2.0
+    w[64:128] = 2.0
     w[128:192] = 4.0
     w[192:256] = 8.0
     return w
 
 
-FRAMES_X      = _code_to_frames_lut()
-BIN_WIDTHS    = _bin_widths_frames()
+FRAMES_X = _code_to_frames_lut()
+BIN_WIDTHS = _bin_widths_frames()
 FRAME_CENTRES = FRAMES_X + BIN_WIDTHS / 2.0
 
 
@@ -95,7 +95,7 @@ def _stats_in_frames(hist_256: np.ndarray) -> dict | None:
         return None
     frames = FRAME_CENTRES
     mean = float((frames * hist).sum() / n)
-    var  = float(((frames - mean) ** 2 * hist).sum() / n)
+    var = float(((frames - mean) ** 2 * hist).sum() / n)
     sigma = float(np.sqrt(max(var, 0.0)))
     cum = np.cumsum(hist)
 
@@ -106,13 +106,20 @@ def _stats_in_frames(hist_256: np.ndarray) -> dict | None:
         return float(FRAME_CENTRES[idx])
 
     return {
-        "n":     n, "mean":  mean, "sigma": sigma,
-        "p25":   at_q(0.25), "p50": at_q(0.50), "p75": at_q(0.75),
-        "p95":   at_q(0.95), "p99": at_q(0.99),
+        "n": n,
+        "mean": mean,
+        "sigma": sigma,
+        "p25": at_q(0.25),
+        "p50": at_q(0.50),
+        "p75": at_q(0.75),
+        "p95": at_q(0.95),
+        "p99": at_q(0.99),
     }
 
 
-def _ratio_above_threshold(hist_256: np.ndarray, threshold_factor: float) -> tuple[float, float, int]:
+def _ratio_above_threshold(
+    hist_256: np.ndarray, threshold_factor: float
+) -> tuple[float, float, int]:
     """For the histogram, compute ratio = mean_above_threshold / overall_mean.
 
     Same math as kinsim_baseline.compute's summary — included here to
@@ -153,7 +160,10 @@ def _color_for(meth_type: str, offset_index: int) -> str:
 
 
 def _distribution_panel(
-    signatures: dict, hist_ipd: dict, stats_by_key: dict, smooth: int,
+    signatures: dict,
+    hist_ipd: dict,
+    stats_by_key: dict,
+    smooth: int,
 ):
     """Two-row figure: bulk (cut at max(p75)) + wide (cut at max(p99))."""
     import plotly.graph_objects as go
@@ -165,7 +175,8 @@ def _distribution_panel(
     cut_p99 = float(np.ceil(max(p99s, default=250.0) / 25.0)) * 25.0
 
     fig = make_subplots(
-        rows=2, cols=1,
+        rows=2,
+        cols=1,
         subplot_titles=[
             f"Vue bulk — x ≤ p75 ({cut_p75:.0f} frames). C'est ici qu'on devrait voir la séparation entre buckets.",
             f"Vue large — x ≤ p99 ({cut_p99:.0f} frames). La queue droite contient théoriquement le signal méthylé.",
@@ -184,20 +195,38 @@ def _distribution_panel(
                 continue
             density = _to_frame_density(h, smooth=smooth)
             color = _color_for(T, i)
-            label = (f"{key}   n={int(s['n']/1e9):.1f}B   "
-                     f"μ={s['mean']:.1f}fr  p50={s['p50']:.0f}  p99={s['p99']:.0f}")
-            fig.add_trace(go.Scatter(
-                x=FRAMES_X, y=density, mode="lines", name=label,
-                line={"color": color, "width": 2},
-                legendgroup=key, showlegend=True,
-                hovertemplate=f"{key}<br>IPD=%{{x}} fr<br>density=%{{y:.6f}}<extra></extra>",
-            ), row=1, col=1)
-            fig.add_trace(go.Scatter(
-                x=FRAMES_X, y=density, mode="lines", name=label,
-                line={"color": color, "width": 2},
-                legendgroup=key, showlegend=False,
-                hovertemplate=f"{key}<br>IPD=%{{x}} fr<br>density=%{{y:.6f}}<extra></extra>",
-            ), row=2, col=1)
+            label = (
+                f"{key}   n={int(s['n'] / 1e9):.1f}B   "
+                f"μ={s['mean']:.1f}fr  p50={s['p50']:.0f}  p99={s['p99']:.0f}"
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=FRAMES_X,
+                    y=density,
+                    mode="lines",
+                    name=label,
+                    line={"color": color, "width": 2},
+                    legendgroup=key,
+                    showlegend=True,
+                    hovertemplate=f"{key}<br>IPD=%{{x}} fr<br>density=%{{y:.6f}}<extra></extra>",
+                ),
+                row=1,
+                col=1,
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=FRAMES_X,
+                    y=density,
+                    mode="lines",
+                    name=label,
+                    line={"color": color, "width": 2},
+                    legendgroup=key,
+                    showlegend=False,
+                    hovertemplate=f"{key}<br>IPD=%{{x}} fr<br>density=%{{y:.6f}}<extra></extra>",
+                ),
+                row=2,
+                col=1,
+            )
 
     fig.update_xaxes(range=[0, cut_p75], title_text="IPD (frames)", row=1, col=1)
     fig.update_xaxes(range=[0, cut_p99], title_text="IPD (frames)", row=2, col=1)
@@ -208,10 +237,13 @@ def _distribution_panel(
         template="plotly_white",
         legend={
             "orientation": "v",
-            "yanchor": "top", "y": 1.0,
-            "xanchor": "left", "x": 1.01,
+            "yanchor": "top",
+            "y": 1.0,
+            "xanchor": "left",
+            "x": 1.01,
             "bgcolor": "rgba(255,255,255,0.95)",
-            "bordercolor": "#ccc", "borderwidth": 1,
+            "bordercolor": "#ccc",
+            "borderwidth": 1,
             "font": {"size": 11},
         },
         margin={"t": 60, "b": 60, "l": 70, "r": 380},
@@ -225,7 +257,10 @@ def _distribution_panel(
 
 
 def _p75_tail_panel(
-    signatures: dict, hist_ipd: dict, stats_by_key: dict, smooth: int,
+    signatures: dict,
+    hist_ipd: dict,
+    stats_by_key: dict,
+    smooth: int,
 ):
     """Per-(T, k) distribution restricted to IPD >= p75.
 
@@ -246,7 +281,8 @@ def _p75_tail_panel(
     cut_p99 = float(np.ceil(max(p99s, default=250.0) / 25.0)) * 25.0
 
     fig = make_subplots(
-        rows=2, cols=1,
+        rows=2,
+        cols=1,
         subplot_titles=[
             "Queue p75+ — densité linéaire. Chaque bucket est filtré à IPD ≥ son propre p75 puis renormalisé.",
             "Queue p75+ — densité log y. Même données, axe log pour voir les différences de forme à faible densité.",
@@ -263,7 +299,7 @@ def _p75_tail_panel(
             s = stats_by_key.get(key)
             if s is None:
                 continue
-            tail_mask = FRAME_CENTRES >= s["p75"]
+            tail_mask = s["p75"] <= FRAME_CENTRES
             h_tail = np.where(tail_mask, h, 0.0)
             n_tail = h_tail.sum()
             if n_tail <= 0:
@@ -277,20 +313,35 @@ def _p75_tail_panel(
             density = (h_tail / n_tail) / BIN_WIDTHS
             density = np.where(tail_mask, density, 0.0)
             color = _color_for(T, i)
-            label = (f"{key}   n_tail={int(n_tail):,}   p75={s['p75']:.0f}  "
-                     f"p99={s['p99']:.0f}")
-            fig.add_trace(go.Scatter(
-                x=FRAMES_X, y=density, mode="lines", name=label,
-                line={"color": color, "width": 2},
-                legendgroup=key, showlegend=True,
-                hovertemplate=f"{key}<br>IPD=%{{x}} fr<br>density=%{{y:.6f}}<extra></extra>",
-            ), row=1, col=1)
-            fig.add_trace(go.Scatter(
-                x=FRAMES_X, y=density, mode="lines", name=label,
-                line={"color": color, "width": 2},
-                legendgroup=key, showlegend=False,
-                hovertemplate=f"{key}<br>IPD=%{{x}} fr<br>density=%{{y:.6f}}<extra></extra>",
-            ), row=2, col=1)
+            label = f"{key}   n_tail={int(n_tail):,}   p75={s['p75']:.0f}  p99={s['p99']:.0f}"
+            fig.add_trace(
+                go.Scatter(
+                    x=FRAMES_X,
+                    y=density,
+                    mode="lines",
+                    name=label,
+                    line={"color": color, "width": 2},
+                    legendgroup=key,
+                    showlegend=True,
+                    hovertemplate=f"{key}<br>IPD=%{{x}} fr<br>density=%{{y:.6f}}<extra></extra>",
+                ),
+                row=1,
+                col=1,
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=FRAMES_X,
+                    y=density,
+                    mode="lines",
+                    name=label,
+                    line={"color": color, "width": 2},
+                    legendgroup=key,
+                    showlegend=False,
+                    hovertemplate=f"{key}<br>IPD=%{{x}} fr<br>density=%{{y:.6f}}<extra></extra>",
+                ),
+                row=2,
+                col=1,
+            )
 
     fig.update_xaxes(range=[0, cut_p99], title_text="IPD (frames)", row=1, col=1)
     fig.update_xaxes(range=[0, cut_p99], title_text="IPD (frames)", row=2, col=1)
@@ -301,10 +352,13 @@ def _p75_tail_panel(
         template="plotly_white",
         legend={
             "orientation": "v",
-            "yanchor": "top", "y": 1.0,
-            "xanchor": "left", "x": 1.01,
+            "yanchor": "top",
+            "y": 1.0,
+            "xanchor": "left",
+            "x": 1.01,
             "bgcolor": "rgba(255,255,255,0.95)",
-            "bordercolor": "#ccc", "borderwidth": 1,
+            "bordercolor": "#ccc",
+            "borderwidth": 1,
             "font": {"size": 11},
         },
         margin={"t": 60, "b": 60, "l": 70, "r": 380},
@@ -325,6 +379,7 @@ def _ratio_bar_figure(signatures: dict, hist_ipd: dict, threshold_factor: float 
     not of methylation.
     """
     import plotly.graph_objects as go
+
     keys, ratios = [], []
     for T, info in signatures.items():
         for k in info["signal_offsets"]:
@@ -338,24 +393,35 @@ def _ratio_bar_figure(signatures: dict, hist_ipd: dict, threshold_factor: float 
             keys.append(key)
             ratios.append(mean_above / mean_all)
     fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=keys, y=ratios,
-        marker={"color": "#e67e22"},
-        text=[f"{r:.2f}" for r in ratios],
-        textposition="outside",
-    ))
+    fig.add_trace(
+        go.Bar(
+            x=keys,
+            y=ratios,
+            marker={"color": "#e67e22"},
+            text=[f"{r:.2f}" for r in ratios],
+            textposition="outside",
+        )
+    )
     fig.update_layout(
-        title=(f"Ratio mean_above / mean_all à seuil {threshold_factor}× "
-               "— quasi-constant car artefact de forme right-skewed"),
-        xaxis_title="meth_type @ offset", yaxis_title="ratio",
-        template="plotly_white", height=380,
-        margin={"t": 60, "b": 80}, yaxis={"range": [0, max(ratios) * 1.2 if ratios else 3]},
+        title=(
+            f"Ratio mean_above / mean_all à seuil {threshold_factor}× "
+            "— quasi-constant car artefact de forme right-skewed"
+        ),
+        xaxis_title="meth_type @ offset",
+        yaxis_title="ratio",
+        template="plotly_white",
+        height=380,
+        margin={"t": 60, "b": 80},
+        yaxis={"range": [0, max(ratios) * 1.2 if ratios else 3]},
     )
     return fig
 
 
 def _gaussian_vs_empirical_figure(
-    signatures: dict, hist_ipd: dict, stats_by_key: dict, smooth: int,
+    signatures: dict,
+    hist_ipd: dict,
+    stats_by_key: dict,
+    smooth: int,
 ):
     """One subplot per (T, k) showing empirical density + 3 fitted curves.
 
@@ -376,7 +442,9 @@ def _gaussian_vs_empirical_figure(
     from plotly.subplots import make_subplots
 
     buckets = [
-        (T, k) for T, info in signatures.items() for k in info["signal_offsets"]
+        (T, k)
+        for T, info in signatures.items()
+        for k in info["signal_offsets"]
         if stats_by_key.get(f"{T}@{k:+d}") is not None
     ]
     n = len(buckets)
@@ -411,8 +479,11 @@ def _gaussian_vs_empirical_figure(
         )
 
     fig = make_subplots(
-        rows=(n + 1) // 2, cols=2,
-        subplot_titles=titles, vertical_spacing=0.18, horizontal_spacing=0.08,
+        rows=(n + 1) // 2,
+        cols=2,
+        subplot_titles=titles,
+        vertical_spacing=0.18,
+        horizontal_spacing=0.08,
     )
 
     x_dense = np.linspace(0.001, 300, 600)
@@ -425,56 +496,86 @@ def _gaussian_vs_empirical_figure(
         emp = _to_frame_density(h, smooth=smooth)
 
         # Empirical
-        fig.add_trace(go.Scatter(
-            x=FRAMES_X, y=emp, mode="lines",
-            name="empirique" if i == 0 else None,
-            line={"color": "#34495e", "width": 2}, showlegend=(i == 0),
-        ), row=row, col=col)
+        fig.add_trace(
+            go.Scatter(
+                x=FRAMES_X,
+                y=emp,
+                mode="lines",
+                name="empirique" if i == 0 else None,
+                line={"color": "#34495e", "width": 2},
+                showlegend=(i == 0),
+            ),
+            row=row,
+            col=col,
+        )
 
         # Gaussian (moments) — bad fit, included for reference
         sigma_m = max(s["sigma"], 1e-6)
         gauss_m = np.exp(-0.5 * ((x_dense - s["mean"]) / sigma_m) ** 2) / (
-            sigma_m * np.sqrt(2 * np.pi))
-        fig.add_trace(go.Scatter(
-            x=x_dense, y=gauss_m, mode="lines",
-            name="N(moments) — large car σ>μ" if i == 0 else None,
-            line={"color": "#e74c3c", "width": 1.2, "dash": "dash"},
-            showlegend=(i == 0),
-        ), row=row, col=col)
+            sigma_m * np.sqrt(2 * np.pi)
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x_dense,
+                y=gauss_m,
+                mode="lines",
+                name="N(moments) — large car σ>μ" if i == 0 else None,
+                line={"color": "#e74c3c", "width": 1.2, "dash": "dash"},
+                showlegend=(i == 0),
+            ),
+            row=row,
+            col=col,
+        )
 
         # Gaussian (robust, IQR-based σ)
         iqr = max(s["p75"] - s["p25"], 1e-6)
         sigma_r = max(iqr / 1.349, 1e-6)
         gauss_r = np.exp(-0.5 * ((x_dense - s["p50"]) / sigma_r) ** 2) / (
-            sigma_r * np.sqrt(2 * np.pi))
-        fig.add_trace(go.Scatter(
-            x=x_dense, y=gauss_r, mode="lines",
-            name="N(robust IQR) — fit le peak" if i == 0 else None,
-            line={"color": "#f39c12", "width": 1.5, "dash": "dash"},
-            showlegend=(i == 0),
-        ), row=row, col=col)
+            sigma_r * np.sqrt(2 * np.pi)
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x_dense,
+                y=gauss_r,
+                mode="lines",
+                name="N(robust IQR) — fit le peak" if i == 0 else None,
+                line={"color": "#f39c12", "width": 1.5, "dash": "dash"},
+                showlegend=(i == 0),
+            ),
+            row=row,
+            col=col,
+        )
 
         # Log-normal
         mu_log, sigma_log = lognormal_params.get(key, (0.0, 0.0))
         sigma_log = max(sigma_log, 1e-6)
         log_x = np.log(x_dense + 1.0)
         logn = np.exp(-0.5 * ((log_x - mu_log) / sigma_log) ** 2) / (
-            (x_dense + 1.0) * sigma_log * np.sqrt(2 * np.pi))
-        fig.add_trace(go.Scatter(
-            x=x_dense, y=logn, mode="lines",
-            name="Log-normale (vrai bon fit)" if i == 0 else None,
-            line={"color": "#27ae60", "width": 1.8, "dash": "dot"},
-            showlegend=(i == 0),
-        ), row=row, col=col)
+            (x_dense + 1.0) * sigma_log * np.sqrt(2 * np.pi)
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x_dense,
+                y=logn,
+                mode="lines",
+                name="Log-normale (vrai bon fit)" if i == 0 else None,
+                line={"color": "#27ae60", "width": 1.8, "dash": "dot"},
+                showlegend=(i == 0),
+            ),
+            row=row,
+            col=col,
+        )
 
         fig.update_xaxes(
             range=[0, 200],
             title_text="IPD (frames)" if row == (n + 1) // 2 else None,
-            row=row, col=col,
+            row=row,
+            col=col,
         )
         fig.update_yaxes(
             title_text="density per frame" if col == 1 else None,
-            row=row, col=col,
+            row=row,
+            col=col,
         )
 
     fig.update_layout(
@@ -521,30 +622,50 @@ def _dilution_illustration_figure(stats_by_key: dict, signatures: dict):
     # log-normal-ish baseline: gamma proxy on x with mode at ~p50, mean at mu_unmod
     # For simplicity, use a normal at (μ_unmod, σ_unmod) — same as the Gaussian fit
     base = np.exp(-0.5 * ((x - mu_unmod) / sigma_unmod) ** 2) / (sigma_unmod * np.sqrt(2 * np.pi))
-    mod  = np.exp(-0.5 * ((x - mu_mod) / sigma_mod) ** 2) / (sigma_mod * np.sqrt(2 * np.pi))
+    mod = np.exp(-0.5 * ((x - mu_mod) / sigma_mod) ** 2) / (sigma_mod * np.sqrt(2 * np.pi))
 
     fig = go.Figure()
     for frac, color, name in [
-        (0.0,  "#34495e", "0% méthylé  (baseline)"),
+        (0.0, "#34495e", "0% méthylé  (baseline)"),
         (0.01, "#e74c3c", "1% méthylé  (signal réel attendu)"),
         (0.05, "#f39c12", "5% méthylé  (max biologique)"),
         (0.20, "#9b59b6", "20% méthylé  (impossible — pour comparaison)"),
     ]:
         mix = (1 - frac) * base + frac * mod
-        fig.add_trace(go.Scatter(
-            x=x, y=mix, mode="lines", name=name,
-            line={"color": color, "width": 2 if frac in (0.0, 0.01) else 1.5,
-                  "dash": "dot" if frac in (0.05, 0.20) else "solid"},
-        ))
-    fig.add_vline(x=mu_unmod, line={"color": "gray", "dash": "dot"},
-                  annotation_text=f"μ_unmod = {mu_unmod:.0f}", annotation_position="top")
-    fig.add_vline(x=mu_mod, line={"color": "gray", "dash": "dot"},
-                  annotation_text=f"μ_mod (×3) = {mu_mod:.0f}", annotation_position="top")
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=mix,
+                mode="lines",
+                name=name,
+                line={
+                    "color": color,
+                    "width": 2 if frac in (0.0, 0.01) else 1.5,
+                    "dash": "dot" if frac in (0.05, 0.20) else "solid",
+                },
+            )
+        )
+    fig.add_vline(
+        x=mu_unmod,
+        line={"color": "gray", "dash": "dot"},
+        annotation_text=f"μ_unmod = {mu_unmod:.0f}",
+        annotation_position="top",
+    )
+    fig.add_vline(
+        x=mu_mod,
+        line={"color": "gray", "dash": "dot"},
+        annotation_text=f"μ_mod (×3) = {mu_mod:.0f}",
+        annotation_position="top",
+    )
     fig.update_layout(
-        title=(f"Simulation: si X% des bases étaient méthylées, à quoi ressemblerait la distribution? "
-               f"(modèle Normal autour de μ={mu_unmod:.0f} ± σ={sigma_unmod:.0f})"),
-        xaxis_title="IPD (frames)", yaxis_title="density",
-        template="plotly_white", height=480,
+        title=(
+            f"Simulation: si X% des bases étaient méthylées, à quoi ressemblerait la distribution? "
+            f"(modèle Normal autour de μ={mu_unmod:.0f} ± σ={sigma_unmod:.0f})"
+        ),
+        xaxis_title="IPD (frames)",
+        yaxis_title="density",
+        template="plotly_white",
+        height=480,
         legend={"orientation": "h", "y": -0.18},
         yaxis_type="log",
     )
@@ -603,6 +724,7 @@ code { background: #edf2f7; padding: 2px 6px; border-radius: 4px;
 
 def _figure_div(fig, fig_id: str) -> str:
     import plotly.io as pio
+
     spec = pio.to_json(fig)
     return (
         f"<div id='{fig_id}' class='plot-box'></div>"
@@ -616,8 +738,9 @@ def _stat_card(val: str, lbl: str) -> str:
     return f'<div class="stat-card"><div class="val">{val}</div><div class="lbl">{lbl}</div></div>'
 
 
-def _kpi_table_html(signatures: dict, stats_by_key: dict, hist_ipd: dict,
-                    threshold_factor: float = 1.3) -> str:
+def _kpi_table_html(
+    signatures: dict, stats_by_key: dict, hist_ipd: dict, threshold_factor: float = 1.3
+) -> str:
     rows = []
     for T, info in signatures.items():
         for k in info["signal_offsets"]:
@@ -655,8 +778,11 @@ def _kpi_table_html(signatures: dict, stats_by_key: dict, hist_ipd: dict,
 
 
 def _build_html(
-    baseline_dir: Path, out_path: Path,
-    signatures: dict, hist_ipd: dict, stats_by_key: dict,
+    baseline_dir: Path,
+    out_path: Path,
+    signatures: dict,
+    hist_ipd: dict,
+    stats_by_key: dict,
     run_info: dict | None,
     smooth: int,
 ) -> None:
@@ -666,7 +792,7 @@ def _build_html(
     n_bams = len((run_info or {}).get("per_bam", {}))
     n_skipped = sum(1 for v in (run_info or {}).get("per_bam", {}).values() if v.get("skipped"))
     elapsed = (run_info or {}).get("elapsed_s")
-    elapsed_str = f"{elapsed/60:.0f} min" if elapsed else "—"
+    elapsed_str = f"{elapsed / 60:.0f} min" if elapsed else "—"
     threshold = (run_info or {}).get("threshold", 1.3)
 
     cards = [
@@ -867,8 +993,7 @@ def analyze(baseline_dir: Path, smooth: int = 2) -> None:
     baseline_dir = Path(baseline_dir)
     json_path = baseline_dir / "baseline.json"
     if not json_path.is_file():
-        log.error("baseline.json not found in %s — did you run `compute` first?",
-                  baseline_dir)
+        log.error("baseline.json not found in %s — did you run `compute` first?", baseline_dir)
         raise SystemExit(1)
 
     log.info("Loading %s", json_path)
@@ -907,19 +1032,37 @@ def analyze(baseline_dir: Path, smooth: int = 2) -> None:
     log.info("=" * 88)
     log.info("Per-(meth_type, offset) — frame-space stats")
     log.info("=" * 88)
-    log.info("%-10s %5s %5s %5s %5s %5s %5s   %s",
-             "bucket", "p25", "p50", "p75", "p95", "p99", "μ→σ", "n")
+    log.info(
+        "%-10s %5s %5s %5s %5s %5s %5s   %s",
+        "bucket",
+        "p25",
+        "p50",
+        "p75",
+        "p95",
+        "p99",
+        "μ→σ",
+        "n",
+    )
     for key, s in stats_by_key.items():
         sigma_flag = "σ>μ ⚠" if s["sigma"] > s["mean"] else "σ≤μ"
-        log.info("  %-8s %5.1f %5.1f %5.1f %5.1f %5.1f %5.1f/%4.1f %s  n=%d",
-                 key, s["p25"], s["p50"], s["p75"], s["p95"], s["p99"],
-                 s["mean"], s["sigma"], sigma_flag, s["n"])
+        log.info(
+            "  %-8s %5.1f %5.1f %5.1f %5.1f %5.1f %5.1f/%4.1f %s  n=%d",
+            key,
+            s["p25"],
+            s["p50"],
+            s["p75"],
+            s["p95"],
+            s["p99"],
+            s["mean"],
+            s["sigma"],
+            sigma_flag,
+            s["n"],
+        )
     log.info("=" * 88)
 
     out_path = baseline_dir / "baseline_report.html"
     log.info("Building dashboard at %s ...", out_path)
-    _build_html(baseline_dir, out_path, signatures, hist_ipd, stats_by_key,
-                run_info, smooth)
+    _build_html(baseline_dir, out_path, signatures, hist_ipd, stats_by_key, run_info, smooth)
     log.info("Done. Open %s in a browser.", out_path)
 
 
@@ -931,11 +1074,14 @@ def main(argv=None):
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("baseline_dir",
-                   help="Directory containing baseline.json from `compute`.")
-    p.add_argument("--smooth", type=int, default=2,
-                   help="Moving-average half-window in code space (default 2 → "
-                        "5-point smoothing). 0 to disable.")
+    p.add_argument("baseline_dir", help="Directory containing baseline.json from `compute`.")
+    p.add_argument(
+        "--smooth",
+        type=int,
+        default=2,
+        help="Moving-average half-window in code space (default 2 → "
+        "5-point smoothing). 0 to disable.",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
     setup_logging(verbose=args.verbose)

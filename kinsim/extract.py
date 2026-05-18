@@ -82,8 +82,6 @@ from .utils.sample_layout import (
     CATEGORY_BASELINE,
     CATEGORY_NEAR_METH,
     CATEGORY_SLOWED,
-    SampleLayout,
-    get_sample_layout,
 )
 
 try:
@@ -134,21 +132,24 @@ def _parse_motif_string_no_rc(motif_string: str) -> list[dict]:
         try:
             _validate_mod_pos(seq, mod_pos, m_type)
         except ValueError as exc:
-            log.warning("extract: motif '%s' (%s) failed validation: %s — skipped",
-                        seq, m_type, exc)
+            log.warning(
+                "extract: motif '%s' (%s) failed validation: %s — skipped", seq, m_type, exc
+            )
             continue
         m_id = get_meth_ids().get(m_type, 0)
         if m_id == 0:
             continue
         frac = float(parts[4]) if len(parts) >= 5 else 1.0
-        motifs.append({
-            "pattern": re.compile(f"(?=({iupac_to_re(seq)}))"),
-            "id": m_id,
-            "mod_pos": mod_pos,
-            "frac": frac,
-            "seq": seq,
-            "type": m_type,
-        })
+        motifs.append(
+            {
+                "pattern": re.compile(f"(?=({iupac_to_re(seq)}))"),
+                "id": m_id,
+                "mod_pos": mod_pos,
+                "frac": frac,
+                "seq": seq,
+                "type": m_type,
+            }
+        )
     return motifs
 
 
@@ -217,10 +218,8 @@ def _build_strand_maps(
     # strand AND not already a SLOWED position. Inherits the meth's frac.
     fwd_near: dict = {}
     rev_near: dict = {}
-    fwd_meth_to_frac = {pos: fwd_slowed.get(pos, (0, 0, 1.0))[2]
-                        for pos in fwd_meth.keys()}
-    rev_meth_to_frac = {pos: rev_slowed.get(pos, (0, 0, 1.0))[2]
-                        for pos in rev_meth.keys()}
+    fwd_meth_to_frac = {pos: fwd_slowed.get(pos, (0, 0, 1.0))[2] for pos in fwd_meth.keys()}
+    rev_meth_to_frac = {pos: rev_slowed.get(pos, (0, 0, 1.0))[2] for pos in rev_meth.keys()}
     for (contig, p), m_id in fwd_meth.items():
         frac = fwd_meth_to_frac[(contig, p)]
         for k in range(1, near_max_dist + 1):
@@ -310,7 +309,7 @@ def _build_contig_arrays(
     edge_invalid = np.zeros(n, dtype=bool)
     edge_invalid[:upstream] = True
     if downstream > 0:
-        edge_invalid[n - downstream:] = True
+        edge_invalid[n - downstream :] = True
     kmer_fwd[edge_invalid | ~kmer_window_valid] = -1
 
     # Reverse-complement kmer at the same ref position: the polymerase reading
@@ -374,9 +373,9 @@ def _build_contig_arrays(
     rev_max_abs = max((abs(int(o)) for o in params.rev_meth_offsets), default=0)
     pad = max(upstream, downstream, rev_max_abs)
     fwd_meth_padded = np.zeros(n + 2 * pad, dtype=np.int8)
-    fwd_meth_padded[pad:pad + n] = fwd_meth_arr
+    fwd_meth_padded[pad : pad + n] = fwd_meth_arr
     rev_meth_padded = np.zeros(n + 2 * pad, dtype=np.int8)
-    rev_meth_padded[pad:pad + n] = rev_meth_arr
+    rev_meth_padded[pad : pad + n] = rev_meth_arr
 
     return {
         "kmer_fwd": kmer_fwd,
@@ -435,7 +434,10 @@ def _check_bystrandified(bam_path: str, n_peek: int = 50) -> None:
                 break
     log.info(
         "[extract] sniff (%d primary reads peeked): ip=%d  fi=%d  ri=%d",
-        n_seen, saw_ip, saw_fi, saw_ri,
+        n_seen,
+        saw_ip,
+        saw_fi,
+        saw_ri,
     )
     if n_seen == 0:
         log.warning("[extract] BAM has no primary mapped reads — sniff inconclusive.")
@@ -507,8 +509,10 @@ def _extract_one_bam(
             "kinsim_config.yaml has no `kinetic_signatures` entries. "
             "Declare per-meth-type signal_offsets and re-run."
         )
-    log.info("[extract] signal offsets: %s",
-             {name_by_mid[mid]: offs for mid, offs in sig_offsets_by_mid.items()})
+    log.info(
+        "[extract] signal offsets: %s",
+        {name_by_mid[mid]: offs for mid, offs in sig_offsets_by_mid.items()},
+    )
 
     log.info("[extract] pre-scanning reference for motif positions (per strand) ...")
     fwd_slowed, rev_slowed, fwd_near, rev_near, fwd_meth, rev_meth = _build_strand_maps(
@@ -516,7 +520,10 @@ def _extract_one_bam(
     )
     log.info(
         "[extract] motif positions: fwd_slowed=%d  rev_slowed=%d  fwd_meth=%d  rev_meth=%d",
-        len(fwd_slowed), len(rev_slowed), len(fwd_meth), len(rev_meth),
+        len(fwd_slowed),
+        len(rev_slowed),
+        len(fwd_meth),
+        len(rev_meth),
     )
 
     # Per-contig precompute: replaces all per-position dict lookups in the
@@ -525,8 +532,16 @@ def _extract_one_bam(
     log.info("[extract] precomputing per-contig lookup arrays ...")
     contig_arrs = {
         contig: _build_contig_arrays(
-            contig, seq, fwd_slowed, rev_slowed, fwd_near, rev_near,
-            fwd_meth, rev_meth, baseline_min_dist_to_meth, params,
+            contig,
+            seq,
+            fwd_slowed,
+            rev_slowed,
+            fwd_near,
+            rev_near,
+            fwd_meth,
+            rev_meth,
+            baseline_min_dist_to_meth,
+            params,
         )
         for contig, seq in ref_seqs.items()
     }
@@ -548,8 +563,8 @@ def _extract_one_bam(
     # (pol_reverse_slice=True), the polymerase reads the reference backward,
     # so we gather at ``ppos - off``; for − strand reads we gather at
     # ``ppos + off``. Both arrays are int64 numpy so the fancy index is fast.
-    rev_offsets_fwd = np.array(params.rev_meth_offsets, dtype=np.int64)   # − strand pol
-    rev_offsets_rev = -rev_offsets_fwd                                    # + strand pol
+    rev_offsets_fwd = np.array(params.rev_meth_offsets, dtype=np.int64)  # − strand pol
+    rev_offsets_rev = -rev_offsets_fwd  # + strand pol
 
     with pysam.AlignmentFile(bam_path, "rb", check_sq=True) as bam:
         bam_contigs = set(bam.references)
@@ -601,8 +616,8 @@ def _extract_one_bam(
                 near_frac = arrs["fwd_near_frac"]
                 pol_padded = arrs["fwd_meth_padded"]
                 opp_padded = arrs["rev_meth_padded"]
-                kmer_arr = arrs["kmer_rev"]   # polymerase 5'→3' frame is the rc
-                pol_reverse_slice = False     # mc/rev read forward in pol frame
+                kmer_arr = arrs["kmer_rev"]  # polymerase 5'→3' frame is the rc
+                pol_reverse_slice = False  # mc/rev read forward in pol frame
             else:
                 slowed_T = arrs["rev_slowed_T"]
                 slowed_off = arrs["rev_slowed_off"]
@@ -613,7 +628,7 @@ def _extract_one_bam(
                 pol_padded = arrs["rev_meth_padded"]
                 opp_padded = arrs["fwd_meth_padded"]
                 kmer_arr = arrs["kmer_fwd"]
-                pol_reverse_slice = True      # − strand polymerase reads ref backward
+                pol_reverse_slice = True  # − strand polymerase reads ref backward
             excluded = arrs["excluded"]
             n_ref = excluded.shape[0]
 
@@ -662,17 +677,21 @@ def _extract_one_bam(
                 # Length of both slices is always ``params.kmer_size``.
                 ppos = ref_pos + pad
                 if pol_reverse_slice:
-                    mc = pol_padded[ppos - downstream:ppos + upstream + 1][::-1]
+                    mc = pol_padded[ppos - downstream : ppos + upstream + 1][::-1]
                     rev = opp_padded[ppos + rev_offsets_rev]
                 else:
-                    mc = pol_padded[ppos - upstream:ppos + downstream + 1]
+                    mc = pol_padded[ppos - upstream : ppos + downstream + 1]
                     rev = opp_padded[ppos + rev_offsets_fwd]
 
                 row = (
-                    float(ipd[read_pos]), float(pw[read_pos]), frac,
+                    float(ipd[read_pos]),
+                    float(pw[read_pos]),
+                    frac,
                     *mc.tolist(),
                     *rev.tolist(),
-                    cat, parent_meth, parent_off,
+                    cat,
+                    parent_meth,
+                    parent_off,
                 )
 
                 if cat == CATEGORY_BASELINE:
@@ -691,7 +710,11 @@ def _extract_one_bam(
             if n_reads_used % PROGRESS_EVERY == 0:
                 log.info(
                     "[extract] progress: %d reads used | slowed=%d near=%d baseline_seen=%d kept=%d",
-                    n_reads_used, n_slowed, n_near, n_baseline_seen, n_baseline_kept,
+                    n_reads_used,
+                    n_slowed,
+                    n_near,
+                    n_baseline_seen,
+                    n_baseline_kept,
                 )
 
     for kid, rows in baseline_buffer.items():
@@ -705,7 +728,11 @@ def _extract_one_bam(
 
     log.info(
         "[extract] DONE  reads_used=%d  slowed=%d  near=%d  baseline_seen=%d  baseline_kept=%d",
-        n_reads_used, n_slowed, n_near, n_baseline_seen, n_baseline_kept,
+        n_reads_used,
+        n_slowed,
+        n_near,
+        n_baseline_seen,
+        n_baseline_kept,
     )
     log.info("[extract] kmers in output: %d", len(result))
     return result
@@ -768,7 +795,9 @@ def extract_to_shard(
     params = extraction_params or get_extraction_params()
 
     if baseline_min_dist_to_meth is None:
-        baseline_min_dist_to_meth = int(extract_cfg.get("baseline_min_dist_to_meth", params.kmer_size))
+        baseline_min_dist_to_meth = int(
+            extract_cfg.get("baseline_min_dist_to_meth", params.kmer_size)
+        )
     if baseline_sample_rate is None:
         baseline_sample_rate = float(extract_cfg.get("baseline_sample_rate", 0.10))
     if near_max_dist is None:
@@ -795,14 +824,20 @@ def extract_to_shard(
     log.info(
         "[extract] window: kmer_size=%d  upstream=%d  downstream=%d  "
         "rev_meth_offsets=%s  sample_ncols=%d",
-        params.kmer_size, params.upstream, params.downstream,
-        list(params.rev_meth_offsets), params.sample_ncols,
+        params.kmer_size,
+        params.upstream,
+        params.downstream,
+        list(params.rev_meth_offsets),
+        params.sample_ncols,
     )
     log.info(
         "[extract] knobs: n_baseline_per_kmer=%d  baseline_min_dist=%d  "
         "near_max_dist=%d  baseline_sample_rate=%.2f  seed=%d",
-        n_baseline_per_kmer, baseline_min_dist_to_meth,
-        near_max_dist, baseline_sample_rate, seed,
+        n_baseline_per_kmer,
+        baseline_min_dist_to_meth,
+        near_max_dist,
+        baseline_sample_rate,
+        seed,
     )
 
     if meth_types is not None:
@@ -810,8 +845,11 @@ def extract_to_shard(
         log.info("[extract] filtered motifs to types %s: %s", sorted(meth_types), motif_string)
 
     ref_seqs = load_reference(ref_path)
-    log.info("[extract] loaded reference: %d contigs, total %d bp",
-             len(ref_seqs), sum(len(s) for s in ref_seqs.values()))
+    log.info(
+        "[extract] loaded reference: %d contigs, total %d bp",
+        len(ref_seqs),
+        sum(len(s) for s in ref_seqs.values()),
+    )
 
     samples = _extract_one_bam(
         bam_path=bam_path,
@@ -888,8 +926,7 @@ def extract_from_manifest_task(
 
     entries = load_manifest(manifest_path)
     if task_index < 1 or task_index > len(entries):
-        log.error("Task index %d out of range (manifest has %d entries).",
-                  task_index, len(entries))
+        log.error("Task index %d out of range (manifest has %d entries).", task_index, len(entries))
         sys.exit(1)
     entry = entries[task_index - 1]
     log.info("task %d/%d: %s", task_index, len(entries), entry.sample_id)
@@ -905,8 +942,7 @@ def extract_from_manifest_task(
         )
         sys.exit(1)
     if not Path(entry.ref_path).exists():
-        log.error("ref_path does not exist for %s: %s",
-                  entry.sample_id, entry.ref_path)
+        log.error("ref_path does not exist for %s: %s", entry.sample_id, entry.ref_path)
         sys.exit(1)
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -971,15 +1007,19 @@ def main(argv=None) -> None:
     p.add_argument("--output-dir", help="Output directory for shards (manifest mode)")
     p.add_argument("--n-baseline-per-kmer", type=int, default=50)
     p.add_argument("--max-reads", type=int, default=-1)
-    p.add_argument("--meth-types", default=None,
-                   help="Comma-separated subset (e.g. 'm6A,m4C'); default = all")
+    p.add_argument(
+        "--meth-types", default=None, help="Comma-separated subset (e.g. 'm6A,m4C'); default = all"
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("-v", "--verbose", action="store_true")
-    p.add_argument("positional", nargs="*", help="<aligned_bam> <ref> <motifs> <output> (single-BAM mode)")
+    p.add_argument(
+        "positional", nargs="*", help="<aligned_bam> <ref> <motifs> <output> (single-BAM mode)"
+    )
     args = p.parse_args(argv)
     setup_logging(verbose=args.verbose)
 
     from .utils.motifs import parse_meth_types_arg
+
     meth_types = parse_meth_types_arg(args.meth_types)
 
     if args.manifest:
@@ -997,8 +1037,10 @@ def main(argv=None) -> None:
         return
 
     if len(args.positional) != 4:
-        p.error("single-BAM mode needs exactly 4 positional args: "
-                "<aligned_bam> <ref_fasta> <motifs> <output.pkl>")
+        p.error(
+            "single-BAM mode needs exactly 4 positional args: "
+            "<aligned_bam> <ref_fasta> <motifs> <output.pkl>"
+        )
     bam, ref, motifs_arg, out_pkl = args.positional
     from .utils.motifs import load_motif_string
 

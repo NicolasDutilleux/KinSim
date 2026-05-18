@@ -56,6 +56,9 @@ htmlcov/
 *.html
 reports/
 reports_*/
+hpc_reports/
+hpc_reports_*/
+diagnostics/
 dictionary_test/
 comparison_*/
 

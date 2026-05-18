@@ -34,7 +34,6 @@ from dataclasses import dataclass
 
 from .config import ExtractionParams, get_extraction_params
 
-
 # ---------------------------------------------------------------------------
 # Category enum
 # ---------------------------------------------------------------------------
@@ -43,8 +42,8 @@ CATEGORY_BASELINE = 0
 CATEGORY_SLOWED = 1
 CATEGORY_NEAR_METH = 2
 CATEGORY_NAMES = {
-    CATEGORY_BASELINE:  "baseline",
-    CATEGORY_SLOWED:    "slowed",
+    CATEGORY_BASELINE: "baseline",
+    CATEGORY_SLOWED: "slowed",
     CATEGORY_NEAR_METH: "near_meth",
 }
 
@@ -100,7 +99,7 @@ class SampleLayout:
     col_parent_offset: int
 
     @classmethod
-    def from_params(cls, params: ExtractionParams) -> "SampleLayout":
+    def from_params(cls, params: ExtractionParams) -> SampleLayout:
         col_meth_ctx_start = 3
         col_meth_ctx_end = col_meth_ctx_start + params.kmer_size
         col_rev_meth = col_meth_ctx_end

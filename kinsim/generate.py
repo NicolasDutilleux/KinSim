@@ -60,7 +60,6 @@ from .utils.encoding import (
     BASE_MAP,
     KMER_MASK,
     KMER_PRED_IDX,
-    KMER_RIGHT_PAD,
     K,
 )
 from .utils.io import (
@@ -121,8 +120,9 @@ def _load_lookup_table(npz_path: str) -> dict:
                            (meth_id, k_pos); 0 = none/fallback.
         ``scenario_labels`` list[str] for logging.
     """
-    from .utils.encoding import K as _K, KMER_PRED_IDX as _PI, get_meth_ids
-    from .utils.config import load_kinsim_config
+    from .utils.encoding import KMER_PRED_IDX as _PI
+    from .utils.encoding import K as _K
+    from .utils.encoding import get_meth_ids
 
     data = np.load(npz_path, allow_pickle=False)
     required = {"scenarios_label", "scenarios_meth_id", "scenarios_offset"}
@@ -132,8 +132,8 @@ def _load_lookup_table(npz_path: str) -> dict:
             f"(needs scenarios_{{label,meth_id,offset}} arrays)."
         )
 
-    labels  = [str(s) for s in data["scenarios_label"].tolist()]
-    m_ids   = data["scenarios_meth_id"].astype(np.int64)
+    labels = [str(s) for s in data["scenarios_label"].tolist()]
+    m_ids = data["scenarios_meth_id"].astype(np.int64)
     offsets = data["scenarios_offset"].astype(np.int64)
 
     # Find a "none" scenario (meth_id == 0). predict-kmers always emits it.
@@ -150,8 +150,12 @@ def _load_lookup_table(npz_path: str) -> dict:
     lut_log = np.empty((n_scenarios, n_kmers, 4), dtype=np.float32)
     for i, label in enumerate(labels):
         sk = label.replace("@", "_at_").replace("+", "p").replace("-", "m")
-        for k_log_field, slot in (("mu_ipd_log", 0), ("mu_pw_log", 1),
-                                   ("sigma_ipd_log", 2), ("sigma_pw_log", 3)):
+        for k_log_field, slot in (
+            ("mu_ipd_log", 0),
+            ("mu_pw_log", 1),
+            ("sigma_ipd_log", 2),
+            ("sigma_pw_log", 3),
+        ):
             key = f"{sk}__{k_log_field}"
             if key not in data.files:
                 raise KeyError(
@@ -176,18 +180,21 @@ def _load_lookup_table(npz_path: str) -> dict:
 
     log.info(
         "LUT loaded from %s: %d scenarios × %d kmers × 4 outputs (%.0f MB log-space)",
-        npz_path, n_scenarios, n_kmers, lut_log.nbytes / 1e6,
+        npz_path,
+        n_scenarios,
+        n_kmers,
+        lut_log.nbytes / 1e6,
     )
     log.info("  scenarios: %s", labels)
 
     return {
-        "lut_log":         lut_log,
+        "lut_log": lut_log,
         "scenario_matrix": scenario_matrix,
         "scenario_labels": labels,
-        "none_idx":        int(none_idx),
-        "pred_idx":        _PI,
-        "K":               _K,
-        "n_kmers":         n_kmers,
+        "none_idx": int(none_idx),
+        "pred_idx": _PI,
+        "K": _K,
+        "n_kmers": n_kmers,
     }
 
 
@@ -237,13 +244,11 @@ def generate_signals_lookup(
     if nonzero_mask.any():
         # Default everyone to none, then overwrite for valid scenarios.
         scenarios_per_pos = np.full(ctx.shape, none_idx, dtype=np.int64)
-        scenarios_per_pos[nonzero_mask] = scenario_matrix[
-            ctx[nonzero_mask], col_idx[nonzero_mask]
-        ]
+        scenarios_per_pos[nonzero_mask] = scenario_matrix[ctx[nonzero_mask], col_idx[nonzero_mask]]
         # First non-none wins — pick the smallest k_pos where scenario != none_idx.
-        is_real = scenarios_per_pos != none_idx        # (N, K)
-        any_real = is_real.any(axis=1)                  # (N,)
-        first_real_kpos = np.argmax(is_real, axis=1)    # 0 if no real (we'll mask)
+        is_real = scenarios_per_pos != none_idx  # (N, K)
+        any_real = is_real.any(axis=1)  # (N,)
+        first_real_kpos = np.argmax(is_real, axis=1)  # 0 if no real (we'll mask)
         scenario_idx = np.where(
             any_real,
             scenarios_per_pos[np.arange(N), first_real_kpos],
@@ -253,22 +258,22 @@ def generate_signals_lookup(
         scenario_idx = np.full(N, none_idx, dtype=np.int64)
 
     # LUT lookup: rows of (mu_ipd_log, mu_pw_log, sigma_ipd_log, sigma_pw_log).
-    rows = lut_log[scenario_idx, kmer_arr]              # (N, 4)
-    mu_ipd_log    = rows[:, 0]
-    mu_pw_log     = rows[:, 1]
+    rows = lut_log[scenario_idx, kmer_arr]  # (N, 4)
+    mu_ipd_log = rows[:, 0]
+    mu_pw_log = rows[:, 1]
     sigma_ipd_log = rows[:, 2]
-    sigma_pw_log  = rows[:, 3]
+    sigma_pw_log = rows[:, 3]
 
     if deterministic:
         ipd_log = mu_ipd_log
-        pw_log  = mu_pw_log
+        pw_log = mu_pw_log
     else:
         ipd_log = mu_ipd_log + sigma_ipd_log * np.random.randn(N).astype(np.float32)
-        pw_log  = mu_pw_log  + sigma_pw_log  * np.random.randn(N).astype(np.float32)
+        pw_log = mu_pw_log + sigma_pw_log * np.random.randn(N).astype(np.float32)
 
     # inv_log_transform: expm1 clamped to [0, 255]
     ipd = np.clip(np.expm1(ipd_log), 0.0, 255.0).astype(np.float32)
-    pw  = np.clip(np.expm1(pw_log),  0.0, 255.0).astype(np.float32)
+    pw = np.clip(np.expm1(pw_log), 0.0, 255.0).astype(np.float32)
     return np.stack([ipd, pw], axis=1)
 
 
@@ -351,7 +356,7 @@ def _process_read_unmapped_vec(
         rate_table = np.ones((max_T + 1, ctx_len), dtype=np.float32)
         for (T, k), p_eff in p_eff_lookup.items():
             k_pos = pred_idx - k
-            if 0 <= k_pos < ctx_len and T <= max_T:
+            if 0 <= k_pos < ctx_len and max_T >= T:
                 if k in sig_offsets.get(T, set()):
                     rate_table[T, k_pos] = float(p_eff)
         # rates[i, k_pos] = rate_table[meth_ctxs[i, k_pos], k_pos]
@@ -457,7 +462,7 @@ def _build_sig_offsets_by_meth_id() -> dict[int, set[int]]:
     cfg = load_kinsim_config()
     ids = get_meth_ids()
     out: dict[int, set[int]] = {}
-    for name in (cfg.get("kinetic_signatures") or {}):
+    for name in cfg.get("kinetic_signatures") or {}:
         T = ids.get(name)
         if T is not None:
             out[T] = set(get_signature_offsets(name))
@@ -737,13 +742,15 @@ def _load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
     if ckpt_kmer_size != K:
         log.error(
             "Checkpoint kmer_size=%d but generate.py only supports K=%d.",
-            ckpt_kmer_size, K,
+            ckpt_kmer_size,
+            K,
         )
         sys.exit(1)
     if ckpt_active_idx != KMER_PRED_IDX:
         log.error(
             "Checkpoint active_site_index=%d but generate.py expects %d.",
-            ckpt_active_idx, KMER_PRED_IDX,
+            ckpt_active_idx,
+            KMER_PRED_IDX,
         )
         sys.exit(1)
 
@@ -754,7 +761,9 @@ def _load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
     n_params = sum(p.numel() for p in model.parameters())
     log.info(
         "Model loaded: K=%d  active_site_index=%d  params=%s  checkpoint=%s",
-        ckpt_kmer_size, ckpt_active_idx, f"{n_params:,}",
+        ckpt_kmer_size,
+        ckpt_active_idx,
+        f"{n_params:,}",
         os.path.basename(checkpoint_path),
     )
     return model
@@ -815,10 +824,12 @@ def generate_signals(
     # Separate forward/reverse strand maps — rev_meth_map fills the
     # complementary-strand block of meth_full at active-site neighbours,
     # matching how `kinsim extract` builds training data.
-    from .utils.motifs import build_reference_meth_map_per_strand
     from .utils.config import get_extraction_params
+    from .utils.motifs import build_reference_meth_map_per_strand
+
     fwd_meth_map, rev_meth_map = build_reference_meth_map_per_strand(
-        ref_seqs, motif_string,
+        ref_seqs,
+        motif_string,
     )
     rev_meth_offsets = tuple(int(o) for o in get_extraction_params().rev_meth_offsets)
     # Per-position fraction (target-genome occupancy) — pairs with p_efficiency
@@ -834,8 +845,7 @@ def generate_signals(
     sig_offsets = _build_sig_offsets_by_meth_id()
     if p_eff_lookup:
         log.info(
-            "Statistical firing enabled: %d (meth, offset) buckets with p_fire ∈ "
-            "[%.2f, %.2f]",
+            "Statistical firing enabled: %d (meth, offset) buckets with p_fire ∈ [%.2f, %.2f]",
             len(p_eff_lookup),
             min(p_eff_lookup.values()),
             max(p_eff_lookup.values()),
@@ -1004,9 +1014,7 @@ def _process_batch(
     _REV_OFFSETS = np.asarray(rev_meth_offsets, dtype=np.int64)
     _ZERO_REV = np.zeros(_N_REV, dtype=np.int64)
     _DO_REV = rev_meth_map is not None and _N_REV > 0
-    _STRAND_AWARE = (
-        rev_meth_map is not None and fwd_meth_map is not None and _N_REV > 0
-    )
+    _STRAND_AWARE = rev_meth_map is not None and fwd_meth_map is not None and _N_REV > 0
     _K = K
     # Window geometry comes from the trained model's config. ``_load_model``
     # already refuses non-K=11 checkpoints (hot path is K=11-specific), but
@@ -1032,7 +1040,7 @@ def _process_batch(
             ref_name, ref_start, _ref_strand, _ref_src_size = maf_info
             ref_seq = ref_seqs[ref_name]
             ref_len = len(ref_seq)
-            ref_meth = meth_map[ref_name]    # combined, used as legacy/non-strand-aware fallback
+            ref_meth = meth_map[ref_name]  # combined, used as legacy/non-strand-aware fallback
             ref_fwd_meth = fwd_meth_map[ref_name] if _STRAND_AWARE else None
             ref_rev_meth = rev_meth_map[ref_name] if _DO_REV else None
             ref_frac = frac_map.get(ref_name) if frac_map else None
@@ -1101,12 +1109,20 @@ def _process_batch(
                             # independently — each polymerase pass is a
                             # separate event in the BAM record.
                             _apply_p_fire_to_mc(
-                                mc_fi, p_eff_lookup, sig_offsets, _PRED_IDX,
-                                ref_pos, ref_frac,
+                                mc_fi,
+                                p_eff_lookup,
+                                sig_offsets,
+                                _PRED_IDX,
+                                ref_pos,
+                                ref_frac,
                             )
                             _apply_p_fire_to_mc(
-                                mc_ri, p_eff_lookup, sig_offsets, _PRED_IDX,
-                                ref_pos, ref_frac,
+                                mc_ri,
+                                p_eff_lookup,
+                                sig_offsets,
+                                _PRED_IDX,
+                                ref_pos,
+                                ref_frac,
                             )
                             mid_fi = int(mc_fi[_PRED_IDX])
                             mid_ri = int(mc_ri[_PRED_IDX])
@@ -1164,8 +1180,13 @@ def _process_batch(
             # (~50–100× faster on long HiFi reads).
             kmer_ids_r, rc_kmer_ids_r, meth_ids_r, fractions_r, meth_ctxs_r, is_n_r = (
                 _process_read_unmapped_vec(
-                    seq, read_len, fallback_motifs, p_eff_lookup, sig_offsets,
-                    _PRED_IDX, _CTX_LEN,
+                    seq,
+                    read_len,
+                    fallback_motifs,
+                    p_eff_lookup,
+                    sig_offsets,
+                    _PRED_IDX,
+                    _CTX_LEN,
                 )
             )
             # Unmapped path: no reference info → strand-aware context not
@@ -1193,17 +1214,17 @@ def _process_batch(
 
     # Flatten the per-read accumulators to single tensors before inference.
     if all_kmer_ids:
-        flat_kmer    = np.concatenate(all_kmer_ids)
+        flat_kmer = np.concatenate(all_kmer_ids)
         flat_rc_kmer = np.concatenate(all_rc_kmer_ids)
-        flat_mid_fi  = np.concatenate(all_meth_id_fi)
-        flat_mid_ri  = np.concatenate(all_meth_id_ri)
+        flat_mid_fi = np.concatenate(all_meth_id_fi)
+        flat_mid_ri = np.concatenate(all_meth_id_ri)
         flat_frac_fi = np.concatenate(all_frac_fi)
         flat_frac_ri = np.concatenate(all_frac_ri)
-        flat_mc_fi   = np.concatenate(all_meth_ctx_fi, axis=0)
-        flat_mc_ri   = np.concatenate(all_meth_ctx_ri, axis=0)
-        flat_rev_fi  = np.concatenate(all_rev_ctx_fi, axis=0) if _DO_REV else None
-        flat_rev_ri  = np.concatenate(all_rev_ctx_ri, axis=0) if _DO_REV else None
-        flat_is_n    = np.concatenate(is_n_context)
+        flat_mc_fi = np.concatenate(all_meth_ctx_fi, axis=0)
+        flat_mc_ri = np.concatenate(all_meth_ctx_ri, axis=0)
+        flat_rev_fi = np.concatenate(all_rev_ctx_fi, axis=0) if _DO_REV else None
+        flat_rev_ri = np.concatenate(all_rev_ctx_ri, axis=0) if _DO_REV else None
+        flat_is_n = np.concatenate(is_n_context)
     else:
         flat_kmer = flat_rc_kmer = flat_mid_fi = flat_mid_ri = np.empty(0, dtype=np.int64)
         flat_frac_fi = flat_frac_ri = np.empty(0, dtype=np.float32)
@@ -1219,22 +1240,38 @@ def _process_batch(
     if flat_kmer.size > 0:
         if lookup_table is not None:
             all_signals = generate_signals_lookup(
-                lookup_table, flat_kmer, flat_mc_fi, deterministic,
+                lookup_table,
+                flat_kmer,
+                flat_mc_fi,
+                deterministic,
             )
             all_rc_signals = generate_signals_lookup(
-                lookup_table, flat_rc_kmer, flat_mc_ri, deterministic,
+                lookup_table,
+                flat_rc_kmer,
+                flat_mc_ri,
+                deterministic,
             )
         else:
             # fi pass: rev-strand template context.
             all_signals = generate_signals_batch(
-                model, flat_kmer, flat_mid_fi, flat_frac_fi, flat_mc_fi,
-                device, deterministic,
+                model,
+                flat_kmer,
+                flat_mid_fi,
+                flat_frac_fi,
+                flat_mc_fi,
+                device,
+                deterministic,
                 rev_meth_contexts=flat_rev_fi,
             )
             # ri pass: fwd-strand template context.
             all_rc_signals = generate_signals_batch(
-                model, flat_rc_kmer, flat_mid_ri, flat_frac_ri, flat_mc_ri,
-                device, deterministic,
+                model,
+                flat_rc_kmer,
+                flat_mid_ri,
+                flat_frac_ri,
+                flat_mc_ri,
+                device,
+                deterministic,
                 rev_meth_contexts=flat_rev_ri,
             )
     else:
@@ -1391,10 +1428,12 @@ def generate_from_bam(
     meth_map = build_reference_meth_map(
         ref_seqs, motif_string, revcomp=revcomp, no_fuzznuc=no_fuzznuc
     )
-    from .utils.motifs import build_reference_meth_map_per_strand
     from .utils.config import get_extraction_params
+    from .utils.motifs import build_reference_meth_map_per_strand
+
     fwd_meth_map, rev_meth_map = build_reference_meth_map_per_strand(
-        ref_seqs, motif_string,
+        ref_seqs,
+        motif_string,
     )
     rev_meth_offsets = tuple(int(o) for o in get_extraction_params().rev_meth_offsets)
     frac_map = build_reference_frac_map(ref_seqs, motif_string, revcomp=revcomp)
@@ -1413,8 +1452,7 @@ def generate_from_bam(
     sig_offsets = _build_sig_offsets_by_meth_id()
     if p_eff_lookup:
         log.info(
-            "Statistical firing enabled: %d (meth, offset) buckets with p_fire ∈ "
-            "[%.2f, %.2f]",
+            "Statistical firing enabled: %d (meth, offset) buckets with p_fire ∈ [%.2f, %.2f]",
             len(p_eff_lookup),
             min(p_eff_lookup.values()),
             max(p_eff_lookup.values()),
@@ -1449,8 +1487,31 @@ def generate_from_bam(
             # in slurm_kinsim/callers/ipdsummary.slurm.
             hd["pb"] = "3.0.7"
         out_dict = {"HD": hd}
+        # Sanitize RG IDs for pbindex. ccs-kinetics-bystrandify appends a
+        # per-strand hex suffix to RG IDs (e.g. `f7c20c6c/33--33-744DFBEF`)
+        # which pbindex rejects with "malformed read group ID: ... Must be
+        # in the form {RGID_STRING}/{bcForward}--{bcReverse}". Strip the
+        # trailing `-{hex}` suffix before writing.
         if "RG" in in_dict:
-            out_dict["RG"] = in_dict["RG"]
+            import re as _re
+
+            _SUFFIX_RE = _re.compile(r"^(.+/\d+--\d+)-[0-9A-Fa-f]+$")
+            cleaned_rg = []
+            for rg in in_dict["RG"]:
+                rg = dict(rg)
+                rg_id = rg.get("ID", "")
+                m = _SUFFIX_RE.match(rg_id)
+                if m:
+                    rg["ID"] = m.group(1)
+                cleaned_rg.append(rg)
+            # Deduplicate by ID — multiple bystrandified RGs collapse to one.
+            seen: set[str] = set()
+            out_rg = []
+            for rg in cleaned_rg:
+                if rg["ID"] not in seen:
+                    out_rg.append(rg)
+                    seen.add(rg["ID"])
+            out_dict["RG"] = out_rg
         else:
             out_dict["RG"] = [{"ID": "00000001", "PL": "PACBIO", "DS": "READTYPE=CCS"}]
         header_out = pysam.AlignmentHeader.from_dict(out_dict)
@@ -1473,7 +1534,9 @@ def generate_from_bam(
             except (ValueError, OSError) as e:
                 log.error(
                     "Cannot fetch region '%s' — input BAM must be indexed "
-                    "(samtools index ...). Underlying error: %s", region, e,
+                    "(samtools index ...). Underlying error: %s",
+                    region,
+                    e,
                 )
                 sys.exit(1)
         else:
@@ -1620,19 +1683,19 @@ def _main_from_bam(argv):
         "--region",
         default=None,
         help="Process only reads overlapping this region (e.g. 'chr1:1-460000'). "
-             "Enables array-job parallelism: launch N tasks, each with a different "
-             "region, then samtools merge the outputs. Input BAM must be indexed.",
+        "Enables array-job parallelism: launch N tasks, each with a different "
+        "region, then samtools merge the outputs. Input BAM must be indexed.",
     )
     parser.add_argument(
         "--use-lookup",
         default=None,
         metavar="PATH_TO_NPZ",
         help="Use a pre-computed lookup table (from `kinsim predict-kmers`) instead "
-             "of running the model on the GPU. The LUT distils the trained model "
-             "into a (kmer, scenario) → (μ, σ) table — pure-numpy inference, no GPU "
-             "needed, ~1000× faster per-position. The checkpoint is still loaded "
-             "(only for p_fire metadata); pass the same checkpoint that produced the "
-             "LUT to keep firing semantics consistent.",
+        "of running the model on the GPU. The LUT distils the trained model "
+        "into a (kmer, scenario) → (μ, σ) table — pure-numpy inference, no GPU "
+        "needed, ~1000× faster per-position. The checkpoint is still loaded "
+        "(only for p_fire metadata); pass the same checkpoint that produced the "
+        "LUT to keep firing semantics consistent.",
     )
     args = parser.parse_args(argv)
 

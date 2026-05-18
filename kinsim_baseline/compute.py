@@ -42,7 +42,6 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
@@ -84,8 +83,12 @@ def load_signatures() -> dict:
         sys.exit(1)
     log.info("Loaded %d meth types from kinsim_config.yaml:", len(out))
     for T, info in out.items():
-        log.info("  %s: modified_base=%s  signal_offsets=%s",
-                 T, info["modified_base"], info["signal_offsets"])
+        log.info(
+            "  %s: modified_base=%s  signal_offsets=%s",
+            T,
+            info["modified_base"],
+            info["signal_offsets"],
+        )
     return out
 
 
@@ -94,7 +97,7 @@ def load_signatures() -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _read_kinetics(read) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+def _read_kinetics(read) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     """Extract (seq_bytes, ipd, pw) from a pysam read, or ``None`` if invalid.
 
     Bystrandified BAMs use ``ip``/``pw``; raw HiFi BAMs use ``fi``/``fp``.
@@ -143,12 +146,14 @@ def _accumulate_read(
             if tgt.size == 0:
                 continue
             ipd_vals = ipd[tgt]
-            pw_vals  = pw[tgt]
+            pw_vals = pw[tgt]
             hist_ipd[(T, k)] += np.bincount(ipd_vals, minlength=256).astype(np.int64)
-            hist_pw[(T, k)]  += np.bincount(pw_vals,  minlength=256).astype(np.int64)
+            hist_pw[(T, k)] += np.bincount(pw_vals, minlength=256).astype(np.int64)
             # 2D: linearise (ipd, pw) → flat index in [0, 65536), bincount, reshape.
             flat = ipd_vals.astype(np.int32) * 256 + pw_vals.astype(np.int32)
-            hist_joint[(T, k)] += np.bincount(flat, minlength=65536).astype(np.int64).reshape(256, 256)
+            hist_joint[(T, k)] += (
+                np.bincount(flat, minlength=65536).astype(np.int64).reshape(256, 256)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -174,8 +179,8 @@ def compute_histograms(
 
     signatures = load_signatures()
 
-    hist_ipd:   dict = defaultdict(lambda: np.zeros(256, dtype=np.int64))
-    hist_pw:    dict = defaultdict(lambda: np.zeros(256, dtype=np.int64))
+    hist_ipd: dict = defaultdict(lambda: np.zeros(256, dtype=np.int64))
+    hist_pw: dict = defaultdict(lambda: np.zeros(256, dtype=np.int64))
     hist_joint: dict = defaultdict(lambda: np.zeros((256, 256), dtype=np.int64))
     per_bam: dict = {}
 
@@ -195,8 +200,7 @@ def compute_histograms(
                 if kin is None:
                     continue
                 seq_arr, ipd, pw = kin
-                _accumulate_read(seq_arr, ipd, pw, signatures,
-                                 hist_ipd, hist_pw, hist_joint)
+                _accumulate_read(seq_arr, ipd, pw, signatures, hist_ipd, hist_pw, hist_joint)
                 n_reads += 1
                 if n_reads % progress_every == 0:
                     log.info("    ... %d reads", n_reads)
@@ -265,17 +269,32 @@ def write_hist_tsv(hist_ipd: dict, hist_pw: dict, signatures: dict, path: Path) 
 
 
 def write_summary_tsv(
-    hist_ipd: dict, hist_pw: dict, signatures: dict, path: Path, threshold: float = 1.3,
+    hist_ipd: dict,
+    hist_pw: dict,
+    signatures: dict,
+    path: Path,
+    threshold: float = 1.3,
 ) -> None:
     """Per-(T, k) summary: baseline (full histogram) + modified (above cutoff) + ratio."""
     cols = [
-        "meth_type", "offset", "modified_base",
+        "meth_type",
+        "offset",
+        "modified_base",
         "n",
-        "ipd_mean", "ipd_p50", "ipd_p95", "ipd_p99",
-        "pw_mean",  "pw_p50",  "pw_p95",  "pw_p99",
-        "threshold", "n_above",
-        "ipd_mean_above", "ipd_ratio",
-        "pw_mean_above",  "pw_ratio",
+        "ipd_mean",
+        "ipd_p50",
+        "ipd_p95",
+        "ipd_p99",
+        "pw_mean",
+        "pw_p50",
+        "pw_p95",
+        "pw_p99",
+        "threshold",
+        "n_above",
+        "ipd_mean_above",
+        "ipd_ratio",
+        "pw_mean_above",
+        "pw_ratio",
     ]
     with open(path, "w") as f:
         f.write("\t".join(cols) + "\n")
@@ -295,24 +314,40 @@ def write_summary_tsv(
                     above_i = _hist_above(hi, cutoff)
                     above_p = _hist_above(hp, cutoff)
                     ipd_ratio = (above_i["mean"] / s_i["mean"]) if above_i["mean"] else None
-                    pw_ratio = (above_p["mean"] / s_p["mean"]) if (above_p["mean"] and s_p["mean"]) else None
+                    pw_ratio = (
+                        (above_p["mean"] / s_p["mean"])
+                        if (above_p["mean"] and s_p["mean"])
+                        else None
+                    )
                 row = [
-                    T, f"{k:+d}", info["modified_base"],
+                    T,
+                    f"{k:+d}",
+                    info["modified_base"],
                     str(s_i["n"]),
-                    _fmt(s_i["mean"], "%.3f"), _fmt(s_i["p50"], "%d"),
-                    _fmt(s_i["p95"], "%d"),   _fmt(s_i["p99"], "%d"),
-                    _fmt(s_p["mean"], "%.3f"), _fmt(s_p["p50"], "%d"),
-                    _fmt(s_p["p95"], "%d"),   _fmt(s_p["p99"], "%d"),
-                    _fmt(threshold, "%.3f"), str(above_i["n"]),
-                    _fmt(above_i["mean"], "%.3f"), _fmt(ipd_ratio, "%.3f"),
-                    _fmt(above_p["mean"], "%.3f"), _fmt(pw_ratio,  "%.3f"),
+                    _fmt(s_i["mean"], "%.3f"),
+                    _fmt(s_i["p50"], "%d"),
+                    _fmt(s_i["p95"], "%d"),
+                    _fmt(s_i["p99"], "%d"),
+                    _fmt(s_p["mean"], "%.3f"),
+                    _fmt(s_p["p50"], "%d"),
+                    _fmt(s_p["p95"], "%d"),
+                    _fmt(s_p["p99"], "%d"),
+                    _fmt(threshold, "%.3f"),
+                    str(above_i["n"]),
+                    _fmt(above_i["mean"], "%.3f"),
+                    _fmt(ipd_ratio, "%.3f"),
+                    _fmt(above_p["mean"], "%.3f"),
+                    _fmt(pw_ratio, "%.3f"),
                 ]
                 f.write("\t".join(row) + "\n")
 
 
 def write_json(
-    hist_ipd: dict, hist_pw: dict, hist_joint: dict,
-    signatures: dict, path: Path,
+    hist_ipd: dict,
+    hist_pw: dict,
+    hist_joint: dict,
+    signatures: dict,
+    path: Path,
 ) -> None:
     """Full histograms in JSON: 1D IPD, 1D PW, and the 2D joint IPD×PW.
 
@@ -335,10 +370,7 @@ def write_json(
                 nz = np.argwhere(hj > 0)
                 if nz.size:
                     counts = hj[nz[:, 0], nz[:, 1]]
-                    out["joint"][key] = [
-                        [int(i), int(j), int(c)]
-                        for (i, j), c in zip(nz, counts)
-                    ]
+                    out["joint"][key] = [[int(i), int(j), int(c)] for (i, j), c in zip(nz, counts)]
                 else:
                     out["joint"][key] = []
     with open(path, "w") as f:
@@ -349,9 +381,19 @@ def log_summary(hist_ipd: dict, signatures: dict, threshold: float) -> None:
     log.info("=" * 72)
     log.info("PER-(meth_type, offset) IPD DISTRIBUTION SUMMARY  (threshold=%.2f)", threshold)
     log.info("=" * 72)
-    log.info("%-6s %5s  %-12s %7s %5s %5s %5s  %-10s %7s  %5s",
-             "meth", "off", "n", "ipd_mean", "p50", "p95", "p99",
-             "n_above", "mean_a", "ratio")
+    log.info(
+        "%-6s %5s  %-12s %7s %5s %5s %5s  %-10s %7s  %5s",
+        "meth",
+        "off",
+        "n",
+        "ipd_mean",
+        "p50",
+        "p95",
+        "p99",
+        "n_above",
+        "mean_a",
+        "ratio",
+    )
     for T, info in signatures.items():
         for k in info["signal_offsets"]:
             h = hist_ipd.get((T, k), np.zeros(256, dtype=np.int64))
@@ -364,8 +406,16 @@ def log_summary(hist_ipd: dict, signatures: dict, threshold: float) -> None:
             ratio = (ab["mean"] / s["mean"]) if ab["mean"] else None
             log.info(
                 "%-6s %+5d  %-12d %7.3f %5d %5d %5d  %-10d %7s  %5s",
-                T, k, s["n"], s["mean"], s["p50"], s["p95"], s["p99"],
-                ab["n"], _fmt(ab["mean"], "%.3f"), _fmt(ratio, "%.3f"),
+                T,
+                k,
+                s["n"],
+                s["mean"],
+                s["p50"],
+                s["p95"],
+                s["p99"],
+                ab["n"],
+                _fmt(ab["mean"], "%.3f"),
+                _fmt(ratio, "%.3f"),
             )
 
 
@@ -383,12 +433,18 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("manifest_csv", help="KinSim manifest CSV (sample_id,bam_path,...)")
-    p.add_argument("output_dir",
-                   help="Output directory; baseline_hist.tsv / baseline_summary.tsv / "
-                        "baseline.json / run_info.json land inside.")
-    p.add_argument("--threshold", type=float, default=1.3,
-                   help="Multiplier × baseline mean IPD used in the summary's "
-                        "'above-cutoff' / IPD-ratio columns (default 1.3).")
+    p.add_argument(
+        "output_dir",
+        help="Output directory; baseline_hist.tsv / baseline_summary.tsv / "
+        "baseline.json / run_info.json land inside.",
+    )
+    p.add_argument(
+        "--threshold",
+        type=float,
+        default=1.3,
+        help="Multiplier × baseline mean IPD used in the summary's "
+        "'above-cutoff' / IPD-ratio columns (default 1.3).",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
     setup_logging(verbose=args.verbose)
@@ -404,22 +460,26 @@ def main(argv=None):
     signatures, hist_ipd, hist_pw, hist_joint, per_bam = compute_histograms(bam_paths)
     elapsed = time.time() - t0
 
-    hist_path    = out_dir / "baseline_hist.tsv"
+    hist_path = out_dir / "baseline_hist.tsv"
     summary_path = out_dir / "baseline_summary.tsv"
-    json_path    = out_dir / "baseline.json"
-    info_path    = out_dir / "run_info.json"
+    json_path = out_dir / "baseline.json"
+    info_path = out_dir / "run_info.json"
 
     write_hist_tsv(hist_ipd, hist_pw, signatures, hist_path)
     write_summary_tsv(hist_ipd, hist_pw, signatures, summary_path, threshold=args.threshold)
     write_json(hist_ipd, hist_pw, hist_joint, signatures, json_path)
     with open(info_path, "w") as f:
-        json.dump({
-            "manifest_csv": str(args.manifest_csv),
-            "threshold":    args.threshold,
-            "elapsed_s":    round(elapsed, 2),
-            "per_bam":      per_bam,
-            "signatures":   signatures,
-        }, f, indent=2)
+        json.dump(
+            {
+                "manifest_csv": str(args.manifest_csv),
+                "threshold": args.threshold,
+                "elapsed_s": round(elapsed, 2),
+                "per_bam": per_bam,
+                "signatures": signatures,
+            },
+            f,
+            indent=2,
+        )
 
     log.info("Saved: %s", hist_path)
     log.info("Saved: %s", summary_path)

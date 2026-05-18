@@ -291,8 +291,8 @@ def _fit_gmms_per_bucket(
 
     # 1D fit on IPD. baseline_pool is (N, 2)=[IPD,PW]; we slice column 0
     # for the fit and keep PW stats for descriptive reporting only.
-    base_mu_full = baseline_pool.mean(axis=0).astype(np.float64)        # (2,)  [IPD, PW]
-    base_sigma_full = baseline_pool.std(axis=0).astype(np.float64)      # (2,)
+    base_mu_full = baseline_pool.mean(axis=0).astype(np.float64)  # (2,)  [IPD, PW]
+    base_sigma_full = baseline_pool.std(axis=0).astype(np.float64)  # (2,)
     base_mu_ipd = float(base_mu_full[0])
     base_var_ipd = float(baseline_pool[:, 0].var()) + 1e-3
     base_sigma_ipd = float(np.sqrt(base_var_ipd))
@@ -301,11 +301,17 @@ def _fit_gmms_per_bucket(
     log.info(
         "[refine.gmm] baseline anchor: IPD %.2f±%.2f  PW %.2f±%.2f  "
         "(similarity threshold = baseline_IPD + %.2f·σ = %.2f)",
-        base_mu_full[0], base_sigma_full[0], base_mu_full[1], base_sigma_full[1],
-        similarity_sigma_margin, similarity_threshold,
+        base_mu_full[0],
+        base_sigma_full[0],
+        base_mu_full[1],
+        base_sigma_full[1],
+        similarity_sigma_margin,
+        similarity_threshold,
     )
 
-    bucket_keys = sorted(slowed_chunks_by_TO.keys(), key=lambda k: (name_by_mid.get(k[0], "z"), k[1]))
+    bucket_keys = sorted(
+        slowed_chunks_by_TO.keys(), key=lambda k: (name_by_mid.get(k[0], "z"), k[1])
+    )
     for T_id, off in bucket_keys:
         T_name = name_by_mid.get(T_id, f"meth{T_id}")
         label = _bucket_label(T_name, off)
@@ -317,13 +323,20 @@ def _fit_gmms_per_bucket(
         if n_TO < min_samples_for_gmm:
             log.warning(
                 "[refine.gmm] %s: only %d slowed samples (< %d) — keeping all (no fit)",
-                label, n_TO, min_samples_for_gmm,
+                label,
+                n_TO,
+                min_samples_for_gmm,
             )
             per_bucket_stats[label] = {
-                "meth_type": T_name, "offset": off,
-                "n_in": n_TO, "n_kept": n_TO, "n_dropped": 0,
-                "p_fire": 1.0, "mean_occupancy": mean_occ,
-                "skipped": True, "reason": "too_few_samples",
+                "meth_type": T_name,
+                "offset": off,
+                "n_in": n_TO,
+                "n_kept": n_TO,
+                "n_dropped": 0,
+                "p_fire": 1.0,
+                "mean_occupancy": mean_occ,
+                "skipped": True,
+                "reason": "too_few_samples",
             }
             continue
 
@@ -335,8 +348,8 @@ def _fit_gmms_per_bucket(
         else:
             idx = rng.choice(len(baseline_pool), n_match, replace=False)
             base_sample = baseline_pool[idx]
-        slowed_arr = slowed_TO.astype(np.float64)            # (n_TO, 2) for descriptive PW
-        slowed_ipd = slowed_arr[:, 0:1]                       # (n_TO, 1) for the fit
+        slowed_arr = slowed_TO.astype(np.float64)  # (n_TO, 2) for descriptive PW
+        slowed_ipd = slowed_arr[:, 0:1]  # (n_TO, 1) for the fit
         pool_ipd = np.concatenate([base_sample[:, 0:1], slowed_ipd])  # (n_pool, 1)
 
         # BIC over candidate Ks. For each K: component 0 is initialised
@@ -356,7 +369,7 @@ def _fit_gmms_per_bucket(
         vetoed_ks: dict[int, str] = {}
         # Cache surviving fits so the strict selection below can
         # pick among them after seeing all BICs.
-        fits_by_k: dict[int, "GaussianMixture"] = {}
+        fits_by_k: dict[int, GaussianMixture] = {}
         for k in candidate_ks:
             # Biology-aligned init on the IPD axis only.
             #   K=1: single component at baseline IPD (lets EM drift
@@ -380,7 +393,7 @@ def _fit_gmms_per_bucket(
                     n_components=k,
                     means_init=means_init,
                     precisions_init=precisions_init,
-                    n_init=1,                  # single init = anchored
+                    n_init=1,  # single init = anchored
                     covariance_type="full",
                     max_iter=100,
                     random_state=seed,
@@ -415,15 +428,14 @@ def _fit_gmms_per_bucket(
                 ]
                 if below:
                     parts = ", ".join(f"comp{j} IPD={mu:.1f}" for j, mu in below)
-                    msg = (
-                        f"component(s) STRICTLY below baseline IPD={base_mu_ipd:.1f}: "
-                        f"{parts}"
-                    )
+                    msg = f"component(s) STRICTLY below baseline IPD={base_mu_ipd:.1f}: {parts}"
                     vetoed_ks[k] = msg
                     log.info(
-                        "[refine.gmm] %s: K=%d VETOED (%s, BIC=%.0f) — "
-                        "excluded from selection",
-                        label, k, msg, bic,
+                        "[refine.gmm] %s: K=%d VETOED (%s, BIC=%.0f) — excluded from selection",
+                        label,
+                        k,
+                        msg,
+                        bic,
                     )
                     continue
 
@@ -447,8 +459,10 @@ def _fit_gmms_per_bucket(
             if 1 in fits_by_k and bic_per_k[1] < best_bic:
                 log.info(
                     "[refine.gmm] %s: K=1 wins on BIC (%.0f < K=2's %.0f) — "
-                    "no separable structure, keeping all rows", label,
-                    bic_per_k[1], best_bic,
+                    "no separable structure, keeping all rows",
+                    label,
+                    bic_per_k[1],
+                    best_bic,
                 )
                 best_k = 1
                 best_gmm = fits_by_k[1]
@@ -461,16 +475,25 @@ def _fit_gmms_per_bucket(
                 if delta > strictness_threshold:
                     log.info(
                         "[refine.gmm] %s: K=%d wins (ΔBIC=%.0f > %.0f = %.2f·N) — "
-                        "switching from K=%d", label, k, delta, strictness_threshold,
-                        strict_bic_nats_per_sample, best_k,
+                        "switching from K=%d",
+                        label,
+                        k,
+                        delta,
+                        strictness_threshold,
+                        strict_bic_nats_per_sample,
+                        best_k,
                     )
                     best_k = k
                     best_gmm = fits_by_k[k]
                     best_bic = bic_per_k[k]
                 else:
                     log.info(
-                        "[refine.gmm] %s: K=%d not strict enough (ΔBIC=%.0f ≤ %.0f) — "
-                        "keeping K=%d", label, k, delta, strictness_threshold, best_k,
+                        "[refine.gmm] %s: K=%d not strict enough (ΔBIC=%.0f ≤ %.0f) — keeping K=%d",
+                        label,
+                        k,
+                        delta,
+                        strictness_threshold,
+                        best_k,
                     )
         else:
             # K=2 unavailable — fall back to lowest-BIC survivor.
@@ -479,23 +502,30 @@ def _fit_gmms_per_bucket(
             best_bic = bic_per_k[best_k]
             log.info(
                 "[refine.gmm] %s: K=2 unavailable — falling back to K=%d (BIC=%.0f)",
-                label, best_k, best_bic,
+                label,
+                best_k,
+                best_bic,
             )
 
         if best_gmm is None:
             log.warning("[refine.gmm] %s: all candidate Ks failed — keeping all", label)
             per_bucket_stats[label] = {
-                "meth_type": T_name, "offset": off,
-                "n_in": n_TO, "n_kept": n_TO, "n_dropped": 0,
-                "p_fire": 1.0, "mean_occupancy": mean_occ,
-                "skipped": True, "reason": "all_fits_failed",
+                "meth_type": T_name,
+                "offset": off,
+                "n_in": n_TO,
+                "n_kept": n_TO,
+                "n_dropped": 0,
+                "p_fire": 1.0,
+                "mean_occupancy": mean_occ,
+                "skipped": True,
+                "reason": "all_fits_failed",
             }
             continue
 
         gmm = best_gmm
-        means_1d = gmm.means_                       # (best_k, 1)
-        covariances_1d = gmm.covariances_           # (best_k, 1, 1)
-        weights = gmm.weights_                      # (best_k,)
+        means_1d = gmm.means_  # (best_k, 1)
+        covariances_1d = gmm.covariances_  # (best_k, 1, 1)
+        weights = gmm.weights_  # (best_k,)
         # Component 0 is the baseline anchor by construction (only when K≥2);
         # verify it didn't drift far during EM (warn if it did).
         anchor_drift_ipd = abs(float(means_1d[0, 0]) - base_mu_ipd)
@@ -522,10 +552,7 @@ def _fit_gmms_per_bucket(
         # Strict version (margin=0): drop only those at/below baseline.
         # Lenient version (margin=0.5): drop those within half a sigma of
         # baseline (treats them as essentially baseline-shaped).
-        keep_idxs = [
-            j for j in range(best_k)
-            if float(means_1d[j, 0]) > similarity_threshold
-        ]
+        keep_idxs = [j for j in range(best_k) if float(means_1d[j, 0]) > similarity_threshold]
 
         # Pretty-print components, IPD-ascending. Tags: ANCHOR (j=0 for K≥2),
         # KEEP / DROP per the similarity rule, NULL for K=1 below baseline.
@@ -557,23 +584,29 @@ def _fit_gmms_per_bucket(
             log.info(
                 "[refine.gmm] %s: K=1 selected — %s. %s. Kept all %d rows.",
                 label,
-                "null signal (mean ≤ similarity threshold)" if null_signal
+                "null signal (mean ≤ similarity threshold)"
+                if null_signal
                 else "unimodal signal (no separable contamination cluster)",
-                comp_summary, n_TO,
+                comp_summary,
+                n_TO,
             )
             fit_params_by_TO[(T_id, off)] = {
                 "means": means_1d.tolist(),
                 "covariances": covariances_1d.tolist(),
                 "weights": weights.tolist(),
                 "baseline_idx": -1,
-                "keep_idxs": [0],            # keep the single component → all rows
+                "keep_idxs": [0],  # keep the single component → all rows
                 "k1_null_signal": null_signal,
                 "fit_dim": 1,
             }
             per_bucket_stats[label] = {
-                "meth_type": T_name, "offset": off,
-                "n_in": n_TO, "n_kept": n_TO, "n_dropped": 0,
-                "p_fire": 1.0, "mean_occupancy": mean_occ,
+                "meth_type": T_name,
+                "offset": off,
+                "n_in": n_TO,
+                "n_kept": n_TO,
+                "n_dropped": 0,
+                "p_fire": 1.0,
+                "mean_occupancy": mean_occ,
                 "skipped": False,
                 "n_components_used": 1,
                 "n_components_candidates": list(candidate_ks),
@@ -593,14 +626,22 @@ def _fit_gmms_per_bucket(
                 "[refine.gmm] %s: no component sits above similarity threshold "
                 "(IPD %.2f + %.2f·σ = %.2f) — no detectable meth signal. "
                 "Keeping all rows. Components: %s",
-                label, base_mu_ipd, similarity_sigma_margin, similarity_threshold,
+                label,
+                base_mu_ipd,
+                similarity_sigma_margin,
+                similarity_threshold,
                 comp_summary,
             )
             per_bucket_stats[label] = {
-                "meth_type": T_name, "offset": off,
-                "n_in": n_TO, "n_kept": n_TO, "n_dropped": 0,
-                "p_fire": 1.0, "mean_occupancy": mean_occ,
-                "skipped": True, "reason": "no_component_above_threshold",
+                "meth_type": T_name,
+                "offset": off,
+                "n_in": n_TO,
+                "n_kept": n_TO,
+                "n_dropped": 0,
+                "p_fire": 1.0,
+                "mean_occupancy": mean_occ,
+                "skipped": True,
+                "reason": "no_component_above_threshold",
                 "n_components_used": best_k,
                 "bic_per_k": bic_per_k,
                 "gmm_means": means_1d.tolist(),
@@ -614,13 +655,22 @@ def _fit_gmms_per_bucket(
         log.info(
             "[refine.gmm] %s: K=%d  BIC=%.0f  drift(IPD)=%.1f  %s.  "
             "Kept %d/%d (%.1f%%), dropped %d.",
-            label, best_k, best_bic, anchor_drift_ipd, comp_summary,
-            n_kept, n_TO, 100.0 * n_kept / max(n_TO, 1), drop_count,
+            label,
+            best_k,
+            best_bic,
+            anchor_drift_ipd,
+            comp_summary,
+            n_kept,
+            n_TO,
+            100.0 * n_kept / max(n_TO, 1),
+            drop_count,
         )
         if anchor_drift_ipd > 5 * base_sigma_ipd:
             log.warning(
                 "[refine.gmm] %s: baseline anchor drifted %.1f IPD units (>5σ_baseline) — "
-                "fit may be unreliable for this bucket.", label, anchor_drift_ipd,
+                "fit may be unreliable for this bucket.",
+                label,
+                anchor_drift_ipd,
             )
 
         fit_params_by_TO[(T_id, off)] = {
@@ -632,9 +682,13 @@ def _fit_gmms_per_bucket(
             "fit_dim": 1,
         }
         per_bucket_stats[label] = {
-            "meth_type": T_name, "offset": off,
-            "n_in": n_TO, "n_kept": n_kept, "n_dropped": drop_count,
-            "p_fire": n_kept / n_TO, "mean_occupancy": mean_occ,
+            "meth_type": T_name,
+            "offset": off,
+            "n_in": n_TO,
+            "n_kept": n_kept,
+            "n_dropped": drop_count,
+            "p_fire": n_kept / n_TO,
+            "mean_occupancy": mean_occ,
             "skipped": False,
             "n_components_used": best_k,
             "n_components_candidates": list(candidate_ks),
@@ -703,7 +757,10 @@ def _fit_gmms_per_bucket(
                 "[refine.gmm] %s: DROP component IPD spreads %.1f units "
                 "across offsets (> %.1f = 2·σ_baseline). Possible mis-clustering "
                 "or motif-kmer-context bias. DROPs: %s",
-                T_name, spread, warn_threshold, pairs,
+                T_name,
+                spread,
+                warn_threshold,
+                pairs,
             )
 
     return fit_params_by_TO, per_bucket_stats
@@ -803,9 +860,7 @@ def _apply_gmm_filter_to_data(
                         # Backwards-compat with older fit params.
                         keep_local = assigned != int(params["baseline_idx"])
                     else:
-                        keep_local = np.isin(
-                            assigned, np.asarray(keep_idxs_TO, dtype=int)
-                        )
+                        keep_local = np.isin(assigned, np.asarray(keep_idxs_TO, dtype=int))
                     full_idx = np.where(mask_TO)[0]
                     tmp = np.zeros_like(mask_TO)
                     tmp[full_idx[keep_local]] = True
@@ -1334,7 +1389,10 @@ def main(argv=None):
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("input_pkl", help="Shard .pkl from `kinsim extract`, OR a directory of *_shard.pkl (sharded mode)")
+    ap.add_argument(
+        "input_pkl",
+        help="Shard .pkl from `kinsim extract`, OR a directory of *_shard.pkl (sharded mode)",
+    )
     ap.add_argument("output_pkl", help="Output refined .pkl")
     # GMM knobs
     ap.add_argument(

@@ -98,6 +98,7 @@ COMPLEMENT = {
     "H": "D",
 }
 
+
 # PacBio CSV "modified_base" resolver: when modificationType is blank or
 # generic, infer the meth type from the base at centerPos. Built lazily
 # from kinsim_config.yaml's ``modified_base`` fields so the mapping is
@@ -122,6 +123,7 @@ def _build_base_to_meth() -> dict[str, str]:
             out[base] = mods[0]
         # else: ambiguous → caller must look at modificationType, not base
     return out
+
 
 # GFF attribute parser: extracts pattern name from fuzznuc GFF output.
 # Matches "Pattern_name=...", "Name=...", or "pattern=..." (case-insensitive).
@@ -458,7 +460,12 @@ def parse_motifs_per_strand(motif_string: str) -> tuple[list, list]:
             log.warning(
                 "parse_motifs_per_strand: auto-rc of '%s' (%s, mod_pos=%d) → "
                 "(%s, mod_pos=%d) invalid (%s). Skipping − strand entry.",
-                seq, m_type, mod_pos, rc, rc_mod_pos, exc,
+                seq,
+                m_type,
+                mod_pos,
+                rc,
+                rc_mod_pos,
+                exc,
             )
             continue
         rev_pattern = re.compile(f"(?=({iupac_to_re(rc)}))")

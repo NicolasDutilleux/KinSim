@@ -46,7 +46,6 @@ import torch
 from torch.utils.data import Dataset, IterableDataset
 
 from ..utils.config import ExtractionParams, get_extraction_params
-from ..utils.encoding import K
 from ..utils.sample_layout import SampleLayout, get_sample_layout
 
 log = logging.getLogger(__name__)
@@ -134,7 +133,7 @@ def read_shard_extraction_params(data_dict: dict) -> ExtractionParams | None:
         return None
     try:
         return ExtractionParams.from_dict(raw)
-    except Exception as exc:  # noqa: BLE001 — caller logs a clearer message
+    except Exception as exc:
         log.warning("shard __meta__.extraction_params failed to parse: %s", exc)
         return None
 
@@ -205,8 +204,8 @@ def _flatten_data_dict(
                 f"point training at the right shards."
             )
         kmer_id = int(key)
-        ctx = samples[:, layout.col_meth_ctx_start:layout.col_meth_ctx_end].astype(np.uint8)
-        rev = samples[:, layout.col_rev_meth:layout.col_category].astype(np.uint8)
+        ctx = samples[:, layout.col_meth_ctx_start : layout.col_meth_ctx_end].astype(np.uint8)
+        rev = samples[:, layout.col_rev_meth : layout.col_category].astype(np.uint8)
         meth_at_center = ctx[:, pred_idx].astype(np.int8)
         n = len(samples)
         kmer_ids_list.append(np.full(n, kmer_id, dtype=np.int64))
@@ -238,19 +237,24 @@ def _flatten_data_dict(
     # Concatenate and *immediately* drop the per-key lists so we don't
     # hold both the lists AND the merged arrays at the same time (each
     # was ~half of peak memory before this fix).
-    kmer_ids       = np.concatenate(kmer_ids_list);     kmer_ids_list = None
-    meth_ids       = np.concatenate(meth_ids_list);     meth_ids_list = None
-    fractions      = np.concatenate(fractions_list).astype(np.float32)
+    kmer_ids = np.concatenate(kmer_ids_list)
+    kmer_ids_list = None
+    meth_ids = np.concatenate(meth_ids_list)
+    meth_ids_list = None
+    fractions = np.concatenate(fractions_list).astype(np.float32)
     fractions_list = None
-    meth_ctx       = np.concatenate(meth_ctx_list);     meth_ctx_list = None
-    rev_meth       = np.concatenate(rev_meth_list);     rev_meth_list = None
-    parent_meths   = np.concatenate(parent_meth_list);  parent_meth_list = None
-    parent_offsets = np.concatenate(parent_offset_list); parent_offset_list = None
-    categories     = np.concatenate(category_list);     category_list = None
-    signals_log    = log_transform(
-        torch.from_numpy(np.concatenate(signals_list, axis=0)).float()
-    )
-    signals_list   = None
+    meth_ctx = np.concatenate(meth_ctx_list)
+    meth_ctx_list = None
+    rev_meth = np.concatenate(rev_meth_list)
+    rev_meth_list = None
+    parent_meths = np.concatenate(parent_meth_list)
+    parent_meth_list = None
+    parent_offsets = np.concatenate(parent_offset_list)
+    parent_offset_list = None
+    categories = np.concatenate(category_list)
+    category_list = None
+    signals_log = log_transform(torch.from_numpy(np.concatenate(signals_list, axis=0)).float())
+    signals_list = None
 
     # ── Vectorised meth_full construction (the big speedup) ────────────────
     # meth_full[i, pos, m] = 1.0 if mc/rev has meth m at pos, else 0.0.
@@ -296,9 +300,7 @@ def _flatten_data_dict(
         if valid.any():
             nb_valid = nb_rows[valid]
             pp_valid = parent_kmer_pos[valid]
-            pm_valid = np.clip(
-                parent_meths[nb_valid].astype(np.int64), 0, num_meth_types - 1
-            )
+            pm_valid = np.clip(parent_meths[nb_valid].astype(np.int64), 0, num_meth_types - 1)
             meth_full[nb_valid, pp_valid, pm_valid] = fractions[nb_valid]
 
     # Rev_meth block: positions [kmer_size, kmer_size + n_rev_meth).
@@ -312,15 +314,15 @@ def _flatten_data_dict(
     del meth_ctx, rev_meth, fractions, rows_idx, cols_idx
 
     return {
-        "kmer_ids":       kmer_ids,
-        "meth_ids":       meth_ids,
-        "signals_log":    signals_log,
-        "meth_full":      meth_full,
-        "parent_meths":   parent_meths,
+        "kmer_ids": kmer_ids,
+        "meth_ids": meth_ids,
+        "signals_log": signals_log,
+        "meth_full": meth_full,
+        "parent_meths": parent_meths,
         "parent_offsets": parent_offsets,
-        "categories":     categories,
-        "n_keys":         n_keys,
-        "meth_counts":    dict(n_meth_counts),
+        "categories": categories,
+        "n_keys": n_keys,
+        "meth_counts": dict(n_meth_counts),
     }
 
 
@@ -366,12 +368,18 @@ def _expand_with_pairs(flat: dict, augment_seed: int = 42) -> dict:
     )
     aug_src = non_baseline_idx[augmentable]
     if aug_src.size == 0:
-        log.warning("augment=True but no augmentable rows found (no kmer has both "
-                    "baseline AND non-baseline observations). Returning original.")
+        log.warning(
+            "augment=True but no augmentable rows found (no kmer has both "
+            "baseline AND non-baseline observations). Returning original."
+        )
         return flat
 
-    log.info("Paired-positive augmentation: %d original rows + %d paired baselines = %d total",
-             n, aug_src.size, n + aug_src.size)
+    log.info(
+        "Paired-positive augmentation: %d original rows + %d paired baselines = %d total",
+        n,
+        aug_src.size,
+        n + aug_src.size,
+    )
 
     # Pre-pick a baseline pair for each augmentable row.
     paired_baseline = np.empty(aug_src.size, dtype=np.int64)
@@ -384,13 +392,13 @@ def _expand_with_pairs(flat: dict, augment_seed: int = 42) -> dict:
     out["n_keys"] = flat["n_keys"]
     out["meth_counts"] = dict(flat["meth_counts"])
     for k, src_dtype in [
-        ("kmer_ids",       flat["kmer_ids"].dtype),
-        ("meth_ids",       flat["meth_ids"].dtype),
-        ("parent_meths",   flat["parent_meths"].dtype),
+        ("kmer_ids", flat["kmer_ids"].dtype),
+        ("meth_ids", flat["meth_ids"].dtype),
+        ("parent_meths", flat["parent_meths"].dtype),
         ("parent_offsets", flat["parent_offsets"].dtype),
-        ("categories",     flat["categories"].dtype),
+        ("categories", flat["categories"].dtype),
     ]:
-        original  = flat[k]
+        original = flat[k]
         from_pair = original[paired_baseline]
         out[k] = np.concatenate([original, from_pair]).astype(src_dtype)
 
@@ -423,10 +431,7 @@ def _build_baseline_index(flat: dict) -> dict[int, np.ndarray]:
     sorted_indices = baseline_idx[order]
     unique_kids, starts = np.unique(sorted_kids, return_index=True)
     ends = np.append(starts[1:], len(sorted_kids))
-    return {
-        int(uk): sorted_indices[s:e]
-        for uk, s, e in zip(unique_kids, starts, ends)
-    }
+    return {int(uk): sorted_indices[s:e] for uk, s, e in zip(unique_kids, starts, ends)}
 
 
 # NOTE: the per-row Python builder ``_build_meth_full`` used to live here.
@@ -504,9 +509,9 @@ class SignalDataset(Dataset):
         self._meth_ids = flat["meth_ids"]
         self._signals = flat["signals_log"]
         self._meth_full = flat["meth_full"]
-        self._parent_meths   = flat["parent_meths"]
+        self._parent_meths = flat["parent_meths"]
         self._parent_offsets = flat["parent_offsets"]
-        self._categories     = flat["categories"]
+        self._categories = flat["categories"]
 
         n_total = len(self._kmer_ids)
         from ..utils.encoding import get_meth_ids
@@ -541,10 +546,10 @@ class SignalDataset(Dataset):
             torch.tensor(int(self._kmer_ids[idx]), dtype=torch.long),
             torch.from_numpy(self._meth_full[idx]),
             self._signals[idx],
-            torch.tensor(int(self._meth_ids[idx]),       dtype=torch.long),
-            torch.tensor(int(self._parent_meths[idx]),   dtype=torch.long),
+            torch.tensor(int(self._meth_ids[idx]), dtype=torch.long),
+            torch.tensor(int(self._parent_meths[idx]), dtype=torch.long),
             torch.tensor(int(self._parent_offsets[idx]), dtype=torch.long),
-            torch.tensor(int(self._categories[idx]),     dtype=torch.long),
+            torch.tensor(int(self._categories[idx]), dtype=torch.long),
         )
 
 
@@ -621,9 +626,13 @@ class ShardedSignalDataset(IterableDataset):
             "upstream=%d, downstream=%d, rev_meth=%s)  shuffle=%s  "
             "augment=%s  balance_kmers=%s",
             len(self._shard_paths),
-            params.kmer_size, params.upstream, params.downstream,
+            params.kmer_size,
+            params.upstream,
+            params.downstream,
             list(params.rev_meth_offsets),
-            shuffle, self._augment, self._balance_kmers,
+            shuffle,
+            self._augment,
+            self._balance_kmers,
         )
 
     def set_epoch(self, epoch: int) -> None:
@@ -689,7 +698,9 @@ class ShardedSignalDataset(IterableDataset):
             if shard_params is not None:
                 self._params.assert_compatible(shard_params, where=f"shard {shard_path}")
             flat = _flatten_data_dict(
-                data_dict, self._layout, num_meth_types=self._num_meth_types,
+                data_dict,
+                self._layout,
+                num_meth_types=self._num_meth_types,
             )
             del data_dict  # release the loaded shard before iterating
             n = len(flat["kmer_ids"])
@@ -711,14 +722,11 @@ class ShardedSignalDataset(IterableDataset):
                 #   actually bias every draw, so rare rows ARE seen more
                 #   per epoch. Some common rows are skipped (random) and
                 #   re-visited in later epochs — fine for training.
-                composite = (
-                    flat["kmer_ids"].astype(np.int64) * 4
-                    + flat["categories"].astype(np.int64)
+                composite = flat["kmer_ids"].astype(np.int64) * 4 + flat["categories"].astype(
+                    np.int64
                 )
                 counts = np.bincount(composite)
-                row_w = 1.0 / np.sqrt(
-                    np.maximum(counts[composite], 1).astype(np.float64)
-                )
+                row_w = 1.0 / np.sqrt(np.maximum(counts[composite], 1).astype(np.float64))
                 row_w /= row_w.sum()
                 target_size = min(cap, n) if (cap is not None and cap > 0) else n
                 order = rng.choice(n, size=target_size, replace=True, p=row_w)
@@ -730,18 +738,16 @@ class ShardedSignalDataset(IterableDataset):
                     order = order[:cap]
 
             # Build per-shard baseline index for augment lookups
-            baseline_idx_by_kmer = (
-                _build_baseline_index(flat) if augment else {}
-            )
+            baseline_idx_by_kmer = _build_baseline_index(flat) if augment else {}
 
             # Convert the numpy arrays to torch once per shard.
-            kmer_ids_t       = torch.from_numpy(flat["kmer_ids"].astype(np.int64))
-            meth_ids_t       = torch.from_numpy(flat["meth_ids"].astype(np.int64))
-            parent_meths_t   = torch.from_numpy(flat["parent_meths"].astype(np.int64))
+            kmer_ids_t = torch.from_numpy(flat["kmer_ids"].astype(np.int64))
+            meth_ids_t = torch.from_numpy(flat["meth_ids"].astype(np.int64))
+            parent_meths_t = torch.from_numpy(flat["parent_meths"].astype(np.int64))
             parent_offsets_t = torch.from_numpy(flat["parent_offsets"].astype(np.int64))
-            categories_t     = torch.from_numpy(flat["categories"].astype(np.int64))
-            meth_full_t      = torch.from_numpy(flat["meth_full"])  # already float32
-            signals_t        = flat["signals_log"]                  # already torch tensor
+            categories_t = torch.from_numpy(flat["categories"].astype(np.int64))
+            meth_full_t = torch.from_numpy(flat["meth_full"])  # already float32
+            signals_t = flat["signals_log"]  # already torch tensor
 
             for idx in order:
                 i = int(idx)

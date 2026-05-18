@@ -49,11 +49,11 @@ from pathlib import Path
 import numpy as np
 
 from kinsim.utils.config import load_manifest
-from kinsim.utils.encoding import K, KMER_PRED_IDX
+from kinsim.utils.encoding import KMER_PRED_IDX, K
 
 log = logging.getLogger(__name__)
 
-N_KMERS = 4 ** K  # 4 194 304
+N_KMERS = 4**K  # 4 194 304
 
 
 # ---------------------------------------------------------------------------
@@ -84,12 +84,21 @@ def load_baseline(predict_npz: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray
             f"Re-run `kinsim predict-kmers` with K={K}."
         )
     log.info(
-        "AI baseline loaded from %s:", predict_npz,
+        "AI baseline loaded from %s:",
+        predict_npz,
     )
-    log.info("  μ_IPD: min=%.2f mean=%.2f max=%.2f",
-             float(mu_ipd.min()), float(mu_ipd.mean()), float(mu_ipd.max()))
-    log.info("  σ_IPD: min=%.2f mean=%.2f max=%.2f",
-             float(sigma_ipd.min()), float(sigma_ipd.mean()), float(sigma_ipd.max()))
+    log.info(
+        "  μ_IPD: min=%.2f mean=%.2f max=%.2f",
+        float(mu_ipd.min()),
+        float(mu_ipd.mean()),
+        float(mu_ipd.max()),
+    )
+    log.info(
+        "  σ_IPD: min=%.2f mean=%.2f max=%.2f",
+        float(sigma_ipd.min()),
+        float(sigma_ipd.mean()),
+        float(sigma_ipd.max()),
+    )
     return mu_ipd, sigma_ipd, mu_pw, sigma_pw
 
 
@@ -147,14 +156,24 @@ def _read_kinetics(read):
 
 
 def _accumulate_read(
-    seq_arr: np.ndarray, ipd: np.ndarray, pw: np.ndarray,
-    thr_ipd: np.ndarray, thr_pw: np.ndarray,
-    n_total: np.ndarray, n_above_ipd: np.ndarray, n_above_pw: np.ndarray,
-    sum_obs_ipd: np.ndarray, sum2_obs_ipd: np.ndarray,
-    sum_above_ipd: np.ndarray, sum2_above_ipd: np.ndarray,
-    sum_obs_pw: np.ndarray, sum2_obs_pw: np.ndarray,
-    sum_above_pw: np.ndarray, sum2_above_pw: np.ndarray,
-    hist_ipd: np.ndarray | None = None, hist_n_bins: int = 64,
+    seq_arr: np.ndarray,
+    ipd: np.ndarray,
+    pw: np.ndarray,
+    thr_ipd: np.ndarray,
+    thr_pw: np.ndarray,
+    n_total: np.ndarray,
+    n_above_ipd: np.ndarray,
+    n_above_pw: np.ndarray,
+    sum_obs_ipd: np.ndarray,
+    sum2_obs_ipd: np.ndarray,
+    sum_above_ipd: np.ndarray,
+    sum2_above_ipd: np.ndarray,
+    sum_obs_pw: np.ndarray,
+    sum2_obs_pw: np.ndarray,
+    sum_above_pw: np.ndarray,
+    sum2_above_pw: np.ndarray,
+    hist_ipd: np.ndarray | None = None,
+    hist_n_bins: int = 64,
 ) -> int:
     """For each valid 11-mer window, compare its centre IPD/PW against the
     AI's per-kmer threshold and update the running accumulators.
@@ -175,7 +194,7 @@ def _accumulate_read(
     # The kmer at window-start i has its prediction position at i + centre.
     # All valid pred positions live inside ipd / pw because centre < K <= L.
     obs_ipd = ipd[centre : centre + n_windows].astype(np.float32)
-    obs_pw  = pw[centre  : centre + n_windows].astype(np.float32)
+    obs_pw = pw[centre : centre + n_windows].astype(np.float32)
 
     kmer_ids = kmer_ids[valid]
     obs_ipd = obs_ipd[valid]
@@ -187,10 +206,10 @@ def _accumulate_read(
     np.add.at(n_total, kmer_ids, ones)
 
     # Observed totals (across all observations) — used to compare μ_obs vs μ_pred
-    np.add.at(sum_obs_ipd,  kmer_ids, obs_ipd.astype(np.float64))
+    np.add.at(sum_obs_ipd, kmer_ids, obs_ipd.astype(np.float64))
     np.add.at(sum2_obs_ipd, kmer_ids, (obs_ipd.astype(np.float64)) ** 2)
-    np.add.at(sum_obs_pw,   kmer_ids, obs_pw.astype(np.float64))
-    np.add.at(sum2_obs_pw,  kmer_ids, (obs_pw.astype(np.float64)) ** 2)
+    np.add.at(sum_obs_pw, kmer_ids, obs_pw.astype(np.float64))
+    np.add.at(sum2_obs_pw, kmer_ids, (obs_pw.astype(np.float64)) ** 2)
 
     # Above-threshold subset (per-kmer threshold from the AI baseline)
     thr_i = thr_ipd[kmer_ids]
@@ -198,8 +217,8 @@ def _accumulate_read(
     if above_i.any():
         ki = kmer_ids[above_i]
         oi = obs_ipd[above_i].astype(np.float64)
-        np.add.at(n_above_ipd,    ki, np.ones(ki.size, dtype=np.int64))
-        np.add.at(sum_above_ipd,  ki, oi)
+        np.add.at(n_above_ipd, ki, np.ones(ki.size, dtype=np.int64))
+        np.add.at(sum_above_ipd, ki, oi)
         np.add.at(sum2_above_ipd, ki, oi * oi)
 
     thr_p = thr_pw[kmer_ids]
@@ -207,8 +226,8 @@ def _accumulate_read(
     if above_p.any():
         kp = kmer_ids[above_p]
         op = obs_pw[above_p].astype(np.float64)
-        np.add.at(n_above_pw,    kp, np.ones(kp.size, dtype=np.int64))
-        np.add.at(sum_above_pw,  kp, op)
+        np.add.at(n_above_pw, kp, np.ones(kp.size, dtype=np.int64))
+        np.add.at(sum_above_pw, kp, op)
         np.add.at(sum2_above_pw, kp, op * op)
 
     # Per-kmer observed IPD histogram — 64-bin (each bin = 4 IPD units).
@@ -216,7 +235,8 @@ def _accumulate_read(
     # save. ``hist_ipd`` shape: (N_KMERS, hist_n_bins).
     if hist_ipd is not None:
         bin_idx = (obs_ipd.astype(np.int32) // (256 // hist_n_bins)).clip(
-            0, hist_n_bins - 1,
+            0,
+            hist_n_bins - 1,
         )
         # Flatten (kmer_id, bin_idx) → linear idx for one np.add.at
         flat = kmer_ids * hist_n_bins + bin_idx
@@ -233,8 +253,10 @@ def _accumulate_read(
 
 def accumulate_per_kmer(
     bam_paths: list[Path],
-    mu_ipd: np.ndarray, sigma_ipd: np.ndarray,
-    mu_pw: np.ndarray,  sigma_pw: np.ndarray,
+    mu_ipd: np.ndarray,
+    sigma_ipd: np.ndarray,
+    mu_pw: np.ndarray,
+    sigma_pw: np.ndarray,
     threshold_factor: float,
     max_reads_per_bam: int | None = None,
     progress_every: int = 50_000,
@@ -245,35 +267,42 @@ def accumulate_per_kmer(
     import pysam
 
     thr_ipd = (mu_ipd + threshold_factor * sigma_ipd).astype(np.float32)
-    thr_pw  = (mu_pw  + threshold_factor * sigma_pw ).astype(np.float32)
+    thr_pw = (mu_pw + threshold_factor * sigma_pw).astype(np.float32)
 
-    n_total       = np.zeros(N_KMERS, dtype=np.int64)
-    n_above_ipd   = np.zeros(N_KMERS, dtype=np.int64)
-    n_above_pw    = np.zeros(N_KMERS, dtype=np.int64)
-    sum_obs_ipd   = np.zeros(N_KMERS, dtype=np.float64)
-    sum2_obs_ipd  = np.zeros(N_KMERS, dtype=np.float64)
+    n_total = np.zeros(N_KMERS, dtype=np.int64)
+    n_above_ipd = np.zeros(N_KMERS, dtype=np.int64)
+    n_above_pw = np.zeros(N_KMERS, dtype=np.int64)
+    sum_obs_ipd = np.zeros(N_KMERS, dtype=np.float64)
+    sum2_obs_ipd = np.zeros(N_KMERS, dtype=np.float64)
     sum_above_ipd = np.zeros(N_KMERS, dtype=np.float64)
-    sum2_above_ipd= np.zeros(N_KMERS, dtype=np.float64)
-    sum_obs_pw    = np.zeros(N_KMERS, dtype=np.float64)
-    sum2_obs_pw   = np.zeros(N_KMERS, dtype=np.float64)
-    sum_above_pw  = np.zeros(N_KMERS, dtype=np.float64)
+    sum2_above_ipd = np.zeros(N_KMERS, dtype=np.float64)
+    sum_obs_pw = np.zeros(N_KMERS, dtype=np.float64)
+    sum2_obs_pw = np.zeros(N_KMERS, dtype=np.float64)
+    sum_above_pw = np.zeros(N_KMERS, dtype=np.float64)
     sum2_above_pw = np.zeros(N_KMERS, dtype=np.float64)
     # Per-kmer observed IPD histogram (~1 GB for 4.2M × 64 × uint32). uint32
     # to avoid silent overflow on np.add.at; we can compress when saving.
-    hist_ipd = (
-        np.zeros((N_KMERS, hist_n_bins), dtype=np.uint32) if collect_hist else None
-    )
+    hist_ipd = np.zeros((N_KMERS, hist_n_bins), dtype=np.uint32) if collect_hist else None
     per_bam: dict = {}
 
     log.info(
         "Walking %d BAMs with threshold = μ_pred + %.2f · σ_pred (per kmer)",
-        len(bam_paths), threshold_factor,
+        len(bam_paths),
+        threshold_factor,
     )
     if collect_hist:
-        log.info("  Collecting per-kmer IPD histogram (%d bins × %d kmers ≈ %.0f MB)",
-                 hist_n_bins, N_KMERS, hist_ipd.nbytes / 1e6)
-    log.info("  IPD threshold: min=%.2f mean=%.2f max=%.2f",
-             float(thr_ipd.min()), float(thr_ipd.mean()), float(thr_ipd.max()))
+        log.info(
+            "  Collecting per-kmer IPD histogram (%d bins × %d kmers ≈ %.0f MB)",
+            hist_n_bins,
+            N_KMERS,
+            hist_ipd.nbytes / 1e6,
+        )
+    log.info(
+        "  IPD threshold: min=%.2f mean=%.2f max=%.2f",
+        float(thr_ipd.min()),
+        float(thr_ipd.mean()),
+        float(thr_ipd.max()),
+    )
 
     for bi, bam_path in enumerate(bam_paths, 1):
         bam_path = Path(bam_path)
@@ -294,11 +323,24 @@ def accumulate_per_kmer(
                     continue
                 seq_arr, ipd, pw = kin
                 n_windows += _accumulate_read(
-                    seq_arr, ipd, pw, thr_ipd, thr_pw,
-                    n_total, n_above_ipd, n_above_pw,
-                    sum_obs_ipd, sum2_obs_ipd, sum_above_ipd, sum2_above_ipd,
-                    sum_obs_pw,  sum2_obs_pw,  sum_above_pw,  sum2_above_pw,
-                    hist_ipd=hist_ipd, hist_n_bins=hist_n_bins,
+                    seq_arr,
+                    ipd,
+                    pw,
+                    thr_ipd,
+                    thr_pw,
+                    n_total,
+                    n_above_ipd,
+                    n_above_pw,
+                    sum_obs_ipd,
+                    sum2_obs_ipd,
+                    sum_above_ipd,
+                    sum2_above_ipd,
+                    sum_obs_pw,
+                    sum2_obs_pw,
+                    sum_above_pw,
+                    sum2_above_pw,
+                    hist_ipd=hist_ipd,
+                    hist_n_bins=hist_n_bins,
                 )
                 n_reads += 1
                 if n_reads % progress_every == 0:
@@ -306,17 +348,24 @@ def accumulate_per_kmer(
         dt = time.time() - t0
         log.info("    → %d reads, %d windows, %.1f s", n_reads, n_windows, dt)
         per_bam[str(bam_path)] = {
-            "n_reads": n_reads, "n_windows": n_windows, "elapsed_s": round(dt, 2),
+            "n_reads": n_reads,
+            "n_windows": n_windows,
+            "elapsed_s": round(dt, 2),
         }
 
     return {
         "n_total": n_total,
-        "n_above_ipd": n_above_ipd, "n_above_pw": n_above_pw,
-        "sum_obs_ipd": sum_obs_ipd, "sum2_obs_ipd": sum2_obs_ipd,
-        "sum_above_ipd": sum_above_ipd, "sum2_above_ipd": sum2_above_ipd,
-        "sum_obs_pw": sum_obs_pw, "sum2_obs_pw": sum2_obs_pw,
-        "sum_above_pw": sum_above_pw, "sum2_above_pw": sum2_above_pw,
-        "hist_ipd": hist_ipd,        # (N_KMERS, hist_n_bins) uint32 or None
+        "n_above_ipd": n_above_ipd,
+        "n_above_pw": n_above_pw,
+        "sum_obs_ipd": sum_obs_ipd,
+        "sum2_obs_ipd": sum2_obs_ipd,
+        "sum_above_ipd": sum_above_ipd,
+        "sum2_above_ipd": sum2_above_ipd,
+        "sum_obs_pw": sum_obs_pw,
+        "sum2_obs_pw": sum2_obs_pw,
+        "sum_above_pw": sum_above_pw,
+        "sum2_above_pw": sum2_above_pw,
+        "hist_ipd": hist_ipd,  # (N_KMERS, hist_n_bins) uint32 or None
         "hist_n_bins": hist_n_bins,
         "per_bam": per_bam,
     }
@@ -330,17 +379,25 @@ def main(argv=None):
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("predict_npz",
-                   help="Output of `kinsim predict-kmers` (.npz with the per-kmer "
-                        "μ, σ predictions under the 'none' scenario).")
-    p.add_argument("manifest_csv",
-                   help="KinSim manifest CSV (sample_id, bam_path, motifs).")
-    p.add_argument("output_dir",
-                   help="Output directory; per_kmer_observed.npz lands here.")
-    p.add_argument("--threshold", type=float, default=2.0,
-                   help="σ-multiplier for the outlier threshold (default 2.0).")
-    p.add_argument("--max-reads-per-bam", type=int, default=None,
-                   help="Cap reads per BAM (default: all). Useful for a quick test.")
+    p.add_argument(
+        "predict_npz",
+        help="Output of `kinsim predict-kmers` (.npz with the per-kmer "
+        "μ, σ predictions under the 'none' scenario).",
+    )
+    p.add_argument("manifest_csv", help="KinSim manifest CSV (sample_id, bam_path, motifs).")
+    p.add_argument("output_dir", help="Output directory; per_kmer_observed.npz lands here.")
+    p.add_argument(
+        "--threshold",
+        type=float,
+        default=2.0,
+        help="σ-multiplier for the outlier threshold (default 2.0).",
+    )
+    p.add_argument(
+        "--max-reads-per-bam",
+        type=int,
+        default=None,
+        help="Cap reads per BAM (default: all). Useful for a quick test.",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
     setup_logging(verbose=args.verbose)
@@ -356,7 +413,11 @@ def main(argv=None):
 
     t0 = time.time()
     out = accumulate_per_kmer(
-        bam_paths, mu_ipd, sigma_ipd, mu_pw, sigma_pw,
+        bam_paths,
+        mu_ipd,
+        sigma_ipd,
+        mu_pw,
+        sigma_pw,
         threshold_factor=args.threshold,
         max_reads_per_bam=args.max_reads_per_bam,
     )
@@ -365,26 +426,38 @@ def main(argv=None):
 
     obs_total = int(out["n_total"].sum())
     above_total_ipd = int(out["n_above_ipd"].sum())
-    above_total_pw  = int(out["n_above_pw"].sum())
+    above_total_pw = int(out["n_above_pw"].sum())
     n_covered = int((out["n_total"] > 0).sum())
-    log.info("Coverage: %d / %d kmers (%.2f%%)",
-             n_covered, N_KMERS, 100 * n_covered / N_KMERS)
+    log.info("Coverage: %d / %d kmers (%.2f%%)", n_covered, N_KMERS, 100 * n_covered / N_KMERS)
     log.info("Observations: %d total", obs_total)
-    log.info("  above-threshold (IPD): %d (%.3f%%)",
-             above_total_ipd, 100 * above_total_ipd / max(obs_total, 1))
-    log.info("  above-threshold (PW):  %d (%.3f%%)",
-             above_total_pw,  100 * above_total_pw  / max(obs_total, 1))
+    log.info(
+        "  above-threshold (IPD): %d (%.3f%%)",
+        above_total_ipd,
+        100 * above_total_ipd / max(obs_total, 1),
+    )
+    log.info(
+        "  above-threshold (PW):  %d (%.3f%%)",
+        above_total_pw,
+        100 * above_total_pw / max(obs_total, 1),
+    )
 
     out_path = out_dir / "per_kmer_observed.npz"
     save_kwargs = {
         "n_total": out["n_total"],
-        "n_above_ipd": out["n_above_ipd"], "n_above_pw": out["n_above_pw"],
-        "sum_obs_ipd": out["sum_obs_ipd"], "sum2_obs_ipd": out["sum2_obs_ipd"],
-        "sum_above_ipd": out["sum_above_ipd"], "sum2_above_ipd": out["sum2_above_ipd"],
-        "sum_obs_pw": out["sum_obs_pw"],   "sum2_obs_pw": out["sum2_obs_pw"],
-        "sum_above_pw": out["sum_above_pw"], "sum2_above_pw": out["sum2_above_pw"],
-        "mu_pred_ipd": mu_ipd, "sigma_pred_ipd": sigma_ipd,
-        "mu_pred_pw": mu_pw,   "sigma_pred_pw": sigma_pw,
+        "n_above_ipd": out["n_above_ipd"],
+        "n_above_pw": out["n_above_pw"],
+        "sum_obs_ipd": out["sum_obs_ipd"],
+        "sum2_obs_ipd": out["sum2_obs_ipd"],
+        "sum_above_ipd": out["sum_above_ipd"],
+        "sum2_above_ipd": out["sum2_above_ipd"],
+        "sum_obs_pw": out["sum_obs_pw"],
+        "sum2_obs_pw": out["sum2_obs_pw"],
+        "sum_above_pw": out["sum_above_pw"],
+        "sum2_above_pw": out["sum2_above_pw"],
+        "mu_pred_ipd": mu_ipd,
+        "sigma_pred_ipd": sigma_ipd,
+        "mu_pred_pw": mu_pw,
+        "sigma_pred_pw": sigma_pw,
         "threshold_factor": np.float32(args.threshold),
     }
     if out["hist_ipd"] is not None:
@@ -397,18 +470,23 @@ def main(argv=None):
     log.info("Saved: %s", out_path)
 
     info_path = out_dir / "per_kmer_observed_info.json"
-    info_path.write_text(json.dumps({
-        "predict_npz":    str(args.predict_npz),
-        "manifest_csv":   str(args.manifest_csv),
-        "threshold":      args.threshold,
-        "n_kmers":        N_KMERS,
-        "n_covered":      n_covered,
-        "obs_total":      obs_total,
-        "above_total_ipd": above_total_ipd,
-        "above_total_pw":  above_total_pw,
-        "elapsed_s":      round(elapsed, 2),
-        "per_bam":        out["per_bam"],
-    }, indent=2))
+    info_path.write_text(
+        json.dumps(
+            {
+                "predict_npz": str(args.predict_npz),
+                "manifest_csv": str(args.manifest_csv),
+                "threshold": args.threshold,
+                "n_kmers": N_KMERS,
+                "n_covered": n_covered,
+                "obs_total": obs_total,
+                "above_total_ipd": above_total_ipd,
+                "above_total_pw": above_total_pw,
+                "elapsed_s": round(elapsed, 2),
+                "per_bam": out["per_bam"],
+            },
+            indent=2,
+        )
+    )
     log.info("Saved: %s", info_path)
 
 

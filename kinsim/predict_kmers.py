@@ -47,7 +47,7 @@ import torch
 from .data.dataset import inv_log_transform
 from .models.predictor import create_from_config, load_state_dict_from_ckpt
 from .utils.config import load_kinsim_config, setup_logging
-from .utils.encoding import K, KMER_PRED_IDX, decode_kmer, get_meth_ids
+from .utils.encoding import KMER_PRED_IDX, K, decode_kmer, get_meth_ids
 from .utils.sample_layout import REV_METH_LEN
 
 log = logging.getLogger(__name__)
@@ -86,7 +86,10 @@ def _scenarios_from_yaml() -> list[tuple[str, int, int]]:
                 log.warning(
                     "Scenario %s@+%d places meth at position %d, "
                     "outside meth_context window [0, %d] — skipping",
-                    T, k, pos, K - 1,
+                    T,
+                    k,
+                    pos,
+                    K - 1,
                 )
                 continue
             out.append((f"{T}@{k:+d}", m_id, k))
@@ -130,8 +133,11 @@ def _load_model(ckpt_dir: Path, device: torch.device) -> tuple[torch.nn.Module, 
 
 
 def _meth_full_for_scenario(
-    batch_size: int, meth_id: int, k_offset: int,
-    num_meth_types: int = 4, device: torch.device | str = "cpu",
+    batch_size: int,
+    meth_id: int,
+    k_offset: int,
+    num_meth_types: int = 4,
+    device: torch.device | str = "cpu",
 ) -> torch.Tensor:
     """Build the ``(B, kmer_size + REV_METH_LEN, num_meth_types)`` tensor.
 
@@ -154,8 +160,12 @@ def _meth_full_for_scenario(
 
 @torch.no_grad()
 def _run_scenario(
-    model: torch.nn.Module, meth_id: int, k_offset: int,
-    n_kmers: int, batch_size: int, num_meth_types: int,
+    model: torch.nn.Module,
+    meth_id: int,
+    k_offset: int,
+    n_kmers: int,
+    batch_size: int,
+    num_meth_types: int,
     device: torch.device,
 ) -> np.ndarray:
     """Run the model on every kmer for one scenario.
@@ -165,7 +175,11 @@ def _run_scenario(
     """
     preds = np.empty((n_kmers, 4), dtype=np.float32)
     template = _meth_full_for_scenario(
-        batch_size, meth_id, k_offset, num_meth_types, device,
+        batch_size,
+        meth_id,
+        k_offset,
+        num_meth_types,
+        device,
     )
     for start in range(0, n_kmers, batch_size):
         end = min(start + batch_size, n_kmers)
@@ -196,15 +210,15 @@ def _to_physical(preds: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray,
     comparable to the empirical IPD std-dev measured on the BAMs.
     """
     mu_ipd_log = preds[:, 0]
-    mu_pw_log  = preds[:, 1]
+    mu_pw_log = preds[:, 1]
     log_sig_ipd = np.clip(preds[:, 2], -6.0, 3.0)
-    log_sig_pw  = np.clip(preds[:, 3], -6.0, 3.0)
+    log_sig_pw = np.clip(preds[:, 3], -6.0, 3.0)
     sigma_ipd_log = np.exp(log_sig_ipd)
-    sigma_pw_log  = np.exp(log_sig_pw)
+    sigma_pw_log = np.exp(log_sig_pw)
     mu_ipd = inv_log_transform(torch.from_numpy(mu_ipd_log)).numpy()
-    mu_pw  = inv_log_transform(torch.from_numpy(mu_pw_log)).numpy()
+    mu_pw = inv_log_transform(torch.from_numpy(mu_pw_log)).numpy()
     sigma_ipd = (mu_ipd + 1.0) * sigma_ipd_log
-    sigma_pw  = (mu_pw  + 1.0) * sigma_pw_log
+    sigma_pw = (mu_pw + 1.0) * sigma_pw_log
     return mu_ipd, mu_pw, sigma_ipd, sigma_pw
 
 
@@ -214,7 +228,8 @@ def _to_physical(preds: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray,
 
 
 def _write_tsv(
-    output_tsv: Path, scenarios: list[tuple[str, int, int]],
+    output_tsv: Path,
+    scenarios: list[tuple[str, int, int]],
     raw_preds: dict[str, np.ndarray],
 ) -> None:
     """Wide-format TSV: one row per kmer, all scenarios side by side."""
@@ -229,7 +244,7 @@ def _write_tsv(
 
     none_mu_ipd, none_mu_pw, _, _ = physical["none"]
     none_mu_ipd_safe = np.maximum(none_mu_ipd, 1e-6)
-    none_mu_pw_safe  = np.maximum(none_mu_pw,  1e-6)
+    none_mu_pw_safe = np.maximum(none_mu_pw, 1e-6)
 
     # Header
     cols = ["kmer", "kmer_id"]
@@ -258,7 +273,7 @@ def _write_tsv(
         col_arrays.append(np.char.mod("%.3f", sig_pw))
         if label != "none":
             r_ipd = mu_ipd / none_mu_ipd_safe
-            r_pw  = mu_pw  / none_mu_pw_safe
+            r_pw = mu_pw / none_mu_pw_safe
             col_arrays.append(np.char.mod("%.3f", r_ipd))
             col_arrays.append(np.char.mod("%.3f", r_pw))
 
@@ -275,7 +290,8 @@ def _write_tsv(
 
 
 def _write_npz(
-    output_npz: Path, scenarios: list[tuple[str, int, int]],
+    output_npz: Path,
+    scenarios: list[tuple[str, int, int]],
     raw_preds: dict[str, np.ndarray],
 ) -> None:
     """Compact binary output. Writes both **physical** (uint8-comparable) and
@@ -294,8 +310,8 @@ def _write_npz(
 
     # Per-scenario metadata: arrays of (label, meth_id, k_offset) — saved as
     # 1D string/int arrays so the LUT consumer can iterate without parsing.
-    labels  = []
-    m_ids   = []
+    labels = []
+    m_ids = []
     offsets = []
 
     for label, m_id, k_off in scenarios:
@@ -309,25 +325,25 @@ def _write_npz(
         sk = label.replace("@", "_at_").replace("+", "p").replace("-", "m")
 
         # Log-space (model native — for sampling in generate)
-        mu_ipd_log  = preds[:, 0].astype(np.float32)
-        mu_pw_log   = preds[:, 1].astype(np.float32)
+        mu_ipd_log = preds[:, 0].astype(np.float32)
+        mu_pw_log = preds[:, 1].astype(np.float32)
         sigma_ipd_log = np.exp(np.clip(preds[:, 2], -6.0, 3.0)).astype(np.float32)
-        sigma_pw_log  = np.exp(np.clip(preds[:, 3], -6.0, 3.0)).astype(np.float32)
-        bundle[f"{sk}__mu_ipd_log"]    = mu_ipd_log
-        bundle[f"{sk}__mu_pw_log"]     = mu_pw_log
+        sigma_pw_log = np.exp(np.clip(preds[:, 3], -6.0, 3.0)).astype(np.float32)
+        bundle[f"{sk}__mu_ipd_log"] = mu_ipd_log
+        bundle[f"{sk}__mu_pw_log"] = mu_pw_log
         bundle[f"{sk}__sigma_ipd_log"] = sigma_ipd_log
-        bundle[f"{sk}__sigma_pw_log"]  = sigma_pw_log
+        bundle[f"{sk}__sigma_pw_log"] = sigma_pw_log
 
         # Physical (uint8-comparable — for inspection & legacy consumers)
         mu_ipd, mu_pw, sig_ipd, sig_pw = _to_physical(preds)
-        bundle[f"{sk}__mu_ipd"]    = mu_ipd
-        bundle[f"{sk}__mu_pw"]     = mu_pw
+        bundle[f"{sk}__mu_ipd"] = mu_ipd
+        bundle[f"{sk}__mu_pw"] = mu_pw
         bundle[f"{sk}__sigma_ipd"] = sig_ipd
-        bundle[f"{sk}__sigma_pw"]  = sig_pw
+        bundle[f"{sk}__sigma_pw"] = sig_pw
 
-    bundle["scenarios_label"]    = np.asarray(labels)
-    bundle["scenarios_meth_id"]  = np.asarray(m_ids,   dtype=np.int64)
-    bundle["scenarios_offset"]   = np.asarray(offsets, dtype=np.int64)
+    bundle["scenarios_label"] = np.asarray(labels)
+    bundle["scenarios_meth_id"] = np.asarray(m_ids, dtype=np.int64)
+    bundle["scenarios_offset"] = np.asarray(offsets, dtype=np.int64)
 
     log.info("Writing %s ... (%d arrays)", output_npz, len(bundle))
     np.savez_compressed(output_npz, **bundle)
@@ -339,8 +355,10 @@ def _write_npz(
 
 
 def predict_all(
-    ckpt_dir: Path, output_prefix: Path,
-    batch_size: int = 65536, device_str: str | None = None,
+    ckpt_dir: Path,
+    output_prefix: Path,
+    batch_size: int = 65536,
+    device_str: str | None = None,
 ) -> None:
     """Enumerate scenarios, predict on all kmers, write TSV + NPZ."""
     if device_str is None:
@@ -353,15 +371,26 @@ def predict_all(
 
     scenarios = _scenarios_from_yaml()
     log.info("Scenarios: %s", [s[0] for s in scenarios])
-    n_kmers = 4 ** K
-    log.info("Enumerating %d kmers (4^%d) for %d scenarios → %d predictions total",
-             n_kmers, K, len(scenarios), n_kmers * len(scenarios))
+    n_kmers = 4**K
+    log.info(
+        "Enumerating %d kmers (4^%d) for %d scenarios → %d predictions total",
+        n_kmers,
+        K,
+        len(scenarios),
+        n_kmers * len(scenarios),
+    )
 
     raw_preds: dict[str, np.ndarray] = {}
     for label, m_id, k_off in scenarios:
         log.info("  ▸ %s  (meth_id=%d, offset=%+d)", label, m_id, k_off)
         raw_preds[label] = _run_scenario(
-            model, m_id, k_off, n_kmers, batch_size, num_meth_types, device,
+            model,
+            m_id,
+            k_off,
+            n_kmers,
+            batch_size,
+            num_meth_types,
+            device,
         )
 
     output_prefix = Path(output_prefix)
@@ -377,14 +406,19 @@ def main(argv=None):
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("checkpoint_dir",
-                   help="Directory containing model_config.json + .pt files.")
-    p.add_argument("output_prefix",
-                   help="Output path WITHOUT extension. Writes .tsv (wide) + .npz (binary).")
-    p.add_argument("--batch-size", type=int, default=65536,
-                   help="Inference batch size (default 65 536). Lower on small GPU.")
-    p.add_argument("--device", default=None,
-                   help="'cuda' / 'cpu' / 'cuda:0' (default: cuda if available).")
+    p.add_argument("checkpoint_dir", help="Directory containing model_config.json + .pt files.")
+    p.add_argument(
+        "output_prefix", help="Output path WITHOUT extension. Writes .tsv (wide) + .npz (binary)."
+    )
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=65536,
+        help="Inference batch size (default 65 536). Lower on small GPU.",
+    )
+    p.add_argument(
+        "--device", default=None, help="'cuda' / 'cpu' / 'cuda:0' (default: cuda if available)."
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
     setup_logging(verbose=args.verbose)

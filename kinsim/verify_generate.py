@@ -49,7 +49,7 @@ def _summarize_shard(path: str | Path) -> dict[tuple[int, int], tuple]:
     geometry the shard was extracted under. Legacy K=11 shards fall back to
     the module-level ``COL_*`` constants.
     """
-    from .data.dataset import read_shard_extraction_params  # noqa: PLC0415
+    from .data.dataset import read_shard_extraction_params
 
     with open(path, "rb") as f:
         data = pickle.load(f)
@@ -137,8 +137,10 @@ def verify(
             )
             n_written += 1
             if r[0] >= min_samples and g[0] >= min_samples:
-                paired_ref_ipd.append(r[1]); paired_gen_ipd.append(g[1])
-                paired_ref_pw.append(r[3]); paired_gen_pw.append(g[3])
+                paired_ref_ipd.append(r[1])
+                paired_gen_ipd.append(g[1])
+                paired_ref_pw.append(r[3])
+                paired_gen_pw.append(g[3])
 
     rri, rgi = np.asarray(paired_ref_ipd), np.asarray(paired_gen_ipd)
     rrp, rgp = np.asarray(paired_ref_pw), np.asarray(paired_gen_pw)
@@ -174,10 +176,16 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("ref_shard", help="Reference shard.pkl from `kinsim extract` on the real BAM")
-    ap.add_argument("gen_shard", help="Generated shard.pkl from `kinsim extract` on the simulated BAM")
+    ap.add_argument(
+        "gen_shard", help="Generated shard.pkl from `kinsim extract` on the simulated BAM"
+    )
     ap.add_argument("output_tsv", help="Output TSV with per-(kmer, meth) comparison")
-    ap.add_argument("--min-samples", type=int, default=5,
-                    help="Drop rows where both shards have fewer than this many samples")
+    ap.add_argument(
+        "--min-samples",
+        type=int,
+        default=5,
+        help="Drop rows where both shards have fewer than this many samples",
+    )
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     setup_logging(verbose=args.verbose)
@@ -187,8 +195,7 @@ def main(argv=None):
             print(f"ERROR: {label} not found: {p}", file=sys.stderr)
             sys.exit(1)
 
-    verify(args.ref_shard, args.gen_shard, Path(args.output_tsv),
-           min_samples=args.min_samples)
+    verify(args.ref_shard, args.gen_shard, Path(args.output_tsv), min_samples=args.min_samples)
 
 
 if __name__ == "__main__":

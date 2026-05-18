@@ -181,7 +181,7 @@ def compute_category_distributions(data: dict) -> dict:
     Resolves column indices from the shard's ``__meta__["extraction_params"]``
     when present; falls back to the legacy K=11 layout otherwise.
     """
-    from .data.dataset import read_shard_extraction_params  # noqa: PLC0415
+    from .data.dataset import read_shard_extraction_params
     from .utils.sample_layout import (
         CATEGORY_BASELINE,
         CATEGORY_NAMES,
@@ -254,7 +254,7 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
     dropped: with PARENT_OFFSET written at extract time, comparing the
     mean IPD across buckets is the cleaner diagnostic.
     """
-    from .data.dataset import read_shard_extraction_params  # noqa: PLC0415
+    from .data.dataset import read_shard_extraction_params
     from .utils.encoding import get_meth_ids
     from .utils.sample_layout import (
         CATEGORY_BASELINE,
@@ -436,9 +436,7 @@ def compute_meth_context_distribution(data: dict) -> dict:
                     mask = m_T & (offset == O_int)
                     if not mask.any():
                         continue
-                    _accumulate(
-                        bucket_dict.setdefault((T_int, O_int), _empty()), mc[mask]
-                    )
+                    _accumulate(bucket_dict.setdefault((T_int, O_int), _empty()), mc[mask])
 
     final: dict = {}
 
@@ -579,10 +577,10 @@ def _bucket_order_key(name: str) -> tuple:
         return (0, "", 0)
     if name.startswith("slowed_by_"):
         prefix = 1
-        body = name[len("slowed_by_"):]
+        body = name[len("slowed_by_") :]
     elif name.startswith("near_meth_by_"):
         prefix = 2
-        body = name[len("near_meth_by_"):]
+        body = name[len("near_meth_by_") :]
     else:
         return (3, name, 0)
     if "_at_" in body:
@@ -1029,9 +1027,7 @@ def _build_html_figures(
         means = [signature_profiles[n]["mean_ipd"] for n in ordered]
         ns = [signature_profiles[n]["n_samples"] for n in ordered]
         colors = [
-            "#1f77b4" if n == "baseline"
-            else "#d62728" if n.startswith("slowed_by_")
-            else "#2ca02c"
+            "#1f77b4" if n == "baseline" else "#d62728" if n.startswith("slowed_by_") else "#2ca02c"
             for n in ordered
         ]
         fig3 = go.Figure(
@@ -1047,7 +1043,7 @@ def _build_html_figures(
         )
         fig3.update_layout(
             title="Per-bucket mean IPD  "
-                  "(SLOWED should sit higher than baseline; NEAR_METH ≈ baseline)",
+            "(SLOWED should sit higher than baseline; NEAR_METH ≈ baseline)",
             yaxis_title="Mean IPD",
             xaxis_tickangle=-45,
         )
@@ -1085,10 +1081,12 @@ def _build_html_figures(
     # ── Fig 6: per-kmer IPD distribution for top-N kmers with methylation ─
     fig6 = _build_kmer_trend_figure(data, top_n=12)
     if fig6 is not None:
-        figures.append((
-            "Per-kmer IPD distributions — top 12 by SLOWED count",
-            fig6,
-        ))
+        figures.append(
+            (
+                "Per-kmer IPD distributions — top 12 by SLOWED count",
+                fig6,
+            )
+        )
 
     return figures
 
@@ -1141,9 +1139,11 @@ def _build_kmer_trend_figure(data: dict, top_n: int = 12):
     cols = 3
     rows = (len(top) + cols - 1) // cols
     fig = make_subplots(
-        rows=rows, cols=cols,
+        rows=rows,
+        cols=cols,
         subplot_titles=[f"{decode_kmer(kid)}  (n_slow={n:,})" for kid, n in top],
-        vertical_spacing=0.10, horizontal_spacing=0.06,
+        vertical_spacing=0.10,
+        horizontal_spacing=0.06,
     )
 
     legend_seen: set[str] = set()
@@ -1158,12 +1158,20 @@ def _build_kmer_trend_figure(data: dict, top_n: int = 12):
         if m_base.any():
             show = "baseline" not in legend_seen
             legend_seen.add("baseline")
-            fig.add_trace(go.Histogram(
-                x=ipds[m_base], name="baseline", marker_color="#1f77b4",
-                opacity=0.5, xbins=dict(start=0, end=256, size=4),
-                histnorm="probability density", showlegend=show,
-                legendgroup="baseline",
-            ), row=r, col=c)
+            fig.add_trace(
+                go.Histogram(
+                    x=ipds[m_base],
+                    name="baseline",
+                    marker_color="#1f77b4",
+                    opacity=0.5,
+                    xbins=dict(start=0, end=256, size=4),
+                    histnorm="probability density",
+                    showlegend=show,
+                    legendgroup="baseline",
+                ),
+                row=r,
+                col=c,
+            )
 
         m_slow = cats == CATEGORY_SLOWED
         for mid in sorted({int(p) for p in parents[m_slow]}):
@@ -1175,13 +1183,20 @@ def _build_kmer_trend_figure(data: dict, top_n: int = 12):
             label = f"slowed/{name_by_id.get(mid, mid)}"
             show = label not in legend_seen
             legend_seen.add(label)
-            fig.add_trace(go.Histogram(
-                x=ipds[m], name=label,
-                marker_color=color_by_id.get(mid, "#888"),
-                opacity=0.55, xbins=dict(start=0, end=256, size=4),
-                histnorm="probability density", showlegend=show,
-                legendgroup=label,
-            ), row=r, col=c)
+            fig.add_trace(
+                go.Histogram(
+                    x=ipds[m],
+                    name=label,
+                    marker_color=color_by_id.get(mid, "#888"),
+                    opacity=0.55,
+                    xbins=dict(start=0, end=256, size=4),
+                    histnorm="probability density",
+                    showlegend=show,
+                    legendgroup=label,
+                ),
+                row=r,
+                col=c,
+            )
         fig.update_xaxes(range=[0, 200], row=r, col=c)
 
     fig.update_layout(
@@ -1261,9 +1276,7 @@ def _build_ipd_pw_density_figure(data: dict):
                     mask = m_T & (offset == O_int)
                     if not mask.any():
                         continue
-                    buckets.setdefault(_bucket_name(prefix, T_name, O_int), []).append(
-                        ipd_pw[mask]
-                    )
+                    buckets.setdefault(_bucket_name(prefix, T_name, O_int), []).append(ipd_pw[mask])
 
     if not buckets:
         return None

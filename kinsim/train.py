@@ -72,8 +72,8 @@ except ImportError:
         ) from exc
 
 from .data.dataset import (
-    SignalDataset,
     ShardedSignalDataset,
+    SignalDataset,
     list_shards,
     split_shards,
 )
@@ -136,7 +136,9 @@ def _beta_nll_loss(
 
 
 def _per_sample_gaussian_nll(
-    mu: np.ndarray, sigma: np.ndarray, targets: np.ndarray,
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    targets: np.ndarray,
 ) -> np.ndarray:
     """Per-sample GNLL on (IPD, PW) — same math as _gaussian_nll_loss but
     returns a (N,) array (mean over the 2 dims). Used to bucket val/test
@@ -144,7 +146,7 @@ def _per_sample_gaussian_nll(
     """
     sigma_safe = np.maximum(sigma, 1e-6)
     log_sig = np.log(sigma_safe)
-    var = sigma_safe ** 2
+    var = sigma_safe**2
     nll = 0.5 * (log_sig * 2.0 + (targets - mu) ** 2 / var)
     return nll.mean(axis=1)
 
@@ -169,6 +171,7 @@ _LOSS_FUNCTIONS = {
     "mse": lambda p, t, **_kw: _mse_loss(p, t),
     "huber": lambda p, t, **_kw: _huber_loss(p, t),
 }
+
 
 def _meth_names() -> dict[int, str]:
     """Return ``{meth_id: meth_name}`` derived from kinsim_config.yaml.
@@ -274,7 +277,9 @@ def _compute_metrics(
     var_mu_pw = np.var(all_mu[:, 1])
     e_sig2_ipd = np.mean(all_sigma[:, 0] ** 2)
     e_sig2_pw = np.mean(all_sigma[:, 1] ** 2)
-    self_oracle_ipd = var_mu_ipd / (var_mu_ipd + e_sig2_ipd) if (var_mu_ipd + e_sig2_ipd) > 0 else 0.0
+    self_oracle_ipd = (
+        var_mu_ipd / (var_mu_ipd + e_sig2_ipd) if (var_mu_ipd + e_sig2_ipd) > 0 else 0.0
+    )
     self_oracle_pw = var_mu_pw / (var_mu_pw + e_sig2_pw) if (var_mu_pw + e_sig2_pw) > 0 else 0.0
     result[f"{prefix}_oracle_ipd"] = float(self_oracle_ipd)
     result[f"{prefix}_oracle_pw"] = float(self_oracle_pw)
@@ -285,25 +290,41 @@ def _compute_metrics(
         uniq, inv, counts = np.unique(bucket_keys, return_inverse=True, return_counts=True)
         keep_mask = counts[inv] >= _ORACLE_MIN_PER_BUCKET
         if keep_mask.any():
-            mu_true_ipd_per = np.bincount(inv[keep_mask], weights=all_true[keep_mask, 0]) / np.maximum(np.bincount(inv[keep_mask]), 1)
-            mu_true_pw_per  = np.bincount(inv[keep_mask], weights=all_true[keep_mask, 1]) / np.maximum(np.bincount(inv[keep_mask]), 1)
+            mu_true_ipd_per = np.bincount(
+                inv[keep_mask], weights=all_true[keep_mask, 0]
+            ) / np.maximum(np.bincount(inv[keep_mask]), 1)
+            mu_true_pw_per = np.bincount(
+                inv[keep_mask], weights=all_true[keep_mask, 1]
+            ) / np.maximum(np.bincount(inv[keep_mask]), 1)
             # Per-bucket variance via E[X²] - (E[X])²
-            sqr_ipd_per = np.bincount(inv[keep_mask], weights=all_true[keep_mask, 0] ** 2) / np.maximum(np.bincount(inv[keep_mask]), 1)
-            sqr_pw_per  = np.bincount(inv[keep_mask], weights=all_true[keep_mask, 1] ** 2) / np.maximum(np.bincount(inv[keep_mask]), 1)
-            var_ipd_per = np.maximum(sqr_ipd_per - mu_true_ipd_per ** 2, 0.0)
-            var_pw_per  = np.maximum(sqr_pw_per  - mu_true_pw_per  ** 2, 0.0)
+            sqr_ipd_per = np.bincount(
+                inv[keep_mask], weights=all_true[keep_mask, 0] ** 2
+            ) / np.maximum(np.bincount(inv[keep_mask]), 1)
+            sqr_pw_per = np.bincount(
+                inv[keep_mask], weights=all_true[keep_mask, 1] ** 2
+            ) / np.maximum(np.bincount(inv[keep_mask]), 1)
+            var_ipd_per = np.maximum(sqr_ipd_per - mu_true_ipd_per**2, 0.0)
+            var_pw_per = np.maximum(sqr_pw_per - mu_true_pw_per**2, 0.0)
             n_valid_buckets = int((np.bincount(inv[keep_mask]) > 0).sum())
             if n_valid_buckets >= 2:
                 # Only buckets that actually have samples in the kept rows
                 nonempty = np.bincount(inv[keep_mask]) > 0
-                v_mu_ipd_emp  = float(np.var(mu_true_ipd_per[nonempty]))
-                v_mu_pw_emp   = float(np.var(mu_true_pw_per[nonempty]))
+                v_mu_ipd_emp = float(np.var(mu_true_ipd_per[nonempty]))
+                v_mu_pw_emp = float(np.var(mu_true_pw_per[nonempty]))
                 e_var_ipd_emp = float(np.mean(var_ipd_per[nonempty]))
-                e_var_pw_emp  = float(np.mean(var_pw_per[nonempty]))
-                emp_oracle_ipd = v_mu_ipd_emp / (v_mu_ipd_emp + e_var_ipd_emp) if (v_mu_ipd_emp + e_var_ipd_emp) > 0 else 0.0
-                emp_oracle_pw  = v_mu_pw_emp  / (v_mu_pw_emp  + e_var_pw_emp)  if (v_mu_pw_emp  + e_var_pw_emp)  > 0 else 0.0
+                e_var_pw_emp = float(np.mean(var_pw_per[nonempty]))
+                emp_oracle_ipd = (
+                    v_mu_ipd_emp / (v_mu_ipd_emp + e_var_ipd_emp)
+                    if (v_mu_ipd_emp + e_var_ipd_emp) > 0
+                    else 0.0
+                )
+                emp_oracle_pw = (
+                    v_mu_pw_emp / (v_mu_pw_emp + e_var_pw_emp)
+                    if (v_mu_pw_emp + e_var_pw_emp) > 0
+                    else 0.0
+                )
                 result[f"{prefix}_oracle_empirical_ipd"] = float(emp_oracle_ipd)
-                result[f"{prefix}_oracle_empirical_pw"]  = float(emp_oracle_pw)
+                result[f"{prefix}_oracle_empirical_pw"] = float(emp_oracle_pw)
                 result[f"{prefix}_oracle_empirical_n_buckets"] = float(n_valid_buckets)
 
     # ── Distribution samples: 10 random per meth type ─────────────────────────
@@ -393,12 +414,14 @@ def _log_metrics(metrics: dict, prefix: str) -> None:
         o_pw,
     )
     emp_ipd = metrics.get(f"{prefix}_oracle_empirical_ipd")
-    emp_pw  = metrics.get(f"{prefix}_oracle_empirical_pw")
-    emp_n   = metrics.get(f"{prefix}_oracle_empirical_n_buckets")
+    emp_pw = metrics.get(f"{prefix}_oracle_empirical_pw")
+    emp_n = metrics.get(f"{prefix}_oracle_empirical_n_buckets")
     if emp_ipd is not None and emp_pw is not None:
         log.info(
             "  Oracle (true)  IPD=%.3f  PW=%.3f  (per-(kmer,meth) empirical, %d buckets ≥5 samples)",
-            emp_ipd, emp_pw, int(emp_n or 0),
+            emp_ipd,
+            emp_pw,
+            int(emp_n or 0),
         )
     log.info(
         "  MAE      IPD=%.4f               PW=%.4f  (log1p space)",
@@ -465,7 +488,9 @@ def _log_metrics(metrics: dict, prefix: str) -> None:
 
 
 def _bucket_keys_from_arrays(
-    categories: np.ndarray, parent_meths: np.ndarray, parent_offsets: np.ndarray,
+    categories: np.ndarray,
+    parent_meths: np.ndarray,
+    parent_offsets: np.ndarray,
 ) -> np.ndarray:
     """Map per-sample (category, parent_meth, parent_offset) → bucket key.
 
@@ -479,6 +504,7 @@ def _bucket_keys_from_arrays(
     signature offset per meth type, which is just noise control).
     """
     from .utils.encoding import get_meth_ids
+
     names_by_id = {v: k for k, v in get_meth_ids().items()}
 
     keys = np.empty(len(categories), dtype=object)
@@ -503,18 +529,23 @@ def _bucket_keys_from_arrays(
 
 def _safe_key(s: str) -> str:
     """Make a bucket key safe as a TensorBoard / CSV metric key."""
-    return (s.replace("/", "_").replace("@", "_at_")
-             .replace("+", "p").replace("-", "m"))
+    return s.replace("/", "_").replace("@", "_at_").replace("+", "p").replace("-", "m")
 
 
 def _compute_bucket_metrics(
-    all_mu: np.ndarray, all_sigma: np.ndarray, all_true: np.ndarray,
-    all_categories: np.ndarray, all_parent_meths: np.ndarray,
-    all_parent_offsets: np.ndarray, prefix: str,
+    all_mu: np.ndarray,
+    all_sigma: np.ndarray,
+    all_true: np.ndarray,
+    all_categories: np.ndarray,
+    all_parent_meths: np.ndarray,
+    all_parent_offsets: np.ndarray,
+    prefix: str,
 ) -> dict:
     """Per-bucket val/test metrics: loss, MAE, Pearson, 2σ calibration."""
     bucket_keys = _bucket_keys_from_arrays(
-        all_categories, all_parent_meths, all_parent_offsets,
+        all_categories,
+        all_parent_meths,
+        all_parent_offsets,
     )
     per_loss = _per_sample_gaussian_nll(all_mu, all_sigma, all_true)  # (N,)
 
@@ -530,21 +561,21 @@ def _compute_bucket_metrics(
         sig_b = all_sigma[mask]
         diff_b = mu_b - true_b
         rec = {
-            "n":           n,
-            "loss":        float(per_loss[mask].mean()),
+            "n": n,
+            "loss": float(per_loss[mask].mean()),
             "pearson_ipd": _pearson(mu_b[:, 0], true_b[:, 0]),
-            "pearson_pw":  _pearson(mu_b[:, 1], true_b[:, 1]),
-            "mae_ipd":     float(np.abs(diff_b[:, 0]).mean()),
-            "mae_pw":      float(np.abs(diff_b[:, 1]).mean()),
-            "calib_2sig":  float((np.abs(diff_b) <= 2.0 * sig_b).mean()),
+            "pearson_pw": _pearson(mu_b[:, 1], true_b[:, 1]),
+            "mae_ipd": float(np.abs(diff_b[:, 0]).mean()),
+            "mae_pw": float(np.abs(diff_b[:, 1]).mean()),
+            "calib_2sig": float((np.abs(diff_b) <= 2.0 * sig_b).mean()),
         }
         by_bucket[bk] = rec
         sk = _safe_key(bk)
-        result[f"{prefix}_bucket_loss_{sk}"]        = rec["loss"]
+        result[f"{prefix}_bucket_loss_{sk}"] = rec["loss"]
         result[f"{prefix}_bucket_pearson_ipd_{sk}"] = rec["pearson_ipd"]
-        result[f"{prefix}_bucket_pearson_pw_{sk}"]  = rec["pearson_pw"]
-        result[f"{prefix}_bucket_mae_ipd_{sk}"]     = rec["mae_ipd"]
-        result[f"{prefix}_bucket_calib2_{sk}"]      = rec["calib_2sig"]
+        result[f"{prefix}_bucket_pearson_pw_{sk}"] = rec["pearson_pw"]
+        result[f"{prefix}_bucket_mae_ipd_{sk}"] = rec["mae_ipd"]
+        result[f"{prefix}_bucket_calib2_{sk}"] = rec["calib_2sig"]
     result["_by_bucket"] = by_bucket
     return result
 
@@ -554,7 +585,7 @@ def _bucket_sort_key(bk: str) -> tuple:
     if bk == "BASELINE":
         return (0, "", 0)
     if bk.startswith("SLOWED/"):
-        rest = bk[len("SLOWED/"):]   # e.g. m6A@+0
+        rest = bk[len("SLOWED/") :]  # e.g. m6A@+0
         if "@" in rest:
             T, off = rest.split("@")
             try:
@@ -563,7 +594,7 @@ def _bucket_sort_key(bk: str) -> tuple:
                 return (1, T, 0)
         return (1, rest, 0)
     if bk.startswith("NEAR_METH/"):
-        return (2, bk[len("NEAR_METH/"):], 0)
+        return (2, bk[len("NEAR_METH/") :], 0)
     return (9, bk, 0)
 
 
@@ -578,14 +609,22 @@ def _log_bucket_metrics(bucket_metrics: dict, prefix: str) -> None:
     log.info("─" * W)
     log.info(
         "    %-26s  %12s  %8s  %8s  %8s  %6s",
-        "bucket", "n", "loss", "pIPD", "pPW", "2σ%",
+        "bucket",
+        "n",
+        "loss",
+        "pIPD",
+        "pPW",
+        "2σ%",
     )
     for bk in sorted(by_bucket.keys(), key=_bucket_sort_key):
         r = by_bucket[bk]
         log.info(
             "    %-26s  %12d  %+8.4f  %8.3f  %8.3f  %5.1f%%",
-            bk, r["n"], r["loss"],
-            r["pearson_ipd"], r["pearson_pw"],
+            bk,
+            r["n"],
+            r["loss"],
+            r["pearson_ipd"],
+            r["pearson_pw"],
             r["calib_2sig"] * 100,
         )
     log.info("─" * W)
@@ -654,6 +693,7 @@ class KineticDataModule(L.LightningDataModule):
         # or to pin a value matching a pre-existing checkpoint.
         if num_meth_types is None:
             from .utils.encoding import get_meth_ids
+
             num_meth_types = max(get_meth_ids().values()) + 1
         self.num_meth_types = int(num_meth_types)
         self.seed = seed
@@ -712,9 +752,7 @@ class KineticDataModule(L.LightningDataModule):
     def _setup_sharded(self, stage: str | None) -> None:
         all_shards = list_shards(self.input_path)
         if not all_shards:
-            raise FileNotFoundError(
-                f"No *_shard*.pkl (raw or refined) in {self.input_path}"
-            )
+            raise FileNotFoundError(f"No *_shard*.pkl (raw or refined) in {self.input_path}")
 
         train_shards, test_shards = split_shards(
             all_shards,
@@ -843,18 +881,18 @@ class KineticPredictor(L.LightningModule):
         self._val_sigma: list[torch.Tensor] = []
         self._val_true: list[torch.Tensor] = []
         self._val_meth_ids: list[torch.Tensor] = []
-        self._val_parent_meths:   list[torch.Tensor] = []
+        self._val_parent_meths: list[torch.Tensor] = []
         self._val_parent_offsets: list[torch.Tensor] = []
-        self._val_categories:     list[torch.Tensor] = []
-        self._val_kmer_ids:       list[torch.Tensor] = []
+        self._val_categories: list[torch.Tensor] = []
+        self._val_kmer_ids: list[torch.Tensor] = []
         self._test_mu: list[torch.Tensor] = []
         self._test_sigma: list[torch.Tensor] = []
         self._test_true: list[torch.Tensor] = []
         self._test_meth_ids: list[torch.Tensor] = []
-        self._test_parent_meths:   list[torch.Tensor] = []
+        self._test_parent_meths: list[torch.Tensor] = []
         self._test_parent_offsets: list[torch.Tensor] = []
-        self._test_categories:     list[torch.Tensor] = []
-        self._test_kmer_ids:       list[torch.Tensor] = []
+        self._test_categories: list[torch.Tensor] = []
+        self._test_kmer_ids: list[torch.Tensor] = []
 
     def forward(self, kmer_ids: torch.Tensor, meth_probs: torch.Tensor) -> torch.Tensor:
         return self.model(kmer_ids, meth_probs)
@@ -870,14 +908,15 @@ class KineticPredictor(L.LightningModule):
         # 7-tuple now; training ignores parent_meth / parent_offset / category.
         kmer_ids, meth_probs, signals, *_extras = batch
         loss = self._loss_fn(
-            self.model(kmer_ids, meth_probs), signals, **self._clamp_kwargs(),
+            self.model(kmer_ids, meth_probs),
+            signals,
+            **self._clamp_kwargs(),
         )
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
-        (kmer_ids, meth_probs, signals, meth_ids,
-         parent_meths, parent_offsets, categories) = batch
+        (kmer_ids, meth_probs, signals, meth_ids, parent_meths, parent_offsets, categories) = batch
         params = self.model(kmer_ids, meth_probs)
         clamp = self._clamp_kwargs()
         loss = self._loss_fn(params, signals, **clamp)
@@ -905,10 +944,10 @@ class KineticPredictor(L.LightningModule):
         all_sigma = torch.cat(self._val_sigma).numpy()  # (N, 2)
         all_true = torch.cat(self._val_true).numpy()  # (N, 2)
         all_meth_ids = torch.cat(self._val_meth_ids).numpy()  # (N,)
-        all_pm  = torch.cat(self._val_parent_meths).numpy()    # (N,)
-        all_po  = torch.cat(self._val_parent_offsets).numpy()  # (N,)
-        all_cat = torch.cat(self._val_categories).numpy()      # (N,)
-        all_kmer = torch.cat(self._val_kmer_ids).numpy()       # (N,)
+        all_pm = torch.cat(self._val_parent_meths).numpy()  # (N,)
+        all_po = torch.cat(self._val_parent_offsets).numpy()  # (N,)
+        all_cat = torch.cat(self._val_categories).numpy()  # (N,)
+        all_kmer = torch.cat(self._val_kmer_ids).numpy()  # (N,)
 
         val_loss = self.trainer.callback_metrics.get("val_loss", float("nan"))
         gnll_grade = _grade(float(val_loss), 1.0, 1.5, higher_is_better=False)
@@ -919,11 +958,21 @@ class KineticPredictor(L.LightningModule):
             gnll_grade,
         )
         metrics = _compute_metrics(
-            all_mu, all_sigma, all_true, all_meth_ids, prefix="val",
+            all_mu,
+            all_sigma,
+            all_true,
+            all_meth_ids,
+            prefix="val",
             kmer_ids=all_kmer,
         )
         bucket_metrics = _compute_bucket_metrics(
-            all_mu, all_sigma, all_true, all_cat, all_pm, all_po, prefix="val",
+            all_mu,
+            all_sigma,
+            all_true,
+            all_cat,
+            all_pm,
+            all_po,
+            prefix="val",
         )
         metrics.update(bucket_metrics)
         self.log_dict(
@@ -943,8 +992,7 @@ class KineticPredictor(L.LightningModule):
         self._val_kmer_ids.clear()
 
     def test_step(self, batch: tuple, batch_idx: int) -> None:
-        (kmer_ids, meth_probs, signals, meth_ids,
-         parent_meths, parent_offsets, categories) = batch
+        (kmer_ids, meth_probs, signals, meth_ids, parent_meths, parent_offsets, categories) = batch
         params = self.model(kmer_ids, meth_probs)
         clamp = self._clamp_kwargs()
         mu = params[:, :2]
@@ -967,17 +1015,27 @@ class KineticPredictor(L.LightningModule):
         all_sigma = torch.cat(self._test_sigma).numpy()
         all_true = torch.cat(self._test_true).numpy()
         all_meth_ids = torch.cat(self._test_meth_ids).numpy()
-        all_pm  = torch.cat(self._test_parent_meths).numpy()
-        all_po  = torch.cat(self._test_parent_offsets).numpy()
+        all_pm = torch.cat(self._test_parent_meths).numpy()
+        all_po = torch.cat(self._test_parent_offsets).numpy()
         all_cat = torch.cat(self._test_categories).numpy()
         all_kmer = torch.cat(self._test_kmer_ids).numpy()
 
         metrics = _compute_metrics(
-            all_mu, all_sigma, all_true, all_meth_ids, prefix="test",
+            all_mu,
+            all_sigma,
+            all_true,
+            all_meth_ids,
+            prefix="test",
             kmer_ids=all_kmer,
         )
         bucket_metrics = _compute_bucket_metrics(
-            all_mu, all_sigma, all_true, all_cat, all_pm, all_po, prefix="test",
+            all_mu,
+            all_sigma,
+            all_true,
+            all_cat,
+            all_pm,
+            all_po,
+            prefix="test",
         )
         metrics.update(bucket_metrics)
         self.log_dict(
@@ -1092,7 +1150,9 @@ def _infer_num_meth_types_from_data(pkl_path: str) -> int:
             n = max(int(v) for v in meth_id_map.values()) + 1
             log.info(
                 "num_meth_types from %s __meta__['meth_id_map'] = %s -> n=%d",
-                paths[0].name, meth_id_map, n,
+                paths[0].name,
+                meth_id_map,
+                n,
             )
             return max(n, 4)
         del first  # release if we don't return
@@ -1205,6 +1265,7 @@ def _save_model_config(
       the statistical-firing decomposition at generate time.
     """
     from .utils.encoding import get_meth_ids
+
     cfg = model.get_config()
     if meth_types is not None:
         cfg["meth_types"] = sorted(meth_types)
@@ -1404,8 +1465,8 @@ def train_mlp(
     # any disagreement with the active YAML. The shard's meta wins because
     # the data was physically extracted under that geometry — training on
     # a model sized to a different geometry would silently produce garbage.
-    from .data.dataset import _peek_shard_extraction_params  # noqa: PLC0415
-    from .utils.config import get_extraction_params as _get_yaml_params  # noqa: PLC0415
+    from .data.dataset import _peek_shard_extraction_params
+    from .utils.config import get_extraction_params as _get_yaml_params
 
     shard_params = None
     if Path(pkl_path).is_dir():
@@ -1418,8 +1479,10 @@ def train_mlp(
         log.info(
             "extraction params: read from kinsim_config.yaml — "
             "kmer_size=%d  upstream=%d  downstream=%d  rev_meth=%s",
-            resolved_params.kmer_size, resolved_params.upstream,
-            resolved_params.downstream, list(resolved_params.rev_meth_offsets),
+            resolved_params.kmer_size,
+            resolved_params.upstream,
+            resolved_params.downstream,
+            list(resolved_params.rev_meth_offsets),
         )
     else:
         yaml_params = _get_yaml_params()
@@ -1427,14 +1490,17 @@ def train_mlp(
             log.warning(
                 "Shard ExtractionParams differ from kinsim_config.yaml; "
                 "shard wins:\n  shard:  %s\n  YAML:   %s",
-                shard_params.to_dict(), yaml_params.to_dict(),
+                shard_params.to_dict(),
+                yaml_params.to_dict(),
             )
         resolved_params = shard_params
         log.info(
             "extraction params: read from shards — "
             "kmer_size=%d  upstream=%d  downstream=%d  rev_meth=%s",
-            resolved_params.kmer_size, resolved_params.upstream,
-            resolved_params.downstream, list(resolved_params.rev_meth_offsets),
+            resolved_params.kmer_size,
+            resolved_params.upstream,
+            resolved_params.downstream,
+            list(resolved_params.rev_meth_offsets),
         )
 
     log.info(
@@ -1503,22 +1569,27 @@ def train_mlp(
 
     # Save model config BEFORE first epoch — generate.py needs it even if interrupted
     _save_model_config(
-        output_dir, model,
+        output_dir,
+        model,
         meth_types=pkl_meth_types,
         p_fire=p_fire,
         mean_occupancy=mean_occ,
     )
 
     if resume_ckpt:
-        from .models.predictor import load_state_dict_from_ckpt  # noqa: PLC0415
+        from .models.predictor import load_state_dict_from_ckpt
 
         log.info("Loading weights from: %s", resume_ckpt)
         model.load_state_dict(load_state_dict_from_ckpt(resume_ckpt))
         log.info("Weights loaded.")
 
     lm = KineticPredictor(
-        model, lr=lr, loss_name=loss_name,
-        lr_schedule=lr_schedule, max_epochs=epochs, warmup_epochs=warmup_epochs,
+        model,
+        lr=lr,
+        loss_name=loss_name,
+        lr_schedule=lr_schedule,
+        max_epochs=epochs,
+        warmup_epochs=warmup_epochs,
     )
     dm = KineticDataModule(
         input_path=pkl_path,
@@ -1556,14 +1627,15 @@ def train_mlp(
     # Snapshot the active YAML next to model_config.json so downstream
     # tooling can reproduce the geometry without re-reading the live config.
     try:
-        from .utils.config import load_kinsim_config as _load_yaml  # noqa: PLC0415
-        import yaml as _yaml  # noqa: PLC0415
+        import yaml as _yaml
+
+        from .utils.config import load_kinsim_config as _load_yaml
 
         (output_dir / "kinsim_config.snapshot.yaml").write_text(
             _yaml.safe_dump(dict(_load_yaml()), sort_keys=False),
             encoding="utf-8",
         )
-    except Exception as _exc:  # noqa: BLE001
+    except Exception as _exc:
         log.warning("Could not snapshot kinsim_config.yaml: %s", _exc)
 
     # ── Loggers ───────────────────────────────────────────────────────────
@@ -1615,8 +1687,8 @@ def train_mlp(
     # `trainer.test()` only ran for ``test_pkl`` which silently dropped the
     # `--test-strains` holdout — leaving users with no per-meth-type test
     # metrics when they used the sharded mode.
-    has_test_set = bool(test_pkl) or bool(test_strains) or (
-        test_fraction is not None and test_fraction > 0
+    has_test_set = (
+        bool(test_pkl) or bool(test_strains) or (test_fraction is not None and test_fraction > 0)
     )
     if has_test_set:
         log.info("Running evaluation on held-out test set")
@@ -1692,7 +1764,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--lr", type=float, default=None, help="Learning rate (default: 1e-3)")
 
     parser.add_argument(
-        "--base-embed-dim", type=int, default=None,
+        "--base-embed-dim",
+        type=int,
+        default=None,
         help="Per-base embedding dimension (default: 16)",
     )
     parser.add_argument(
@@ -1708,19 +1782,23 @@ def main(argv: list[str] | None = None) -> None:
         "--head-dim", type=int, default=None, help="Head hidden layer width (default: 128)"
     )
     parser.add_argument(
-        "--meth-proj-dim", type=int, default=None,
+        "--meth-proj-dim",
+        type=int,
+        default=None,
         help="Methylation projection output dim (default: 8)",
     )
     parser.add_argument(
-        "--dropout", type=float, default=None, help="Dropout probability (default: 0.1)",
+        "--dropout",
+        type=float,
+        default=None,
+        help="Dropout probability (default: 0.1)",
     )
     parser.add_argument(
         "--loss",
         default=None,
-        choices=["gnll", "betanll", "betanll_0.3", "betanll_0.5", "betanll_1.0",
-                 "mse", "huber"],
+        choices=["gnll", "betanll", "betanll_0.3", "betanll_0.5", "betanll_1.0", "mse", "huber"],
         help="Loss function: gnll=Gaussian NLL, betanll=Beta-NLL β=0.5 (default), "
-             "betanll_<β> for explicit β, mse, huber",
+        "betanll_<β> for explicit β, mse, huber",
     )
     parser.add_argument(
         "--val-fraction",
@@ -1759,9 +1837,9 @@ def main(argv: list[str] | None = None) -> None:
         action="store_false",
         default=None,
         help="Disable paired-positive augmentation (default: ON). When on, "
-             "each non-baseline row is paired with a real baseline of the "
-             "same kmer — forces the meth/no-meth contrast on the same "
-             "sequence (Khosla 2020).",
+        "each non-baseline row is paired with a real baseline of the "
+        "same kmer — forces the meth/no-meth contrast on the same "
+        "sequence (Khosla 2020).",
     )
     parser.add_argument(
         "--no-balance-kmers",
@@ -1769,8 +1847,8 @@ def main(argv: list[str] | None = None) -> None:
         action="store_false",
         default=None,
         help="Disable per-(kmer, category) inverse-frequency sampling "
-             "(default: ON). When on, rare kmers / rare categories get "
-             "proportionally more gradient (He+Garcia 2009, Cui 2019).",
+        "(default: ON). When on, rare kmers / rare categories get "
+        "proportionally more gradient (He+Garcia 2009, Cui 2019).",
     )
     parser.add_argument(
         "--no-biology-mask",
@@ -1778,23 +1856,23 @@ def main(argv: list[str] | None = None) -> None:
         action="store_false",
         default=None,
         help="Disable architectural biology mask (default: ON). When on, "
-             "the model literally cannot see impossible (base, meth_id) "
-             "pairs (e.g. m5C on an A) — kills the 'meth flag → boost' "
-             "shortcut at the architecture level.",
+        "the model literally cannot see impossible (base, meth_id) "
+        "pairs (e.g. m5C on an A) — kills the 'meth flag → boost' "
+        "shortcut at the architecture level.",
     )
     parser.add_argument(
         "--log-sigma-clamp-max",
         type=float,
         default=None,
         help="Upper clamp on log σ (default: 1.5). Tighten to prevent the "
-             "model from gaming σ instead of fitting μ. Legacy was 3.0.",
+        "model from gaming σ instead of fitting μ. Legacy was 3.0.",
     )
     parser.add_argument(
         "--lr-schedule",
         default=None,
         choices=["cosine", "plateau"],
         help="LR schedule: cosine (default) with linear warmup + cosine "
-             "decay to 1%% lr, or plateau (legacy ReduceLROnPlateau).",
+        "decay to 1%% lr, or plateau (legacy ReduceLROnPlateau).",
     )
     parser.add_argument(
         "--warmup-epochs",

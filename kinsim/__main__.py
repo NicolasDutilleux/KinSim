@@ -88,14 +88,14 @@ def main(argv=None):
     # One verb per pipeline stage. Each command imports its own main()
     # lazily so invoking one verb doesn't pull in unrelated deps.
     DISPATCH = {
-        "extract":         "kinsim.extract",
-        "refine":          "kinsim.refine",
-        "train":           "kinsim.train",
-        "generate":        "kinsim.generate",
-        "evaluate":        "kinsim.evaluate",
+        "extract": "kinsim.extract",
+        "refine": "kinsim.refine",
+        "train": "kinsim.train",
+        "generate": "kinsim.generate",
+        "evaluate": "kinsim.evaluate",
         "verify-generate": "kinsim.verify_generate",
-        "analyze":         "kinsim.analyze",
-        "predict-kmers":   "kinsim.predict_kmers",
+        "analyze": "kinsim.analyze",
+        "predict-kmers": "kinsim.predict_kmers",
     }
 
     if cmd in DISPATCH:

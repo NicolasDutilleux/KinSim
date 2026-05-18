@@ -75,9 +75,12 @@ def get_meth_ids() -> dict:
         # surface what went wrong — silent falls hid YAML typos in the
         # past, leading to extract running with a stale meth_id_map.
         import logging as _logging
+
         _logging.getLogger(__name__).warning(
             "get_meth_ids: could not load kinsim_config.yaml (%s) — "
-            "falling back to the built-in METH_IDS=%s", exc, METH_IDS,
+            "falling back to the built-in METH_IDS=%s",
+            exc,
+            METH_IDS,
         )
         return dict(METH_IDS)
 

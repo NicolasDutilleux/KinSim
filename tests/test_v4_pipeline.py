@@ -185,9 +185,7 @@ def test_parse_motifs_fails_loudly_on_wrong_centerpos():
     assert "GATC" in msg, f"first bad entry not in error message: {msg}"
     assert "CTGAAG" in msg, f"second bad entry not in error message: {msg}"
     # The error must give a clear hint about the format.
-    assert "1-based" in msg or "fix" in msg.lower(), (
-        f"error message lacks corrective hint: {msg}"
-    )
+    assert "1-based" in msg or "fix" in msg.lower(), f"error message lacks corrective hint: {msg}"
 
 
 def test_parse_motifs_accepts_correct_entries():
@@ -370,7 +368,7 @@ def test_gmm_k2_separates_clean_two_distributions():
     )
 
     # Per-bucket fit stored with reasonable means (lowest ~30, highest ~90).
-    assert stats["method"] == "gmm_per_meth_offset"
+    assert stats["method"] == "gmm_anchored_log1p"
     m6a_stats = stats["per_bucket"]["m6A@+0"]
     assert not m6a_stats["skipped"]
     # 2D fit: gmm_means is (K, 2) — read the IPD axis only for the assertion.
@@ -601,13 +599,9 @@ def test_gmm_per_offset_isolates_noisy_offset_from_clean_offset():
     b5 = by_bucket["m6A@+5"]
 
     # m6A@+0 must be a successful fit with most slowed surviving.
-    assert not b0["skipped"], (
-        f"m6A@+0 should fit cleanly (got skipped={b0.get('reason')})"
-    )
+    assert not b0["skipped"], f"m6A@+0 should fit cleanly (got skipped={b0.get('reason')})"
     survival0 = b0["n_kept"] / b0["n_in"]
-    assert 0.55 < survival0 < 0.95, (
-        f"m6A@+0 survival {survival0:.2%} outside expected ~75% range"
-    )
+    assert 0.55 < survival0 < 0.95, f"m6A@+0 survival {survival0:.2%} outside expected ~75% range"
 
     # m6A@+5 is indistinguishable from baseline → defensive (skipped or
     # ~100 % kept). Either way, it must NOT have dropped m6A@+0.
@@ -636,7 +630,7 @@ def test_refine_pkl_writes_output_gmm():
         with open(out, "rb") as f:
             refined = pickle.load(f)
         meta = refined.pop("__meta__")
-        assert meta["method"] == "gmm_per_meth_offset"
+        assert meta["method"] == "gmm_anchored_log1p"
         assert "m6A@+0" in meta["stats"]["per_bucket"]
         # Each kmer has at least baseline rows surviving.
         for kid in range(50):
@@ -892,14 +886,14 @@ def test_sharded_signal_dataset_iterates_all_rows():
         assert meth_full.shape == (11, 4)
         assert log_signal.shape == (2,)
         assert isinstance(meth_id, _torch.Tensor)
-        assert isinstance(parent_meth,   _torch.Tensor) and parent_meth.dtype   == _torch.long
+        assert isinstance(parent_meth, _torch.Tensor) and parent_meth.dtype == _torch.long
         assert isinstance(parent_offset, _torch.Tensor) and parent_offset.dtype == _torch.long
-        assert isinstance(category,      _torch.Tensor) and category.dtype      == _torch.long
+        assert isinstance(category, _torch.Tensor) and category.dtype == _torch.long
 
 
 def test_sharded_refine_writes_per_shard_clean_pkls():
     """slowed_split_gmm_shards over 2 synthetic shards produces 2 cleaned shards
-    in the output dir, with __meta__["method"] = 'gmm_per_meth_offset'."""
+    in the output dir, with __meta__["method"] = 'gmm_anchored_log1p'."""
     from kinsim.refine import slowed_split_gmm_shards
 
     meth_ids = get_meth_ids()
@@ -946,14 +940,14 @@ def test_sharded_refine_writes_per_shard_clean_pkls():
         cleaned = sorted((out_dir).glob("*_clean.pkl"))
         assert len(cleaned) == 2
         # Method recorded.
-        assert stats["method"] == "gmm_per_meth_offset"
+        assert stats["method"] == "gmm_anchored_log1p"
         assert stats["n_shards"] == 2
         # Each cleaned shard has __meta__ with refine info.
         for p in cleaned:
             with open(p, "rb") as f:
                 d = pickle.load(f)
             assert "__meta__" in d
-            assert d["__meta__"]["method"] == "gmm_per_meth_offset"
+            assert d["__meta__"]["method"] == "gmm_anchored_log1p"
 
 
 def test_concat_shards_in_analyze_merges_per_kmer_arrays():

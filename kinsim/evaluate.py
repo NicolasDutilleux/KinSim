@@ -55,7 +55,6 @@ from __future__ import annotations
 
 import json
 import logging
-import pickle
 from pathlib import Path
 
 import numpy as np
@@ -536,9 +535,6 @@ def plot_kmer_distribution(
     else:
         plt.show()
     plt.close()
-
-
-
 
 
 # ---------------------------------------------------------------------------
