@@ -88,17 +88,52 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _gaussian_nll_loss(params: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+def _gaussian_nll_loss(
+    params: torch.Tensor,
+    targets: torch.Tensor,
+    log_sigma_min: float = -6.0,
+    log_sigma_max: float = 3.0,
+) -> torch.Tensor:
     """Gaussian NLL for (IPD, PW) jointly.
 
     Args:
-        params:  Model output (batch, 4) — [μ_ipd, μ_pw, log_σ_ipd, log_σ_pw].
-        targets: Ground-truth signals (batch, 2) — [IPD, PW] in log1p space.
+        params:        Model output (batch, 4) — [μ_ipd, μ_pw, log_σ_ipd, log_σ_pw].
+        targets:       Ground-truth signals (batch, 2) — [IPD, PW] in log1p space.
+        log_sigma_min: Lower clamp on log σ (default -6).
+        log_sigma_max: Upper clamp on log σ (default 3, tighten to 1.5 to
+                       prevent the model from gaming σ instead of fitting μ).
     """
     mu = params[:, :2]
-    log_sig = torch.clamp(params[:, 2:], -6.0, 3.0)
+    log_sig = torch.clamp(params[:, 2:], log_sigma_min, log_sigma_max)
     var = torch.exp(2.0 * log_sig)
     return (0.5 * (log_sig * 2.0 + (targets - mu) ** 2 / var)).mean()
+
+
+def _beta_nll_loss(
+    params: torch.Tensor,
+    targets: torch.Tensor,
+    beta: float = 0.5,
+    log_sigma_min: float = -6.0,
+    log_sigma_max: float = 3.0,
+) -> torch.Tensor:
+    """Beta-NLL (Seitzer+ 2022) — reweights per-sample GNLL by σ^(2β).
+
+    Standard GNLL allows the network to "cheat" by inflating σ on hard
+    samples instead of improving μ. Beta-NLL multiplies the per-sample
+    NLL by ``σ²ᵝ`` (detached from the graph) — large-σ samples get
+    proportionally more gradient on μ, eliminating the shortcut.
+
+    β=0   → identity (vanilla GNLL).
+    β=0.5 → recommended default in the paper.
+    β=1   → equivalent to plain MSE on μ (σ gradient cancelled).
+    """
+    mu = params[:, :2]
+    log_sig = torch.clamp(params[:, 2:], log_sigma_min, log_sigma_max)
+    var = torch.exp(2.0 * log_sig)
+    nll = 0.5 * (log_sig * 2.0 + (targets - mu) ** 2 / var)
+    # Stop-grad reweighting term: σ²ᵝ as a fixed scalar per element.
+    weight = var.detach() ** beta
+    return (nll * weight).mean()
 
 
 def _per_sample_gaussian_nll(
@@ -127,8 +162,13 @@ def _huber_loss(params: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
 
 _LOSS_FUNCTIONS = {
     "gnll": _gaussian_nll_loss,
-    "mse": _mse_loss,
-    "huber": _huber_loss,
+    "betanll": lambda p, t, **kw: _beta_nll_loss(p, t, beta=0.5, **kw),
+    "betanll_0.3": lambda p, t, **kw: _beta_nll_loss(p, t, beta=0.3, **kw),
+    "betanll_0.5": lambda p, t, **kw: _beta_nll_loss(p, t, beta=0.5, **kw),
+    "betanll_1.0": lambda p, t, **kw: _beta_nll_loss(p, t, beta=1.0, **kw),
+    # MSE/huber don't use σ — accept and ignore the clamp kwargs.
+    "mse": lambda p, t, **_kw: _mse_loss(p, t),
+    "huber": lambda p, t, **_kw: _huber_loss(p, t),
 }
 
 def _meth_names() -> dict[int, str]:
@@ -172,6 +212,10 @@ def _compute_metrics(
         {
             f"{prefix}_mse_ipd": float(mse[0]),
             f"{prefix}_mse_pw": float(mse[1]),
+            # Single μ-only checkpoint metric: average MSE of IPD and PW.
+            # Best checkpoint by val_mse_mu picks the model that fits μ
+            # best regardless of σ-cheating (Seitzer 2022 motivation).
+            f"{prefix}_mse_mu": float((mse[0] + mse[1]) / 2.0),
             f"{prefix}_mae_ipd": float(mae[0]),
             f"{prefix}_mae_pw": float(mae[1]),
             f"{prefix}_pearson_ipd": _pearson(all_mu[:, 0], all_true[:, 0]),
@@ -548,6 +592,9 @@ class KineticDataModule(L.LightningDataModule):
         seed: int = 42,
         max_rows_per_shard: int | None = None,
         num_workers: int = 2,
+        augment: bool = True,
+        balance_kmers: bool = True,
+        params=None,  # ExtractionParams | None
     ) -> None:
         super().__init__()
         self.input_path = str(input_path)
@@ -571,6 +618,13 @@ class KineticDataModule(L.LightningDataModule):
         # while guaranteeing each shard is seen at least once.
         self.max_rows_per_shard = max_rows_per_shard
         self.num_workers = int(num_workers)
+        # Augmentation / balancing flags applied only to the TRAIN split —
+        # val and test stay clean for honest metrics.
+        self.augment = bool(augment)
+        self.balance_kmers = bool(balance_kmers)
+        # Window geometry: forwarded into every Dataset constructed in setup()
+        # so the column layout is fixed and verified per shard.
+        self.params = params
         # populated in setup()
         self._train_subset = None
         self._val_subset = None
@@ -586,7 +640,13 @@ class KineticDataModule(L.LightningDataModule):
     # ── Single-pkl path ────────────────────────────────────────────────
     def _setup_monolithic(self, stage: str | None) -> None:
         if stage in ("fit", None):
-            dataset = MLPSignalDataset(self.input_path, num_meth_types=self.num_meth_types)
+            dataset = MLPSignalDataset(
+                self.input_path,
+                num_meth_types=self.num_meth_types,
+                augment=self.augment,
+                augment_seed=self.seed,
+                params=self.params,
+            )
             n_val = max(1, int(len(dataset) * self.val_fraction))
             n_train = len(dataset) - n_val
             rng = torch.Generator().manual_seed(self.seed)
@@ -595,7 +655,11 @@ class KineticDataModule(L.LightningDataModule):
             self._val_subset = Subset(dataset, indices[n_train:])
             log.info("Data split — train: %d samples, val: %d samples", n_train, n_val)
         if stage in ("test", None) and self.test_pkl:
-            self._test_dataset = MLPSignalDataset(self.test_pkl, num_meth_types=self.num_meth_types)
+            self._test_dataset = MLPSignalDataset(
+                self.test_pkl,
+                num_meth_types=self.num_meth_types,
+                params=self.params,
+            )
             log.info("Test set: %d keys from %s", len(self._test_dataset), self.test_pkl)
 
     # ── Sharded path ───────────────────────────────────────────────────
@@ -637,6 +701,9 @@ class KineticDataModule(L.LightningDataModule):
                 shuffle=True,
                 num_meth_types=self.num_meth_types,
                 seed=self.seed,
+                augment=self.augment,
+                balance_kmers=self.balance_kmers,
+                params=self.params,
             )
             # Per-shard cap on train so every shard is visited per epoch
             # (rather than burning the full budget on one big shard).
@@ -646,6 +713,7 @@ class KineticDataModule(L.LightningDataModule):
                 shuffle=False,
                 num_meth_types=self.num_meth_types,
                 seed=self.seed + 100,
+                params=self.params,
             )
         if stage in ("test", None) and test_shards:
             self._test_dataset = ShardedSignalDataset(
@@ -653,6 +721,7 @@ class KineticDataModule(L.LightningDataModule):
                 shuffle=False,
                 num_meth_types=self.num_meth_types,
                 seed=self.seed + 200,
+                params=self.params,
             )
 
     def train_dataloader(self) -> DataLoader:
@@ -720,11 +789,18 @@ class KineticPredictor(L.LightningModule):
         model: MLPPredictor,
         lr: float = 1e-3,
         loss_name: str = "gnll",
+        lr_schedule: str = "cosine",
+        max_epochs: int = 50,
+        warmup_epochs: int = 3,
     ) -> None:
         super().__init__()
         self.model = model
         self.lr = lr
+        self.loss_name = loss_name
         self._loss_fn = _LOSS_FUNCTIONS[loss_name]
+        self.lr_schedule = str(lr_schedule)
+        self.max_epochs = int(max_epochs)
+        self.warmup_epochs = int(warmup_epochs)
         # Accumulate per-batch predictions for epoch-level metrics
         self._val_mu: list[torch.Tensor] = []
         self._val_sigma: list[torch.Tensor] = []
@@ -744,10 +820,23 @@ class KineticPredictor(L.LightningModule):
     def forward(self, kmer_ids: torch.Tensor, meth_probs: torch.Tensor) -> torch.Tensor:
         return self.model(kmer_ids, meth_probs)
 
+    def _clamp_kwargs(self) -> dict:
+        """Return the model's log-σ clamp range as kwargs for the loss fn.
+
+        Falls back to the legacy (-6, 3) range for models that don't
+        expose ``log_sigma_clamp_*`` attributes (i.e. the MLP path).
+        """
+        return {
+            "log_sigma_min": float(getattr(self.model, "log_sigma_clamp_min", -6.0)),
+            "log_sigma_max": float(getattr(self.model, "log_sigma_clamp_max", 3.0)),
+        }
+
     def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
         # 7-tuple now; training ignores parent_meth / parent_offset / category.
         kmer_ids, meth_probs, signals, *_extras = batch
-        loss = self._loss_fn(self.model(kmer_ids, meth_probs), signals)
+        loss = self._loss_fn(
+            self.model(kmer_ids, meth_probs), signals, **self._clamp_kwargs(),
+        )
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
@@ -755,10 +844,11 @@ class KineticPredictor(L.LightningModule):
         (kmer_ids, meth_probs, signals, meth_ids,
          parent_meths, parent_offsets, categories) = batch
         params = self.model(kmer_ids, meth_probs)
-        loss = self._loss_fn(params, signals)
+        clamp = self._clamp_kwargs()
+        loss = self._loss_fn(params, signals, **clamp)
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         mu = params[:, :2]
-        log_sig = torch.clamp(params[:, 2:], -6.0, 3.0)
+        log_sig = torch.clamp(params[:, 2:], clamp["log_sigma_min"], clamp["log_sigma_max"])
         sigma = torch.exp(log_sig)
         # ``.float()`` upcasts bf16 → fp32 so ``.numpy()`` works at epoch end
         # (numpy has no native BFloat16 dtype). Without this, bf16-mixed
@@ -815,8 +905,9 @@ class KineticPredictor(L.LightningModule):
         (kmer_ids, meth_probs, signals, meth_ids,
          parent_meths, parent_offsets, categories) = batch
         params = self.model(kmer_ids, meth_probs)
+        clamp = self._clamp_kwargs()
         mu = params[:, :2]
-        log_sig = torch.clamp(params[:, 2:], -6.0, 3.0)
+        log_sig = torch.clamp(params[:, 2:], clamp["log_sigma_min"], clamp["log_sigma_max"])
         sigma = torch.exp(log_sig)
         # ``.float()`` upcasts bf16 → fp32 so ``.numpy()`` works at epoch end.
         self._test_mu.append(mu.detach().float().cpu())
@@ -859,6 +950,36 @@ class KineticPredictor(L.LightningModule):
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.lr)
+
+        if self.lr_schedule == "cosine":
+            # Linear warmup for `warmup_epochs`, then cosine decay over the
+            # remaining epochs down to lr * 0.01. Decoupled from val_loss so
+            # the LR schedule is fully deterministic and reproducible.
+            import math
+
+            max_epochs = max(1, self.max_epochs)
+            warmup = max(0, min(self.warmup_epochs, max_epochs - 1))
+            min_factor = 0.01
+
+            def _lr_lambda(epoch: int) -> float:
+                if warmup > 0 and epoch < warmup:
+                    return float(epoch + 1) / float(warmup)
+                progress = (epoch - warmup) / max(1, max_epochs - warmup)
+                progress = min(max(progress, 0.0), 1.0)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return min_factor + (1.0 - min_factor) * cosine
+
+            scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "epoch",
+                    "frequency": 1,
+                },
+            }
+
+        # Legacy: ReduceLROnPlateau on val_loss.
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=0.5, patience=5
         )
@@ -905,9 +1026,25 @@ class LegacyCheckpointCallback(Callback):
         checkpoint_every: Save every N epochs (default 10).
     """
 
-    def __init__(self, output_dir: Path, checkpoint_every: int = 10) -> None:
+    def __init__(
+        self,
+        output_dir: Path,
+        checkpoint_every: int = 10,
+        kinsim_config: dict | None = None,
+    ) -> None:
+        """Args:
+            output_dir:       Directory to write checkpoint_epoch*.pt files.
+            checkpoint_every: Save every N epochs.
+            kinsim_config:    Optional snapshot of the full kinsim_config.yaml
+                              used for this run. Embedded in every checkpoint
+                              under the ``"kinsim_config"`` key so downstream
+                              tools (generate, evaluate, verify_generate) can
+                              reproduce the geometry without re-reading the
+                              project-wide YAML.
+        """
         self.output_dir = Path(output_dir)
         self.checkpoint_every = checkpoint_every
+        self.kinsim_config = kinsim_config
 
     def _save(
         self,
@@ -919,7 +1056,13 @@ class LegacyCheckpointCallback(Callback):
             "epoch": epoch,
             "model": pl_module.model.state_dict(),
             "optimizer": trainer.optimizers[0].state_dict(),
+            # Self-describing checkpoint: carries the model's get_config()
+            # plus the active kinsim_config snapshot so inference code never
+            # has to guess geometry from a YAML that may have moved.
+            "model_config": pl_module.model.get_config(),
         }
+        if self.kinsim_config is not None:
+            state["kinsim_config"] = self.kinsim_config
         if trainer.lr_scheduler_configs:
             state["scheduler"] = trainer.lr_scheduler_configs[0].scheduler.state_dict()
         path = self.output_dir / f"checkpoint_epoch{epoch}.pt"
@@ -1271,6 +1414,13 @@ def train_mlp(
     run_optuna: bool = False,
     n_trials: int = 20,
     optuna_epochs: int = 20,
+    # Accuracy improvements (defaults reflect what's actually safe and known to help)
+    augment: bool = True,
+    balance_kmers: bool = True,
+    biology_mask: bool = False,   # off — see kinsim_config.yaml notes
+    log_sigma_clamp_max: float = 3.0,
+    lr_schedule: str = "cosine",
+    warmup_epochs: int = 3,
 ) -> None:
     """Train kinetic predictor using PyTorch Lightning.
 
@@ -1379,6 +1529,43 @@ def train_mlp(
     num_meth_types = _infer_num_meth_types_from_data(pkl_path)
     log.info("num_meth_types (data-derived): %d", num_meth_types)
 
+    # Resolve the window geometry from the shards (authoritative) and reject
+    # any disagreement with the active YAML. The shard's meta wins because
+    # the data was physically extracted under that geometry — training on
+    # a model sized to a different geometry would silently produce garbage.
+    from .data.dataset import _peek_shard_extraction_params  # noqa: PLC0415
+    from .utils.config import get_extraction_params as _get_yaml_params  # noqa: PLC0415
+
+    shard_params = None
+    if Path(pkl_path).is_dir():
+        shards = list_shards(pkl_path)
+        if shards:
+            shard_params = _peek_shard_extraction_params(shards[0])
+    if shard_params is None:
+        # Single-pkl mode or pre-v0.5 shard — try the YAML.
+        resolved_params = _get_yaml_params()
+        log.info(
+            "extraction params: read from kinsim_config.yaml — "
+            "kmer_size=%d  upstream=%d  downstream=%d  rev_meth=%s",
+            resolved_params.kmer_size, resolved_params.upstream,
+            resolved_params.downstream, list(resolved_params.rev_meth_offsets),
+        )
+    else:
+        yaml_params = _get_yaml_params()
+        if shard_params != yaml_params:
+            log.warning(
+                "Shard ExtractionParams differ from kinsim_config.yaml; "
+                "shard wins:\n  shard:  %s\n  YAML:   %s",
+                shard_params.to_dict(), yaml_params.to_dict(),
+            )
+        resolved_params = shard_params
+        log.info(
+            "extraction params: read from shards — "
+            "kmer_size=%d  upstream=%d  downstream=%d  rev_meth=%s",
+            resolved_params.kmer_size, resolved_params.upstream,
+            resolved_params.downstream, list(resolved_params.rev_meth_offsets),
+        )
+
     if architecture == "conv":
         log.info(
             "Training — arch=conv  %d epochs  loss=%s  lr=%.2e  base_embed=%d  "
@@ -1404,6 +1591,11 @@ def train_mlp(
             kernel_size=kernel_size,
             head_dim=head_dim,
             dropout=dropout,
+            biology_mask=biology_mask,
+            log_sigma_clamp_max=log_sigma_clamp_max,
+            kmer_size=resolved_params.kmer_size,
+            active_site_index=resolved_params.active_site_index,
+            n_rev_meth=resolved_params.n_rev_meth,
         )
     else:
         log.info(
@@ -1424,6 +1616,9 @@ def train_mlp(
             meth_proj_dim=meth_proj_dim,
             num_meth_types=num_meth_types,
             dropout=dropout,
+            kmer_size=resolved_params.kmer_size,
+            active_site_index=resolved_params.active_site_index,
+            n_rev_meth=resolved_params.n_rev_meth,
         )
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -1488,7 +1683,10 @@ def train_mlp(
             )
         log.info("Weights loaded.")
 
-    lm = KineticPredictor(model, lr=lr, loss_name=loss_name)
+    lm = KineticPredictor(
+        model, lr=lr, loss_name=loss_name,
+        lr_schedule=lr_schedule, max_epochs=epochs, warmup_epochs=warmup_epochs,
+    )
     dm = KineticDataModule(
         input_path=pkl_path,
         test_pkl=test_pkl,
@@ -1498,6 +1696,9 @@ def train_mlp(
         batch_size=batch_size,
         num_meth_types=num_meth_types,
         seed=split_seed,
+        augment=augment,
+        balance_kmers=balance_kmers,
+        params=resolved_params,
     )
 
     # ── Callbacks ─────────────────────────────────────────────────────────
@@ -1510,9 +1711,29 @@ def train_mlp(
         save_top_k=3,
         save_last=True,
     )
+    # Second checkpoint tracking μ-only MSE — picks the model that fits the
+    # mean best, independent of how σ is being shaped by GNLL/Beta-NLL.
+    mu_ckpt = ModelCheckpoint(
+        dirpath=str(output_dir / "lightning_ckpts"),
+        filename="best_mu-{epoch:03d}-{val_mse_mu:.4f}",
+        monitor="val_mse_mu",
+        mode="min",
+        save_top_k=1,
+    )
+    # Snapshot the active YAML so the checkpoint is fully self-describing.
+    # Errors in load_kinsim_config are non-fatal: the model_config saved in
+    # the checkpoint alone is enough to rebuild the model; the YAML
+    # snapshot is a convenience for downstream tooling.
+    try:
+        from .utils.config import load_kinsim_config as _load_yaml  # noqa: PLC0415
+        _yaml_snapshot = dict(_load_yaml())
+    except Exception as _exc:  # noqa: BLE001
+        log.warning("Could not snapshot kinsim_config.yaml into checkpoint: %s", _exc)
+        _yaml_snapshot = None
     legacy_ckpt = LegacyCheckpointCallback(
         output_dir=output_dir,
         checkpoint_every=checkpoint_every,
+        kinsim_config=_yaml_snapshot,
     )
 
     # ── Loggers ───────────────────────────────────────────────────────────
@@ -1549,7 +1770,7 @@ def train_mlp(
         accelerator=accelerator,
         devices=1,
         gradient_clip_val=0.5,
-        callbacks=[early_stop, lightning_ckpt, legacy_ckpt],
+        callbacks=[early_stop, lightning_ckpt, mu_ckpt, legacy_ckpt],
         logger=loggers,
         log_every_n_steps=50,
         enable_progress_bar=True,
@@ -1559,8 +1780,16 @@ def train_mlp(
     trainer.fit(lm, datamodule=dm)
     log.info("Training complete. Outputs in: %s", output_dir)
 
-    if test_pkl:
-        log.info("Running evaluation on held-out test set: %s", test_pkl)
+    # Run final test pass when EITHER a separate test pkl OR a sharded-mode
+    # holdout (test_strains / test_fraction) was provided. Before this fix,
+    # `trainer.test()` only ran for ``test_pkl`` which silently dropped the
+    # `--test-strains` holdout — leaving users with no per-meth-type test
+    # metrics when they used the sharded mode.
+    has_test_set = bool(test_pkl) or bool(test_strains) or (
+        test_fraction is not None and test_fraction > 0
+    )
+    if has_test_set:
+        log.info("Running evaluation on held-out test set")
         trainer.test(lm, datamodule=dm)
 
 
@@ -1688,8 +1917,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--loss",
         default=None,
-        choices=["gnll", "mse", "huber"],
-        help="Loss function: gnll=Gaussian NLL (default), mse, huber",
+        choices=["gnll", "betanll", "betanll_0.3", "betanll_0.5", "betanll_1.0",
+                 "mse", "huber"],
+        help="Loss function: gnll=Gaussian NLL, betanll=Beta-NLL β=0.5 (default), "
+             "betanll_<β> for explicit β, mse, huber",
     )
     parser.add_argument(
         "--val-fraction",
@@ -1725,6 +1956,57 @@ def main(argv: list[str] | None = None) -> None:
         type=int,
         default=None,
         help="Epochs per Optuna trial (default: 20, shorter than --epochs)",
+    )
+
+    # ── Accuracy improvements (all ON by default — flags opt OUT) ────────
+    parser.add_argument(
+        "--no-augment",
+        dest="augment",
+        action="store_false",
+        default=None,
+        help="Disable paired-positive augmentation (default: ON). When on, "
+             "each non-baseline row is paired with a real baseline of the "
+             "same kmer — forces the meth/no-meth contrast on the same "
+             "sequence (Khosla 2020).",
+    )
+    parser.add_argument(
+        "--no-balance-kmers",
+        dest="balance_kmers",
+        action="store_false",
+        default=None,
+        help="Disable per-(kmer, category) inverse-frequency sampling "
+             "(default: ON). When on, rare kmers / rare categories get "
+             "proportionally more gradient (He+Garcia 2009, Cui 2019).",
+    )
+    parser.add_argument(
+        "--no-biology-mask",
+        dest="biology_mask",
+        action="store_false",
+        default=None,
+        help="Disable architectural biology mask (default: ON). When on, "
+             "the model literally cannot see impossible (base, meth_id) "
+             "pairs (e.g. m5C on an A) — kills the 'meth flag → boost' "
+             "shortcut at the architecture level.",
+    )
+    parser.add_argument(
+        "--log-sigma-clamp-max",
+        type=float,
+        default=None,
+        help="Upper clamp on log σ (default: 1.5). Tighten to prevent the "
+             "model from gaming σ instead of fitting μ. Legacy was 3.0.",
+    )
+    parser.add_argument(
+        "--lr-schedule",
+        default=None,
+        choices=["cosine", "plateau"],
+        help="LR schedule: cosine (default) with linear warmup + cosine "
+             "decay to 1%% lr, or plateau (legacy ReduceLROnPlateau).",
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=None,
+        help="Linear warmup epochs for cosine schedule (default: 3).",
     )
 
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG-level logging")
@@ -1784,7 +2066,7 @@ def main(argv: list[str] | None = None) -> None:
         # Shared
         meth_proj_dim=_get(args.meth_proj_dim, "meth_proj_dim", 8),
         dropout=_get(args.dropout, "dropout", default_dropout),
-        loss_name=_get(args.loss, "loss", "gnll"),
+        loss_name=_get(args.loss, "loss", "betanll"),
         val_fraction=_get(args.val_fraction, "val_fraction", 0.10),
         checkpoint_every=_get(args.checkpoint_every, "checkpoint_every", 10),
         device=_get(args.device, "device", "cuda"),
@@ -1792,6 +2074,13 @@ def main(argv: list[str] | None = None) -> None:
         run_optuna=args.optuna or cfg.get("optuna", False),
         n_trials=_get(args.n_trials, "n_trials", 20),
         optuna_epochs=_get(args.optuna_epochs, "optuna_epochs", 20),
+        # Accuracy improvements (all ON by default; `--no-X` opts out).
+        augment=_get(args.augment, "augment", True),
+        balance_kmers=_get(args.balance_kmers, "balance_kmers", True),
+        biology_mask=_get(args.biology_mask, "biology_mask", False),
+        log_sigma_clamp_max=_get(args.log_sigma_clamp_max, "log_sigma_clamp_max", 3.0),
+        lr_schedule=_get(args.lr_schedule, "lr_schedule", "cosine"),
+        warmup_epochs=_get(args.warmup_epochs, "warmup_epochs", 3),
     )
 
 

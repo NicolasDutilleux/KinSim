@@ -55,6 +55,7 @@ from .models.predictor import MLPPredictor, create_from_config
 from .utils.encoding import (
     BASE_MAP,
     KMER_MASK,
+    KMER_PRED_IDX,
     KMER_RIGHT_PAD,
     K,
 )
@@ -695,9 +696,10 @@ def _apply_meth_types(
 def _load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
     """Load a trained model from a checkpoint file.
 
-    Reads model_config.json from the same directory as the checkpoint to
-    reconstruct the exact architecture used during training.  Supports both
-    ConvPredictor (architecture="conv") and MLPPredictor (architecture="mlp").
+    Reads ``model_config.json`` from the same directory as the checkpoint
+    to reconstruct the exact architecture used during training. Supports
+    both ConvPredictor (``architecture="conv"``) and MLPPredictor
+    (``architecture="mlp"``).
 
     Args:
         checkpoint_path: Path to the .pt checkpoint file.
@@ -705,6 +707,13 @@ def _load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
 
     Returns:
         Model in eval mode, ready for inference.
+
+    Raises:
+        SystemExit: If ``model_config.json`` is missing OR if the model was
+            trained with a window geometry the generate.py hot path does not
+            yet support (currently K=11 only — the numpy kmer-encoding and
+            N-context helpers are K=11-specific). A clear message points the
+            user at the parameters they need to set to widen the path.
     """
     ckpt = torch.load(checkpoint_path, map_location=device)
 
@@ -712,7 +721,7 @@ def _load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
     if not os.path.exists(config_path):
         log.error(
             "model_config.json not found in %s. "
-            "This file is written by 'kinsim mlp train' at the start of training. "
+            "This file is written by 'kinsim train' at the start of training. "
             "Ensure the checkpoint directory contains model_config.json.",
             os.path.dirname(checkpoint_path),
         )
@@ -721,6 +730,29 @@ def _load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
     with open(config_path) as f:
         config = json.load(f)
 
+    # Geometry guard — the numpy hot path (sliding_window_view, _KMER_POWERS,
+    # is_n_context, ref-scan slices) is K=11-specific. Reject other geometries
+    # with an actionable error rather than silently producing garbage.
+    ckpt_kmer_size = int(config.get("kmer_size", K))
+    ckpt_active_idx = int(config.get("active_site_index", config.get("KMER_PRED_IDX", 7)))
+    if ckpt_kmer_size != K:
+        log.error(
+            "Checkpoint was trained with kmer_size=%d but generate.py currently "
+            "only supports K=%d (the numpy encoding helpers are hardcoded). "
+            "To widen the inference path, replace the module-level `K` / "
+            "`KMER_PRED_IDX` / `_KMER_POWERS` constants in kinsim/generate.py "
+            "with values derived from the checkpoint, then re-run.",
+            ckpt_kmer_size, K,
+        )
+        sys.exit(1)
+    if ckpt_active_idx != KMER_PRED_IDX:
+        log.error(
+            "Checkpoint active_site_index=%d but generate.py expects %d. "
+            "Same fix path as the kmer_size mismatch above.",
+            ckpt_active_idx, KMER_PRED_IDX,
+        )
+        sys.exit(1)
+
     model = create_from_config(config).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
@@ -728,8 +760,11 @@ def _load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
     arch = config.get("architecture", "mlp")
     n_params = sum(p.numel() for p in model.parameters())
     log.info(
-        "Model loaded: architecture=%s  params=%s  checkpoint=%s",
+        "Model loaded: architecture=%s  K=%d  active_site_index=%d  "
+        "params=%s  checkpoint=%s",
         arch,
+        ckpt_kmer_size,
+        ckpt_active_idx,
         f"{n_params:,}",
         os.path.basename(checkpoint_path),
     )
@@ -1278,9 +1313,23 @@ def generate_from_bam(
 
     # Build a clean unaligned header (no SQ entries) so pbmm2 treats
     # the output as unaligned and properly converts fi/fp/ri/rp → ip/pw.
+    #
+    # CRITICAL: copy the PacBio `pb:` tag from the source @HD line if it
+    # exists, otherwise add a sane default. Downstream PacBio tools
+    # (pbindex, ipdSummary) read this tag at startup and KeyError'd in a
+    # previous incident when it was missing — the resulting silent
+    # absence of a .pbi file then poisons the whole validation chain.
     with pysam.AlignmentFile(input_bam, "rb", check_sq=False) as bam_in:
         in_dict = bam_in.header.to_dict()
-        out_dict = {"HD": {"VN": "1.6", "SO": "unknown"}}
+        hd = {"VN": "1.6", "SO": "unknown"}
+        in_hd = in_dict.get("HD", {})
+        if "pb" in in_hd:
+            hd["pb"] = in_hd["pb"]
+        else:
+            # SMRT-Tools 25.x default. Matches the version used by ipdSummary
+            # in slurm_kinsim/callers/ipdsummary.slurm.
+            hd["pb"] = "3.0.7"
+        out_dict = {"HD": hd}
         if "RG" in in_dict:
             out_dict["RG"] = in_dict["RG"]
         else:

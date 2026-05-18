@@ -35,31 +35,43 @@ from .utils.sample_layout import (
     COL_IPD,
     COL_PARENT_METH,
     COL_PW,
+    get_sample_layout,
 )
 
 log = logging.getLogger(__name__)
 
 
 def _summarize_shard(path: str | Path) -> dict[tuple[int, int], tuple]:
-    """Load a shard and return ``{(kmer_id, meth_id): (n, mu_ipd, sd_ipd, mu_pw, sd_pw)}``.
+    """Load a shard and return ``{(kmer_id, parent_meth): (n, μ_ipd, σ_ipd, μ_pw, σ_pw)}``.
 
-    ``meth_id`` here is the parent meth (col 36 of the row layout). For
-    BASELINE rows ``meth_id == 0``. Buckets per (kmer, parent_meth).
+    Reads the shard's :class:`~kinsim.utils.config.ExtractionParams` from its
+    ``__meta__`` block (when present) so the column indices adapt to whatever
+    geometry the shard was extracted under. Legacy K=11 shards fall back to
+    the module-level ``COL_*`` constants.
     """
+    from .data.dataset import read_shard_extraction_params  # noqa: PLC0415
+
     with open(path, "rb") as f:
         data = pickle.load(f)
+    # Resolve column layout from shard meta (new shards) or fall back to legacy.
+    params = read_shard_extraction_params(data)
+    layout = get_sample_layout(params) if params is not None else None
+    col_ipd = layout.col_ipd if layout else COL_IPD
+    col_pw = layout.col_pw if layout else COL_PW
+    col_parent_meth = layout.col_parent_meth if layout else COL_PARENT_METH
+
     data.pop("__meta__", None)
     out: dict[tuple[int, int], tuple] = {}
     for kid, arr in data.items():
         if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
             continue
-        if arr.ndim != 2 or arr.shape[1] <= COL_PARENT_METH:
+        if arr.ndim != 2 or arr.shape[1] <= col_parent_meth:
             continue
-        parent = arr[:, COL_PARENT_METH].astype(np.int8)
+        parent = arr[:, col_parent_meth].astype(np.int8)
         for m_id in np.unique(parent):
             mask = parent == m_id
-            ipd = arr[mask, COL_IPD].astype(np.float32)
-            pw = arr[mask, COL_PW].astype(np.float32)
+            ipd = arr[mask, col_ipd].astype(np.float32)
+            pw = arr[mask, col_pw].astype(np.float32)
             n = len(ipd)
             if n == 0:
                 continue

@@ -41,6 +41,10 @@ Use ``create_from_config(config_dict)`` to reconstruct a model from a
 saved model_config.json.
 """
 
+from __future__ import annotations
+
+import logging
+
 import torch
 import torch.nn as nn
 
@@ -49,6 +53,52 @@ from ..data.dataset import inv_log_transform, log_transform  # noqa: F401
 from ..utils.encoding import KMER_PRED_IDX
 from ..utils.encoding import K as _DEFAULT_K
 from ..utils.sample_layout import REV_METH_LEN as _REV_METH_LEN
+
+log = logging.getLogger(__name__)
+
+
+# =========================================================================
+# Biology compatibility mask (architectural enforcement)
+# =========================================================================
+#
+# Forbids the model from ever seeing an impossible (base, meth_id) pair —
+# e.g. m5C on an A. The mask is multiplied into ``meth_full`` at the kmer
+# positions before FiLM, so the model literally cannot learn the
+# "meth flag → boost" shortcut on the wrong base.
+#
+# Built from kinsim_config.yaml's ``kinetic_signatures.<name>.modified_base``
+# field (single source of truth — adding a new meth type = YAML edit only).
+
+
+_BASE_TO_ID = {"A": 0, "C": 1, "G": 2, "T": 3}
+
+
+def _build_meth_compat_buffer(num_meth_types: int) -> torch.Tensor:
+    """Return a (4, num_meth_types) float buffer.
+
+    ``compat[base_id, meth_id] = 1.0`` iff the meth can biologically
+    occur on that base. ``meth_id = 0`` (none) is always compatible
+    with every base. Falls back to all-ones if the YAML can't be loaded
+    (defensive — never silently break training).
+    """
+    compat = torch.zeros(4, num_meth_types, dtype=torch.float32)
+    compat[:, 0] = 1.0  # "none" is always allowed on any base
+    try:
+        from ..utils.config import get_modified_base_map
+        from ..utils.encoding import get_meth_ids
+
+        base_map = get_modified_base_map()
+        meth_id_map = get_meth_ids()
+        for mname, base in base_map.items():
+            mid = int(meth_id_map.get(mname, 0))
+            bid = _BASE_TO_ID.get(str(base).upper())
+            if mid > 0 and 0 <= mid < num_meth_types and bid is not None:
+                compat[bid, mid] = 1.0
+    except Exception as exc:  # pragma: no cover — defensive
+        log.warning("biology_mask: could not build from YAML (%s) — "
+                    "falling back to all-ones (no constraint).", exc)
+        compat.fill_(1.0)
+    return compat
 
 # =========================================================================
 # MLPPredictor (legacy architecture)
@@ -74,6 +124,10 @@ class MLPPredictor(nn.Module):
         num_meth_types: Number of methylation types M (default 4).
     """
 
+    # Practical cap on the kmer-embedding table size — 4^13 × 64 dim
+    # float32 ≈ 17 GB. Refuse rather than OOM.
+    _MAX_KMER_SIZE_FOR_EMBEDDING = 12
+
     def __init__(
         self,
         kmer_embed_dim: int = 64,
@@ -82,8 +136,19 @@ class MLPPredictor(nn.Module):
         dropout: float = 0.0,
         kmer_size: int = _DEFAULT_K,
         num_meth_types: int = 4,
+        active_site_index: int | None = None,
+        n_rev_meth: int = _REV_METH_LEN,
     ):
         super().__init__()
+
+        if kmer_size > self._MAX_KMER_SIZE_FOR_EMBEDDING:
+            raise ValueError(
+                f"MLPPredictor requires kmer_size <= "
+                f"{self._MAX_KMER_SIZE_FOR_EMBEDDING}, got {kmer_size}. "
+                f"At K={kmer_size} the embedding table would have 4^K = "
+                f"{4**kmer_size:,} rows — refuses to allocate. Use "
+                f"architecture='conv' (ConvPredictor scales to K up to 31)."
+            )
 
         self.kmer_embed_dim = kmer_embed_dim
         self.hidden_dim = hidden_dim
@@ -91,13 +156,23 @@ class MLPPredictor(nn.Module):
         self.dropout = dropout
         self.kmer_size = kmer_size
         self.num_meth_types = num_meth_types
+        # Active-site index inside the kmer window. Defaults to the legacy
+        # KMER_PRED_IDX so existing checkpoints reproduce bit-exact.
+        self.active_site_index = (
+            KMER_PRED_IDX if active_site_index is None else int(active_site_index)
+        )
+        # Number of rev_meth positions captured at the active-site footprint.
+        # Stored as an int (not the offsets themselves) because MLPPredictor
+        # uses only the count to size its flat projection.
+        self.n_rev_meth = int(n_rev_meth)
 
         _num_kmers = 4**kmer_size
         self.kmer_embed = nn.Embedding(_num_kmers, kmer_embed_dim)
-        # Accepts the (kmer_size + rev_meth) × num_meth_types flat context
-        # — forward meth at offsets [-7..+3] plus rev_meth at active-site
-        # neighbours [-1, 0, +1] from sample_layout.REV_METH_LEN.
-        self._meth_positions = kmer_size + _REV_METH_LEN
+        # Accepts the (kmer_size + n_rev_meth) × num_meth_types flat context
+        # — forward meth context plus rev_meth at the active-site footprint.
+        # Sized dynamically from kmer_size + n_rev_meth so the same code
+        # handles arbitrary window geometries.
+        self._meth_positions = kmer_size + self.n_rev_meth
         self.meth_proj = nn.Linear(
             self._meth_positions * num_meth_types, meth_proj_dim, bias=False
         )
@@ -141,12 +216,13 @@ class MLPPredictor(nn.Module):
         kmer_emb = self.kmer_embed(kmer_ids)
 
         if meth_probs.dim() == 2:
-            # Legacy (B, M): place at center position; pad rev_meth with 0
+            # Legacy (B, M): place at the active-site position; pad
+            # rev_meth with 0.
             B, M = meth_probs.shape
             full = torch.zeros(
                 B, self._meth_positions, M, device=meth_probs.device, dtype=meth_probs.dtype
             )
-            full[:, KMER_PRED_IDX, :] = meth_probs
+            full[:, self.active_site_index, :] = meth_probs
             meth_flat = full.view(B, -1)
         else:
             # (B, total_pos, M) → flatten to (B, total_pos*M)
@@ -173,13 +249,15 @@ class MLPPredictor(nn.Module):
     def get_config(self) -> dict:
         """Return architecture config for model_config.json."""
         return {
-            "architecture": "mlp",
-            "kmer_size": self.kmer_size,
-            "kmer_embed_dim": self.kmer_embed_dim,
-            "hidden_dim": self.hidden_dim,
-            "meth_proj_dim": self.meth_proj_dim,
-            "dropout": self.dropout,
-            "num_meth_types": self.num_meth_types,
+            "architecture":       "mlp",
+            "kmer_size":          self.kmer_size,
+            "active_site_index":  self.active_site_index,
+            "n_rev_meth":         self.n_rev_meth,
+            "kmer_embed_dim":     self.kmer_embed_dim,
+            "hidden_dim":         self.hidden_dim,
+            "meth_proj_dim":      self.meth_proj_dim,
+            "dropout":            self.dropout,
+            "num_meth_types":     self.num_meth_types,
         }
 
 
@@ -247,8 +325,33 @@ class ConvPredictor(nn.Module):
         dropout: float = 0.1,
         kmer_size: int = _DEFAULT_K,
         kmer_aware_film: bool = True,
+        biology_mask: bool = True,
+        log_sigma_clamp_min: float = -6.0,
+        log_sigma_clamp_max: float = 1.5,
+        active_site_index: int | None = None,
+        n_rev_meth: int = _REV_METH_LEN,
     ):
+        """Args:
+            ... (see class docstring)
+            active_site_index: Index of the prediction position inside the
+                kmer window. Defaults to ``KMER_PRED_IDX`` (= 7 for K=11)
+                so legacy checkpoints reproduce bit-exact.
+            n_rev_meth: Number of complementary-strand meth positions
+                captured at the active-site footprint. Defaults to
+                ``REV_METH_LEN`` (= 3).
+
+        Raises:
+            ValueError: If ``active_site_index`` is outside ``[0, kmer_size)``.
+        """
         super().__init__()
+
+        if active_site_index is None:
+            active_site_index = KMER_PRED_IDX
+        if not 0 <= active_site_index < kmer_size:
+            raise ValueError(
+                f"ConvPredictor: active_site_index ({active_site_index}) "
+                f"must satisfy 0 <= idx < kmer_size ({kmer_size})."
+            )
 
         self.base_embed_dim = base_embed_dim
         self.num_meth_types = num_meth_types
@@ -259,30 +362,41 @@ class ConvPredictor(nn.Module):
         self.head_dim = head_dim
         self.dropout_p = dropout
         self.kmer_size = kmer_size
+        self.active_site_index = int(active_site_index)
+        self.n_rev_meth = int(n_rev_meth)
         # When True, FiLM (gamma, beta) is conditioned on
         # ``concat(meth_proj, kmer_summary)`` instead of meth alone.
         # Lets the methylation modulation depend on the surrounding
         # sequence context (GC content, neighbour identities) — the
         # kinetic effect of e.g. m6A varies by motif family.
         self.kmer_aware_film = kmer_aware_film
+        # Architectural biology gate: zeros impossible (base, meth_id)
+        # pairs in ``meth_full`` before FiLM, so the model cannot learn
+        # the "meth flag → boost" shortcut on the wrong base.
+        self.biology_mask = bool(biology_mask)
+        # Configurable log-sigma clamp. Default ``log_sigma_clamp_max=1.5``
+        # gives σ ≤ exp(1.5) ≈ 4.48 in log1p space → ~89 in raw IPD.
+        # Wider (legacy 3.0) lets the network slack on μ accuracy.
+        self.log_sigma_clamp_min = float(log_sigma_clamp_min)
+        self.log_sigma_clamp_max = float(log_sigma_clamp_max)
 
         # --- Per-base embedding: A=0, C=1, G=2, T=3 ---
         self.base_embed = nn.Embedding(4, base_embed_dim)
 
         # --- Learnable positional embedding (kmer_size positions) ---
-        # Captures "distance from active site" effects: the center position
-        # is where the polymerase incorporates; flanking bases contribute
-        # stiffness, steric effects, unzipping energy.
+        # Captures "distance from active site" effects: the active-site
+        # position is where the polymerase incorporates; flanking bases
+        # contribute stiffness, steric effects, unzipping energy.
         self.pos_embed = nn.Parameter(torch.zeros(1, kmer_size, base_embed_dim))
 
         # --- Methylation projection: GLOBAL embedding from per-position context.
-        # Forward meth context [-7, +3] (kmer_size positions) plus rev_meth
-        # at active-site neighbours [-1, 0, +1] (REV_METH_LEN positions) —
-        # flattened to (B, (kmer_size + REV_METH_LEN) * M) and projected
-        # to a single embedding. FiLM conditioning is decoupled from
-        # per-position alignment, so the model sees both strands' meth
-        # status simultaneously (handles bilateral palindromic sites).
-        self._meth_positions = kmer_size + _REV_METH_LEN
+        # Forward meth context (kmer_size positions) plus rev_meth at the
+        # active-site footprint (n_rev_meth positions) — flattened to
+        # (B, (kmer_size + n_rev_meth) * M) and projected to a single
+        # embedding. FiLM conditioning is decoupled from per-position
+        # alignment, so the model sees both strands' meth status
+        # simultaneously (handles bilateral palindromic sites).
+        self._meth_positions = kmer_size + self.n_rev_meth
         self.meth_proj = nn.Linear(
             self._meth_positions * num_meth_types, meth_proj_dim, bias=False
         )
@@ -330,6 +444,17 @@ class ConvPredictor(nn.Module):
         self.register_buffer(
             "_shifts",
             torch.arange(kmer_size - 1, -1, -1) * 2,
+        )
+
+        # --- Biology compatibility buffer (4, num_meth_types) ---
+        # Not persistent: rebuilt from YAML when the model is reconstructed.
+        # That way changing kinsim_config.yaml after a checkpoint is saved
+        # still respects the current biology — and avoids state-dict size
+        # mismatches when loading.
+        self.register_buffer(
+            "_meth_compat",
+            _build_meth_compat_buffer(num_meth_types),
+            persistent=False,
         )
 
         self._init_weights()
@@ -383,15 +508,15 @@ class ConvPredictor(nn.Module):
     def _expand_center_meth(self, meth_probs: torch.Tensor) -> torch.Tensor:
         """Expand center-only methylation probs to the full meth tensor.
 
-        Backwards-compat shim for the legacy (B, M) input shape: places
-        the centre meth at the prediction position and zeros everywhere
-        else (including the rev_meth slots at the tail).
+        Backwards-compat shim for the legacy ``(B, M)`` input shape: places
+        the centre meth at the active-site position (``self.active_site_index``)
+        and zeros everywhere else, including the rev_meth slots at the tail.
         """
         B, M = meth_probs.shape
         full = torch.zeros(
             B, self._meth_positions, M, device=meth_probs.device, dtype=meth_probs.dtype
         )
-        full[:, KMER_PRED_IDX, :] = meth_probs
+        full[:, self.active_site_index, :] = meth_probs
         return full
 
     # ------------------------------------------------------------------
@@ -412,6 +537,29 @@ class ConvPredictor(nn.Module):
         Returns:
             (B, 4) Float tensor: [mu_ipd, mu_pw, log_sigma_ipd, log_sigma_pw].
         """
+        # Architectural biology gate: zero out impossible (base, meth_id)
+        # pairs at the kmer positions BEFORE FiLM sees them. The rev_meth
+        # tail positions are left untouched (different strand context).
+        #
+        # SUBTLETY — kmer bases vs methylation base:
+        # ``bases`` encodes the SYNTHESIZED-strand kmer (the read sequence
+        # the polymerase produced). The methylation, however, sits on the
+        # TEMPLATE strand the polymerase was reading. Template base at a
+        # given position is the complement of the synthesized base
+        # (A↔T, C↔G). We must check compatibility against the template
+        # base, otherwise reads from the reverse strand systematically
+        # have their (correct) meth flags zeroed — A is methylated on the
+        # template, the polymerase synthesises T, and a naive
+        # compat[T, m6A]=0 would wipe out half the m6A training signal.
+        # 2-bit encoding (A=0, C=1, G=2, T=3) makes complement = bases ^ 3.
+        if self.biology_mask:
+            kmer_len = bases.shape[1]
+            template_bases = bases ^ 3                                    # A↔T, C↔G
+            compat_at_pos = self._meth_compat[template_bases]              # (B, kmer_len, M)
+            # Out-of-place: meth_full is shared across yields in IterableDataset
+            meth_full = meth_full.clone()
+            meth_full[:, :kmer_len, :] = meth_full[:, :kmer_len, :] * compat_at_pos
+
         # Per-base embedding + positional encoding
         x = self.base_embed(bases) + self.pos_embed  # (B, 11, base_embed_dim)
 
@@ -438,8 +586,11 @@ class ConvPredictor(nn.Module):
         x = x.transpose(1, 2)  # (B, base_embed_dim, 11)
         x = self.conv(x)  # (B, conv_dim, 11)
 
-        # Dual readout: center (active site) + global context
-        center = x[:, :, KMER_PRED_IDX]  # (B, conv_dim)
+        # Dual readout: active-site position + global context. The active
+        # site index is read from ``self.active_site_index`` so the same
+        # head works for asymmetric (e.g. [-7, +3]) and symmetric (e.g.
+        # [-10, +10]) windows alike.
+        center = x[:, :, self.active_site_index]  # (B, conv_dim)
         global_pool = x.mean(dim=2)  # (B, conv_dim)
         readout = torch.cat([center, global_pool], dim=1)  # (B, 2*conv_dim)
 
@@ -501,7 +652,9 @@ class ConvPredictor(nn.Module):
         """Sample (IPD, PW) from the predicted Gaussian.  Stochastic."""
         params = self.forward(kmer_ids, meth_probs)
         mu = params[:, :2]
-        log_sig = torch.clamp(params[:, 2:], -6.0, 3.0)
+        log_sig = torch.clamp(
+            params[:, 2:], self.log_sigma_clamp_min, self.log_sigma_clamp_max,
+        )
         sigma = torch.exp(log_sig)
         z = torch.randn_like(mu)
         return inv_log_transform(mu + sigma * z)
@@ -515,17 +668,22 @@ class ConvPredictor(nn.Module):
     def get_config(self) -> dict:
         """Return architecture config for model_config.json."""
         return {
-            "architecture": "conv",
-            "kmer_size": self.kmer_size,
-            "base_embed_dim": self.base_embed_dim,
-            "num_meth_types": self.num_meth_types,
-            "meth_proj_dim": self.meth_proj_dim,
-            "conv_dim": self.conv_dim,
-            "n_conv_layers": self.n_conv_layers,
-            "kernel_size": self.kernel_size,
-            "head_dim": self.head_dim,
-            "dropout": self.dropout_p,
-            "kmer_aware_film": self.kmer_aware_film,
+            "architecture":         "conv",
+            "kmer_size":            self.kmer_size,
+            "active_site_index":    self.active_site_index,
+            "n_rev_meth":           self.n_rev_meth,
+            "base_embed_dim":       self.base_embed_dim,
+            "num_meth_types":       self.num_meth_types,
+            "meth_proj_dim":        self.meth_proj_dim,
+            "conv_dim":             self.conv_dim,
+            "n_conv_layers":        self.n_conv_layers,
+            "kernel_size":          self.kernel_size,
+            "head_dim":             self.head_dim,
+            "dropout":              self.dropout_p,
+            "kmer_aware_film":      self.kmer_aware_film,
+            "biology_mask":         self.biology_mask,
+            "log_sigma_clamp_min":  self.log_sigma_clamp_min,
+            "log_sigma_clamp_max":  self.log_sigma_clamp_max,
         }
 
 
@@ -549,6 +707,10 @@ def create_from_config(config: dict) -> nn.Module:
     arch = config.get("architecture", "mlp")
 
     kmer_size = config.get("kmer_size", _DEFAULT_K)
+    # Legacy fallback: pre-v0.5 configs omit these fields; they all assumed
+    # K=11 with the asymmetric [-7, +3] window and (-1, 0, +1) rev_meth.
+    active_site_index = config.get("active_site_index", KMER_PRED_IDX)
+    n_rev_meth = config.get("n_rev_meth", _REV_METH_LEN)
 
     if arch == "mlp":
         return MLPPredictor(
@@ -558,6 +720,8 @@ def create_from_config(config: dict) -> nn.Module:
             dropout=config.get("dropout", 0.0),
             kmer_size=kmer_size,
             num_meth_types=config.get("num_meth_types", 4),
+            active_site_index=active_site_index,
+            n_rev_meth=n_rev_meth,
         )
     elif arch == "conv":
         return ConvPredictor(
@@ -574,8 +738,17 @@ def create_from_config(config: dict) -> nn.Module:
             # that pre-date the kmer-aware FiLM head — those have a
             # smaller film_in_dim so we must respect the saved config.
             kmer_aware_film=config.get("kmer_aware_film", False),
+            # Legacy default: pre-existing checkpoints did not apply the
+            # biology mask and used the wider σ clamp. Respect what was
+            # saved so old checkpoints reproduce bit-exact.
+            biology_mask=config.get("biology_mask", False),
+            log_sigma_clamp_min=config.get("log_sigma_clamp_min", -6.0),
+            log_sigma_clamp_max=config.get("log_sigma_clamp_max", 3.0),
+            active_site_index=active_site_index,
+            n_rev_meth=n_rev_meth,
         )
     else:
         raise ValueError(
-            f"Unknown architecture '{arch}' in model_config.json. Expected 'mlp' or 'conv'."
+            f"Unknown architecture '{arch}' in model_config.json. "
+            f"Expected 'mlp' or 'conv'."
         )

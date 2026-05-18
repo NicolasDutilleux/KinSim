@@ -1,11 +1,16 @@
 #!/bin/bash
 #SBATCH --job-name=ml_03_train
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=64G
+#SBATCH --mem=192G
 #SBATCH --account=p774
 #SBATCH --partition=pgpu
 #SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00
+# Note: --mem must accommodate the BIGGEST shard × num_workers + the main
+# process scanning shards at startup. v12 corpus has vega_bc2041 at ~330M
+# rows ≈ 30-40 GB unpickled. With 2 DataLoader workers loading concurrently
+# AND the main process keeping the previous shard alive during transitions,
+# peak RSS can hit 100+ GB. 192 GB gives generous headroom.
 #SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/ml_03_train_%J.log
 #SBATCH --mail-user=nicolas.dutilleux@unifr.ch
 #SBATCH --mail-type=FAIL
