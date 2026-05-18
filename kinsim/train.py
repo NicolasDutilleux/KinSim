@@ -368,118 +368,63 @@ def _grade(value: float, good: float, ok: float, higher_is_better: bool = True) 
 
 
 def _log_metrics(metrics: dict, prefix: str) -> None:
-    """Print a compact, self-interpreting summary of metrics.
+    """Print a compact summary. Pearson thresholds match PacBio noise floor."""
+    P_IPD_GOOD, P_IPD_OK = 0.35, 0.20
+    P_PW_GOOD,  P_PW_OK  = 0.30, 0.15
 
-    Reference thresholds (log1p-space, PacBio IPD/PW):
-      Pearson r IPD : GOOD ≥ 0.70  OK ≥ 0.50  POOR < 0.50
-      Pearson r PW  : GOOD ≥ 0.60  OK ≥ 0.40  POOR < 0.40
-      2σ calibration: GOOD 90–99%  OK 80–90%  POOR otherwise
-        (ideal 95.4% — if overconfident model: <80%, underconfident: >99%)
-      GNLL loss     : GOOD ≤ 1.0   OK ≤ 1.5   POOR > 1.5
-        (lower = better; well-calibrated model on log1p signals ≈ 0.5–1.0)
-    """
-    W = 72
-    log.info("─" * W)
-    log.info("  %s  [GOOD/OK/POOR thresholds shown]", prefix.upper())
-    log.info("─" * W)
+    def g(v, good, ok, lower=False):
+        return _grade(v, good, ok, higher_is_better=not lower)
 
-    p_ipd = metrics.get(f"{prefix}_pearson_ipd", 0.0)
-    p_pw = metrics.get(f"{prefix}_pearson_pw", 0.0)
-    m_ipd = metrics.get(f"{prefix}_mae_ipd", 0.0)
-    m_pw = metrics.get(f"{prefix}_mae_pw", 0.0)
-    c1i = metrics.get(f"{prefix}_calib_1sig_ipd", 0.0) * 100
-    c2i = metrics.get(f"{prefix}_calib_2sig_ipd", 0.0) * 100
-    c3i = metrics.get(f"{prefix}_calib_3sig_ipd", 0.0) * 100
-    c1p = metrics.get(f"{prefix}_calib_1sig_pw", 0.0) * 100
-    c2p = metrics.get(f"{prefix}_calib_2sig_pw", 0.0) * 100
-    c3p = metrics.get(f"{prefix}_calib_3sig_pw", 0.0) * 100
+    def get(k, default=0.0):
+        return metrics.get(f"{prefix}_{k}", default)
 
-    # Calibration grade: ideally near 95.4% for 2σ
-    calib_grade = _grade(c2i, 90.0, 80.0, higher_is_better=True)
-    if c2i > 99.0:
-        calib_grade = "POOR"  # underconfident
+    p_ipd, p_pw = get("pearson_ipd"), get("pearson_pw")
+    c2i, c2p    = get("calib_2sig_ipd") * 100, get("calib_2sig_pw") * 100
+    calib_grade = "POOR" if c2i > 99.0 else g(c2i, 90.0, 80.0)
 
-    o_ipd = metrics.get(f"{prefix}_oracle_ipd", 0.0)
-    o_pw = metrics.get(f"{prefix}_oracle_pw", 0.0)
-    log.info(
-        "  Pearson  IPD=%.3f [%s ≥0.70]   PW=%.3f [%s ≥0.60]",
-        p_ipd,
-        _grade(p_ipd, 0.70, 0.50),
-        p_pw,
-        _grade(p_pw, 0.60, 0.40),
-    )
-    log.info(
-        "  Oracle (self)  IPD=%.3f  PW=%.3f  (Var(μ)/(Var(μ)+E[σ²])  — circular if σ inflated)",
-        o_ipd,
-        o_pw,
-    )
+    log.info("─" * 72)
+    log.info("  %s metrics", prefix.upper())
+    log.info("─" * 72)
+    log.info("  Pearson  IPD=%.3f [%s >=%.2f]   PW=%.3f [%s >=%.2f]",
+             p_ipd, g(p_ipd, P_IPD_GOOD, P_IPD_OK), P_IPD_GOOD,
+             p_pw,  g(p_pw,  P_PW_GOOD,  P_PW_OK),  P_PW_GOOD)
+
     emp_ipd = metrics.get(f"{prefix}_oracle_empirical_ipd")
-    emp_pw = metrics.get(f"{prefix}_oracle_empirical_pw")
-    emp_n = metrics.get(f"{prefix}_oracle_empirical_n_buckets")
-    if emp_ipd is not None and emp_pw is not None:
-        log.info(
-            "  Oracle (true)  IPD=%.3f  PW=%.3f  (per-(kmer,meth) empirical, %d buckets ≥5 samples)",
-            emp_ipd,
-            emp_pw,
-            int(emp_n or 0),
-        )
-    log.info(
-        "  MAE      IPD=%.4f               PW=%.4f  (log1p space)",
-        m_ipd,
-        m_pw,
-    )
-    log.info(
-        "  Calib    IPD: 1σ=%.1f%%  2σ=%.1f%% [%s 90-99%%]  3σ=%.1f%%",
-        c1i,
-        c2i,
-        calib_grade,
-        c3i,
-    )
-    log.info(
-        "           PW:  1σ=%.1f%%  2σ=%.1f%%               3σ=%.1f%%",
-        c1p,
-        c2p,
-        c3p,
-    )
-    log.info("  (ideal calibration: 1σ=68%%  2σ=95.4%%  3σ=99.7%%)")
+    emp_pw  = metrics.get(f"{prefix}_oracle_empirical_pw")
+    n_buck  = int(metrics.get(f"{prefix}_oracle_empirical_n_buckets") or 0)
+    if emp_ipd is not None and emp_ipd > 0:
+        pct_i = 100.0 * p_ipd / emp_ipd
+        pct_p = 100.0 * p_pw / emp_pw if emp_pw and emp_pw > 0 else 0.0
+        log.info("  Ceiling  IPD=%.3f  PW=%.3f  (empirical, %d buckets)  achieved=%.0f%%/%.0f%%",
+                 emp_ipd, emp_pw, n_buck, pct_i, pct_p)
+    else:
+        log.info("  Oracle   IPD=%.3f  PW=%.3f  (self, circular if sigma inflated)",
+                 get("oracle_ipd"), get("oracle_pw"))
+
+    log.info("  MAE      IPD=%.4f  PW=%.4f  (log1p)", get("mae_ipd"), get("mae_pw"))
+    log.info("  Calib    IPD 2sigma=%.1f%% [%s]   PW 2sigma=%.1f%%   (ideal=95.4%%)",
+             c2i, calib_grade, c2p)
 
     by_type = metrics.get("_by_type", {})
     if by_type:
-        log.info("  Per-type breakdown:")
+        log.info("  Per-type (%d in data: %s):", len(by_type), ", ".join(by_type.keys()))
         for name, t in by_type.items():
-            cg = _grade(t["calib_2sig"] * 100, 90.0, 80.0)
-            if t["calib_2sig"] * 100 > 99.0:
-                cg = "POOR"
-            log.info(
-                "    %-6s  n=%-7d  pearson=(IPD %.3f [%s] PW %.3f [%s])  2σ=%.1f%% [%s]",
-                name,
-                t["n"],
-                t["pearson_ipd"],
-                _grade(t["pearson_ipd"], 0.70, 0.50),
-                t["pearson_pw"],
-                _grade(t["pearson_pw"], 0.60, 0.40),
-                t["calib_2sig"] * 100,
-                cg,
-            )
-    # ── Distribution samples (10 per meth type) ─────────────────────────────
-    dist_samples = metrics.get("_dist_samples", {})
-    if dist_samples:
-        log.info("  Distribution samples (predicted μ ± σ in log1p space):")
-        for name, s in dist_samples.items():
-            mu_ipd_mean = float(np.mean(s["mu_ipd"]))
-            mu_pw_mean = float(np.mean(s["mu_pw"]))
-            sig_ipd_mean = float(np.mean(s["sigma_ipd"]))
-            sig_pw_mean = float(np.mean(s["sigma_pw"]))
-            log.info(
-                "    %-6s  IPD: μ=%.3f ± σ=%.3f   PW: μ=%.3f ± σ=%.3f  (avg of %d samples)",
-                name,
-                mu_ipd_mean,
-                sig_ipd_mean,
-                mu_pw_mean,
-                sig_pw_mean,
-                len(s["mu_ipd"]),
-            )
-    log.info("─" * W)
+            c2 = t["calib_2sig"] * 100
+            cg = "POOR" if c2 > 99.0 else g(c2, 90.0, 80.0)
+            log.info("    %-6s  n=%-7d  IPD=%.3f [%s]  PW=%.3f [%s]  2sigma=%.1f%% [%s]",
+                     name, t["n"],
+                     t["pearson_ipd"], g(t["pearson_ipd"], P_IPD_GOOD, P_IPD_OK),
+                     t["pearson_pw"],  g(t["pearson_pw"],  P_PW_GOOD,  P_PW_OK),
+                     c2, cg)
+
+    samples = metrics.get("_dist_samples", {})
+    if samples:
+        log.info("  Mean predicted mu/sigma per meth type (log1p):")
+        for name, s in samples.items():
+            log.info("    %-6s  IPD mu=%.3f sigma=%.3f   PW mu=%.3f sigma=%.3f",
+                     name, float(np.mean(s["mu_ipd"])), float(np.mean(s["sigma_ipd"])),
+                     float(np.mean(s["mu_pw"])),  float(np.mean(s["sigma_pw"])))
+    log.info("─" * 72)
 
 
 # ---------------------------------------------------------------------------
