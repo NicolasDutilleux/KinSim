@@ -1487,33 +1487,19 @@ def generate_from_bam(
             # in slurm_kinsim/callers/ipdsummary.slurm.
             hd["pb"] = "3.0.7"
         out_dict = {"HD": hd}
-        # Sanitize RG IDs for pbindex. ccs-kinetics-bystrandify appends a
-        # per-strand hex suffix to RG IDs (e.g. `f7c20c6c/33--33-744DFBEF`)
-        # which pbindex rejects with "malformed read group ID: ... Must be
-        # in the form {RGID_STRING}/{bcForward}--{bcReverse}". Strip the
-        # trailing `-{hex}` suffix before writing.
-        if "RG" in in_dict:
-            import re as _re
-
-            _SUFFIX_RE = _re.compile(r"^(.+/\d+--\d+)-[0-9A-Fa-f]+$")
-            cleaned_rg = []
-            for rg in in_dict["RG"]:
-                rg = dict(rg)
-                rg_id = rg.get("ID", "")
-                m = _SUFFIX_RE.match(rg_id)
-                if m:
-                    rg["ID"] = m.group(1)
-                cleaned_rg.append(rg)
-            # Deduplicate by ID — multiple bystrandified RGs collapse to one.
-            seen: set[str] = set()
-            out_rg = []
-            for rg in cleaned_rg:
-                if rg["ID"] not in seen:
-                    out_rg.append(rg)
-                    seen.add(rg["ID"])
-            out_dict["RG"] = out_rg
+        # Single synthetic RG with a pbindex-friendly ID. Replaces the
+        # bystrandify-mangled RG IDs (e.g. `f7c20c6c/33--33-744DFBEF`)
+        # that pbindex rejects. Copies non-ID fields from the first input
+        # RG so SM/LB/PU/PM metadata is preserved.
+        synthetic_rg = {"ID": "kinsim/0--0", "PL": "PACBIO", "DS": "READTYPE=CCS"}
+        if "RG" in in_dict and in_dict["RG"]:
+            first = dict(in_dict["RG"][0])
+            first["ID"] = synthetic_rg["ID"]
+            first.setdefault("PL", synthetic_rg["PL"])
+            first.setdefault("DS", synthetic_rg["DS"])
+            out_dict["RG"] = [first]
         else:
-            out_dict["RG"] = [{"ID": "00000001", "PL": "PACBIO", "DS": "READTYPE=CCS"}]
+            out_dict["RG"] = [synthetic_rg]
         header_out = pysam.AlignmentHeader.from_dict(out_dict)
 
     # Multi-threaded BGZF I/O — htslib uses these threads for parallel
