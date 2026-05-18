@@ -192,6 +192,7 @@ def _compute_metrics(
     all_true: np.ndarray,
     all_meth_ids: np.ndarray,
     prefix: str,
+    kmer_ids: np.ndarray | None = None,
 ) -> dict:
     """Compute overall + per-meth-type metrics.
 
@@ -256,16 +257,54 @@ def _compute_metrics(
 
     result["_by_type"] = by_type  # human-readable, not logged as scalar
 
-    # ── Pearson oracle: theoretical ceiling for a perfect distributional model ─
-    # r_oracle = Var(μ) / (Var(μ) + E[σ²])
+    # ── Pearson oracle: theoretical ceiling for a perfect distributional model
+    # Two flavours are logged side-by-side:
+    #
+    #   r_self_oracle = Var(μ_pred) / (Var(μ_pred) + E[σ_pred²])
+    #       Uses the model's own predicted σ. Useful as a diagnostic but
+    #       CIRCULAR: a lazy model that inflates σ on hard samples lowers
+    #       its own ceiling, then matches it — looking healthy when it's
+    #       only consistent with its own laziness.
+    #
+    #   r_empirical_oracle = Var(per-bucket μ_true) / (Var + mean(per-bucket σ_true²))
+    #       Per-(kmer_id, meth_id) bucket from the OBSERVED signals; the
+    #       true irreducible noise. Requires kmer_ids and at least
+    #       _ORACLE_MIN_PER_BUCKET samples per bucket; otherwise skipped.
     var_mu_ipd = np.var(all_mu[:, 0])
     var_mu_pw = np.var(all_mu[:, 1])
     e_sig2_ipd = np.mean(all_sigma[:, 0] ** 2)
     e_sig2_pw = np.mean(all_sigma[:, 1] ** 2)
-    oracle_ipd = var_mu_ipd / (var_mu_ipd + e_sig2_ipd) if (var_mu_ipd + e_sig2_ipd) > 0 else 0.0
-    oracle_pw = var_mu_pw / (var_mu_pw + e_sig2_pw) if (var_mu_pw + e_sig2_pw) > 0 else 0.0
-    result[f"{prefix}_oracle_ipd"] = float(oracle_ipd)
-    result[f"{prefix}_oracle_pw"] = float(oracle_pw)
+    self_oracle_ipd = var_mu_ipd / (var_mu_ipd + e_sig2_ipd) if (var_mu_ipd + e_sig2_ipd) > 0 else 0.0
+    self_oracle_pw = var_mu_pw / (var_mu_pw + e_sig2_pw) if (var_mu_pw + e_sig2_pw) > 0 else 0.0
+    result[f"{prefix}_oracle_ipd"] = float(self_oracle_ipd)
+    result[f"{prefix}_oracle_pw"] = float(self_oracle_pw)
+
+    if kmer_ids is not None and len(kmer_ids) == len(all_true):
+        _ORACLE_MIN_PER_BUCKET = 5
+        bucket_keys = (kmer_ids.astype(np.int64) << 8) | (all_meth_ids.astype(np.int64) & 0xFF)
+        uniq, inv, counts = np.unique(bucket_keys, return_inverse=True, return_counts=True)
+        keep_mask = counts[inv] >= _ORACLE_MIN_PER_BUCKET
+        if keep_mask.any():
+            mu_true_ipd_per = np.bincount(inv[keep_mask], weights=all_true[keep_mask, 0]) / np.maximum(np.bincount(inv[keep_mask]), 1)
+            mu_true_pw_per  = np.bincount(inv[keep_mask], weights=all_true[keep_mask, 1]) / np.maximum(np.bincount(inv[keep_mask]), 1)
+            # Per-bucket variance via E[X²] - (E[X])²
+            sqr_ipd_per = np.bincount(inv[keep_mask], weights=all_true[keep_mask, 0] ** 2) / np.maximum(np.bincount(inv[keep_mask]), 1)
+            sqr_pw_per  = np.bincount(inv[keep_mask], weights=all_true[keep_mask, 1] ** 2) / np.maximum(np.bincount(inv[keep_mask]), 1)
+            var_ipd_per = np.maximum(sqr_ipd_per - mu_true_ipd_per ** 2, 0.0)
+            var_pw_per  = np.maximum(sqr_pw_per  - mu_true_pw_per  ** 2, 0.0)
+            n_valid_buckets = int((np.bincount(inv[keep_mask]) > 0).sum())
+            if n_valid_buckets >= 2:
+                # Only buckets that actually have samples in the kept rows
+                nonempty = np.bincount(inv[keep_mask]) > 0
+                v_mu_ipd_emp  = float(np.var(mu_true_ipd_per[nonempty]))
+                v_mu_pw_emp   = float(np.var(mu_true_pw_per[nonempty]))
+                e_var_ipd_emp = float(np.mean(var_ipd_per[nonempty]))
+                e_var_pw_emp  = float(np.mean(var_pw_per[nonempty]))
+                emp_oracle_ipd = v_mu_ipd_emp / (v_mu_ipd_emp + e_var_ipd_emp) if (v_mu_ipd_emp + e_var_ipd_emp) > 0 else 0.0
+                emp_oracle_pw  = v_mu_pw_emp  / (v_mu_pw_emp  + e_var_pw_emp)  if (v_mu_pw_emp  + e_var_pw_emp)  > 0 else 0.0
+                result[f"{prefix}_oracle_empirical_ipd"] = float(emp_oracle_ipd)
+                result[f"{prefix}_oracle_empirical_pw"]  = float(emp_oracle_pw)
+                result[f"{prefix}_oracle_empirical_n_buckets"] = float(n_valid_buckets)
 
     # ── Distribution samples: 10 random per meth type ─────────────────────────
     dist_samples: dict = {}
@@ -349,10 +388,18 @@ def _log_metrics(metrics: dict, prefix: str) -> None:
         _grade(p_pw, 0.60, 0.40),
     )
     log.info(
-        "  Oracle   IPD=%.3f              PW=%.3f  (theoretical ceiling)",
+        "  Oracle (self)  IPD=%.3f  PW=%.3f  (Var(μ)/(Var(μ)+E[σ²])  — circular if σ inflated)",
         o_ipd,
         o_pw,
     )
+    emp_ipd = metrics.get(f"{prefix}_oracle_empirical_ipd")
+    emp_pw  = metrics.get(f"{prefix}_oracle_empirical_pw")
+    emp_n   = metrics.get(f"{prefix}_oracle_empirical_n_buckets")
+    if emp_ipd is not None and emp_pw is not None:
+        log.info(
+            "  Oracle (true)  IPD=%.3f  PW=%.3f  (per-(kmer,meth) empirical, %d buckets ≥5 samples)",
+            emp_ipd, emp_pw, int(emp_n or 0),
+        )
     log.info(
         "  MAE      IPD=%.4f               PW=%.4f  (log1p space)",
         m_ipd,
@@ -799,6 +846,7 @@ class KineticPredictor(L.LightningModule):
         self._val_parent_meths:   list[torch.Tensor] = []
         self._val_parent_offsets: list[torch.Tensor] = []
         self._val_categories:     list[torch.Tensor] = []
+        self._val_kmer_ids:       list[torch.Tensor] = []
         self._test_mu: list[torch.Tensor] = []
         self._test_sigma: list[torch.Tensor] = []
         self._test_true: list[torch.Tensor] = []
@@ -806,6 +854,7 @@ class KineticPredictor(L.LightningModule):
         self._test_parent_meths:   list[torch.Tensor] = []
         self._test_parent_offsets: list[torch.Tensor] = []
         self._test_categories:     list[torch.Tensor] = []
+        self._test_kmer_ids:       list[torch.Tensor] = []
 
     def forward(self, kmer_ids: torch.Tensor, meth_probs: torch.Tensor) -> torch.Tensor:
         return self.model(kmer_ids, meth_probs)
@@ -846,6 +895,7 @@ class KineticPredictor(L.LightningModule):
         self._val_parent_meths.append(parent_meths.detach().cpu())
         self._val_parent_offsets.append(parent_offsets.detach().cpu())
         self._val_categories.append(categories.detach().cpu())
+        self._val_kmer_ids.append(kmer_ids.detach().cpu())
         return loss
 
     def on_validation_epoch_end(self) -> None:
@@ -858,6 +908,7 @@ class KineticPredictor(L.LightningModule):
         all_pm  = torch.cat(self._val_parent_meths).numpy()    # (N,)
         all_po  = torch.cat(self._val_parent_offsets).numpy()  # (N,)
         all_cat = torch.cat(self._val_categories).numpy()      # (N,)
+        all_kmer = torch.cat(self._val_kmer_ids).numpy()       # (N,)
 
         val_loss = self.trainer.callback_metrics.get("val_loss", float("nan"))
         gnll_grade = _grade(float(val_loss), 1.0, 1.5, higher_is_better=False)
@@ -867,7 +918,10 @@ class KineticPredictor(L.LightningModule):
             float(val_loss),
             gnll_grade,
         )
-        metrics = _compute_metrics(all_mu, all_sigma, all_true, all_meth_ids, prefix="val")
+        metrics = _compute_metrics(
+            all_mu, all_sigma, all_true, all_meth_ids, prefix="val",
+            kmer_ids=all_kmer,
+        )
         bucket_metrics = _compute_bucket_metrics(
             all_mu, all_sigma, all_true, all_cat, all_pm, all_po, prefix="val",
         )
@@ -886,6 +940,7 @@ class KineticPredictor(L.LightningModule):
         self._val_parent_meths.clear()
         self._val_parent_offsets.clear()
         self._val_categories.clear()
+        self._val_kmer_ids.clear()
 
     def test_step(self, batch: tuple, batch_idx: int) -> None:
         (kmer_ids, meth_probs, signals, meth_ids,
@@ -903,6 +958,7 @@ class KineticPredictor(L.LightningModule):
         self._test_parent_meths.append(parent_meths.detach().cpu())
         self._test_parent_offsets.append(parent_offsets.detach().cpu())
         self._test_categories.append(categories.detach().cpu())
+        self._test_kmer_ids.append(kmer_ids.detach().cpu())
 
     def on_test_epoch_end(self) -> None:
         if not self._test_mu:
@@ -914,8 +970,12 @@ class KineticPredictor(L.LightningModule):
         all_pm  = torch.cat(self._test_parent_meths).numpy()
         all_po  = torch.cat(self._test_parent_offsets).numpy()
         all_cat = torch.cat(self._test_categories).numpy()
+        all_kmer = torch.cat(self._test_kmer_ids).numpy()
 
-        metrics = _compute_metrics(all_mu, all_sigma, all_true, all_meth_ids, prefix="test")
+        metrics = _compute_metrics(
+            all_mu, all_sigma, all_true, all_meth_ids, prefix="test",
+            kmer_ids=all_kmer,
+        )
         bucket_metrics = _compute_bucket_metrics(
             all_mu, all_sigma, all_true, all_cat, all_pm, all_po, prefix="test",
         )
@@ -933,6 +993,7 @@ class KineticPredictor(L.LightningModule):
         self._test_parent_meths.clear()
         self._test_parent_offsets.clear()
         self._test_categories.clear()
+        self._test_kmer_ids.clear()
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.lr)
@@ -1271,7 +1332,7 @@ def train_mlp(
     augment: bool = True,
     balance_kmers: bool = True,
     biology_mask: bool = False,
-    log_sigma_clamp_max: float = 3.0,
+    log_sigma_clamp_max: float = 1.5,
     lr_schedule: str = "cosine",
     warmup_epochs: int = 3,
 ) -> None:
@@ -1799,7 +1860,7 @@ def main(argv: list[str] | None = None) -> None:
         augment=_get(args.augment, "augment", True),
         balance_kmers=_get(args.balance_kmers, "balance_kmers", True),
         biology_mask=_get(args.biology_mask, "biology_mask", False),
-        log_sigma_clamp_max=_get(args.log_sigma_clamp_max, "log_sigma_clamp_max", 3.0),
+        log_sigma_clamp_max=_get(args.log_sigma_clamp_max, "log_sigma_clamp_max", 1.5),
         lr_schedule=_get(args.lr_schedule, "lr_schedule", "cosine"),
         warmup_epochs=_get(args.warmup_epochs, "warmup_epochs", 3),
     )

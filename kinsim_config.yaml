@@ -180,7 +180,12 @@ model:
   biology_mask:       false     # off by default — extract already enforces base/meth chemistry,
                                 # the mask is a redundant safety net and introduced a
                                 # subtle synthesized-vs-template-strand bug in v0.5.0
-  log_sigma_clamp_max: 3.0      # upper clamp on log σ (legacy value, safe default)
+  log_sigma_clamp_max: 1.5      # upper clamp on log σ. exp(1.5)≈4.48 in log1p
+                                # space (~89 in raw IPD) — wide enough for real
+                                # variance but tight enough to stop the model
+                                # from gaming σ in place of fitting μ. Legacy
+                                # 3.0 → σ ≈ 20 in log1p (3.6× the signal range)
+                                # made the σ-cheating regime cheap.
 
 # ─────────────────────────────────────────────────────────────────────────
 # Training defaults

@@ -526,12 +526,21 @@ def generate_signals_batch(
     meth_contexts: list,
     device: torch.device,
     deterministic: bool = False,
+    rev_meth_contexts=None,
 ) -> np.ndarray:
     """Generate IPD/PW signals for a batch of contexts.
 
     Builds the per-position one-hot meth tensor from each row's mc context
     (the per-row Bernoulli has already happened upstream — fractions arrive
     as 0 or 1) and runs the model in chunks to bound GPU memory.
+
+    Args:
+        rev_meth_contexts: Optional (N, n_rev_meth) int64 array of
+            complementary-strand meth_id at the active-site neighbours
+            (offsets from ``ExtractionParams.rev_meth_offsets``). When
+            ``None``, the rev_meth block stays zero — matches the legacy
+            behaviour, but loses the partner-strand signal at palindromic
+            motifs the model was trained on.
 
     Returns:
         np.ndarray of shape (N, 2) with raw [IPD, PW] values in [0, 255].
@@ -542,33 +551,44 @@ def generate_signals_batch(
     meth_ids_bin = np.asarray(meth_ids, dtype=np.int64)
     fractions_bin = np.asarray(fractions, dtype=np.float32)
 
-    from .utils.sample_layout import METH_CTX_LEFT, METH_CTX_LEN, REV_METH_LEN
-
-    K_SIZE = METH_CTX_LEN
-    PRED_IDX = METH_CTX_LEFT
-    TOTAL_POS = K_SIZE + REV_METH_LEN  # forward context + rev_meth positions
-    # Number of methylation states is set by the trained model — read it
-    # from the model's config rather than hard-coding 4. Adding a new mod
-    # type to kinsim_config.yaml widens this automatically once the model
-    # is retrained; the saved checkpoint carries the correct value.
-    NUM_M = int(model.get_config().get("num_meth_types", 4))
+    # Window geometry comes from the trained model's config — every shape
+    # downstream (kmer_size, active-site index, rev_meth count, num meth
+    # types) flows from there, so changing kinsim_config.yaml to K=21 and
+    # retraining propagates automatically without touching this code.
+    cfg = model.get_config()
+    K_SIZE = int(cfg.get("kmer_size", 11))
+    PRED_IDX = int(cfg.get("active_site_index", 7))
+    N_REV = int(cfg.get("n_rev_meth", 3))
+    TOTAL_POS = K_SIZE + N_REV
+    NUM_M = int(cfg.get("num_meth_types", 4))
     ctx_np = np.asarray(meth_contexts, dtype=np.int64)
     # meth_full layout matches the trained dataset:
-    #   positions [0, K_SIZE)          → forward meth context (offsets [-7..+3])
+    #   positions [0, K_SIZE)          → forward meth context (offsets [-upstream..+downstream])
     #   positions [K_SIZE, TOTAL_POS)  → rev_meth at active-site neighbours
-    # Generate has no complementary-strand methylation information, so the
-    # rev_meth block stays zero (the most common training distribution case).
+    # When ``rev_meth_contexts`` is provided, the rev_meth block is filled
+    # from the complementary-strand meth map — matches training. When
+    # ``None`` the block stays zero (legacy behaviour, loses palindromic
+    # partner-strand signal).
     meth_full_np = np.zeros((N, TOTAL_POS, NUM_M), dtype=np.float32)
 
-    # Single vectorised scatter for all forward positions — replaces the
-    # 11-iteration Python loop that did O(N) mask + np.where per iteration.
-    # For 10 M-position batches this saves ~0.5 s of pure overhead AND avoids
-    # forcing page commits across all 2.24 GB of meth_full; only the sparse
-    # non-zero entries touch memory.
+    # Forward block scatter.
     non_zero = ctx_np > 0
     if non_zero.any():
         rows, cols = np.where(non_zero)
         meth_full_np[rows, cols, ctx_np[rows, cols]] = 1.0
+
+    # rev_meth block scatter (optional — current path is partial without it).
+    if rev_meth_contexts is not None:
+        rev_ctx_np = np.asarray(rev_meth_contexts, dtype=np.int64)
+        if rev_ctx_np.shape != (N, N_REV):
+            raise ValueError(
+                f"rev_meth_contexts shape {rev_ctx_np.shape} != expected (N, n_rev_meth) "
+                f"= ({N}, {N_REV}). Check rev_meth_offsets vs model.n_rev_meth."
+            )
+        rev_non_zero = rev_ctx_np > 0
+        if rev_non_zero.any():
+            r_rows, r_cols = np.where(rev_non_zero)
+            meth_full_np[r_rows, K_SIZE + r_cols, rev_ctx_np[r_rows, r_cols]] = 1.0
 
     # Override the pred_idx column with stoichiometric fraction (0 or 1 per row).
     # The single-scatter above set meth_full_np[i, PRED_IDX, meth_id] = 1.0 for
@@ -792,6 +812,15 @@ def generate_signals(
     meth_map = build_reference_meth_map(
         ref_seqs, motif_string, revcomp=revcomp, no_fuzznuc=no_fuzznuc
     )
+    # Separate forward/reverse strand maps — rev_meth_map fills the
+    # complementary-strand block of meth_full at active-site neighbours,
+    # matching how `kinsim extract` builds training data.
+    from .utils.motifs import build_reference_meth_map_per_strand
+    from .utils.config import get_extraction_params
+    _fwd_meth_map, rev_meth_map = build_reference_meth_map_per_strand(
+        ref_seqs, motif_string,
+    )
+    rev_meth_offsets = tuple(int(o) for o in get_extraction_params().rev_meth_offsets)
     # Per-position fraction (target-genome occupancy) — pairs with p_efficiency
     # so the per-site Bernoulli rate at generate is target_frac × p_efficiency.
     frac_map = build_reference_frac_map(ref_seqs, motif_string, revcomp=revcomp)
@@ -871,6 +900,8 @@ def generate_signals(
                     circular,
                     bam_out,
                     header,
+                    rev_meth_map=rev_meth_map,
+                    rev_meth_offsets=rev_meth_offsets,
                 )
                 n_mapped += n_m
                 n_unmapped += n_u
@@ -892,6 +923,8 @@ def generate_signals(
                 circular,
                 bam_out,
                 header,
+                rev_meth_map=rev_meth_map,
+                rev_meth_offsets=rev_meth_offsets,
             )
             n_mapped += n_m
             n_unmapped += n_u
@@ -918,6 +951,8 @@ def _process_batch(
     bam_out,
     header,
     lookup_table=None,
+    rev_meth_map=None,
+    rev_meth_offsets=(),
 ):
     """Process a batch of reads with batched MLP inference.
 
@@ -942,16 +977,23 @@ def _process_batch(
     all_fractions: list[np.ndarray] = []     # each entry: (L_i,) float32
     all_rc_kmer_ids: list[np.ndarray] = []
     all_meth_ctxs: list[np.ndarray] = []     # each entry: (L_i, 11) int64
+    all_rev_meth_ctxs: list[np.ndarray] = []  # each entry: (L_i, n_rev_meth) int64
     is_n_context: list[np.ndarray] = []      # each entry: (L_i,) bool
     read_offsets = [0]                       # cumulative POSITION counts
     n_positions = 0
+    _N_REV = len(rev_meth_offsets)
+    _REV_OFFSETS = np.asarray(rev_meth_offsets, dtype=np.int64)
+    _ZERO_REV = np.zeros(_N_REV, dtype=np.int64)
+    _DO_REV = rev_meth_map is not None and _N_REV > 0
     _K = K
-    from .utils.sample_layout import METH_CTX_LEFT, METH_CTX_LEN, METH_CTX_RIGHT
-
-    _LEFT = METH_CTX_LEFT  # 7
-    _RIGHT = METH_CTX_RIGHT  # 3
-    _CTX_LEN = METH_CTX_LEN  # 11
-    _PRED_IDX = METH_CTX_LEFT  # prediction position inside the context array
+    # Window geometry comes from the trained model's config. ``_load_model``
+    # already refuses non-K=11 checkpoints (hot path is K=11-specific), but
+    # reading from model_config keeps the indices self-consistent.
+    _cfg = model.get_config()
+    _CTX_LEN = int(_cfg.get("kmer_size", 11))
+    _PRED_IDX = int(_cfg.get("active_site_index", 7))
+    _LEFT = _PRED_IDX
+    _RIGHT = _CTX_LEN - _PRED_IDX - 1
     _ZERO_CTX = np.zeros(_CTX_LEN, dtype=np.int64)  # placeholder for N/unmapped
 
     n_mapped = n_unmapped = 0
@@ -969,6 +1011,7 @@ def _process_batch(
             ref_seq = ref_seqs[ref_name]
             ref_len = len(ref_seq)
             ref_meth = meth_map[ref_name]
+            ref_rev_meth = rev_meth_map[ref_name] if _DO_REV else None
             ref_frac = frac_map.get(ref_name) if frac_map else None
 
             # Extended context pads K//2 bases on each side from the reference,
@@ -984,6 +1027,7 @@ def _process_batch(
             r_meth_id: list = []
             r_frac: list = []
             r_meth_ctx: list = []
+            r_rev_meth_ctx: list = []
             r_is_n: list = []
 
             for i in range(len(ext_context)):
@@ -1003,6 +1047,8 @@ def _process_batch(
                             r_meth_id.append(0)
                             r_frac.append(0.0)
                             r_meth_ctx.append(_ZERO_CTX)
+                            if _DO_REV:
+                                r_rev_meth_ctx.append(_ZERO_REV)
                         else:
                             ref_pos = ref_start + read_pos
                             ctx = np.zeros(_CTX_LEN, dtype=np.int64)
@@ -1022,6 +1068,17 @@ def _process_batch(
                             r_meth_id.append(meth_id)
                             r_frac.append(1.0 if meth_id else 0.0)
                             r_meth_ctx.append(ctx)
+                            if _DO_REV:
+                                # rev_meth at active-site neighbours from the
+                                # complementary-strand meth map (forward coords).
+                                rev_ctx = np.zeros(_N_REV, dtype=np.int64)
+                                for j, off in enumerate(_REV_OFFSETS):
+                                    tgt = ref_pos + int(off)
+                                    if circular:
+                                        rev_ctx[j] = int(ref_rev_meth[tgt % ref_len])
+                                    elif 0 <= tgt < ref_len:
+                                        rev_ctx[j] = int(ref_rev_meth[tgt])
+                                r_rev_meth_ctx.append(rev_ctx)
 
             # End of mapped read — convert per-read lists to arrays and push.
             if r_kmer:
@@ -1030,6 +1087,8 @@ def _process_batch(
                 all_meth_ids.append(np.asarray(r_meth_id, dtype=np.int64))
                 all_fractions.append(np.asarray(r_frac, dtype=np.float32))
                 all_meth_ctxs.append(np.stack(r_meth_ctx, axis=0).astype(np.int64))
+                if _DO_REV:
+                    all_rev_meth_ctxs.append(np.stack(r_rev_meth_ctx, axis=0).astype(np.int64))
                 is_n_context.append(np.asarray(r_is_n, dtype=bool))
                 n_positions += len(r_kmer)
 
@@ -1051,6 +1110,10 @@ def _process_batch(
             all_meth_ids.append(meth_ids_r)
             all_fractions.append(fractions_r)
             all_meth_ctxs.append(meth_ctxs_r)
+            if _DO_REV:
+                # Unmapped reads have no reference position → no rev_meth info.
+                # Pad with zeros so the per-batch concat stays aligned.
+                all_rev_meth_ctxs.append(np.zeros((kmer_ids_r.size, _N_REV), dtype=np.int64))
             is_n_context.append(is_n_r)
             n_positions += kmer_ids_r.size
 
@@ -1065,11 +1128,13 @@ def _process_batch(
         flat_meth_id = np.concatenate(all_meth_ids)
         flat_frac    = np.concatenate(all_fractions)
         flat_meth_ctx = np.concatenate(all_meth_ctxs, axis=0)
+        flat_rev_meth_ctx = np.concatenate(all_rev_meth_ctxs, axis=0) if _DO_REV else None
         flat_is_n    = np.concatenate(is_n_context)
     else:
         flat_kmer = flat_rc_kmer = flat_meth_id = np.empty(0, dtype=np.int64)
         flat_frac = np.empty(0, dtype=np.float32)
         flat_meth_ctx = np.empty((0, _CTX_LEN), dtype=np.int64)
+        flat_rev_meth_ctx = np.empty((0, _N_REV), dtype=np.int64) if _DO_REV else None
         flat_is_n = np.empty(0, dtype=bool)
 
     # Inference — dispatch on whether a lookup table is provided.
@@ -1088,10 +1153,12 @@ def _process_batch(
             all_signals = generate_signals_batch(
                 model, flat_kmer, flat_meth_id, flat_frac, flat_meth_ctx,
                 device, deterministic,
+                rev_meth_contexts=flat_rev_meth_ctx,
             )
             all_rc_signals = generate_signals_batch(
                 model, flat_rc_kmer, flat_meth_id, flat_frac, flat_meth_ctx,
                 device, deterministic,
+                rev_meth_contexts=flat_rev_meth_ctx,
             )
     else:
         all_signals = np.zeros((0, 2), dtype=np.float32)
@@ -1247,6 +1314,12 @@ def generate_from_bam(
     meth_map = build_reference_meth_map(
         ref_seqs, motif_string, revcomp=revcomp, no_fuzznuc=no_fuzznuc
     )
+    from .utils.motifs import build_reference_meth_map_per_strand
+    from .utils.config import get_extraction_params
+    _fwd_meth_map, rev_meth_map = build_reference_meth_map_per_strand(
+        ref_seqs, motif_string,
+    )
+    rev_meth_offsets = tuple(int(o) for o in get_extraction_params().rev_meth_offsets)
     frac_map = build_reference_frac_map(ref_seqs, motif_string, revcomp=revcomp)
     fallback_motifs = parse_motifs(motif_string, revcomp=revcomp)
 
@@ -1385,6 +1458,8 @@ def generate_from_bam(
                     bam_out,
                     header_out,
                     lookup_table=lookup_table,
+                    rev_meth_map=rev_meth_map,
+                    rev_meth_offsets=rev_meth_offsets,
                 )
                 n_mapped += n_m
                 n_unmapped += n_u
@@ -1410,6 +1485,8 @@ def generate_from_bam(
                 bam_out,
                 header_out,
                 lookup_table=lookup_table,
+                rev_meth_map=rev_meth_map,
+                rev_meth_offsets=rev_meth_offsets,
             )
             n_mapped += n_m
             n_unmapped += n_u

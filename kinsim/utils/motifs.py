@@ -741,6 +741,32 @@ def _build_meth_map_regex(ref_seqs, motif_string, revcomp=True):
     return {name: scan_sequence(seq, motifs) for name, seq in ref_seqs.items()}
 
 
+def build_reference_meth_map_per_strand(ref_seqs, motif_string):
+    """Return ``(fwd_map, rev_map)`` — per-strand meth_id maps in forward coords.
+
+    ``fwd_map[contig][p]`` is the meth_id at forward-strand position ``p`` if
+    a forward-strand motif methylates there, else 0. ``rev_map[contig][p]``
+    is the meth_id of the reverse-strand methylation at the same locus
+    (forward-strand coordinates), else 0. The union of these two equals
+    what :func:`build_reference_meth_map` returns with ``revcomp=True``.
+
+    Needed by :mod:`kinsim.generate` to populate the ``rev_meth`` block of
+    ``meth_full`` (complementary-strand methylation at the active-site
+    neighbours) the same way :mod:`kinsim.extract` does at training time.
+    Without this, palindromic motifs (e.g. m6A on both strands of GATC)
+    lose their partner-strand signal at inference.
+    """
+    fwd_motifs, rev_motifs = parse_motifs_per_strand(motif_string)
+    fwd_map: dict[str, np.ndarray] = {}
+    rev_map: dict[str, np.ndarray] = {}
+    for name, seq in ref_seqs.items():
+        fwd_map[name] = scan_sequence(seq, fwd_motifs)
+        rc_hits = scan_sequence(reverse_complement(seq), rev_motifs)
+        # rc_hits is in rev-complement coordinates; flip to forward coords.
+        rev_map[name] = rc_hits[::-1].copy()
+    return fwd_map, rev_map
+
+
 def build_reference_frac_map(ref_seqs, motif_string, revcomp=True):
     """Build per-position stoichiometric fraction map for the reference genome.
 
