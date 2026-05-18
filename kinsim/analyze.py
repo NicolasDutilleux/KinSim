@@ -1082,7 +1082,114 @@ def _build_html_figures(
     if fig5 is not None:
         figures.append(("3D density: joint (IPD, PW) per bucket", fig5))
 
+    # ── Fig 6: per-kmer IPD distribution for top-N kmers with methylation ─
+    fig6 = _build_kmer_trend_figure(data, top_n=12)
+    if fig6 is not None:
+        figures.append((
+            "Per-kmer IPD distributions — top 12 by SLOWED count",
+            fig6,
+        ))
+
     return figures
+
+
+def _build_kmer_trend_figure(data: dict, top_n: int = 12):
+    """Per-kmer IPD distribution for the N kmers carrying the most methylation.
+
+    For each of the top N kmers (ranked by CATEGORY_SLOWED row count), the
+    subplot overlays:
+      - baseline rows (unmodified IPD)
+      - one trace per parent_meth (m6A/m4C/m5C) of the SLOWED rows
+
+    Reading the figure:
+      - Clear separation between baseline and SLOWED peaks ⇒ the model
+        has a clean signal to fit.
+      - TWO distinct peaks on the SLOWED side (bimodal) ⇒ the kmer
+        carries mixed populations (e.g. partial occupancy). A single
+        Gaussian will average them and predict a wrong μ for both
+        modes — the model is structurally underfit on that kmer.
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    from .utils.encoding import decode_kmer, get_meth_ids
+    from .utils.sample_layout import (
+        CATEGORY_BASELINE,
+        CATEGORY_SLOWED,
+        COL_CATEGORY,
+        COL_IPD,
+        COL_PARENT_METH,
+    )
+
+    counts: list[tuple[int, int]] = []
+    for kid, arr in data.items():
+        if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
+            continue
+        if arr.shape[1] <= COL_PARENT_METH:
+            continue
+        n_slow = int((arr[:, COL_CATEGORY].astype(np.int8) == CATEGORY_SLOWED).sum())
+        if n_slow > 0:
+            counts.append((int(kid), n_slow))
+    if not counts:
+        return None
+    counts.sort(key=lambda x: x[1], reverse=True)
+    top = counts[:top_n]
+
+    name_by_id = {v: k for k, v in get_meth_ids().items()}
+    color_by_id = {1: "#d62728", 2: "#9467bd", 3: "#2ca02c", 4: "#ff7f0e"}
+
+    cols = 3
+    rows = (len(top) + cols - 1) // cols
+    fig = make_subplots(
+        rows=rows, cols=cols,
+        subplot_titles=[f"{decode_kmer(kid)}  (n_slow={n:,})" for kid, n in top],
+        vertical_spacing=0.10, horizontal_spacing=0.06,
+    )
+
+    legend_seen: set[str] = set()
+    for i, (kid, _) in enumerate(top):
+        r, c = i // cols + 1, i % cols + 1
+        arr = data[kid]
+        cats = arr[:, COL_CATEGORY].astype(np.int8)
+        parents = arr[:, COL_PARENT_METH].astype(np.int8)
+        ipds = arr[:, COL_IPD]
+
+        m_base = cats == CATEGORY_BASELINE
+        if m_base.any():
+            show = "baseline" not in legend_seen
+            legend_seen.add("baseline")
+            fig.add_trace(go.Histogram(
+                x=ipds[m_base], name="baseline", marker_color="#1f77b4",
+                opacity=0.5, xbins=dict(start=0, end=256, size=4),
+                histnorm="probability density", showlegend=show,
+                legendgroup="baseline",
+            ), row=r, col=c)
+
+        m_slow = cats == CATEGORY_SLOWED
+        for mid in sorted({int(p) for p in parents[m_slow]}):
+            if mid == 0:
+                continue
+            m = m_slow & (parents == mid)
+            if not m.any():
+                continue
+            label = f"slowed/{name_by_id.get(mid, mid)}"
+            show = label not in legend_seen
+            legend_seen.add(label)
+            fig.add_trace(go.Histogram(
+                x=ipds[m], name=label,
+                marker_color=color_by_id.get(mid, "#888"),
+                opacity=0.55, xbins=dict(start=0, end=256, size=4),
+                histnorm="probability density", showlegend=show,
+                legendgroup=label,
+            ), row=r, col=c)
+        fig.update_xaxes(range=[0, 200], row=r, col=c)
+
+    fig.update_layout(
+        title=f"Top {len(top)} kmers by SLOWED count — bimodal SLOWED peaks ⇒ mixed populations the model can't fit with one Gaussian.",
+        barmode="overlay",
+        height=260 * rows,
+    )
+    return fig
 
 
 def _build_ipd_pw_density_figure(data: dict):

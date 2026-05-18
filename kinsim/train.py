@@ -35,8 +35,8 @@ Train/test split
 
 Hyperparameter search
 ---------------------
-``--optuna --n-trials N`` runs an Optuna search over lr / kmer_embed_dim /
-hidden_dim before the final training run.
+``--optuna --n-trials N`` runs an Optuna search over lr / base_embed_dim /
+conv_dim / head_dim / kernel_size / dropout before the final training run.
 
 Checkpoints
 -----------
@@ -60,25 +60,24 @@ from torch.utils.data import DataLoader, IterableDataset, Subset
 try:
     import lightning as L
     from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
-    from lightning.pytorch.callbacks.callback import Callback
     from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
 except ImportError:
     try:
         import pytorch_lightning as L
-        from pytorch_lightning.callbacks import Callback, EarlyStopping, ModelCheckpoint
+        from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
         from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
     except ImportError as exc:
         raise ImportError(
-            "PyTorch Lightning is required for MLP training.\nInstall with: pip install lightning"
+            "PyTorch Lightning is required for training.\nInstall with: pip install lightning"
         ) from exc
 
 from .data.dataset import (
-    MLPSignalDataset,
+    SignalDataset,
     ShardedSignalDataset,
     list_shards,
     split_shards,
 )
-from .models.predictor import ConvPredictor, MLPPredictor
+from .models.predictor import ConvPredictor
 
 log = logging.getLogger(__name__)
 
@@ -555,7 +554,7 @@ class KineticDataModule(L.LightningDataModule):
 
     Two input modes (auto-detected from ``input_path``):
 
-    * **Single .pkl** — loads :class:`MLPSignalDataset` once into RAM,
+    * **Single .pkl** — loads :class:`SignalDataset` once into RAM,
       then random train/val split. Optional separate ``test_pkl`` for a
       held-out evaluation set. Best for small datasets.
 
@@ -640,7 +639,7 @@ class KineticDataModule(L.LightningDataModule):
     # ── Single-pkl path ────────────────────────────────────────────────
     def _setup_monolithic(self, stage: str | None) -> None:
         if stage in ("fit", None):
-            dataset = MLPSignalDataset(
+            dataset = SignalDataset(
                 self.input_path,
                 num_meth_types=self.num_meth_types,
                 augment=self.augment,
@@ -655,7 +654,7 @@ class KineticDataModule(L.LightningDataModule):
             self._val_subset = Subset(dataset, indices[n_train:])
             log.info("Data split — train: %d samples, val: %d samples", n_train, n_val)
         if stage in ("test", None) and self.test_pkl:
-            self._test_dataset = MLPSignalDataset(
+            self._test_dataset = SignalDataset(
                 self.test_pkl,
                 num_meth_types=self.num_meth_types,
                 params=self.params,
@@ -766,27 +765,18 @@ class KineticDataModule(L.LightningDataModule):
 
 
 class KineticPredictor(L.LightningModule):
-    """Lightning module wrapping MLPPredictor.
-
-    Training:
-        - Gaussian NLL loss (or MSE/Huber via loss_name).
-        - Adam optimiser with ReduceLROnPlateau (patience=5, factor=0.5).
+    """Lightning module wrapping :class:`ConvPredictor`.
 
     Validation (per epoch):
-        - val_loss: GNLL on the validation split (used by EarlyStopping / scheduler).
+        - val_loss: GNLL / Beta-NLL on the validation split.
         - val_mse_ipd / val_mse_pw: mean squared error in log1p space.
         - val_pearson_ipd / val_pearson_pw: Pearson r between predicted μ and truth.
         - val_calib_ipd / val_calib_pw: 2σ calibration coverage (~95.4 % expected).
-
-    Args:
-        model:     MLPPredictor instance (architecture defined externally).
-        lr:        Initial Adam learning rate.
-        loss_name: "gnll" (default) | "mse" | "huber".
     """
 
     def __init__(
         self,
-        model: MLPPredictor,
+        model: ConvPredictor,
         lr: float = 1e-3,
         loss_name: str = "gnll",
         lr_schedule: str = "cosine",
@@ -821,14 +811,10 @@ class KineticPredictor(L.LightningModule):
         return self.model(kmer_ids, meth_probs)
 
     def _clamp_kwargs(self) -> dict:
-        """Return the model's log-σ clamp range as kwargs for the loss fn.
-
-        Falls back to the legacy (-6, 3) range for models that don't
-        expose ``log_sigma_clamp_*`` attributes (i.e. the MLP path).
-        """
+        """Return the model's log-σ clamp range as kwargs for the loss fn."""
         return {
-            "log_sigma_min": float(getattr(self.model, "log_sigma_clamp_min", -6.0)),
-            "log_sigma_max": float(getattr(self.model, "log_sigma_clamp_max", 3.0)),
+            "log_sigma_min": float(self.model.log_sigma_clamp_min),
+            "log_sigma_max": float(self.model.log_sigma_clamp_max),
         }
 
     def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
@@ -994,103 +980,8 @@ class KineticPredictor(L.LightningModule):
 
     @torch.no_grad()
     def sample(self, kmer_ids: torch.Tensor, meth_probs: torch.Tensor) -> torch.Tensor:
-        """Stochastic inference — delegates to MLPPredictor.sample()."""
+        """Stochastic inference — delegates to ConvPredictor.sample()."""
         return self.model.sample(kmer_ids, meth_probs)
-
-
-# ---------------------------------------------------------------------------
-# LegacyCheckpointCallback
-# ---------------------------------------------------------------------------
-
-
-class LegacyCheckpointCallback(Callback):
-    """Write checkpoint_epoch{N}.pt in the legacy format.
-
-    Allows kinsim mlp generate and kinsim mlp evaluate to work unchanged
-    alongside the new Lightning checkpoint infrastructure.  The legacy format
-    stores only the MLPPredictor state dict (no 'model.' prefix), matching
-    what generate.py and evaluate.py expect:
-
-        {
-            "epoch":     int,
-            "model":     MLPPredictor.state_dict(),   # no "model." prefix
-            "optimizer": ...,
-            "scheduler": ...,                         # when available
-        }
-
-    Saves every checkpoint_every epochs.  Always saves at the very end of
-    training to handle early stopping (which may stop mid-interval).
-
-    Args:
-        output_dir:       Directory to write checkpoint_epoch*.pt files.
-        checkpoint_every: Save every N epochs (default 10).
-    """
-
-    def __init__(
-        self,
-        output_dir: Path,
-        checkpoint_every: int = 10,
-        kinsim_config: dict | None = None,
-    ) -> None:
-        """Args:
-            output_dir:       Directory to write checkpoint_epoch*.pt files.
-            checkpoint_every: Save every N epochs.
-            kinsim_config:    Optional snapshot of the full kinsim_config.yaml
-                              used for this run. Embedded in every checkpoint
-                              under the ``"kinsim_config"`` key so downstream
-                              tools (generate, evaluate, verify_generate) can
-                              reproduce the geometry without re-reading the
-                              project-wide YAML.
-        """
-        self.output_dir = Path(output_dir)
-        self.checkpoint_every = checkpoint_every
-        self.kinsim_config = kinsim_config
-
-    def _save(
-        self,
-        trainer: L.Trainer,
-        pl_module: KineticPredictor,
-        epoch: int,
-    ) -> None:
-        state: dict = {
-            "epoch": epoch,
-            "model": pl_module.model.state_dict(),
-            "optimizer": trainer.optimizers[0].state_dict(),
-            # Self-describing checkpoint: carries the model's get_config()
-            # plus the active kinsim_config snapshot so inference code never
-            # has to guess geometry from a YAML that may have moved.
-            "model_config": pl_module.model.get_config(),
-        }
-        if self.kinsim_config is not None:
-            state["kinsim_config"] = self.kinsim_config
-        if trainer.lr_scheduler_configs:
-            state["scheduler"] = trainer.lr_scheduler_configs[0].scheduler.state_dict()
-        path = self.output_dir / f"checkpoint_epoch{epoch}.pt"
-        torch.save(state, path)
-        log.info("Legacy checkpoint saved: %s", path)
-
-    def on_train_epoch_end(
-        self,
-        trainer: L.Trainer,
-        pl_module: KineticPredictor,
-    ) -> None:
-        # trainer.current_epoch is 0-indexed during on_train_epoch_end
-        epoch = trainer.current_epoch + 1
-        if epoch % self.checkpoint_every == 0:
-            self._save(trainer, pl_module, epoch)
-
-    def on_train_end(
-        self,
-        trainer: L.Trainer,
-        pl_module: KineticPredictor,
-    ) -> None:
-        """Save the final epoch — handles early stopping stopping mid-interval."""
-        # After the last on_train_epoch_end, current_epoch is incremented by Lightning.
-        # So at on_train_end, current_epoch == number of completed epochs (1-indexed).
-        epoch = trainer.current_epoch
-        ckpt_path = self.output_dir / f"checkpoint_epoch{epoch}.pt"
-        if not ckpt_path.exists():
-            self._save(trainer, pl_module, epoch)
 
 
 # ---------------------------------------------------------------------------
@@ -1266,9 +1157,8 @@ def _save_model_config(
     path = output_dir / "model_config.json"
     path.write_text(json.dumps(cfg, indent=2))
     log.info(
-        "Model config saved: %s  (architecture=%s, meth_types=%s, meth_id_map=%s, p_fire=%s, mean_occ=%s)",
+        "Model config saved: %s  (meth_types=%s, meth_id_map=%s, p_fire=%s, mean_occ=%s)",
         path,
-        cfg.get("architecture"),
         cfg.get("meth_types", "all"),
         cfg["meth_id_map"],
         f"{len(p_fire)} buckets" if p_fire else "none",
@@ -1285,7 +1175,6 @@ def objective(
     trial,
     pkl_path: str,
     output_dir: Path,
-    architecture: str = "conv",
     optuna_epochs: int = 20,
     batch_size: int = 4096,
     val_fraction: float = 0.10,
@@ -1294,53 +1183,25 @@ def objective(
 ) -> float:
     """Optuna objective — returns best val_loss (GNLL) for a trial.
 
-    Search space depends on architecture:
-        conv: lr, base_embed_dim, conv_dim, head_dim, kernel_size, dropout
-        mlp:  lr, kmer_embed_dim, hidden_dim, dropout
-
-    Args:
-        trial:         Optuna Trial object.
-        pkl_path:      Merged .pkl file path.
-        output_dir:    Root dir for trial subdirectories.
-        architecture:  "conv" (default) or "mlp".
-        optuna_epochs: Max epochs per trial (shorter than final run).
-        batch_size:    DataLoader batch size.
-        val_fraction:  Fraction of keys for validation.
-        loss_name:     Loss function.
-        device:        "cuda" or "cpu".
-
-    Returns:
-        Best val_loss seen during this trial (lower is better).
+    Search space: lr, base_embed_dim, conv_dim, head_dim, kernel_size, dropout.
     """
     # Derive from the data, not the YAML — see _infer_num_meth_types_from_data.
     num_meth_types = _infer_num_meth_types_from_data(pkl_path)
 
     lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
     dropout = trial.suggest_float("dropout", 0.0, 0.4)
-
-    if architecture == "conv":
-        base_embed_dim = trial.suggest_categorical("base_embed_dim", [8, 16])
-        conv_dim = trial.suggest_categorical("conv_dim", [64, 128])
-        head_dim = trial.suggest_categorical("head_dim", [64, 128, 256])
-        kernel_size = trial.suggest_categorical("kernel_size", [3, 5])
-        model = ConvPredictor(
-            base_embed_dim=base_embed_dim,
-            conv_dim=conv_dim,
-            head_dim=head_dim,
-            kernel_size=kernel_size,
-            num_meth_types=num_meth_types,
-            dropout=dropout,
-        )
-    else:
-        kmer_embed_dim = trial.suggest_categorical("kmer_embed_dim", [32, 64])
-        hidden_dim = trial.suggest_categorical("hidden_dim", [128, 256, 512])
-        model = MLPPredictor(
-            kmer_embed_dim=kmer_embed_dim,
-            hidden_dim=hidden_dim,
-            meth_proj_dim=8,
-            num_meth_types=num_meth_types,
-            dropout=dropout,
-        )
+    base_embed_dim = trial.suggest_categorical("base_embed_dim", [8, 16])
+    conv_dim = trial.suggest_categorical("conv_dim", [64, 128])
+    head_dim = trial.suggest_categorical("head_dim", [64, 128, 256])
+    kernel_size = trial.suggest_categorical("kernel_size", [3, 5])
+    model = ConvPredictor(
+        base_embed_dim=base_embed_dim,
+        conv_dim=conv_dim,
+        head_dim=head_dim,
+        kernel_size=kernel_size,
+        num_meth_types=num_meth_types,
+        dropout=dropout,
+    )
 
     lm = KineticPredictor(model, lr=lr, loss_name=loss_name)
     dm = KineticDataModule(
@@ -1390,74 +1251,31 @@ def train_mlp(
     test_strains: list | None = None,
     test_fraction: float | None = None,
     split_seed: int = 42,
-    architecture: str = "conv",
     epochs: int = 50,
     batch_size: int = 4096,
     lr: float = 1e-3,
-    # Conv architecture params
     base_embed_dim: int = 16,
     conv_dim: int = 128,
     n_conv_layers: int = 3,
     kernel_size: int = 3,
     head_dim: int = 128,
-    # MLP architecture params (legacy)
-    kmer_embed_dim: int = 64,
-    hidden_dim: int = 128,
-    # Shared params
     meth_proj_dim: int = 8,
     dropout: float = 0.1,
     loss_name: str = "gnll",
     val_fraction: float = 0.10,
-    checkpoint_every: int = 10,
     device: str = "cuda",
     resume_ckpt: str | None = None,
     run_optuna: bool = False,
     n_trials: int = 20,
     optuna_epochs: int = 20,
-    # Accuracy improvements (defaults reflect what's actually safe and known to help)
     augment: bool = True,
     balance_kmers: bool = True,
-    biology_mask: bool = False,   # off — see kinsim_config.yaml notes
+    biology_mask: bool = False,
     log_sigma_clamp_max: float = 3.0,
     lr_schedule: str = "cosine",
     warmup_epochs: int = 3,
 ) -> None:
-    """Train kinetic predictor using PyTorch Lightning.
-
-    Supports two architectures:
-        "conv" (default): ConvPredictor — per-base embeddings + 1D conv + FiLM.
-                          ~140K params.  Learns compositional spatial rules.
-        "mlp"  (legacy):  MLPPredictor — flat 4.2M k-mer embedding + MLP.
-                          ~268M params.  Fast lookup, but memorises each 11-mer.
-
-    If run_optuna=True, an Optuna HPO study runs first.  Best values override
-    defaults for the final training run.
-
-    Args:
-        pkl_path:         Shard .pkl OR a directory of shard.pkl files (sharded mode).
-        output_dir:       Directory for checkpoints, logs, and model config.
-        architecture:     "conv" (default) or "mlp".
-        epochs:           Total training epochs for the final run.
-        batch_size:       Mini-batch size (unique (kmer, meth) keys per step).
-        lr:               Initial Adam learning rate.
-        base_embed_dim:   [conv] Per-base embedding dimension (default 16).
-        conv_dim:         [conv] Conv channel width (default 128).
-        n_conv_layers:    [conv] Number of conv layers (default 3).
-        kernel_size:      [conv] Conv kernel size (default 3).
-        head_dim:         [conv] Head hidden layer width (default 128).
-        kmer_embed_dim:   [mlp] 11-mer embedding dimension (32 or 64).
-        hidden_dim:       [mlp] Hidden layer width.
-        meth_proj_dim:    Methylation projection output dimension.
-        dropout:          Dropout probability (default 0.1 for conv, 0.0 for mlp).
-        loss_name:        "gnll" (default) | "mse" | "huber".
-        val_fraction:     Fraction of keys reserved for validation.
-        checkpoint_every: Save legacy checkpoint_epoch*.pt every N epochs.
-        device:           "cuda" or "cpu".
-        resume_ckpt:      Legacy .pt or Lightning .ckpt to load weights from.
-        run_optuna:       Run Optuna HPO before the final training run.
-        n_trials:         Number of Optuna trials.
-        optuna_epochs:    Epochs per trial (typically much shorter than epochs).
-    """
+    """Train :class:`ConvPredictor` using PyTorch Lightning."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1470,23 +1288,20 @@ def train_mlp(
                 "Optuna is required for HPO. Install with: pip install optuna"
             ) from exc
 
-        log.info(
-            "Optuna HPO — arch=%s  %d trials × %d epochs", architecture, n_trials, optuna_epochs
-        )
+        log.info("Optuna HPO — %d trials × %d epochs", n_trials, optuna_epochs)
         optuna_dir = output_dir / "optuna"
         optuna_dir.mkdir(exist_ok=True)
 
         study = optuna.create_study(
             direction="minimize",
             pruner=optuna.pruners.MedianPruner(n_warmup_steps=5),
-            study_name="kinsim_mlp",
+            study_name="kinsim",
         )
         study.optimize(
             lambda trial: objective(
                 trial,
                 pkl_path=pkl_path,
                 output_dir=optuna_dir,
-                architecture=architecture,
                 optuna_epochs=optuna_epochs,
                 batch_size=batch_size,
                 val_fraction=val_fraction,
@@ -1498,17 +1313,12 @@ def train_mlp(
 
         best = study.best_params
         log.info("Optuna best — val_loss=%.6f  params=%s", study.best_value, best)
-        # Override with Optuna's best hyperparameters
         lr = best["lr"]
         dropout = best.get("dropout", dropout)
-        if architecture == "conv":
-            base_embed_dim = best.get("base_embed_dim", base_embed_dim)
-            conv_dim = best.get("conv_dim", conv_dim)
-            head_dim = best.get("head_dim", head_dim)
-            kernel_size = best.get("kernel_size", kernel_size)
-        else:
-            kmer_embed_dim = best.get("kmer_embed_dim", kmer_embed_dim)
-            hidden_dim = best.get("hidden_dim", hidden_dim)
+        base_embed_dim = best.get("base_embed_dim", base_embed_dim)
+        conv_dim = best.get("conv_dim", conv_dim)
+        head_dim = best.get("head_dim", head_dim)
+        kernel_size = best.get("kernel_size", kernel_size)
         (output_dir / "optuna_best_params.json").write_text(
             json.dumps({"best_val_loss": study.best_value, **best}, indent=2)
         )
@@ -1566,63 +1376,39 @@ def train_mlp(
             resolved_params.downstream, list(resolved_params.rev_meth_offsets),
         )
 
-    if architecture == "conv":
-        log.info(
-            "Training — arch=conv  %d epochs  loss=%s  lr=%.2e  base_embed=%d  "
-            "conv_dim=%d  n_layers=%d  k=%d  head=%d  meth_proj=%d  dropout=%.2f  accel=%s",
-            epochs,
-            loss_name,
-            lr,
-            base_embed_dim,
-            conv_dim,
-            n_conv_layers,
-            kernel_size,
-            head_dim,
-            meth_proj_dim,
-            dropout,
-            accelerator,
-        )
-        model = ConvPredictor(
-            base_embed_dim=base_embed_dim,
-            meth_proj_dim=meth_proj_dim,
-            num_meth_types=num_meth_types,
-            conv_dim=conv_dim,
-            n_conv_layers=n_conv_layers,
-            kernel_size=kernel_size,
-            head_dim=head_dim,
-            dropout=dropout,
-            biology_mask=biology_mask,
-            log_sigma_clamp_max=log_sigma_clamp_max,
-            kmer_size=resolved_params.kmer_size,
-            active_site_index=resolved_params.active_site_index,
-            n_rev_meth=resolved_params.n_rev_meth,
-        )
-    else:
-        log.info(
-            "Training — arch=mlp  %d epochs  loss=%s  lr=%.2e  embed=%d  hidden=%d  "
-            "meth_proj=%d  dropout=%.2f  accel=%s",
-            epochs,
-            loss_name,
-            lr,
-            kmer_embed_dim,
-            hidden_dim,
-            meth_proj_dim,
-            dropout,
-            accelerator,
-        )
-        model = MLPPredictor(
-            kmer_embed_dim=kmer_embed_dim,
-            hidden_dim=hidden_dim,
-            meth_proj_dim=meth_proj_dim,
-            num_meth_types=num_meth_types,
-            dropout=dropout,
-            kmer_size=resolved_params.kmer_size,
-            active_site_index=resolved_params.active_site_index,
-            n_rev_meth=resolved_params.n_rev_meth,
-        )
+    log.info(
+        "Training — %d epochs  loss=%s  lr=%.2e  base_embed=%d  "
+        "conv_dim=%d  n_layers=%d  k=%d  head=%d  meth_proj=%d  dropout=%.2f  accel=%s",
+        epochs,
+        loss_name,
+        lr,
+        base_embed_dim,
+        conv_dim,
+        n_conv_layers,
+        kernel_size,
+        head_dim,
+        meth_proj_dim,
+        dropout,
+        accelerator,
+    )
+    model = ConvPredictor(
+        base_embed_dim=base_embed_dim,
+        meth_proj_dim=meth_proj_dim,
+        num_meth_types=num_meth_types,
+        conv_dim=conv_dim,
+        n_conv_layers=n_conv_layers,
+        kernel_size=kernel_size,
+        head_dim=head_dim,
+        dropout=dropout,
+        biology_mask=biology_mask,
+        log_sigma_clamp_max=log_sigma_clamp_max,
+        kmer_size=resolved_params.kmer_size,
+        active_site_index=resolved_params.active_site_index,
+        n_rev_meth=resolved_params.n_rev_meth,
+    )
 
     n_params = sum(p.numel() for p in model.parameters())
-    log.info("Model parameters: %s (%s)", f"{n_params:,}", architecture)
+    log.info("Model parameters: %s", f"{n_params:,}")
 
     # Surface the meth-alphabet used for extraction so training logs make it
     # explicit which modification types this checkpoint is valid for.
@@ -1663,24 +1449,10 @@ def train_mlp(
     )
 
     if resume_ckpt:
+        from .models.predictor import load_state_dict_from_ckpt  # noqa: PLC0415
+
         log.info("Loading weights from: %s", resume_ckpt)
-        ckpt = torch.load(resume_ckpt, map_location="cpu", weights_only=False)
-        if "model" in ckpt:
-            # Legacy format: direct MLPPredictor state dict (no "model." prefix)
-            model.load_state_dict(ckpt["model"])
-        elif "state_dict" in ckpt:
-            # Lightning format: strip "model." prefix added by KineticPredictor wrapper
-            state_dict = {
-                k[len("model.") :]: v
-                for k, v in ckpt["state_dict"].items()
-                if k.startswith("model.")
-            }
-            model.load_state_dict(state_dict)
-        else:
-            raise ValueError(
-                f"Unrecognized checkpoint format in {resume_ckpt}.\n"
-                "Expected 'model' key (legacy) or 'state_dict' key (Lightning)."
-            )
+        model.load_state_dict(load_state_dict_from_ckpt(resume_ckpt))
         log.info("Weights loaded.")
 
     lm = KineticPredictor(
@@ -1720,21 +1492,18 @@ def train_mlp(
         mode="min",
         save_top_k=1,
     )
-    # Snapshot the active YAML so the checkpoint is fully self-describing.
-    # Errors in load_kinsim_config are non-fatal: the model_config saved in
-    # the checkpoint alone is enough to rebuild the model; the YAML
-    # snapshot is a convenience for downstream tooling.
+    # Snapshot the active YAML next to model_config.json so downstream
+    # tooling can reproduce the geometry without re-reading the live config.
     try:
         from .utils.config import load_kinsim_config as _load_yaml  # noqa: PLC0415
-        _yaml_snapshot = dict(_load_yaml())
+        import yaml as _yaml  # noqa: PLC0415
+
+        (output_dir / "kinsim_config.snapshot.yaml").write_text(
+            _yaml.safe_dump(dict(_load_yaml()), sort_keys=False),
+            encoding="utf-8",
+        )
     except Exception as _exc:  # noqa: BLE001
-        log.warning("Could not snapshot kinsim_config.yaml into checkpoint: %s", _exc)
-        _yaml_snapshot = None
-    legacy_ckpt = LegacyCheckpointCallback(
-        output_dir=output_dir,
-        checkpoint_every=checkpoint_every,
-        kinsim_config=_yaml_snapshot,
-    )
+        log.warning("Could not snapshot kinsim_config.yaml: %s", _exc)
 
     # ── Loggers ───────────────────────────────────────────────────────────
     loggers: list = [CSVLogger(str(output_dir), name="logs")]
@@ -1770,7 +1539,7 @@ def train_mlp(
         accelerator=accelerator,
         devices=1,
         gradient_clip_val=0.5,
-        callbacks=[early_stop, lightning_ckpt, mu_ckpt, legacy_ckpt],
+        callbacks=[early_stop, lightning_ckpt, mu_ckpt],
         logger=loggers,
         log_every_n_steps=50,
         enable_progress_bar=True,
@@ -1806,7 +1575,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="kinsim train",
         description=(
-            "Train ConvPredictor / MLPPredictor on shard pkls.\n\n"
+            "Train ConvPredictor on shard pkls.\n\n"
             "Input: a directory of refined *_shard.pkl (sharded mode, recommended)\n"
             "or a single shard.pkl (small datasets, debugging). Auto-detected.\n\n"
             "Pipeline:\n"
@@ -1814,8 +1583,7 @@ def main(argv: list[str] | None = None) -> None:
             "  kinsim refine  shards/   refined/\n"
             "  kinsim train   refined/  checkpoints/\n\n"
             "All flags may be specified in a YAML config file (--config).\n"
-            "Command-line flags override YAML values.\n\n"
-            "Optuna HPO: --optuna --n-trials N  (searches lr / kmer_embed_dim / hidden_dim)."
+            "Command-line flags override YAML values."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1854,14 +1622,6 @@ def main(argv: list[str] | None = None) -> None:
         help="Seed for the random shard split (sharded mode only).",
     )
 
-    # Architecture selection
-    parser.add_argument(
-        "--architecture",
-        default=None,
-        choices=["conv", "mlp"],
-        help="Model architecture: conv (default, 1D-conv + FiLM) or mlp (legacy embedding)",
-    )
-
     # Training hyperparameters
     parser.add_argument(
         "--config", default=None, help="YAML config file (all flags can be set here)"
@@ -1870,49 +1630,28 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: 4096)")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate (default: 1e-3)")
 
-    # Conv architecture params
     parser.add_argument(
-        "--base-embed-dim",
-        type=int,
-        default=None,
-        help="[conv] Per-base embedding dimension (default: 16)",
+        "--base-embed-dim", type=int, default=None,
+        help="Per-base embedding dimension (default: 16)",
     )
     parser.add_argument(
-        "--conv-dim", type=int, default=None, help="[conv] Conv channel width (default: 128)"
+        "--conv-dim", type=int, default=None, help="Conv channel width (default: 128)"
     )
     parser.add_argument(
-        "--n-conv-layers", type=int, default=None, help="[conv] Number of conv layers (default: 3)"
+        "--n-conv-layers", type=int, default=None, help="Number of conv layers (default: 3)"
     )
     parser.add_argument(
-        "--kernel-size", type=int, default=None, help="[conv] Conv kernel size (default: 3)"
+        "--kernel-size", type=int, default=None, help="Conv kernel size (default: 3)"
     )
     parser.add_argument(
-        "--head-dim", type=int, default=None, help="[conv] Head hidden layer width (default: 128)"
-    )
-
-    # MLP architecture params (legacy)
-    parser.add_argument(
-        "--kmer-embed-dim",
-        type=int,
-        default=None,
-        help="[mlp] 11-mer embedding dimension (default: 64)",
+        "--head-dim", type=int, default=None, help="Head hidden layer width (default: 128)"
     )
     parser.add_argument(
-        "--hidden-dim", type=int, default=None, help="[mlp] Hidden layer width (default: 128)"
-    )
-
-    # Shared params
-    parser.add_argument(
-        "--meth-proj-dim",
-        type=int,
-        default=None,
+        "--meth-proj-dim", type=int, default=None,
         help="Methylation projection output dim (default: 8)",
     )
     parser.add_argument(
-        "--dropout",
-        type=float,
-        default=None,
-        help="Dropout probability (default: 0.1 for conv, 0.0 for mlp)",
+        "--dropout", type=float, default=None, help="Dropout probability (default: 0.1)",
     )
     parser.add_argument(
         "--loss",
@@ -1929,19 +1668,13 @@ def main(argv: list[str] | None = None) -> None:
         help="Fraction for validation split (default: 0.10)",
     )
     parser.add_argument(
-        "--checkpoint-every",
-        type=int,
-        default=None,
-        help="Save legacy checkpoint every N epochs (default: 10)",
-    )
-    parser.add_argument(
         "--device",
         default=None,
         choices=["cuda", "cpu"],
         help="Device (default: cuda, falls back to cpu automatically)",
     )
     parser.add_argument(
-        "--resume", dest="resume_ckpt", help="Resume weights from a checkpoint .pt or .ckpt file"
+        "--resume", dest="resume_ckpt", help="Resume weights from a checkpoint .ckpt or .pt file"
     )
 
     # Optuna HPO flags
@@ -2030,10 +1763,6 @@ def main(argv: list[str] | None = None) -> None:
     if not output_dir:
         parser.error("output_dir is required (positional arg or 'output_dir' in YAML config)")
 
-    architecture = _get(args.architecture, "architecture", "conv")
-    # Default dropout depends on architecture
-    default_dropout = 0.1 if architecture == "conv" else 0.0
-
     # Parse --test-strains "a,b,c" into a list (sharded mode only).
     test_strains_arg = args.test_strains or cfg.get("test_strains")
     if isinstance(test_strains_arg, str):
@@ -2050,31 +1779,23 @@ def main(argv: list[str] | None = None) -> None:
         test_strains=test_strains_list,
         test_fraction=_get(args.test_fraction, "test_fraction", None),
         split_seed=_get(args.split_seed, "split_seed", 42),
-        architecture=architecture,
         epochs=_get(args.epochs, "epochs", 50),
         batch_size=_get(args.batch_size, "batch_size", 4096),
         lr=_get(args.lr, "lr", 1e-3),
-        # Conv params
         base_embed_dim=_get(args.base_embed_dim, "base_embed_dim", 16),
         conv_dim=_get(args.conv_dim, "conv_dim", 128),
         n_conv_layers=_get(args.n_conv_layers, "n_conv_layers", 3),
         kernel_size=_get(args.kernel_size, "kernel_size", 3),
         head_dim=_get(args.head_dim, "head_dim", 128),
-        # MLP params
-        kmer_embed_dim=_get(args.kmer_embed_dim, "kmer_embed_dim", 64),
-        hidden_dim=_get(args.hidden_dim, "hidden_dim", 128),
-        # Shared
         meth_proj_dim=_get(args.meth_proj_dim, "meth_proj_dim", 8),
-        dropout=_get(args.dropout, "dropout", default_dropout),
+        dropout=_get(args.dropout, "dropout", 0.1),
         loss_name=_get(args.loss, "loss", "betanll"),
         val_fraction=_get(args.val_fraction, "val_fraction", 0.10),
-        checkpoint_every=_get(args.checkpoint_every, "checkpoint_every", 10),
         device=_get(args.device, "device", "cuda"),
         resume_ckpt=args.resume_ckpt or cfg.get("resume"),
         run_optuna=args.optuna or cfg.get("optuna", False),
         n_trials=_get(args.n_trials, "n_trials", 20),
         optuna_epochs=_get(args.optuna_epochs, "optuna_epochs", 20),
-        # Accuracy improvements (all ON by default; `--no-X` opts out).
         augment=_get(args.augment, "augment", True),
         balance_kmers=_get(args.balance_kmers, "balance_kmers", True),
         biology_mask=_get(args.biology_mask, "biology_mask", False),

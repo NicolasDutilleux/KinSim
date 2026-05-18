@@ -850,7 +850,7 @@ def main(argv=None) -> None:
     # Validate inputs
     for f in args.inputs:
         if not Path(f).is_file():
-            print(f"ERROR: input file not found: {f}", file=sys.stderr)
+            log.error("input file not found: %s", f)
             sys.exit(1)
 
     stats = merge_motifs(

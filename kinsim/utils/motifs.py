@@ -913,7 +913,7 @@ def main(argv=None):
     if result:
         print(result)
     else:
-        print("No motifs found / passed the filter.", file=sys.stderr)
+        log.error("No motifs found / passed the filter.")
         sys.exit(1)
 
 

@@ -224,6 +224,99 @@ def _distribution_panel(
     return fig
 
 
+def _p75_tail_panel(
+    signatures: dict, hist_ipd: dict, stats_by_key: dict, smooth: int,
+):
+    """Per-(T, k) distribution restricted to IPD >= p75.
+
+    Each bucket's own p75 is the cut — everything below is dropped and the
+    surviving tail is re-normalised to its own density. The hypothesis is
+    that the bottom ~75 % of every (T, k) bucket is unmodified background;
+    isolating the top 25 % reveals whatever methylated-shape signal sits in
+    the tail. If real methylation is present you should see the tail shapes
+    diverge between (T, k) buckets that carry signal and those that don't.
+
+    Two rows: linear and log y so a small tail bump is still visible after
+    re-normalisation.
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    p99s = [s["p99"] for s in stats_by_key.values() if s]
+    cut_p99 = float(np.ceil(max(p99s, default=250.0) / 25.0)) * 25.0
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        subplot_titles=[
+            "Queue p75+ — densité linéaire. Chaque bucket est filtré à IPD ≥ son propre p75 puis renormalisé.",
+            "Queue p75+ — densité log y. Même données, axe log pour voir les différences de forme à faible densité.",
+        ],
+        vertical_spacing=0.20,
+    )
+
+    for T, info in signatures.items():
+        for i, k in enumerate(info["signal_offsets"]):
+            key = f"{T}@{k:+d}"
+            h = np.asarray(hist_ipd.get(key, []), dtype=np.float64)
+            if h.size == 0:
+                continue
+            s = stats_by_key.get(key)
+            if s is None:
+                continue
+            tail_mask = FRAME_CENTRES >= s["p75"]
+            h_tail = np.where(tail_mask, h, 0.0)
+            n_tail = h_tail.sum()
+            if n_tail <= 0:
+                continue
+            if smooth > 0:
+                h_tail = _smooth(h_tail, smooth)
+                # Renormalise after smoothing so total mass = n_tail still.
+                s_after = h_tail.sum()
+                if s_after > 0:
+                    h_tail = h_tail * (n_tail / s_after)
+            density = (h_tail / n_tail) / BIN_WIDTHS
+            density = np.where(tail_mask, density, 0.0)
+            color = _color_for(T, i)
+            label = (f"{key}   n_tail={int(n_tail):,}   p75={s['p75']:.0f}  "
+                     f"p99={s['p99']:.0f}")
+            fig.add_trace(go.Scatter(
+                x=FRAMES_X, y=density, mode="lines", name=label,
+                line={"color": color, "width": 2},
+                legendgroup=key, showlegend=True,
+                hovertemplate=f"{key}<br>IPD=%{{x}} fr<br>density=%{{y:.6f}}<extra></extra>",
+            ), row=1, col=1)
+            fig.add_trace(go.Scatter(
+                x=FRAMES_X, y=density, mode="lines", name=label,
+                line={"color": color, "width": 2},
+                legendgroup=key, showlegend=False,
+                hovertemplate=f"{key}<br>IPD=%{{x}} fr<br>density=%{{y:.6f}}<extra></extra>",
+            ), row=2, col=1)
+
+    fig.update_xaxes(range=[0, cut_p99], title_text="IPD (frames)", row=1, col=1)
+    fig.update_xaxes(range=[0, cut_p99], title_text="IPD (frames)", row=2, col=1)
+    fig.update_yaxes(title_text="density (queue)", row=1, col=1)
+    fig.update_yaxes(title_text="density (queue, log)", type="log", row=2, col=1)
+    fig.update_layout(
+        height=820,
+        template="plotly_white",
+        legend={
+            "orientation": "v",
+            "yanchor": "top", "y": 1.0,
+            "xanchor": "left", "x": 1.01,
+            "bgcolor": "rgba(255,255,255,0.95)",
+            "bordercolor": "#ccc", "borderwidth": 1,
+            "font": {"size": 11},
+        },
+        margin={"t": 60, "b": 60, "l": 70, "r": 380},
+        hovermode="x unified",
+    )
+    for ann in fig["layout"]["annotations"]:
+        ann["font"] = {"size": 12, "color": "#444"}
+        ann["xanchor"] = "left"
+        ann["x"] = 0.0
+    return fig
+
+
 def _ratio_bar_figure(signatures: dict, hist_ipd: dict, threshold_factor: float = 1.3):
     """Bar chart showing the ipd_ratio = mean_above / mean_all per (T, k).
 
@@ -588,6 +681,7 @@ def _build_html(
 
     # Figures
     fig_dist = _distribution_panel(signatures, hist_ipd, stats_by_key, smooth)
+    fig_p75 = _p75_tail_panel(signatures, hist_ipd, stats_by_key, smooth)
     fig_ratio = _ratio_bar_figure(signatures, hist_ipd, threshold)
     fig_gauss = _gaussian_vs_empirical_figure(signatures, hist_ipd, stats_by_key, smooth)
     fig_dilu = _dilution_illustration_figure(stats_by_key, signatures)
@@ -629,6 +723,18 @@ def _build_html(
     {_figure_div(fig_dist, "fig_dist")}
     <p class="figure-caption">Haut: zoom bulk (x ≤ p75). Bas: vue large
        jusqu'à p99 incluant la queue droite.</p>
+  </div>
+
+  <div class="section">
+    <h2>Queue p75+ par bucket — signal méthylé candidat</h2>
+    {_figure_div(fig_p75, "fig_p75")}
+    <p class="figure-caption">Chaque bucket est filtré à <code>IPD ≥ son
+       propre p75</code> puis renormalisé. L'idée: les ~75 % du bas sont
+       le bulk non-modifié; isoler le quart supérieur révèle la forme
+       du signal méthylé. Si la méthylation est réelle, les courbes des
+       buckets qui en portent (m6A@+0, m6A@+5, ...) doivent diverger
+       visuellement des buckets témoins. Axe y log en bas pour comparer
+       les formes à faible densité.</p>
   </div>
 
   <div class="section">

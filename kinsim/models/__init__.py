@@ -1,1 +1,1 @@
-"""Model architectures: ConvPredictor and MLPPredictor."""
+"""ConvPredictor and supporting helpers."""

@@ -116,14 +116,6 @@ extraction:
   # Most setups can leave this at [-1, 0, +1] regardless of kmer_size.
   rev_meth_offsets: [-1, 0, 1]
 
-# Legacy alias — kept for backward compatibility with older YAMLs. If you
-# delete the `extraction:` block above, KinSim falls back to reading
-# `meth_context.left/right` and assumes K = left + 1 + right. Prefer the
-# `extraction:` block for new configs.
-meth_context:
-  left:  7      # bases of meth context BEFORE the prediction position
-  right: 3      # bases AFTER the prediction position
-
 # ─────────────────────────────────────────────────────────────────────────
 # Extraction parameters
 # ─────────────────────────────────────────────────────────────────────────
@@ -160,18 +152,6 @@ extract:
   # somewhere in the meth_context" alone does NOT imply elevated IPD —
   # only meth at a configured signal offset does.
   near_meth_max_dist:         7     # bases downstream of the motif centre (1..K-1)
-
-# ─────────────────────────────────────────────────────────────────────────
-# Refinement parameters
-# ─────────────────────────────────────────────────────────────────────────
-# `kinsim refine` filters motif-FP rows from the SLOWED category. The
-# default method is per-(meth_type, offset) 2D Gaussian Mixture (see
-# kinsim/refine.py); the p95 method below is the legacy single-threshold
-# fallback. ``secondary_percentile`` is read only when refine runs with
-# ``--method p95`` — the GMM path ignores it.
-refine:
-  slowed_split:
-    secondary_percentile: 95   # p95 of per-kmer baseline mean → drop SLOWED below this
 
 # ─────────────────────────────────────────────────────────────────────────
 # Model defaults

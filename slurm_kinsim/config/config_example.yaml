@@ -44,16 +44,11 @@ lr_patience:      5         # epochs without val improvement before LR halved
 lr_factor:        0.5       # LR multiplied by this on plateau
 
 # ============================================================
-# MODEL ARCHITECTURE
-# Choose architecture: "conv" (recommended) or "mlp" (legacy)
-# ============================================================
-
-architecture: conv          # conv (~140K params) | mlp (~268M params, embedding-heavy)
-
-# --- ConvPredictor (architecture: conv) ---
+# MODEL ARCHITECTURE — ConvPredictor (~140K params)
 # Per-base embedding + 1D conv backbone with FiLM methylation conditioning.
 # Learns spatial rules (e.g. "A at offset -3 shifts IPD by X") rather than
 # memorising each k-mer independently. Generalises to unseen k-mers.
+# ============================================================
 base_embed_dim: 16          # per-base (A/C/G/T) embedding dimension
 num_meth_types: 4           # number of methylation types (none/m6A/m4C/m5C)
 meth_proj_dim:  8           # methylation projection output dimension
@@ -62,13 +57,6 @@ n_conv_layers:  3           # number of Conv1d layers (depth of the backbone)
 kernel_size:    3           # Conv1d kernel size (receptive field per layer)
 head_dim:       128         # output head hidden layer width
 dropout:        0.1         # dropout probability in output head
-
-# --- MLPPredictor (architecture: mlp) ---
-# Legacy flat embedding. Only used if architecture: mlp above.
-# kmer_embed_dim: 64        # embedding table columns (32 = ~0.5 GB, 64 = ~1 GB)
-# hidden_dim:     128       # width of the two hidden MLP layers
-# meth_proj_dim:  8         # methylation linear projection output dimension
-# dropout:        0.0
 
 # ============================================================
 # DEVICE

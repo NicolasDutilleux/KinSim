@@ -10,7 +10,7 @@ never contaminates a clean offset of the same type.
 
 Tests cover:
   1. Storage constants + get_categories on the 38-col layout.
-  2. Refine: slowed_split filters CATEGORY_SLOWED below the
+  2. Refine: slowed_split_gmm filters CATEGORY_SLOWED rows whose
      per-kmer-mean baseline percentile; CATEGORY_BASELINE and
      CATEGORY_NEAR_METH pass through untouched.
   3. Refine GMM fits one model per (meth_type, offset) bucket.
@@ -28,7 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
-from kinsim.refine import refine_pkl, slowed_split, slowed_split_gmm
+from kinsim.refine import refine_pkl, slowed_split_gmm
 from kinsim.utils.encoding import KMER_PRED_IDX, get_meth_ids
 from kinsim.utils.sample_layout import (
     CATEGORY_BASELINE,
@@ -276,45 +276,6 @@ def _build_v4_master(n_kmers: int = 10) -> dict:
             rows.append(r)
         data[kid] = np.stack(rows)
     return data
-
-
-def test_slowed_split_only_filters_slowed():
-    """Only SLOWED below the per-kmer-mean baseline percentile is dropped.
-    BASELINE and NEAR_METH pass through untouched."""
-    data = _build_v4_master(5)
-    _new_data, stats = slowed_split(data, secondary_pct=95.0)
-
-    # All kmers have baseline mean = 50 (50 samples, all IPD=50) so
-    # p95 of per-kmer means = 50.
-    assert stats["threshold"] == 50.0
-    assert stats["n_baseline_in"] == 5 * 50
-    assert stats["n_baseline_out"] == 5 * 50
-    assert stats["n_near_in"] == 5 * 25
-    assert stats["n_near_out"] == 5 * 25
-    assert stats["n_slowed_in"] == 5 * 50
-    assert stats["n_slowed_kept"] == 5 * 30  # IPD=180 above threshold
-    assert stats["n_slowed_dropped"] == 5 * 20  # IPD=20 below
-
-
-def test_refine_pkl_writes_output_p95():
-    """Legacy p95 method end-to-end: loads, runs slowed_split, writes a clean pkl."""
-    data = _build_v4_master(3)
-    with tempfile.TemporaryDirectory() as td:
-        inp = Path(td) / "in.pkl"
-        out = Path(td) / "out.pkl"
-        with open(inp, "wb") as f:
-            pickle.dump(data, f)
-        refine_pkl(inp, out, method="p95")
-        with open(out, "rb") as f:
-            refined = pickle.load(f)
-        meta = refined.pop("__meta__")
-        assert meta["method"] == "p95_per_kmer_baseline_mean"
-        # Per kmer: 50 baseline + 30 slowed kept + 25 near = 105
-        for kid in range(3):
-            assert kid in refined
-            arr = refined[kid]
-            assert arr.shape[1] == SAMPLE_NCOLS
-            assert len(arr) == 105
 
 
 # ---------------------------------------------------------------------------
@@ -1023,10 +984,6 @@ if __name__ == "__main__":
     print("[pass] get_categories")
     test_layout_column_contract()
     print("[pass] layout column contract (38 cols, 35 cat, 36 parent_meth, 37 parent_off)")
-    test_slowed_split_only_filters_slowed()
-    print("[pass] slowed_split (p95)")
-    test_refine_pkl_writes_output_p95()
-    print("[pass] refine_pkl (p95)")
     test_refine_fails_fast_on_obsolete_layout()
     print("[pass] refine fails fast on obsolete layout")
     test_gmm_k2_separates_clean_two_distributions()

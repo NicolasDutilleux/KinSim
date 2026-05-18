@@ -8,7 +8,7 @@ Usage:
 import difflib
 import sys
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 COMMANDS = [
     "extract",
@@ -107,29 +107,10 @@ def main(argv=None):
         mod.main([cmd, *rest] if cmd == "extract" else rest)
         return
 
-    # -- unknown --
     msg = f"Unknown command: '{cmd}'"
     hint = _suggest(cmd, COMMANDS)
     if hint:
         msg += f"\n\nDid you mean:  kinsim {hint[0]}"
-    # Data prep commands live in a separate CLI.
-    prep_cmds = {"prep", "rebase", "manifest", "filter", "prepare", "parse", "motifs"}
-    if cmd in prep_cmds:
-        msg += f"\n\nData prep commands live in 'kinsim-prep'.\n  Try:  kinsim-prep {cmd} ..."
-    # Auxiliary scripts live in scripts/, not as kinsim subcommands.
-    legacy_tool_cmds = {"compare", "inspect-model", "sample", "strip-kinetics", "merge"}
-    if cmd in legacy_tool_cmds:
-        if cmd == "merge":
-            msg += (
-                "\n\n'kinsim merge' has been removed. Shards are the canonical training "
-                "format now — refine and train both consume the shards directory directly.\n"
-                "  kinsim refine shards/  refined/\n  kinsim train  refined/ checkpoints/"
-            )
-        else:
-            msg += (
-                f"\n\n'kinsim {cmd}' has been moved out of the main CLI. Run the standalone "
-                f"script directly:\n  python scripts/{cmd.replace('-', '_')}.py ..."
-            )
     print(msg, file=sys.stderr)
     print(USAGE)
     sys.exit(1)
