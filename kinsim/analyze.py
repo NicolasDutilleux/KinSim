@@ -1088,6 +1088,15 @@ def _build_html_figures(
             )
         )
 
+    # ── Fig 7+: one section per meth type — answer the bimodality question ─
+    for meth_name, fig_m in _build_per_meth_kmer_figures(data, top_n=12):
+        figures.append(
+            (
+                f"Per-kmer baseline vs slowed/{meth_name} — top 12 by slowed-{meth_name} count",
+                fig_m,
+            )
+        )
+
     return figures
 
 
@@ -1205,6 +1214,125 @@ def _build_kmer_trend_figure(data: dict, top_n: int = 12):
         height=260 * rows,
     )
     return fig
+
+
+def _build_per_meth_kmer_figures(data: dict, top_n: int = 12):
+    """One figure per meth type: top-N kmers for that meth, baseline + slowed/T.
+
+    Diagnostic for the "bimodal slowed peak" question:
+      - 1 bump (slowed cleanly shifted from baseline) → model fits with 1 Gaussian.
+      - 2 bumps on the slowed side (PER kmer) → mixed populations specific to
+        that kmer. Some kmers are bimodal, others aren't — kmer-specific issue.
+      - 2 bumps on EVERY kmer of a given meth type → systematic. Upstream
+        bug (extract misattributing) or model architecture limit.
+
+    Yields ``(meth_name, plotly_figure)`` pairs.
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    from .utils.encoding import decode_kmer, get_meth_ids
+    from .utils.sample_layout import (
+        CATEGORY_BASELINE,
+        CATEGORY_SLOWED,
+        COL_CATEGORY,
+        COL_IPD,
+        COL_PARENT_METH,
+    )
+
+    name_by_id = {v: k for k, v in get_meth_ids().items()}
+    color_by_id = {1: "#d62728", 2: "#9467bd", 3: "#2ca02c", 4: "#ff7f0e"}
+
+    # Discover meth types present in the data.
+    present: set[int] = set()
+    for kid, arr in data.items():
+        if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
+            continue
+        if arr.shape[1] <= COL_PARENT_METH:
+            continue
+        cats = arr[:, COL_CATEGORY].astype(np.int8)
+        parents = arr[:, COL_PARENT_METH].astype(np.int8)
+        present.update({int(p) for p in parents[cats == CATEGORY_SLOWED] if p > 0})
+
+    for mid in sorted(present):
+        meth_name = name_by_id.get(mid, f"meth{mid}")
+        # Rank kmers by slowed-rows of THIS meth type.
+        counts: list[tuple[int, int]] = []
+        for kid, arr in data.items():
+            if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
+                continue
+            if arr.shape[1] <= COL_PARENT_METH:
+                continue
+            cats = arr[:, COL_CATEGORY].astype(np.int8)
+            parents = arr[:, COL_PARENT_METH].astype(np.int8)
+            n = int(((cats == CATEGORY_SLOWED) & (parents == mid)).sum())
+            if n > 0:
+                counts.append((int(kid), n))
+        if not counts:
+            continue
+        counts.sort(key=lambda x: x[1], reverse=True)
+        top = counts[:top_n]
+
+        cols = 3
+        rows = (len(top) + cols - 1) // cols
+        fig = make_subplots(
+            rows=rows,
+            cols=cols,
+            subplot_titles=[
+                f"{decode_kmer(kid)}  (n_{meth_name}={n:,})" for kid, n in top
+            ],
+            vertical_spacing=0.10,
+            horizontal_spacing=0.06,
+        )
+
+        legend_seen: set[str] = set()
+        for i, (kid, _) in enumerate(top):
+            r, c = i // cols + 1, i % cols + 1
+            arr = data[kid]
+            cats = arr[:, COL_CATEGORY].astype(np.int8)
+            parents = arr[:, COL_PARENT_METH].astype(np.int8)
+            ipds = arr[:, COL_IPD]
+
+            m_base = cats == CATEGORY_BASELINE
+            if m_base.any():
+                show = "baseline" not in legend_seen
+                legend_seen.add("baseline")
+                fig.add_trace(
+                    go.Histogram(
+                        x=ipds[m_base], name="baseline", marker_color="#1f77b4",
+                        opacity=0.55, xbins=dict(start=0, end=256, size=4),
+                        histnorm="probability density",
+                        showlegend=show, legendgroup="baseline",
+                    ),
+                    row=r, col=c,
+                )
+
+            m_slow = (cats == CATEGORY_SLOWED) & (parents == mid)
+            if m_slow.any():
+                label = f"slowed/{meth_name}"
+                show = label not in legend_seen
+                legend_seen.add(label)
+                fig.add_trace(
+                    go.Histogram(
+                        x=ipds[m_slow], name=label,
+                        marker_color=color_by_id.get(mid, "#888"),
+                        opacity=0.6, xbins=dict(start=0, end=256, size=4),
+                        histnorm="probability density",
+                        showlegend=show, legendgroup=label,
+                    ),
+                    row=r, col=c,
+                )
+            fig.update_xaxes(range=[0, 200], row=r, col=c)
+
+        fig.update_layout(
+            title=(
+                f"Top {len(top)} kmers by slowed-{meth_name} count — "
+                f"two bumps on the slowed/{meth_name} side ⇒ bimodal."
+            ),
+            barmode="overlay",
+            height=260 * rows,
+        )
+        yield meth_name, fig
 
 
 def _build_ipd_pw_density_figure(data: dict):
