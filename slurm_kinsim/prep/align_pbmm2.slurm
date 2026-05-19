@@ -62,4 +62,10 @@ apptainer exec --bind /data "$SMRT_SIF" \
 echo "Elapsed: $(( $(date +%s) - T ))s"
 
 [ -s "$OUT_BAM" ] || { echo "FAILED: pbmm2 empty output"; exit 1; }
+
+# pbindex the aligned output — ipdSummary requires it, and the post-align
+# .pbi is a different beast from the input .pbi (records have changed).
+apptainer exec --bind /data "$SMRT_SIF" pbindex "$OUT_BAM"
+[ -f "${OUT_BAM}.pbi" ] || { echo "FAILED: pbindex did not produce .pbi"; exit 1; }
+
 samtools flagstat "$OUT_BAM" | head -5
