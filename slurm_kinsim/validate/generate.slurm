@@ -58,7 +58,7 @@ done
 if [ "${#TMP_OUTS[@]}" -eq 1 ]; then
   mv "${TMP_OUTS[0]}" "$SHARD_OUT"
 else
-  samtools merge -@ "$SLURM_CPUS_PER_TASK" -f "$SHARD_OUT" "${TMP_OUTS[@]}"
+  samtools merge -c -@ "$SLURM_CPUS_PER_TASK" -f "$SHARD_OUT" "${TMP_OUTS[@]}"
   rm "${TMP_OUTS[@]}"
 fi
 echo "Done: $SHARD_OUT"
