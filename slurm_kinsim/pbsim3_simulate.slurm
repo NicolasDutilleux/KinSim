@@ -42,13 +42,14 @@
 #         - ERRHMM-ONT.model       (ONT)
 #         - ERRHMM-ONT-HQ.model    (ONT high-quality)
 #
-# PacBio @RG metadata (used by ccs / pbindex / jasmine) defaults to Revio
-# P2-C2 codes. Override via env if a specific chemistry is needed:
-#   PB_BINDINGKIT       (default: 101-820-500)
-#   PB_SEQUENCINGKIT    (default: 101-826-100)
-#   PB_BASECALLERVERSION (default: 5.0.0)
-#   PB_FRAMERATEHZ      (default: 80.000000)
-#   PB_PM               (default: REVIO)   — platform model
+# PacBio @RG kit codes are DERIVED from the model name so the simulated
+# chemistry matches the metadata CCS sees (chemistry mismatch → CCS errors
+# or degraded consensus):
+#   *-SEQUEL → Sequel I P6-C4 kits, basecaller 4.0.0
+#   *-RSII   → RSII   P5-C3 kits, basecaller 2.3.0
+#   other    → Revio  P2-C2 kits, basecaller 5.0.0
+# Override any field via env (PB_BINDINGKIT, PB_SEQUENCINGKIT,
+# PB_BASECALLERVERSION, PB_FRAMERATEHZ, PB_PM).
 #
 # Count N:  ls <genomes_dir>/*.fna | wc -l
 
@@ -119,13 +120,20 @@ rm "${TMPPREFIX}"_*.sam "${TMPPREFIX}"_*.ref 2>/dev/null
 # Patch the @RG so `ccs` accepts the BAM. PBSIM3 emits a minimal
 # ``@RG ID:S1 PL:PACBIO`` line without the PacBio chemistry fields. CCS
 # (and downstream pbbam tools like jasmine, pbindex) FATAL on missing
-# BASECALLERVERSION, BINDINGKIT, SEQUENCINGKIT, FRAMERATEHZ. We inject
-# them with sensible Revio defaults; override via env (see header).
-PB_BINDINGKIT="${PB_BINDINGKIT:-101-820-500}"
-PB_SEQUENCINGKIT="${PB_SEQUENCINGKIT:-101-826-100}"
-PB_BASECALLERVERSION="${PB_BASECALLERVERSION:-5.0.0}"
+# BASECALLERVERSION, BINDINGKIT, SEQUENCINGKIT, FRAMERATEHZ. Pick kit
+# codes that match the PBSIM3 model so CCS doesn't see a chemistry
+# mismatch. Env overrides take precedence.
+case "$(basename "$MODEL_PATH")" in
+  *SEQUEL*) DEF_BK=100-862-200; DEF_SK=101-093-700; DEF_BCV=4.0.0;  DEF_PM=SEQUEL ;;
+  *RSII*)   DEF_BK=100-619-300; DEF_SK=001-093-700; DEF_BCV=2.3.0;  DEF_PM=RSII   ;;
+  *)        DEF_BK=101-820-500; DEF_SK=101-826-100; DEF_BCV=5.0.0;  DEF_PM=REVIO  ;;
+esac
+PB_BINDINGKIT="${PB_BINDINGKIT:-$DEF_BK}"
+PB_SEQUENCINGKIT="${PB_SEQUENCINGKIT:-$DEF_SK}"
+PB_BASECALLERVERSION="${PB_BASECALLERVERSION:-$DEF_BCV}"
 PB_FRAMERATEHZ="${PB_FRAMERATEHZ:-80.000000}"
-PB_PM="${PB_PM:-REVIO}"
+PB_PM="${PB_PM:-$DEF_PM}"
+echo "  @RG chemistry: PM=${PB_PM} BK=${PB_BINDINGKIT} SK=${PB_SEQUENCINGKIT} BCV=${PB_BASECALLERVERSION}"
 PB_DS="READTYPE=SUBREAD;BINDINGKIT=${PB_BINDINGKIT};SEQUENCINGKIT=${PB_SEQUENCINGKIT};BASECALLERVERSION=${PB_BASECALLERVERSION};FRAMERATEHZ=${PB_FRAMERATEHZ}"
 PB_RG=$'@RG\tID:00000000/0--0\tPL:PACBIO\tPM:'"${PB_PM}"$'\tPU:kinsim\tSM:'"${SPECIES}"$'\tDS:'"${PB_DS}"
 samtools view -H "$RAW_BAM" \
