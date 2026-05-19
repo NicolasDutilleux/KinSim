@@ -21,7 +21,9 @@ SHARD_DIR=${1:?shard dir required}
 OUT_BAM=${2:?output BAM required}
 
 ls "$SHARD_DIR"/shard_*.bam
-samtools merge -@ "$SLURM_CPUS_PER_TASK" -f "$OUT_BAM" "$SHARD_DIR"/shard_*.bam
+# -c (combine-rg) collapses identical @RG IDs across shards into one.
+# Without it samtools appends a hex suffix to duplicates → pbindex chokes.
+samtools merge -c -@ "$SLURM_CPUS_PER_TASK" -f "$OUT_BAM" "$SHARD_DIR"/shard_*.bam
 
 apptainer exec --bind /data /containers/apptainer/pacbio-smrt-tools-25.3.sif \
           pbindex "$OUT_BAM"
