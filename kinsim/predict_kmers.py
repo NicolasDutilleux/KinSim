@@ -19,6 +19,10 @@ Outputs (next to the chosen output path):
                 <scenario>_ratio_ipd_vs_none | <scenario>_ratio_pw_vs_none
                 (5 prediction cols × N_scenarios + 2 ratio cols × (N-1) for non-none)
     <out>.npz   compact binary (one array per scenario, plus kmer ids)
+    <out>.html  per-scenario distribution of μ_ipd / μ_baseline across all
+                kmers — one histogram per non-none scenario, with median +
+                IQR annotations. Diagnostic for "did the model learn a
+                plausible shift per (meth_type, offset)?".
 
 Predicted means/sigmas are returned in **raw uint8-equivalent space**
 (via ``inv_log_transform``), so they are directly comparable to PacBio
@@ -397,7 +401,114 @@ def predict_all(
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
     _write_tsv(output_prefix.with_suffix(".tsv"), scenarios, raw_preds)
     _write_npz(output_prefix.with_suffix(".npz"), scenarios, raw_preds)
+    _write_ratio_html(output_prefix.with_suffix(".html"), scenarios, raw_preds)
     log.info("Done.")
+
+
+def _write_ratio_html(
+    output_html: Path,
+    scenarios: list[tuple[str, int, int]],
+    raw_preds: dict[str, np.ndarray],
+) -> None:
+    """HTML dashboard — per-scenario distribution of μ_ipd / μ_baseline across all kmers.
+
+    One subplot per non-``none`` scenario, with the histogram of the per-kmer
+    IPD ratio (model μ for this scenario / model μ for ``none``). Annotates
+    median and IQR so the reader sees the central tendency at a glance.
+
+    Lets you eyeball whether the model has learned a plausible per-scenario
+    shift (median ratio > 1 for methylated scenarios) and how heterogeneous
+    the response is across kmers (wide IQR = high kmer-specificity).
+    """
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        log.warning("plotly not installed — skipping ratio distribution HTML")
+        return
+
+    if "none" not in raw_preds:
+        log.warning("predict-kmers: no 'none' scenario, can't compute ratios — skipping HTML")
+        return
+
+    none_mu_ipd, none_mu_pw, _, _ = _to_physical(raw_preds["none"])
+    eps = 1e-6
+    none_mu_ipd_safe = np.maximum(none_mu_ipd, eps)
+    none_mu_pw_safe = np.maximum(none_mu_pw, eps)
+
+    # Filter to non-none scenarios that actually have data.
+    meth_scenarios = [
+        (label, m_id, k_off)
+        for (label, m_id, k_off) in scenarios
+        if label != "none" and label in raw_preds
+    ]
+    if not meth_scenarios:
+        log.info("predict-kmers: no methylated scenarios — skipping HTML")
+        return
+
+    cols = 3
+    rows = (len(meth_scenarios) + cols - 1) // cols
+    fig = make_subplots(
+        rows=rows,
+        cols=cols,
+        subplot_titles=[lbl for lbl, _, _ in meth_scenarios],
+        vertical_spacing=0.12,
+        horizontal_spacing=0.06,
+    )
+
+    color_by_mid = {1: "#d62728", 2: "#9467bd", 3: "#2ca02c", 4: "#ff7f0e"}
+
+    for i, (label, m_id, _k_off) in enumerate(meth_scenarios):
+        r, c = i // cols + 1, i % cols + 1
+        mu_ipd, _, _, _ = _to_physical(raw_preds[label])
+        ratio = mu_ipd / none_mu_ipd_safe
+
+        # Robust stats — full kmer set (4^K ~ 4M rows), report quartiles.
+        q05, q25, q50, q75, q95 = np.percentile(ratio, [5, 25, 50, 75, 95])
+        fig.add_trace(
+            go.Histogram(
+                x=ratio,
+                xbins=dict(start=0, end=6.0, size=0.05),
+                marker_color=color_by_mid.get(m_id, "#888"),
+                opacity=0.75,
+                showlegend=False,
+            ),
+            row=r,
+            col=c,
+        )
+        # μ_ratio = 1 vertical line — visual anchor for "no shift".
+        fig.add_vline(x=1.0, line=dict(color="black", dash="dot", width=1), row=r, col=c)
+        fig.add_vline(x=q50, line=dict(color="#222", width=2), row=r, col=c)
+        fig.add_annotation(
+            row=r, col=c, xref="x domain", yref="y domain",
+            x=0.98, y=0.98, xanchor="right", yanchor="top",
+            text=(
+                f"median={q50:.2f}<br>IQR=[{q25:.2f}, {q75:.2f}]<br>"
+                f"p05={q05:.2f}  p95={q95:.2f}<br>n={len(ratio):,}"
+            ),
+            showarrow=False,
+            font=dict(size=10, color="#222"),
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="rgba(0,0,0,0.2)",
+            borderwidth=1,
+            borderpad=3,
+        )
+        fig.update_xaxes(range=[0, 6.0], title_text="μ_ipd / μ_baseline" if r == rows else None,
+                         row=r, col=c)
+        fig.update_yaxes(title_text="count" if c == 1 else None, row=r, col=c)
+
+    fig.update_layout(
+        title=(
+            "Per-kmer μ_ipd ratio vs unmethylated baseline — distribution across all "
+            f"{len(none_mu_ipd):,} kmers per methylation scenario. "
+            "Dotted line at 1.0 = no shift; solid line = median."
+        ),
+        height=320 * rows,
+        bargap=0.02,
+    )
+
+    log.info("Writing %s ...", output_html)
+    fig.write_html(str(output_html), include_plotlyjs="cdn", full_html=True)
 
 
 def main(argv=None):
