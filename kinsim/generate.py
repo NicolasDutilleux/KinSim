@@ -1509,9 +1509,11 @@ def generate_from_bam(
         out_dict = {"HD": hd}
         # Single synthetic RG with a pbindex-friendly ID. Replaces the
         # bystrandify-mangled RG IDs (e.g. `f7c20c6c/33--33-744DFBEF`)
-        # that pbindex rejects. Copies non-ID fields from the first input
-        # RG so SM/LB/PU/PM metadata is preserved.
-        synthetic_rg = {"ID": "kinsim/0--0", "PL": "PACBIO", "DS": "READTYPE=CCS"}
+        # that pbindex rejects. Format must be ``<8-hex>/<int>--<int>``:
+        # pbindex parses the prefix as a movie hash via stoul(), so the
+        # 8 chars MUST be valid hex (0-9a-f). All-zero hash is safe and
+        # recognisable; non-hex (e.g. "kinsim") triggers stoul FATAL.
+        synthetic_rg = {"ID": "00000000/0--0", "PL": "PACBIO", "DS": "READTYPE=CCS"}
         if "RG" in in_dict and in_dict["RG"]:
             first = dict(in_dict["RG"][0])
             first["ID"] = synthetic_rg["ID"]
