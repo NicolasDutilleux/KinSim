@@ -1543,6 +1543,47 @@ def generate_from_bam(
                        "SEQUENCINGKIT=101-826-100;BASECALLERVERSION=5.0.0;"
                        "FRAMERATEHZ=80.000000"),
             }]
+
+        # @PG chain — append a KinSim record after the input's chain (ccs,
+        # bystrandify, pbmm2, ...). Reviewers can read the BAM header and
+        # see exactly which tools touched the data, in order, plus the
+        # KinSim training corpus + checkpoint that produced these kinetics.
+        from . import __version__ as _kinsim_version
+        in_pg = in_dict.get("PG", []) or []
+        existing_ids = {p.get("ID") for p in in_pg if p.get("ID")}
+        pp_targets = {p.get("PP") for p in in_pg if p.get("PP")}
+        # Tail = the @PG no other @PG points to as PP (= latest applied tool).
+        chain_tail = next(
+            (p["ID"] for p in reversed(in_pg) if p.get("ID") and p["ID"] not in pp_targets),
+            None,
+        )
+        kinsim_id = "kinsim"
+        _suffix = 1
+        while kinsim_id in existing_ids:
+            kinsim_id = f"kinsim.{_suffix}"
+            _suffix += 1
+        try:
+            _mcfg = model.get_config() if model is not None else {}
+            _arch = _mcfg.get("architecture", "conv")
+            _ksize = int(_mcfg.get("kmer_size", 11))
+        except Exception:
+            _arch, _ksize = "?", 11
+        _n_motifs = motif_string.count(";") + 1 if motif_string else 0
+        kinsim_pg = {
+            "ID": kinsim_id,
+            "PN": "kinsim",
+            "VN": _kinsim_version,
+            "CL": " ".join(["kinsim"] + sys.argv[1:]),
+            "DS": (
+                "KinSim kinetic injection. "
+                "Training corpus: Revio HiFi (Strepto + Vega). "
+                f"n_motifs={_n_motifs}; K={_ksize}; architecture={_arch}"
+            ),
+        }
+        if chain_tail:
+            kinsim_pg["PP"] = chain_tail
+        out_dict["PG"] = in_pg + [kinsim_pg]
+
         header_out = pysam.AlignmentHeader.from_dict(out_dict)
 
     # Multi-threaded BGZF I/O — htslib uses these threads for parallel
