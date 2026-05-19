@@ -1088,11 +1088,16 @@ def _build_html_figures(
             )
         )
 
-    # ── Fig 7+: one section per meth type — answer the bimodality question ─
-    for meth_name, fig_m in _build_per_meth_kmer_figures(data, top_n=12):
+    # ── Fig 7+: two sections per meth type ─
+    #   • top 12 by slowed-meth count — highest-signal kmers
+    #   • 12 random kmers (≥ 50 slowed rows)  — sanity check that bimodality
+    #     isn't a top-n artefact. Each subplot overlays a Gaussian fit
+    #     (μ, σ from data) on top of the histogram so the user can see
+    #     whether the slowed distribution is single- or multi-modal.
+    for meth_name, panel_label, fig_m in _build_per_meth_kmer_figures(data, top_n=12):
         figures.append(
             (
-                f"Per-kmer baseline vs slowed/{meth_name} — top 12 by slowed-{meth_name} count",
+                f"Per-kmer baseline vs slowed/{meth_name} — {panel_label}",
                 fig_m,
             )
         )
@@ -1217,16 +1222,21 @@ def _build_kmer_trend_figure(data: dict, top_n: int = 12):
 
 
 def _build_per_meth_kmer_figures(data: dict, top_n: int = 12):
-    """One figure per meth type: top-N kmers for that meth, baseline + slowed/T.
+    """Two figures per meth type: top-N by slowed count, and N random kmers.
+
+    Each subplot overlays:
+      • baseline histogram (blue) + fitted Gaussian curve
+      • slowed/T histogram (meth-typed colour) + fitted Gaussian curve
+      • annotation with μ, σ for both distributions
 
     Diagnostic for the "bimodal slowed peak" question:
-      - 1 bump (slowed cleanly shifted from baseline) → model fits with 1 Gaussian.
-      - 2 bumps on the slowed side (PER kmer) → mixed populations specific to
-        that kmer. Some kmers are bimodal, others aren't — kmer-specific issue.
-      - 2 bumps on EVERY kmer of a given meth type → systematic. Upstream
-        bug (extract misattributing) or model architecture limit.
+      - Slowed Gaussian fits the histogram well → unimodal, refine done.
+      - Histogram has 2 bumps but only 1 Gaussian → bimodal, refine didn't
+        clean. The Gaussian curve will sit awkwardly between the bumps.
+      - 2 bumps on EVERY kmer of a given meth type → systematic substoichio
+        or extract misattribution.
 
-    Yields ``(meth_name, plotly_figure)`` pairs.
+    Yields ``(meth_name, panel_label, plotly_figure)`` triples.
     """
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
@@ -1242,6 +1252,22 @@ def _build_per_meth_kmer_figures(data: dict, top_n: int = 12):
 
     name_by_id = {v: k for k, v in get_meth_ids().items()}
     color_by_id = {1: "#d62728", 2: "#9467bd", 3: "#2ca02c", 4: "#ff7f0e"}
+    MIN_RANDOM_N = 50           # min slowed rows for a kmer to be eligible for the random panel
+    GAUSS_X = np.arange(0, 201, dtype=np.float32)
+
+    def _gauss_curve(values: np.ndarray):
+        """Return (mu, sigma, y) for a 1-D Gaussian fitted by moments to `values`.
+
+        Returns ``(None, None, None)`` if values is empty or sigma is 0.
+        """
+        if values.size == 0:
+            return None, None, None
+        mu = float(values.mean())
+        sigma = float(values.std(ddof=0))
+        if sigma <= 0:
+            return mu, sigma, None
+        y = np.exp(-0.5 * ((GAUSS_X - mu) / sigma) ** 2) / (sigma * np.sqrt(2 * np.pi))
+        return mu, sigma, y
 
     # Discover meth types present in the data.
     present: set[int] = set()
@@ -1254,6 +1280,7 @@ def _build_per_meth_kmer_figures(data: dict, top_n: int = 12):
         parents = arr[:, COL_PARENT_METH].astype(np.int8)
         present.update({int(p) for p in parents[cats == CATEGORY_SLOWED] if p > 0})
 
+    rng = np.random.default_rng(42)
     for mid in sorted(present):
         meth_name = name_by_id.get(mid, f"meth{mid}")
         # Rank kmers by slowed-rows of THIS meth type.
@@ -1271,68 +1298,130 @@ def _build_per_meth_kmer_figures(data: dict, top_n: int = 12):
         if not counts:
             continue
         counts.sort(key=lambda x: x[1], reverse=True)
-        top = counts[:top_n]
 
-        cols = 3
-        rows = (len(top) + cols - 1) // cols
-        fig = make_subplots(
-            rows=rows,
-            cols=cols,
-            subplot_titles=[
-                f"{decode_kmer(kid)}  (n_{meth_name}={n:,})" for kid, n in top
-            ],
-            vertical_spacing=0.10,
-            horizontal_spacing=0.06,
-        )
+        # Top panel: highest-signal kmers.
+        top_panel = counts[:top_n]
+        # Random panel: uniformly drawn from kmers with ≥ MIN_RANDOM_N slowed
+        # rows. Avoids pathological low-n kmers in the random sample.
+        eligible = [c for c in counts if c[1] >= MIN_RANDOM_N]
+        if len(eligible) > top_n:
+            idx = rng.choice(len(eligible), size=top_n, replace=False)
+            random_panel = [eligible[int(i)] for i in idx]
+        else:
+            random_panel = eligible
 
-        legend_seen: set[str] = set()
-        for i, (kid, _) in enumerate(top):
-            r, c = i // cols + 1, i % cols + 1
-            arr = data[kid]
-            cats = arr[:, COL_CATEGORY].astype(np.int8)
-            parents = arr[:, COL_PARENT_METH].astype(np.int8)
-            ipds = arr[:, COL_IPD]
+        panels = [
+            (f"top {len(top_panel)} by slowed-{meth_name} count", top_panel),
+            (f"{len(random_panel)} random (≥ {MIN_RANDOM_N} slowed rows)", random_panel),
+        ]
 
-            m_base = cats == CATEGORY_BASELINE
-            if m_base.any():
-                show = "baseline" not in legend_seen
-                legend_seen.add("baseline")
-                fig.add_trace(
-                    go.Histogram(
-                        x=ipds[m_base], name="baseline", marker_color="#1f77b4",
-                        opacity=0.55, xbins=dict(start=0, end=256, size=4),
-                        histnorm="probability density",
-                        showlegend=show, legendgroup="baseline",
-                    ),
-                    row=r, col=c,
+        for panel_label, kmer_list in panels:
+            if not kmer_list:
+                continue
+
+            cols = 3
+            rows = (len(kmer_list) + cols - 1) // cols
+            fig = make_subplots(
+                rows=rows,
+                cols=cols,
+                subplot_titles=[
+                    f"{decode_kmer(kid)}  (n_{meth_name}={n:,})" for kid, n in kmer_list
+                ],
+                vertical_spacing=0.12,
+                horizontal_spacing=0.06,
+            )
+
+            legend_seen: set[str] = set()
+            for i, (kid, _) in enumerate(kmer_list):
+                r, c = i // cols + 1, i % cols + 1
+                arr = data[kid]
+                cats = arr[:, COL_CATEGORY].astype(np.int8)
+                parents = arr[:, COL_PARENT_METH].astype(np.int8)
+                ipds = arr[:, COL_IPD]
+
+                m_base = cats == CATEGORY_BASELINE
+                m_slow = (cats == CATEGORY_SLOWED) & (parents == mid)
+                base_ipds = ipds[m_base]
+                slow_ipds = ipds[m_slow]
+
+                # Baseline histogram + Gaussian.
+                if base_ipds.size > 0:
+                    show = "baseline" not in legend_seen
+                    legend_seen.add("baseline")
+                    fig.add_trace(
+                        go.Histogram(
+                            x=base_ipds, name="baseline", marker_color="#1f77b4",
+                            opacity=0.55, xbins=dict(start=0, end=256, size=4),
+                            histnorm="probability density",
+                            showlegend=show, legendgroup="baseline",
+                        ),
+                        row=r, col=c,
+                    )
+                    mu_b, sg_b, y_b = _gauss_curve(base_ipds)
+                    if y_b is not None:
+                        fig.add_trace(
+                            go.Scatter(
+                                x=GAUSS_X, y=y_b, mode="lines",
+                                line=dict(color="#1f77b4", width=2),
+                                name="baseline fit", legendgroup="baseline",
+                                showlegend=False, hoverinfo="skip",
+                            ),
+                            row=r, col=c,
+                        )
+
+                # Slowed histogram + Gaussian.
+                if slow_ipds.size > 0:
+                    label = f"slowed/{meth_name}"
+                    show = label not in legend_seen
+                    legend_seen.add(label)
+                    fig.add_trace(
+                        go.Histogram(
+                            x=slow_ipds, name=label,
+                            marker_color=color_by_id.get(mid, "#888"),
+                            opacity=0.6, xbins=dict(start=0, end=256, size=4),
+                            histnorm="probability density",
+                            showlegend=show, legendgroup=label,
+                        ),
+                        row=r, col=c,
+                    )
+                    mu_s, sg_s, y_s = _gauss_curve(slow_ipds)
+                    if y_s is not None:
+                        fig.add_trace(
+                            go.Scatter(
+                                x=GAUSS_X, y=y_s, mode="lines",
+                                line=dict(color=color_by_id.get(mid, "#888"), width=2),
+                                name=f"{label} fit", legendgroup=label,
+                                showlegend=False, hoverinfo="skip",
+                            ),
+                            row=r, col=c,
+                        )
+
+                # μ/σ annotation top-right of each subplot.
+                mu_b_s = f"μ_b={mu_b:.1f}, σ_b={sg_b:.1f}" if base_ipds.size > 0 else "μ_b=—"
+                mu_s_s = (
+                    f"μ_s={mu_s:.1f}, σ_s={sg_s:.1f}" if slow_ipds.size > 0 else "μ_s=—"
                 )
-
-            m_slow = (cats == CATEGORY_SLOWED) & (parents == mid)
-            if m_slow.any():
-                label = f"slowed/{meth_name}"
-                show = label not in legend_seen
-                legend_seen.add(label)
-                fig.add_trace(
-                    go.Histogram(
-                        x=ipds[m_slow], name=label,
-                        marker_color=color_by_id.get(mid, "#888"),
-                        opacity=0.6, xbins=dict(start=0, end=256, size=4),
-                        histnorm="probability density",
-                        showlegend=show, legendgroup=label,
-                    ),
+                fig.add_annotation(
                     row=r, col=c,
+                    xref="x domain", yref="y domain",
+                    x=0.98, y=0.98, xanchor="right", yanchor="top",
+                    text=f"{mu_b_s}<br>{mu_s_s}",
+                    showarrow=False,
+                    font=dict(size=9, color="#222"),
+                    bgcolor="rgba(255,255,255,0.7)",
+                    bordercolor="rgba(0,0,0,0.2)", borderwidth=1, borderpad=2,
                 )
-            fig.update_xaxes(range=[0, 200], row=r, col=c)
+                fig.update_xaxes(range=[0, 200], row=r, col=c)
 
-        fig.update_layout(
-            title=(
-                f"Top {len(top)} kmers by slowed-{meth_name} count — "
-                f"two bumps on the slowed/{meth_name} side ⇒ bimodal."
-            ),
-            barmode="overlay",
-            height=260 * rows,
-        )
-        yield meth_name, fig
+            fig.update_layout(
+                title=(
+                    f"slowed/{meth_name} — {panel_label}. "
+                    "Curve = Gaussian fit (μ, σ) on top-right per kmer."
+                ),
+                barmode="overlay",
+                height=260 * rows,
+            )
+            yield meth_name, panel_label, fig
 
 
 def _build_ipd_pw_density_figure(data: dict):
