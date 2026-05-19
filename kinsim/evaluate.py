@@ -196,7 +196,8 @@ def evaluate(
     mse = (diff**2).mean(axis=0)
     mae = np.abs(diff).mean(axis=0)
 
-    _METH_NAMES = {v: k for k, v in METH_IDS.items()}
+    from .utils.encoding import get_meth_ids as _gmi
+    _METH_NAMES = {v: k for k, v in _gmi().items()}
 
     def _pearson(a, b):
         return float(np.corrcoef(a, b)[0, 1]) if a.std() > 1e-9 and b.std() > 1e-9 else 0.0
@@ -409,38 +410,67 @@ def plot_kmer_distribution(
             "matplotlib is required for plotting. Install with: pip install matplotlib"
         ) from exc
 
-    if len(kmer_str) != 11:
-        raise ValueError(f"kmer_str must be exactly 11 bases, got {len(kmer_str)}")
-    if meth_name not in METH_IDS:
-        raise ValueError(f"meth_name must be one of {list(METH_IDS)}, got '{meth_name}'")
-
-    kmer_id = encode_kmer(kmer_str)
-    meth_id = METH_IDS[meth_name]
-    key = (kmer_id, meth_id)
-
-    if key not in data:
-        raise KeyError(
-            f"Context '{kmer_str}' / '{meth_name}' not found in dataset.\n"
-            f"Available meth states for this k-mer: "
-            + str([m_name for m_name, m_id in METH_IDS.items() if (kmer_id, m_id) in data])
+    from .utils.encoding import K as _K
+    from .utils.encoding import get_meth_ids as _gmi
+    from .utils.sample_layout import (
+        CATEGORY_SLOWED,
+        COL_CATEGORY,
+        COL_IPD,
+        COL_PARENT_METH,
+        COL_PW,
+    )
+    _METH_IDS_RUNTIME = _gmi()
+    if len(kmer_str) != _K:
+        raise ValueError(f"kmer_str must be exactly {_K} bases, got {len(kmer_str)}")
+    if meth_name not in _METH_IDS_RUNTIME:
+        raise ValueError(
+            f"meth_name must be one of {list(_METH_IDS_RUNTIME)}, got '{meth_name}'"
         )
 
-    # Actual data: raw uint8 → log1p (use only IPD/PW columns)
-    samples = data[key].astype(np.float32)
-    actual_raw = samples[:, :2]  # (N, 2) [IPD, PW]
-    actual_log = np.log1p(actual_raw)  # (N, 2) log1p space
+    kmer_id = encode_kmer(kmer_str)
+    meth_id = _METH_IDS_RUNTIME[meth_name]
 
-    # Build stoichiometric meth_probs from stored fraction (3rd column)
-    # For legacy 2-column data, default to 1.0 for methylated.
-    if samples.shape[1] >= 3:
-        fraction = float(samples[0, 2])
-    else:
-        fraction = 1.0 if meth_id > 0 else 0.0
-
-    kmer_tensor = torch.tensor([kmer_id], dtype=torch.long, device=device)
-    meth_probs = torch.zeros(1, 4, device=device)
+    # Current shard format: int kmer_id → ndarray with meth in COL_PARENT_METH.
+    # Filter rows of THIS kmer where the parent meth matches the requested name,
+    # category=SLOWED (the rows the user actually wants to see for non-none
+    # meth_name; for meth_name="none" we filter to BASELINE rows).
+    if kmer_id not in data or not isinstance(data[kmer_id], np.ndarray):
+        raise KeyError(
+            f"k-mer '{kmer_str}' not found in dataset (int-keyed format)."
+        )
+    arr = data[kmer_id]
     if meth_id > 0:
-        meth_probs[0, meth_id] = fraction
+        sel = (arr[:, COL_CATEGORY].astype(np.int8) == CATEGORY_SLOWED) & (
+            arr[:, COL_PARENT_METH].astype(np.int8) == meth_id
+        )
+    else:
+        from .utils.sample_layout import CATEGORY_BASELINE
+        sel = arr[:, COL_CATEGORY].astype(np.int8) == CATEGORY_BASELINE
+    if not sel.any():
+        raise KeyError(
+            f"Context '{kmer_str}' / '{meth_name}' has 0 matching rows."
+        )
+    samples = arr[sel].astype(np.float32)
+    actual_raw = np.stack([samples[:, COL_IPD], samples[:, COL_PW]], axis=1)
+    actual_log = np.log1p(actual_raw)
+
+    # Build a 3-D meth_probs (B, K+rev, M) — ConvPredictor refuses 2-D input.
+    # Mark the active site (slot KMER_PRED_IDX) with the meth_id's full prob.
+    from .utils.encoding import KMER_PRED_IDX
+    _M = len(_METH_IDS_RUNTIME)  # number of meth types (incl. none)
+    # Active-site row count = K + N_REV (3 by default). Use the model's config
+    # if available to stay K-agnostic.
+    try:
+        mcfg = model.get_config()
+        _kmer_size = int(mcfg.get("kmer_size", _K))
+        _n_rev = int(mcfg.get("n_rev_meth", 3))
+    except Exception:
+        _kmer_size = _K
+        _n_rev = 3
+    meth_probs = torch.zeros(1, _kmer_size + _n_rev, _M, device=device)
+    if meth_id > 0:
+        meth_probs[0, KMER_PRED_IDX, meth_id] = 1.0
+    kmer_tensor = torch.tensor([kmer_id], dtype=torch.long, device=device)
 
     params = model(kmer_tensor, meth_probs)  # (1, 4)
     mu_log = params[0, :2].cpu().numpy()  # [μ_ipd, μ_pw] log1p
@@ -603,8 +633,12 @@ def main(argv=None) -> None:
 
             raw_data = pickle.load(f)
 
-        # Remove non-tuple keys (__meta__, etc.)
-        data = {k: v for k, v in raw_data.items() if isinstance(k, tuple)}
+        # Keep int-keyed entries (current shard format); drop __meta__ etc.
+        data = {
+            k: v
+            for k, v in raw_data.items()
+            if isinstance(k, (int, np.integer)) and isinstance(v, np.ndarray)
+        }
 
         plot_kmer_distribution(
             model,

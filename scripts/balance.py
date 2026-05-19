@@ -107,6 +107,18 @@ def balance_pkl(
         for k, v in data.items()
         if isinstance(k, tuple) and len(k) == 2 and isinstance(v, np.ndarray)
     }
+    # Refuse current int-keyed shards explicitly instead of silently emitting
+    # an empty output. balance.py was written for the legacy (kmer_id, meth_id)
+    # tuple-key layout. Current shards key by kmer_id alone (meth in
+    # COL_PARENT_METH). Use `kinsim refine` for filtering/balancing instead.
+    if not keyed and any(isinstance(k, (int, np.integer)) for k in data):
+        log.error(
+            "Input %s uses the current int-keyed shard format, but balance.py "
+            "was written for the legacy (kmer_id, meth_id) tuple-key layout. "
+            "Use `kinsim refine` (GMM-based per-bucket filtering) instead.",
+            input_path,
+        )
+        sys.exit(2)
 
     keys_in = len(keyed)
     samples_in = sum(len(v) for v in keyed.values())

@@ -1800,10 +1800,11 @@ def main(argv: list[str] | None = None) -> None:
         dest="biology_mask",
         action="store_false",
         default=None,
-        help="Disable architectural biology mask (default: ON). When on, "
-        "the model literally cannot see impossible (base, meth_id) "
-        "pairs (e.g. m5C on an A) — kills the 'meth flag → boost' "
-        "shortcut at the architecture level.",
+        help="Disable architectural biology mask (default: OFF per "
+        "kinsim_config.yaml, model.biology_mask=false — v0.5.0 had a "
+        "subtle synthesized-vs-template-strand bug; extract already "
+        "enforces base/meth chemistry so the mask is a redundant "
+        "safety net). Pass --biology-mask to force it ON.",
     )
     parser.add_argument(
         "--log-sigma-clamp-max",

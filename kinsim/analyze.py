@@ -49,7 +49,17 @@ log = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-_ID_TO_NAME = {v: k for k, v in METH_IDS.items()}
+def _id_to_name() -> dict[int, str]:
+    """Dynamic id→name from YAML — picks up user-added meth types at call time.
+
+    Called per-figure so a YAML edit between analyze invocations is reflected
+    without re-importing the module.
+    """
+    from .utils.encoding import get_meth_ids
+    return {v: k for k, v in get_meth_ids().items()}
+
+
+_ID_TO_NAME = _id_to_name()  # back-compat snapshot for callers that read it directly
 
 # Plotly palette — cycles for any number of meth types.
 _COLORS = [
@@ -486,8 +496,9 @@ def collect_stats(data: dict, pkl_path: str) -> DictStats:
     kmer_size = _detect_kmer_size(data, meta)
     total_possible = 4**kmer_size
 
-    # Known meth_ids — see kinsim.utils.encoding.METH_IDS.
-    KNOWN_METH_IDS = (0, 1, 2, 3)
+    # Known meth_ids — dynamic from YAML so user-added types appear.
+    from .utils.encoding import get_meth_ids as _gmi
+    KNOWN_METH_IDS = tuple(sorted(_gmi().values()))
 
     # Pre-allocate per-meth scalar lists (cheap append, np.array() at end).
     # No ndarray slices are stored — only per-(kmer, meth) scalar stats.

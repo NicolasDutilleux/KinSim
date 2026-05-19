@@ -57,6 +57,17 @@ class ModkitParser(BaseOutputParser):
         min_fraction: float = 0.40,
         min_detected: int = 20,
     ) -> str:
+        # The "motif" column we emit is ``chrom:pos:strand`` — NOT an IUPAC
+        # sequence. Downstream consumers (parse_motifs, scan_sequence) expect
+        # IUPAC patterns and WILL crash on this. modkit pileup is per-site,
+        # not motif-discovery. Use jasmine_modkit.slurm to convert pileup to
+        # real motif strings, or pass --motifs to modkit pileup directly.
+        log.warning(
+            "ModkitParser emits per-site pseudo-motifs (chrom:pos:strand) "
+            "that are NOT valid IUPAC. Use this output for downstream "
+            "motif-discovery only (e.g. modkit find-motifs); do not feed "
+            "it directly to kinsim extract / generate."
+        )
         entries: list[str] = []
         seen: set[str] = set()  # deduplicate identical entries
 
@@ -108,14 +119,18 @@ class ModkitParser(BaseOutputParser):
         return ";".join(entries)
 
     def is_file_for_this_parser(self, filepath: str) -> bool:
-        """Match .bed or .tsv files with modkit-like content."""
+        """Match modkit bedMethyl files only — narrow auto-detect.
+
+        We REQUIRE the filename to mention ``modkit`` or ``bedmethyl`` (in
+        addition to the column-shape check). Otherwise any TSV with 11+
+        columns would auto-trigger this parser and the user would get a
+        confusing "modkit emits per-site pseudo-motifs" CSV instead of an
+        explicit error. Use ``create_parser("modkit")`` to bypass this.
+        """
         lower = filepath.lower()
-        if not (
-            lower.endswith(".bed")
-            or lower.endswith(".tsv")
-            or "modkit" in lower
-            or "bedmethyl" in lower
-        ):
+        if not ("modkit" in lower or "bedmethyl" in lower):
+            return False
+        if not (lower.endswith(".bed") or lower.endswith(".tsv")):
             return False
         try:
             with open(filepath) as f:

@@ -15,7 +15,7 @@ from __future__ import annotations
 import csv
 import logging
 
-from kinsim.utils.encoding import METH_IDS
+from kinsim.utils.encoding import METH_IDS, get_meth_ids
 from kinsim.utils.motifs import reverse_complement
 
 from .base import BaseOutputParser
@@ -202,7 +202,7 @@ class PacBioParser(BaseOutputParser):
                     else:
                         mod_type = resolved
 
-                if mod_type not in METH_IDS:
+                if mod_type not in get_meth_ids():
                     log.warning(
                         "PacBio CSV line %d: unknown mod type '%s' for %s -- skipped",
                         lineno,

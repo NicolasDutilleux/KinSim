@@ -447,12 +447,14 @@ def parse_motifs_per_strand(motif_string: str) -> tuple[list, list]:
         fwd_motifs.append({"pattern": fwd_pattern, "id": m_id, "pos": mod_pos, "frac": frac})
         # Reverse: matches the same modification on the − strand. Use the
         # rev-comp sequence with ``rc_mod_pos = len(seq) - 1 - mod_pos`` and
-        # validate that the rc base is a target for this meth type. If the
-        # user already provided the rc as a separate motif entry, skip — it
-        # will be parsed in its own pass.
+        # validate that the rc base is a target for this meth type.
+        # NOTE: even when the user provides the rc as a separate motif entry
+        # (e.g. asymmetric pair CTGAAG + CTTCAG), we STILL add this rev_motif.
+        # Otherwise rev_motifs ends up empty for bilaterally-provided motifs,
+        # and both partners land in fwd_motifs — mis-routing − strand
+        # methylations into fwd_meth_map. The duplicate that comes from the
+        # partner iteration scans the same + strand positions and is fine.
         rc = reverse_complement(seq)
-        if rc in user_seqs:
-            continue  # user provides the rc explicitly; will be added when iterated
         rc_mod_pos = len(seq) - 1 - mod_pos
         try:
             _validate_mod_pos(rc, rc_mod_pos, m_type)
@@ -478,19 +480,17 @@ def parse_motifs_per_strand(motif_string: str) -> tuple[list, list]:
             f"{'entry' if len(errors) == 1 else 'entries'}.\n  - {bullet}"
         )
 
-    # When both orientations are user-provided (e.g. CTGAAG + CTTCAG),
-    # parse_motifs_per_strand puts each in fwd_motifs (its own forward
-    # match against the + strand of the reference). For the user-provided
-    # rc partner (CTTCAG when the genome's + strand carries CTGAAG), its
-    # forward matches in the + strand reference correspond to genomic loci
-    # where the + strand happens to read as CTTCAG (which is the rc of a
-    # CTGAAG site on the − strand). So those matches in fwd_motifs are
-    # actually capturing − strand methylations. To keep the strand semantics
-    # correct, we relabel: any user-provided sequence whose rc is also user-
-    # provided contributes to BOTH fwd and rev maps via the partner — we let
-    # the iteration above handle this naturally because both sequences end
-    # up in fwd_motifs (each scanning the + strand directly), and the rev_
-    # motifs list captures the auto-rc cases for asymmetric inputs.
+    # Strand bookkeeping summary:
+    #   Each user-provided entry contributes one fwd_pattern (scans + strand
+    #   for the user's exact sequence) and one rev_pattern (scans + strand
+    #   for the rc of the user's sequence — which corresponds to − strand
+    #   occurrences of the original motif).
+    #   - Palindromic motifs (e.g. GATC): fwd and rev patterns scan the same
+    #     sites; rev_meth_map tags the partner-strand methylation position.
+    #   - Asymmetric bilaterally-provided pairs (CTGAAG + CTTCAG): each entry
+    #     adds its own fwd + rev. The "duplicate" rev from one partner equals
+    #     the fwd of the other, but their meth_pos differ — each captures the
+    #     methylation on its own strand at the correct base.
     return fwd_motifs, rev_motifs
 
 
@@ -621,9 +621,10 @@ def parse_motifs_csv(csv_path, min_fraction=0.40, min_detected=20):
                     continue
                 mod_type = resolved
 
-            if mod_type not in METH_IDS:
+            if mod_type not in get_meth_ids():
                 log.warning(
-                    "motifs.csv line %d: unknown mod type '%s' for %s — skipped",
+                    "motifs.csv line %d: mod type '%s' for %s not declared "
+                    "in kinsim_config.yaml kinetic_signatures — skipped",
                     lineno,
                     mod_type,
                     motif_seq,

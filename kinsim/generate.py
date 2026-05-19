@@ -738,6 +738,9 @@ def _load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
         config = json.load(f)
 
     # Geometry guard — the numpy hot path is K=11-specific.
+    # (Old configs used the key "KMER_PRED_IDX"; current ConvPredictor writes
+    # "active_site_index". The old key is never produced anymore, but kept
+    # as a tolerant read for any legacy pickled config still floating around.)
     ckpt_kmer_size = int(config.get("kmer_size", K))
     ckpt_active_idx = int(config.get("active_site_index", config.get("KMER_PRED_IDX", 7)))
     if ckpt_kmer_size != K:

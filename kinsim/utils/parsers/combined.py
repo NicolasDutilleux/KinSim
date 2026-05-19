@@ -10,7 +10,8 @@ and fibertools 6mA results into a single CSV:
 Column mapping to KinSim:
     mod_type  -> KinSim mod type (5mC->m5C, 6mA->m6A, 4mC->m4C)
     motif     -> IUPAC recognition sequence
-    offset    -> 0-based position of modified base within motif
+    offset    -> 1-based position of modified base within motif
+                 (PacBio convention; matches parse_motifs() which subtracts 1)
     n_sites   -> nDetected (for filtering)
     frac_mod  -> fraction (for filtering)
     source    -> informational only (modkit, fibertools, etc.)
@@ -23,7 +24,7 @@ and 'frac_mod' in the CSV header.
 import csv
 import logging
 
-from kinsim.utils.encoding import METH_IDS
+from kinsim.utils.encoding import METH_IDS, get_meth_ids
 
 from .base import BaseOutputParser
 from .registry import register
@@ -112,9 +113,10 @@ class CombinedParser(BaseOutputParser):
                 if fraction < min_fraction or n_sites < min_detected:
                     continue
 
-                if mod_type not in METH_IDS:
+                if mod_type not in get_meth_ids():
                     log.warning(
-                        "Combined CSV line %d: mod_type '%s' not in METH_IDS -- skipped",
+                        "Combined CSV line %d: mod_type '%s' not declared in "
+                        "kinsim_config.yaml kinetic_signatures -- skipped",
                         lineno,
                         mod_type,
                     )

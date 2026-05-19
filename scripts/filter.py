@@ -98,6 +98,19 @@ def filter_pkl(
     keys_in = len(data)
     samples_in = sum(len(v) for v in data.values() if isinstance(v, np.ndarray))
 
+    # Refuse current int-keyed shards explicitly. filter.py was written for
+    # the legacy tuple-key (kmer_id, meth_id) layout. Current shards key by
+    # kmer_id alone with meth_id stored in COL_PARENT_METH inside the array.
+    # Use `kinsim refine --method gmm` for the modern equivalent.
+    if any(isinstance(k, (int, np.integer)) for k in data):
+        log.error(
+            "Input %s uses the current int-keyed shard format, but filter.py "
+            "was written for the legacy (kmer_id, meth_id) tuple-key layout. "
+            "Use `kinsim refine` (per-(meth, offset) GMM filter) instead.",
+            input_path,
+        )
+        sys.exit(2)
+
     # Apply filters
     filtered = {}
     fraction_dropped = 0

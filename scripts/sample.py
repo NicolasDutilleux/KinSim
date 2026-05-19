@@ -65,8 +65,8 @@ def sample_pkl(
     keys_in = keys_out = samples_in = samples_out = 0
 
     for key, samples in data.items():
-        if not isinstance(key, tuple):
-            # Preserve metadata
+        # __meta__ + any other string key: pass through unmodified.
+        if not isinstance(key, (int, np.integer)):
             result[key] = samples
             continue
 
@@ -117,7 +117,10 @@ def sample_pkl(
 def main(argv=None):
     import argparse
 
-    from .utils.config import setup_logging
+    # Absolute import — this script is run as `python scripts/sample.py …`,
+    # which means relative imports (`from .utils...`) fail with
+    # "attempted relative import with no known parent package".
+    from kinsim.utils.config import setup_logging
 
     parser = argparse.ArgumentParser(
         prog="kinsim sample",

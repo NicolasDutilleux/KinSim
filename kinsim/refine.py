@@ -1337,9 +1337,10 @@ def refine_pkl(
     sample_arr = next(iter(int_keyed.values()))
     if sample_arr.shape[1] < SAMPLE_NCOLS:
         log.error(
-            "Input pkl uses an obsolete %d-col layout; current layout is %d cols "
-            "(adds PARENT_METH at col 36, PARENT_OFFSET at col 37). "
-            "Re-run `kinsim extract` to regenerate.",
+            "Input pkl uses an obsolete %d-col layout; current layout is "
+            "%d cols (CATEGORY at col 17, PARENT_METH at col 18, "
+            "PARENT_OFFSET at col 19). Re-run `kinsim extract` to "
+            "regenerate.",
             sample_arr.shape[1],
             SAMPLE_NCOLS,
         )
