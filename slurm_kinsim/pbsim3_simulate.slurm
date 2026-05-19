@@ -42,6 +42,14 @@
 #         - ERRHMM-ONT.model       (ONT)
 #         - ERRHMM-ONT-HQ.model    (ONT high-quality)
 #
+# PacBio @RG metadata (used by ccs / pbindex / jasmine) defaults to Revio
+# P2-C2 codes. Override via env if a specific chemistry is needed:
+#   PB_BINDINGKIT       (default: 101-820-500)
+#   PB_SEQUENCINGKIT    (default: 101-826-100)
+#   PB_BASECALLERVERSION (default: 5.0.0)
+#   PB_FRAMERATEHZ      (default: 80.000000)
+#   PB_PM               (default: REVIO)   — platform model
+#
 # Count N:  ls <genomes_dir>/*.fna | wc -l
 
 set +u
@@ -111,9 +119,15 @@ rm "${TMPPREFIX}"_*.sam "${TMPPREFIX}"_*.ref 2>/dev/null
 # Patch the @RG so `ccs` accepts the BAM. PBSIM3 emits a minimal
 # ``@RG ID:S1 PL:PACBIO`` line without the PacBio chemistry fields. CCS
 # (and downstream pbbam tools like jasmine, pbindex) FATAL on missing
-# BASECALLERVERSION, BINDINGKIT, SEQUENCINGKIT, FRAMERATEHZ. We inject a
-# plausible Sequel/Revio-era @RG; values are synthetic but pass validation.
-PB_RG=$'@RG\tID:00000000/0--0\tPL:PACBIO\tPM:REVIO\tPU:kinsim\tSM:kinsim\tDS:READTYPE=SUBREAD;BINDINGKIT=101-820-500;SEQUENCINGKIT=101-826-100;BASECALLERVERSION=5.0.0;FRAMERATEHZ=80.000000'
+# BASECALLERVERSION, BINDINGKIT, SEQUENCINGKIT, FRAMERATEHZ. We inject
+# them with sensible Revio defaults; override via env (see header).
+PB_BINDINGKIT="${PB_BINDINGKIT:-101-820-500}"
+PB_SEQUENCINGKIT="${PB_SEQUENCINGKIT:-101-826-100}"
+PB_BASECALLERVERSION="${PB_BASECALLERVERSION:-5.0.0}"
+PB_FRAMERATEHZ="${PB_FRAMERATEHZ:-80.000000}"
+PB_PM="${PB_PM:-REVIO}"
+PB_DS="READTYPE=SUBREAD;BINDINGKIT=${PB_BINDINGKIT};SEQUENCINGKIT=${PB_SEQUENCINGKIT};BASECALLERVERSION=${PB_BASECALLERVERSION};FRAMERATEHZ=${PB_FRAMERATEHZ}"
+PB_RG=$'@RG\tID:00000000/0--0\tPL:PACBIO\tPM:'"${PB_PM}"$'\tPU:kinsim\tSM:'"${SPECIES}"$'\tDS:'"${PB_DS}"
 samtools view -H "$RAW_BAM" \
     | grep -v '^@RG' \
     | { cat; echo "$PB_RG"; } \
