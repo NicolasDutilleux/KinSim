@@ -44,6 +44,7 @@ import gzip
 import json
 import logging
 import os
+import re
 import sys
 
 import numpy as np
@@ -1517,21 +1518,31 @@ def generate_from_bam(
             # in slurm_kinsim/callers/ipdsummary.slurm.
             hd["pb"] = "3.0.7"
         out_dict = {"HD": hd}
-        # Single synthetic RG with a pbindex-friendly ID. Replaces the
-        # bystrandify-mangled RG IDs (e.g. `f7c20c6c/33--33-744DFBEF`)
-        # that pbindex rejects. Format must be ``<8-hex>/<int>--<int>``:
-        # pbindex parses the prefix as a movie hash via stoul(), so the
-        # 8 chars MUST be valid hex (0-9a-f). All-zero hash is safe and
-        # recognisable; non-hex (e.g. "kinsim") triggers stoul FATAL.
-        synthetic_rg = {"ID": "00000000/0--0", "PL": "PACBIO", "DS": "READTYPE=CCS"}
+        # Inherit the input BAM's RG verbatim. The input is either a raw HiFi
+        # BAM (proper PacBio RG with BV/PM/PU/SM/DS) or a bystrandify-mangled
+        # BAM (RG ID has an extra ``-<8hex>`` suffix that pbindex rejects via
+        # stoul). We strip ONLY that suffix — everything else (BASECALLERVERSION,
+        # BINDINGKIT, SEQUENCINGKIT, ...) stays so downstream tools (pbindex,
+        # ipdSummary, jasmine) find the metadata they expect.
         if "RG" in in_dict and in_dict["RG"]:
-            first = dict(in_dict["RG"][0])
-            first["ID"] = synthetic_rg["ID"]
-            first.setdefault("PL", synthetic_rg["PL"])
-            first.setdefault("DS", synthetic_rg["DS"])
-            out_dict["RG"] = [first]
+            rg = dict(in_dict["RG"][0])
+            rg["ID"] = re.sub(r"-[0-9A-Fa-f]{8}$", "", rg.get("ID", ""))
+            if not rg["ID"]:
+                rg["ID"] = "00000000/0--0"
+            out_dict["RG"] = [rg]
         else:
-            out_dict["RG"] = [synthetic_rg]
+            # Synthetic fallback — only triggered when the input has no RG
+            # at all (rare). Include BASECALLERVERSION so jasmine/pbbam don't
+            # FATAL on "basecaller version is too short".
+            out_dict["RG"] = [{
+                "ID": "00000000/0--0",
+                "PL": "PACBIO",
+                "PM": "REVIO",
+                "PU": "kinsim",
+                "DS": ("READTYPE=CCS;BINDINGKIT=101-820-500;"
+                       "SEQUENCINGKIT=101-826-100;BASECALLERVERSION=5.0.0;"
+                       "FRAMERATEHZ=80.000000"),
+            }]
         header_out = pysam.AlignmentHeader.from_dict(out_dict)
 
     # Multi-threaded BGZF I/O — htslib uses these threads for parallel
