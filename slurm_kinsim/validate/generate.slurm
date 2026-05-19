@@ -31,10 +31,21 @@ SHARD_DIR=${6:?shard dir required}
 
 mkdir -p "$SHARD_DIR"
 
-# Clean this task's stale intermediates from earlier failed runs (per-region
-# .bam files that should have been rm'd after the inner-merge but weren't
-# if the prior task crashed). Leaves other tasks' shards untouched.
 TASK_PAT=$(printf 'shard_%03d' "$SLURM_ARRAY_TASK_ID")
+SHARD_OUT=$(printf '%s/shard_%03d.bam' "$SHARD_DIR" "$SLURM_ARRAY_TASK_ID")
+
+# SKIP-first: if the canonical shard already exists, do nothing. This is the
+# safe re-entry behaviour — we never auto-rm a finished shard (the user may
+# have post-processed it, e.g. samtools addreplacerg to patch the RG). Force
+# a full re-run via FORCE_GEN=1.
+if [ -s "$SHARD_OUT" ] && [ "${FORCE_GEN:-0}" != "1" ]; then
+  echo "SKIP — $SHARD_OUT exists. Set FORCE_GEN=1 to re-run."
+  exit 0
+fi
+
+# Only when we're actually re-generating: clean this task's stale per-region
+# intermediates from earlier crashed runs. The canonical shard.bam is wiped
+# too because we're about to overwrite it.
 rm -f "${SHARD_DIR}/${TASK_PAT}.bam" "${SHARD_DIR}/${TASK_PAT}_"*.bam
 
 REGION=$(awk -v t="$SLURM_ARRAY_TASK_ID" '$1==t {print $2}' "$REGIONS_FILE" | paste -sd,)
@@ -45,8 +56,6 @@ fi
 
 CKPT=$(ls -t "$CKPT_DIR"/checkpoint_epoch*.pt 2>/dev/null | head -1)
 [ -n "$CKPT" ] || { echo "ERROR: no checkpoint_epoch*.pt in $CKPT_DIR" >&2; exit 1; }
-
-SHARD_OUT=$(printf '%s/shard_%03d.bam' "$SHARD_DIR" "$SLURM_ARRAY_TASK_ID")
 TMP_OUTS=()
 for R in ${REGION//,/ }; do
   SAFE=$(echo "$R" | tr ':/-' '___')

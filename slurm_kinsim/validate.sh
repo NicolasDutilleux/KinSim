@@ -4,12 +4,14 @@
 # Each row of the manifest (CSV with header `sample_id,lineage`) gets the
 # chain:
 #   prep → generate (array) → merge → align → ipdSummary → motifmaker
-#                                          └→ jasmine → final motif merge
+#                                   │
+#                                   └→ jasmine → final motif merge
 #
-# `align` is a pbmm2 alignment of the generated (unmapped HiFi) BAM
-# against the reference. ipdSummary needs an aligned BAM, and jasmine
-# also benefits (it does its own align internally but having a single
-# aligned BAM is cleaner).
+# `align` is a pbmm2 alignment of the generated (flag=4 HiFi) BAM against
+# the reference. ipdSummary needs an aligned BAM. Jasmine is fed the
+# UNALIGNED BAM (raw HiFi format with fi/fp/ri/rp): jasmine assumes raw
+# HiFi input and does its own pbmm2 align internally — feeding it an
+# already-aligned BAM caused 10-second crashes.
 #
 # Usage:
 #   bash slurm_kinsim/validate.sh <manifest.csv>
@@ -99,9 +101,8 @@ while IFS=, read -r SAMPLE LINEAGE _rest; do
     "$VAL_SLURM/merge.slurm" "$SHARD_DIR" "$SIM_BAM")
   # pbmm2 align — kinsim generate writes flag=4 unmapped HiFi, ipdSummary
   # needs an aligned BAM with ip/pw tags (pbmm2 converts fi/fp/ri/rp → ip/pw
-  # during alignment). Reuses prep/align_pbmm2.slurm (skip-first if output
-  # exists). Jasmine has its own internal align so it could use SIM_BAM,
-  # but feeding it SIM_ALIGNED_BAM avoids the duplicate alignment.
+  # during alignment). Uses prep/align_pbmm2.slurm (skip-first if output
+  # exists, idempotent pbindex step).
   J_ALIGN=$(sbatch --parsable --dependency=afterok:$J_MERGE \
     --job-name="val_align_$SAMPLE" \
     "$REPO/slurm_kinsim/prep/align_pbmm2.slurm" "$SIM_BAM" "$REF" "$SIM_ALIGNED_BAM")
@@ -111,9 +112,12 @@ while IFS=, read -r SAMPLE LINEAGE _rest; do
   J_MM=$(sbatch --parsable --dependency=afterok:$J_IPD \
     --job-name="val_mm_$SAMPLE" \
     "$CALLERS/pbmotifmaker.slurm" "$REF" "$SIM_GFF" "$SIM_MM_CSV")
-  J_JM=$(sbatch --parsable --dependency=afterok:$J_ALIGN \
+  # Jasmine takes UNALIGNED HiFi (raw format with fi/fp/ri/rp). Feeding it
+  # the aligned BAM crashed jasmine in ~10s. jasmine_modkit.slurm runs its
+  # own pbmm2 align internally before modkit pileup.
+  J_JM=$(sbatch --parsable --dependency=afterok:$J_MERGE \
     --job-name="val_jm_$SAMPLE" \
-    "$CALLERS/jasmine_modkit.slurm" "$SIM_ALIGNED_BAM" "$REF" "$SIM_JM_CSV")
+    "$CALLERS/jasmine_modkit.slurm" "$SIM_BAM" "$REF" "$SIM_JM_CSV")
   J_FINAL=$(sbatch --parsable --dependency=afterok:${J_MM}:${J_JM} \
     --job-name="val_final_$SAMPLE" \
     "$CALLERS/merge_motifs.slurm" "$SIM_MERGED_CSV" 0.7 "$SIM_MM_CSV" "$SIM_JM_CSV")
