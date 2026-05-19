@@ -8,7 +8,7 @@ Usage:
 import difflib
 import sys
 
-__version__ = "0.5.0"
+from . import __version__
 
 COMMANDS = [
     "extract",
@@ -38,9 +38,10 @@ Pipeline (one verb per stage; each consumes the previous stage's output):
   analyze          Diagnostic dashboard for any shard or refined directory.
   predict-kmers    Dump (μ, σ) for every kmer × every YAML methylation scenario.
 
-Data preparation:
-  Use 'kinsim-prep' for motif parsing, REBASE fetching, manifest tools,
-  and .pkl filtering / balancing.
+Data preparation (run directly with python, not via the kinsim CLI):
+  python scripts/manifest.py            count / validate / list manifest CSV
+  python -m kinsim.utils.parsers.rebase fetch / parse REBASE motifs
+  python -m kinsim.utils.parsers.motif_merge merge + filter + dedup motifs
 
 Auxiliary scripts (not pipeline stages, run directly with python):
   scripts/compare.py             Cross-dataset kinetic comparison.

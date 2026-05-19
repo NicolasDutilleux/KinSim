@@ -1165,8 +1165,14 @@ def _process_batch(
                                 #     rev[j] = rev_meth at ref_pos + off
                                 rev_fi = np.zeros(_N_REV, dtype=np.int64)
                                 rev_ri = np.zeros(_N_REV, dtype=np.int64)
-                                fi_rev_src = ref_fwd_meth if _STRAND_AWARE else ref_rev_meth
-                                ri_rev_src = ref_rev_meth if _STRAND_AWARE else ref_rev_meth
+                                # Fallback (non-strand-aware) uses the combined
+                                # meth map for BOTH passes — matches the mc_fi /
+                                # mc_ri fallbacks above. Previous code had
+                                # ``ri_rev_src = ref_rev_meth`` in the fallback
+                                # (copy-paste from the strand-aware branch),
+                                # which made the two branches identical.
+                                fi_rev_src = ref_fwd_meth if _STRAND_AWARE else ref_meth
+                                ri_rev_src = ref_rev_meth if _STRAND_AWARE else ref_meth
                                 for j, off in enumerate(_REV_OFFSETS):
                                     tgt_fi = ref_pos - int(off)
                                     tgt_ri = ref_pos + int(off)

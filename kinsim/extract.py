@@ -868,7 +868,7 @@ def extract_to_shard(
     samples["__meta__"] = {
         "extract_path": "aligned",
         "kinsim_version": _KINSIM_VERSION,
-        "created": datetime.datetime.utcnow().isoformat(),
+        "created": datetime.datetime.now(datetime.UTC).isoformat(),
         "source_bam": bam_path,
         "source_ref": ref_path,
         "motif_string": motif_string,
