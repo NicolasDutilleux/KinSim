@@ -19,7 +19,14 @@ Usage::
         3-panel HTML: scatter μ_pred vs μ_obs, above-rate distribution,
         and top-K kmers detail (AI baseline vs above-threshold population).
 
-See ``compute.py``, ``analyze.py``, ``per_kmer.py``, ``plot_kmer.py``.
+    python -m kinsim_baseline generate --format bam|pkl --baseline BASELINE_JSON --output OUT [...]
+        Naive-Gaussian generation. --format bam writes a kinsim-generate
+        lookup NPZ (consume via `kinsim generate --use-lookup`). --format
+        pkl rewrites a shard's IPD/PW with samples from the per-(T, k)
+        Gaussian (requires --input SHARD.pkl). Both modes ignore kmer
+        context — the baseline against which to benchmark the ML model.
+
+See ``compute.py``, ``analyze.py``, ``per_kmer.py``, ``plot_kmer.py``, ``generate.py``.
 """
 
 from __future__ import annotations
@@ -70,6 +77,21 @@ def main():
             "        - σ histogram across kmers (informs outlier threshold)\n"
             "        - coverage histogram (log y)\n"
             "      Output: per_kmer_dashboard.html + per_kmer_summary.tsv\n"
+            "\n"
+            "  generate --format bam|pkl --baseline BASELINE_JSON --output OUT [opts]\n"
+            "      Naive-Gaussian generation. Per-(T, k) μ/σ in log1p space\n"
+            "      from baseline.json are applied without kmer context.\n"
+            "        --format bam  Build a kinsim-generate-compatible lookup\n"
+            "                      NPZ where every kmer has the SAME (μ, σ)\n"
+            "                      per scenario. Then run\n"
+            "                        kinsim generate <bam> <ref> <DUMMY> <motifs>\n"
+            "                          <out.bam> --use-lookup OUT.npz\n"
+            "                      to produce the naive BAM.\n"
+            "        --format pkl  Rewrite IPD/PW columns of an existing shard\n"
+            "                      (requires --input SHARD.pkl). The kmer keys,\n"
+            "                      meth_context, parent_meth/offset all stay;\n"
+            "                      only IPD/PW are replaced with naive samples.\n"
+            "      Output: <out>.npz  (bam mode)  or  <out>.pkl  (pkl mode)\n"
         )
         sys.exit(0 if len(sys.argv) >= 2 else 1)
 
@@ -84,9 +106,14 @@ def main():
         from .per_kmer import main as cmd_main
     elif cmd == "plot-per-kmer":
         from .plot_kmer import main as cmd_main
+    elif cmd == "generate":
+        from .generate import main as cmd_main
     else:
         print(f"unknown command: {cmd}", file=sys.stderr)
-        print("expected: compute | analyze | per-kmer | plot-per-kmer", file=sys.stderr)
+        print(
+            "expected: compute | analyze | per-kmer | plot-per-kmer | generate",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     cmd_main(rest)
