@@ -1,148 +1,119 @@
 #!/bin/bash
-#SBATCH --job-name=PBSIM3_Simulate
+#SBATCH --job-name=pbsim3_simulate
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --account=p774
 #SBATCH --partition=pibu_el8
-#SBATCH --time=04:00:00
+#SBATCH --time=06:00:00
 #SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/pbsim3_simulate_%A_%a.log
-#SBATCH --mail-user=nicolas.dutilleux@unifr.ch
-#SBATCH --mail-type=FAIL
-
-# ============================================================
-# PBSIM3 — Simulate PacBio HiFi reads from reference genomes (array job)
 #
-# Takes a directory of .fna reference genomes and creates one species
-# subdirectory per genome, ready for kinsim generate.
+# PBSIM3 — simulate PacBio multi-pass subreads from a reference genome.
+#
+# Default `--pass-num 1` would give single-pass reads (~85% accuracy).
+# We use `--pass-num 10` so the output can be fed to `ccs` to produce
+# HiFi consensus reads (~99.9% accuracy) with native fi/fp/ri/rp kinetic
+# tags. Chain:
+#
+#   pbsim3_simulate.slurm  → reads.subreads.bam   (multi-pass subreads)
+#                         ↓
+#   ccs_subreads.slurm     → reads.hifi.bam       (HiFi, fi/fp/ri/rp)
+#                         ↓
+#   prep/align_pbmm2.slurm → reads.aligned.bam    (ip/pw + alignment)
+#                         ↓
+#   kinsim generate        → reads_with_kinetics.bam
+#                                                 (fi/fp/ri/rp, flag=4)
+#
+# pbmm2 align is REQUIRED before generate so the mapped path (strand-aware
+# mc/rev_meth from the reference) is taken — see kinsim/generate.py.
 #
 # Usage:
-#   sbatch --array=1-N pbsim3_simulate.slurm <genomes_dir> <output_root> <model>
+#   sbatch --array=1-N pbsim3_simulate.slurm <genomes_dir> <output_root> [<model>]
 #
-# Arguments:
-#   $1  Directory containing reference genomes (.fna files)
-#   $2  Output root directory (one species subdir created per genome)
-#   $3  PBSIM3 QSHMM model file path (e.g. /data/tools/pbsim3/data/QSHMM-PACBIO-CCS.model)
+# Args:
+#   $1  Directory with .fna reference genomes (one .fna per species).
+#   $2  Output root — one species subdir per genome is created.
+#   $3  PBSIM3 quality/error model file.
+#       Default: ERRHMM-SEQUEL.model (closest to PacBio Sequel/Revio chemistry).
+#       Other options shipped with pbsim3 conda package:
+#         - QSHMM-RSII.model       (PacBio RSII)
+#         - QSHMM-ONT.model        (ONT)
+#         - QSHMM-ONT-HQ.model     (ONT high-quality)
+#         - ERRHMM-RSII.model      (PacBio RSII, error-HMM)
+#         - ERRHMM-ONT.model       (ONT)
+#         - ERRHMM-ONT-HQ.model    (ONT high-quality)
 #
-# Count N:
-#   ls <genomes_dir>/*.fna | wc -l
-#
-# Example:
-#   sbatch --array=1-57 pbsim3_simulate.slurm genomes/ pbsim3_output/ \
-#       /data/tools/pbsim3/data/QSHMM-PACBIO-CCS.model
-#
-# Output directory structure created per genome:
-#   pbsim3_output/
-#     Ecoli/
-#       genome.fna          <- copy of the reference
-#       reads.fq.gz         <- simulated reads (compressed)
-#       reads.maf.gz        <- alignment truth file (compressed)
-#                              (place your motifs.csv here before running kinsim)
-#     Salmonella/
-#       ...
-#
-# After PBSIM3, place motifs.csv in each species subdirectory, then run:
-#   kinsim generate pbsim3_output/ checkpoint.pt motifs output/
-#
-# Optional PBSIM3 parameters (edit below):
-#   --depth        Read depth (default: 30)
-#   --length-min   Minimum read length (default: 1000)
-#   --length-max   Maximum read length (default: 25000)
-#   --accuracy-min Minimum read accuracy (default: 0.9)
-# ============================================================
+# Count N:  ls <genomes_dir>/*.fna | wc -l
 
-# ---- Usage check ----
-if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then
-    echo "Usage: sbatch --array=1-N pbsim3_simulate.slurm <genomes_dir> <output_root> <model>"
-    echo ""
-    echo "Arguments:"
-    echo "  genomes_dir   Directory with .fna reference genome files"
-    echo "  output_root   Root output directory (one species subdir per genome)"
-    echo "  model         PBSIM3 QSHMM model file (.model)"
-    echo ""
-    echo "Count N: ls <genomes_dir>/*.fna | wc -l"
-    exit 1
-fi
-
-# ---- Environment ----
+set +u
 source ~/.bashrc
 conda activate kinsim_env
-# pbsim3 must be on PATH. Install with: conda install -c bioconda pbsim3
+set -euo pipefail
 
-# ---- Config ----
-GENOMES_DIR="$1"
-OUTPUT_ROOT="$2"
-MODEL_PATH="$3"
+GENOMES_DIR=${1:?genomes_dir required (directory with .fna files)}
+OUTPUT_ROOT=${2:?output_root required}
+MODEL_PATH=${3:-$CONDA_PREFIX/data/ERRHMM-SEQUEL.model}
 
-if [ ! -d "$GENOMES_DIR" ]; then
-    echo "ERROR: Genomes directory not found: $GENOMES_DIR"
-    exit 1
-fi
-if [ ! -f "$MODEL_PATH" ]; then
-    echo "ERROR: PBSIM3 model file not found: $MODEL_PATH"
-    exit 1
-fi
+[ -d "$GENOMES_DIR" ] || { echo "ERROR: genomes_dir not found: $GENOMES_DIR" >&2; exit 1; }
+[ -f "$MODEL_PATH" ]  || { echo "ERROR: PBSIM3 model not found: $MODEL_PATH" >&2; exit 1; }
 
-# ---- Pick genome for this task ----
 FNA_FILE=$(ls "${GENOMES_DIR}"/*.fna | sort | sed -n "${SLURM_ARRAY_TASK_ID}p")
-
-if [ -z "$FNA_FILE" ]; then
-    echo "ERROR: No .fna file at index $SLURM_ARRAY_TASK_ID in $GENOMES_DIR"
-    exit 1
-fi
+[ -n "$FNA_FILE" ] || { echo "ERROR: no .fna at index $SLURM_ARRAY_TASK_ID in $GENOMES_DIR" >&2; exit 1; }
 
 SPECIES=$(basename "$FNA_FILE" .fna)
 OUTDIR="${OUTPUT_ROOT}/${SPECIES}"
-
-echo "=== Task $SLURM_ARRAY_TASK_ID: $SPECIES ==="
-echo "Reference: $FNA_FILE"
-echo "Output:    $OUTDIR"
-echo ""
-
 mkdir -p "$OUTDIR"
-
-# Copy reference genome into species subdir
 cp "$FNA_FILE" "${OUTDIR}/genome.fna"
 
-# ---- Run PBSIM3 ----
+echo "── PBSIM3 task $SLURM_ARRAY_TASK_ID: $SPECIES ──"
+echo "  reference : $FNA_FILE"
+echo "  output    : $OUTDIR"
+echo "  model     : $MODEL_PATH"
+
+# Pick the right model flag based on filename — errhmm vs qshmm.
+case "$(basename "$MODEL_PATH")" in
+  ERRHMM-*) METHOD=errhmm; MODEL_FLAG="--errhmm $MODEL_PATH" ;;
+  QSHMM-*)  METHOD=qshmm;  MODEL_FLAG="--qshmm  $MODEL_PATH" ;;
+  *) echo "ERROR: cannot infer --method from model filename: $MODEL_PATH" >&2; exit 1 ;;
+esac
+
 TMPPREFIX="${OUTDIR}/reads"
 
+# --pass-num 10 gives ten subread passes per ZMW. ccs (next step) needs
+# >= 3 passes to compute a HiFi consensus; 10 is the sweet spot for
+# Sequel/Revio chemistry.
 pbsim \
     --strategy wgs \
-    --method qshmm \
-    --qshmm "$MODEL_PATH" \
+    --method "$METHOD" \
+    $MODEL_FLAG \
     --genome "${OUTDIR}/genome.fna" \
     --prefix "$TMPPREFIX" \
     --depth 30 \
     --length-min 1000 \
     --length-max 25000 \
-    --accuracy-min 0.9
+    --accuracy-mean 0.95 \
+    --pass-num 10
 
-# PBSIM3 outputs: reads_0001.fastq, reads_0001.maf (one set per chromosome)
-# For multi-chromosome genomes, merge all fastq/maf files, then compress.
+# With --pass-num > 1, PBSIM3 emits reads_NNNN.sam (multi-pass subreads),
+# reads_NNNN.maf (alignment truth) and reads_NNNN.ref per chromosome.
+# Convert all SAMs to a single subread BAM that `ccs` can consume.
+SAM_FILES=("${TMPPREFIX}"_*.sam)
+[ -f "${SAM_FILES[0]}" ] || { echo "ERROR: PBSIM3 produced no .sam output (check --pass-num >= 2)" >&2; exit 1; }
 
-# ---- Collect and compress outputs ----
-FASTQ_FILES=("${TMPPREFIX}"_*.fastq)
-MAF_FILES=("${TMPPREFIX}"_*.maf)
-
-if [ ${#FASTQ_FILES[@]} -eq 1 ]; then
-    # Single chromosome: rename and compress
-    gzip -c "${FASTQ_FILES[0]}" > "${OUTDIR}/reads.fq.gz"
-    gzip -c "${MAF_FILES[0]}"   > "${OUTDIR}/reads.maf.gz"
-    rm "${FASTQ_FILES[0]}" "${MAF_FILES[0]}"
+if [ "${#SAM_FILES[@]}" -eq 1 ]; then
+  samtools view -bS "${SAM_FILES[0]}" -o "${OUTDIR}/reads.subreads.bam"
 else
-    # Multiple chromosomes: concatenate, then compress
-    cat "${TMPPREFIX}"_*.fastq | gzip > "${OUTDIR}/reads.fq.gz"
-    cat "${TMPPREFIX}"_*.maf   | gzip > "${OUTDIR}/reads.maf.gz"
-    rm "${TMPPREFIX}"_*.fastq "${TMPPREFIX}"_*.maf
+  # Concat headers + bodies; samtools merge handles dedup.
+  samtools merge -f "${OUTDIR}/reads.subreads.bam" "${SAM_FILES[@]}"
 fi
+samtools index "${OUTDIR}/reads.subreads.bam"
+rm "${TMPPREFIX}"_*.sam "${TMPPREFIX}"_*.ref 2>/dev/null
 
-# Remove PBSIM3 ref files (not needed)
-rm -f "${TMPPREFIX}"_*.ref
+# Keep the MAF (alignment truth) — useful for downstream validation.
+cat "${TMPPREFIX}"_*.maf | gzip > "${OUTDIR}/reads.maf.gz"
+rm "${TMPPREFIX}"_*.maf
 
-echo ""
-echo "=== Done: $SPECIES ==="
-echo "  reads.fq.gz:   $(du -sh "${OUTDIR}/reads.fq.gz" | cut -f1)"
-echo "  reads.maf.gz:  $(du -sh "${OUTDIR}/reads.maf.gz" | cut -f1)"
-echo ""
-echo "  Next: place motifs.csv in ${OUTDIR}/"
-echo "  Then: kinsim generate ${OUTPUT_ROOT}/ checkpoint.pt motifs output/"
+echo "── PBSIM3 done ──"
+echo "  subreads BAM : ${OUTDIR}/reads.subreads.bam ($(du -sh "${OUTDIR}/reads.subreads.bam" | cut -f1))"
+echo "  truth MAF    : ${OUTDIR}/reads.maf.gz       ($(du -sh "${OUTDIR}/reads.maf.gz" | cut -f1))"
+echo
+echo "  Next: sbatch slurm_kinsim/ccs_subreads.slurm ${OUTDIR}/reads.subreads.bam ${OUTDIR}/reads.hifi.bam"

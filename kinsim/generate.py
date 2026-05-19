@@ -1101,24 +1101,30 @@ def _process_batch(
                                 r_rev_ri.append(_ZERO_REV)
                         else:
                             ref_pos = ref_start + read_pos
-                            # Strand-aware path: fi sees rev-strand template,
-                            # ri sees fwd-strand template (matches extract.py's
-                            # pol_padded/opp_padded for + strand reads).
-                            # Fallback: combined map for both passes when the
-                            # caller doesn't supply per-strand maps.
+                            # Strand-aware meth context. Mirrors extract.py's
+                            # per-pass slicing exactly so the model sees the
+                            # same indexing convention it was trained on:
+                            #   fi (= + pol, extract is_reverse=False):
+                            #     mc = rev_meth[ref - downstream : ref + upstream + 1][::-1]
+                            #     equiv: mc[k] = rev_meth at ref_pos + upstream - k
+                            #   ri (= − pol, extract is_reverse=True):
+                            #     mc = fwd_meth[ref - upstream : ref + downstream + 1]
+                            #     equiv: mc[k] = fwd_meth at ref_pos - upstream + k
                             mc_fi = np.zeros(_CTX_LEN, dtype=np.int64)
                             mc_ri = np.zeros(_CTX_LEN, dtype=np.int64)
                             fi_src = ref_rev_meth if _STRAND_AWARE else ref_meth
                             ri_src = ref_fwd_meth if _STRAND_AWARE else ref_meth
                             for k_pos in range(_CTX_LEN):
-                                rp_k = ref_pos + k_pos - _LEFT
+                                rp_fi = ref_pos + _LEFT - k_pos   # descending
+                                rp_ri = ref_pos - _LEFT + k_pos   # ascending
                                 if circular:
-                                    idx = rp_k % ref_len
-                                    mc_fi[k_pos] = int(fi_src[idx])
-                                    mc_ri[k_pos] = int(ri_src[idx])
-                                elif 0 <= rp_k < ref_len:
-                                    mc_fi[k_pos] = int(fi_src[rp_k])
-                                    mc_ri[k_pos] = int(ri_src[rp_k])
+                                    mc_fi[k_pos] = int(fi_src[rp_fi % ref_len])
+                                    mc_ri[k_pos] = int(ri_src[rp_ri % ref_len])
+                                else:
+                                    if 0 <= rp_fi < ref_len:
+                                        mc_fi[k_pos] = int(fi_src[rp_fi])
+                                    if 0 <= rp_ri < ref_len:
+                                        mc_ri[k_pos] = int(ri_src[rp_ri])
                             # Apply per-site Bernoulli firing on each pass
                             # independently — each polymerase pass is a
                             # separate event in the BAM record.
@@ -1151,22 +1157,26 @@ def _process_batch(
                             if _DO_REV:
                                 # rev_meth = synthesized-strand neighbours
                                 # (opposite of the polymerase's template).
-                                # For + strand reads: fi template = rev, so
-                                # rev_meth for fi = fwd; ri's template = fwd,
-                                # so rev_meth for ri = rev.
+                                # Mirrors extract.py's per-pass offset sign:
+                                #   fi (= + pol, rev_offsets_rev = -offsets):
+                                #     rev[j] = fwd_meth at ref_pos - off
+                                #   ri (= − pol, rev_offsets_fwd = +offsets):
+                                #     rev[j] = rev_meth at ref_pos + off
                                 rev_fi = np.zeros(_N_REV, dtype=np.int64)
                                 rev_ri = np.zeros(_N_REV, dtype=np.int64)
                                 fi_rev_src = ref_fwd_meth if _STRAND_AWARE else ref_rev_meth
                                 ri_rev_src = ref_rev_meth if _STRAND_AWARE else ref_rev_meth
                                 for j, off in enumerate(_REV_OFFSETS):
-                                    tgt = ref_pos + int(off)
+                                    tgt_fi = ref_pos - int(off)
+                                    tgt_ri = ref_pos + int(off)
                                     if circular:
-                                        idx = tgt % ref_len
-                                        rev_fi[j] = int(fi_rev_src[idx])
-                                        rev_ri[j] = int(ri_rev_src[idx])
-                                    elif 0 <= tgt < ref_len:
-                                        rev_fi[j] = int(fi_rev_src[tgt])
-                                        rev_ri[j] = int(ri_rev_src[tgt])
+                                        rev_fi[j] = int(fi_rev_src[tgt_fi % ref_len])
+                                        rev_ri[j] = int(ri_rev_src[tgt_ri % ref_len])
+                                    else:
+                                        if 0 <= tgt_fi < ref_len:
+                                            rev_fi[j] = int(fi_rev_src[tgt_fi])
+                                        if 0 <= tgt_ri < ref_len:
+                                            rev_ri[j] = int(ri_rev_src[tgt_ri])
                                 r_rev_fi.append(rev_fi)
                                 r_rev_ri.append(rev_ri)
 
@@ -1567,15 +1577,12 @@ def generate_from_bam(
             )
 
             # Build maf_mapping entry from BAM alignment — same fields parse_maf returns.
-            # Gated by KINSIM_USE_REF_CTX (default off): the mapped-path inner
-            # loop is unvectorised and ~50× slower than the unmapped path. For
-            # whole-genome motif validation the edge-accuracy gain from
-            # reference-context padding is statistically negligible, so we
-            # default to the fast unmapped path. Set KINSIM_USE_REF_CTX=1 to
-            # re-enable the (slow) mapped path.
+            # Always use the strand-aware mapped path when the BAM has
+            # alignment info. Unmapped reads fall back to the read-only path
+            # (approximate: mc_fi == mc_ri, rev_meth = 0). For raw HiFi inputs,
+            # align with pbmm2 before generate to take the mapped path.
             if (
-                os.environ.get("KINSIM_USE_REF_CTX") == "1"
-                and not read.is_unmapped
+                not read.is_unmapped
                 and read.reference_name is not None
                 and read.reference_name in ref_seqs
             ):
@@ -1646,6 +1653,13 @@ def generate_from_bam(
     log.info(
         "Done. %d reads processed (%d with ref context, %d without).", n_reads, n_mapped, n_unmapped
     )
+    if n_unmapped > 0:
+        log.warning(
+            "%d reads had no alignment — processed via the unmapped path "
+            "(approximate: mc_fi == mc_ri, rev_meth = 0). Align the input "
+            "BAM with pbmm2 before generate for full strand-aware fidelity.",
+            n_unmapped,
+        )
     log.info("Output: %s", output_bam)
 
 
