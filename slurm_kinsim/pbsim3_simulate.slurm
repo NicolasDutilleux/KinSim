@@ -99,14 +99,36 @@ pbsim \
 SAM_FILES=("${TMPPREFIX}"_*.sam)
 [ -f "${SAM_FILES[0]}" ] || { echo "ERROR: PBSIM3 produced no .sam output (check --pass-num >= 2)" >&2; exit 1; }
 
+RAW_BAM="${OUTDIR}/reads.subreads.raw.bam"
 if [ "${#SAM_FILES[@]}" -eq 1 ]; then
-  samtools view -bS "${SAM_FILES[0]}" -o "${OUTDIR}/reads.subreads.bam"
+  samtools view -bS "${SAM_FILES[0]}" -o "$RAW_BAM"
 else
   # Concat headers + bodies; samtools merge handles dedup.
-  samtools merge -f "${OUTDIR}/reads.subreads.bam" "${SAM_FILES[@]}"
+  samtools merge -f "$RAW_BAM" "${SAM_FILES[@]}"
 fi
-samtools index "${OUTDIR}/reads.subreads.bam"
 rm "${TMPPREFIX}"_*.sam "${TMPPREFIX}"_*.ref 2>/dev/null
+
+# Patch the @RG so `ccs` accepts the BAM. PBSIM3 emits a minimal
+# ``@RG ID:S1 PL:PACBIO`` line without the PacBio chemistry fields. CCS
+# (and downstream pbbam tools like jasmine, pbindex) FATAL on missing
+# BASECALLERVERSION, BINDINGKIT, SEQUENCINGKIT, FRAMERATEHZ. We inject a
+# plausible Sequel/Revio-era @RG; values are synthetic but pass validation.
+PB_RG=$'@RG\tID:00000000/0--0\tPL:PACBIO\tPM:REVIO\tPU:kinsim\tSM:kinsim\tDS:READTYPE=SUBREAD;BINDINGKIT=101-820-500;SEQUENCINGKIT=101-826-100;BASECALLERVERSION=5.0.0;FRAMERATEHZ=80.000000'
+samtools view -H "$RAW_BAM" \
+    | grep -v '^@RG' \
+    | { cat; echo "$PB_RG"; } \
+    > "${OUTDIR}/reads.subreads.header.sam"
+samtools reheader "${OUTDIR}/reads.subreads.header.sam" "$RAW_BAM" \
+    > "${OUTDIR}/reads.subreads.nohdr.bam"
+
+# Rewrite per-record RG tag to match the new @RG ID.
+samtools addreplacerg -m overwrite_all -r "${PB_RG#@RG$'\t'}" \
+    -o "${OUTDIR}/reads.subreads.bam" \
+    "${OUTDIR}/reads.subreads.nohdr.bam"
+
+samtools index "${OUTDIR}/reads.subreads.bam"
+rm -f "$RAW_BAM" "${OUTDIR}/reads.subreads.header.sam" \
+      "${OUTDIR}/reads.subreads.nohdr.bam"
 
 # Keep the MAF (alignment truth) — useful for downstream validation.
 cat "${TMPPREFIX}"_*.maf | gzip > "${OUTDIR}/reads.maf.gz"
