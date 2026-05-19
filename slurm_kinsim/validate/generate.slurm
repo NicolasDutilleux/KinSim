@@ -31,6 +31,12 @@ SHARD_DIR=${6:?shard dir required}
 
 mkdir -p "$SHARD_DIR"
 
+# Clean this task's stale intermediates from earlier failed runs (per-region
+# .bam files that should have been rm'd after the inner-merge but weren't
+# if the prior task crashed). Leaves other tasks' shards untouched.
+TASK_PAT=$(printf 'shard_%03d' "$SLURM_ARRAY_TASK_ID")
+rm -f "${SHARD_DIR}/${TASK_PAT}.bam" "${SHARD_DIR}/${TASK_PAT}_"*.bam
+
 REGION=$(awk -v t="$SLURM_ARRAY_TASK_ID" '$1==t {print $2}' "$REGIONS_FILE" | paste -sd,)
 if [ -z "$REGION" ]; then
   echo "no region for task $SLURM_ARRAY_TASK_ID — exiting cleanly"

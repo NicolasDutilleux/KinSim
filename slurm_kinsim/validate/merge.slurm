@@ -20,10 +20,11 @@ set -euo pipefail
 SHARD_DIR=${1:?shard dir required}
 OUT_BAM=${2:?output BAM required}
 
-ls "$SHARD_DIR"/shard_*.bam
+# Match only canonical shard_NNN.bam — NOT shard_NNN_*.bam per-region
+# intermediates that may linger from earlier failed generate runs.
+ls "$SHARD_DIR"/shard_[0-9][0-9][0-9].bam
 # -c (combine-rg) collapses identical @RG IDs across shards into one.
-# Without it samtools appends a hex suffix to duplicates → pbindex chokes.
-samtools merge -c -@ "$SLURM_CPUS_PER_TASK" -f "$OUT_BAM" "$SHARD_DIR"/shard_*.bam
+samtools merge -c -@ "$SLURM_CPUS_PER_TASK" -f "$OUT_BAM" "$SHARD_DIR"/shard_[0-9][0-9][0-9].bam
 
 apptainer exec --bind /data /containers/apptainer/pacbio-smrt-tools-25.3.sif \
           pbindex "$OUT_BAM"
