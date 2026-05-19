@@ -44,28 +44,35 @@ echo "Input BAM: $IN_BAM"
 echo "Reference: $REF"
 echo "Out BAM:   $OUT_BAM"
 
+# Both steps are SKIP-first and independent so re-running on a partial
+# state (BAM but no .pbi, e.g. from a job killed between align and index)
+# completes the missing half without re-aligning.
+
 if [ -s "$OUT_BAM" ]; then
-    echo "SKIP — aligned BAM exists"
-    exit 0
+    echo "SKIP align — aligned BAM exists"
+else
+    # pbmm2 may need .pbi on input; create if missing.
+    if [ ! -f "${IN_BAM}.pbi" ]; then
+        echo "=== pbindex input (pbmm2 requires) ==="
+        apptainer exec --bind /data "$SMRT_SIF" pbindex "$IN_BAM"
+    fi
+
+    T=$(date +%s)
+    apptainer exec --bind /data "$SMRT_SIF" \
+        pbmm2 align "$REF" "$IN_BAM" "$OUT_BAM" \
+        --preset CCS --sort --num-threads "${SLURM_CPUS_PER_TASK}"
+    echo "Elapsed: $(( $(date +%s) - T ))s"
+
+    [ -s "$OUT_BAM" ] || { echo "FAILED: pbmm2 empty output"; exit 1; }
 fi
 
-# pbmm2 may need .pbi on input; create if missing.
-if [ ! -f "${IN_BAM}.pbi" ]; then
-    echo "=== pbindex input (pbmm2 requires) ==="
-    apptainer exec --bind /data "$SMRT_SIF" pbindex "$IN_BAM"
+# pbindex on the aligned output — ipdSummary requires it. Idempotent: if
+# the .pbi exists and is newer than the BAM, skip.
+if [ -f "${OUT_BAM}.pbi" ] && [ "${OUT_BAM}.pbi" -nt "$OUT_BAM" ]; then
+    echo "SKIP pbindex — .pbi up to date"
+else
+    apptainer exec --bind /data "$SMRT_SIF" pbindex "$OUT_BAM"
+    [ -f "${OUT_BAM}.pbi" ] || { echo "FAILED: pbindex did not produce .pbi"; exit 1; }
 fi
-
-T=$(date +%s)
-apptainer exec --bind /data "$SMRT_SIF" \
-    pbmm2 align "$REF" "$IN_BAM" "$OUT_BAM" \
-    --preset CCS --sort --num-threads "${SLURM_CPUS_PER_TASK}"
-echo "Elapsed: $(( $(date +%s) - T ))s"
-
-[ -s "$OUT_BAM" ] || { echo "FAILED: pbmm2 empty output"; exit 1; }
-
-# pbindex the aligned output — ipdSummary requires it, and the post-align
-# .pbi is a different beast from the input .pbi (records have changed).
-apptainer exec --bind /data "$SMRT_SIF" pbindex "$OUT_BAM"
-[ -f "${OUT_BAM}.pbi" ] || { echo "FAILED: pbindex did not produce .pbi"; exit 1; }
 
 samtools flagstat "$OUT_BAM" | head -5
