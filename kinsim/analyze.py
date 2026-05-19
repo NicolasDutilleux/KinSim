@@ -360,7 +360,7 @@ def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def compute_meth_context_distribution(data: dict) -> dict:
+def compute_meth_context_distribution(data: dict, kmer_size: int | None = None) -> dict:
     """For each (category, parent_meth, parent_offset) bucket, count
     meth_id occurrences at each meth_context offset.
 
@@ -382,7 +382,7 @@ def compute_meth_context_distribution(data: dict) -> dict:
         COL_CATEGORY,
         COL_PARENT_METH,
         COL_PARENT_OFFSET,
-        METH_CTX_LEN,
+        METH_CTX_LEN as _LEGACY_METH_CTX_LEN,
     )
 
     meth_ids = get_meth_ids()
@@ -390,16 +390,20 @@ def compute_meth_context_distribution(data: dict) -> dict:
     name_by_mid = {v: k for k, v in meth_ids.items()}
     nmid = len(meth_id_list)
 
+    # K-aware: prefer caller-provided kmer_size, fall back to the legacy
+    # K=11 constant. The mc slice is ``v[:, 3 : 3 + mc_len]``.
+    mc_len = int(kmer_size) if kmer_size else _LEGACY_METH_CTX_LEN
+
     def _empty():
         return {
-            "counts": np.zeros((METH_CTX_LEN, nmid), dtype=np.int64),
+            "counts": np.zeros((mc_len, nmid), dtype=np.int64),
             "n_samples": 0,
         }
 
     def _accumulate(bkt: dict, mc_arr: np.ndarray) -> None:
         """Vectorised per-position meth_id counts.
 
-        For a (n, METH_CTX_LEN) mc_arr, ``(mc_arr == mid).sum(axis=0)``
+        For a (n, mc_len) mc_arr, ``(mc_arr == mid).sum(axis=0)``
         is the per-position count of meth_id ``mid`` — one numpy reduction
         per meth_id, NMID total (~4). No Python row loop.
         """
@@ -421,7 +425,7 @@ def compute_meth_context_distribution(data: dict) -> dict:
         cats = v[:, COL_CATEGORY].astype(np.int8)
         parent = v[:, COL_PARENT_METH].astype(np.int8)
         offset = v[:, COL_PARENT_OFFSET].astype(np.int8)
-        mc = v[:, 3 : 3 + METH_CTX_LEN].astype(np.int32)
+        mc = v[:, 3 : 3 + mc_len].astype(np.int32)
 
         base_mask = cats == CATEGORY_BASELINE
         if base_mask.any():
@@ -519,7 +523,9 @@ def collect_stats(data: dict, pkl_path: str) -> DictStats:
     for kid, v in data.items():
         if not isinstance(kid, (int, np.integer)) or not isinstance(v, np.ndarray):
             continue
-        if v.shape[1] < 14:
+        # Need at least IPD/PW/frac + mc-up-to-prediction-index. 3 + KMER_PRED_IDX + 1
+        # = 11 for K=11 (legacy: ``< 14`` was a magic constant from an older layout).
+        if v.shape[1] < 3 + KMER_PRED_IDX + 1:
             continue
         # One column read; int8 enough for meth_ids in [0, 3].
         center = v[:, 3 + KMER_PRED_IDX].astype(np.int8)
@@ -840,6 +846,19 @@ def render_txt_report(
         from .utils.encoding import KMER_PRED_IDX
         from .utils.sample_layout import METH_CTX_LEFT, METH_CTX_LEN
 
+        # K-aware label width — derive from a real bucket's shape so K=21
+        # shards get the right offset labels.
+        first_cd = next(iter(context_distribution.values()), None)
+        if first_cd is not None and first_cd.get("fractions") is not None:
+            mc_len = int(first_cd["fractions"].shape[0])
+        else:
+            mc_len = METH_CTX_LEN
+        # When K!=11 the left/right padding shifts. With the default
+        # (upstream=7, downstream=3) we keep METH_CTX_LEFT=7 — for other
+        # geometries the active site stays at KMER_PRED_IDX, so the offset
+        # is ``i - KMER_PRED_IDX``.
+        mc_left = METH_CTX_LEFT if mc_len == METH_CTX_LEN else KMER_PRED_IDX
+
         p("-" * W)
         p("Methylation context distribution  (which meth_id sits at each offset")
         p("around the prediction position, per bucket)")
@@ -847,8 +866,8 @@ def render_txt_report(
         p(f"Centre [C] sits at meth_context index {KMER_PRED_IDX} (offset 0).")
         p()
         pos_labels = []
-        for i in range(METH_CTX_LEN):
-            off = i - METH_CTX_LEFT
+        for i in range(mc_len):
+            off = i - mc_left
             tag = "[C]" if off == 0 else ""
             pos_labels.append(f"{off:+d}{tag}")
 
@@ -1833,7 +1852,7 @@ def analyze_pkl(
     sig_profiles = compute_signature_profiles(data, kmer_size=stats.kmer_size)
 
     log.info("Computing meth-context distribution per bucket ...")
-    ctx_dist = compute_meth_context_distribution(data)
+    ctx_dist = compute_meth_context_distribution(data, kmer_size=stats.kmer_size)
 
     log.info("Computing per-category IPD distribution ...")
     cat_dist = compute_category_distributions(data)

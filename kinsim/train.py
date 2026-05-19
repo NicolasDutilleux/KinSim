@@ -1110,18 +1110,21 @@ def _infer_num_meth_types_from_data(pkl_path: str) -> int:
         len(paths),
     )
     max_id = 0
-    meth_cols_end = COL_REV_METH + REV_METH_LEN  # = 17
     for i, path in enumerate(paths, 1):
         with open(path, "rb") as f:
             data = pickle.load(f)
         for k, arr in data.items():
             if not isinstance(k, (int, np.integer)) or not isinstance(arr, np.ndarray):
                 continue
-            if arr.shape[1] < SAMPLE_NCOLS or arr.size == 0:
+            if arr.size == 0 or arr.shape[1] < 6:
                 continue
-            # mc + rev_meth columns (3..17) are all meth_id-bearing
+            # K-aware: mc + rev_meth columns are cols 3..(NCOLS-3). The last
+            # 3 cols are CATEGORY / PARENT_METH / PARENT_OFFSET regardless of
+            # K. Replaces the legacy ``COL_REV_METH + REV_METH_LEN`` (= 17
+            # for K=11). For K=21 it adapts to 27 automatically.
+            meth_cols_end = arr.shape[1] - 3
             mc_block_max = int(arr[:, COL_METH_CTX_START:meth_cols_end].max())
-            pm_max = int(arr[:, COL_PARENT_METH].max())
+            pm_max = int(arr[:, arr.shape[1] - 2].max())  # COL_PARENT_METH
             shard_max = max(mc_block_max, pm_max)
             if shard_max > max_id:
                 max_id = shard_max
@@ -1255,6 +1258,17 @@ def objective(
     # Derive from the data, not the YAML — see _infer_num_meth_types_from_data.
     num_meth_types = _infer_num_meth_types_from_data(pkl_path)
 
+    # Read geometry from the shard meta so non-default K (e.g. K=21) works.
+    # Otherwise ConvPredictor builds at K=11 default and KineticDataModule
+    # raises a shape mismatch on the first batch.
+    from .utils.config import get_extraction_params as _get_yaml_params
+    _meta = _read_pkl_meta(pkl_path)
+    _ext = (_meta or {}).get("extraction_params", {}) if _meta else {}
+    _kmer_size = int(_ext.get("kmer_size", 11))
+    _active_idx = int(_ext.get("active_site_index", _ext.get("upstream", 7)))
+    _n_rev = int(_ext.get("n_rev_meth", 3))
+    _params = _get_yaml_params()
+
     lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
     dropout = trial.suggest_float("dropout", 0.0, 0.4)
     base_embed_dim = trial.suggest_categorical("base_embed_dim", [8, 16])
@@ -1268,6 +1282,9 @@ def objective(
         kernel_size=kernel_size,
         num_meth_types=num_meth_types,
         dropout=dropout,
+        kmer_size=_kmer_size,
+        active_site_index=_active_idx,
+        n_rev_meth=_n_rev,
     )
 
     lm = KineticPredictor(model, lr=lr, loss_name=loss_name)
@@ -1276,6 +1293,7 @@ def objective(
         val_fraction=val_fraction,
         batch_size=batch_size,
         num_meth_types=num_meth_types,
+        params=_params,
     )
 
     callbacks: list = [EarlyStopping(monitor="val_loss", patience=5, mode="min")]

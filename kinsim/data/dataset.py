@@ -722,8 +722,21 @@ class ShardedSignalDataset(IterableDataset):
                 #   actually bias every draw, so rare rows ARE seen more
                 #   per epoch. Some common rows are skipped (random) and
                 #   re-visited in later epochs — fine for training.
-                composite = flat["kmer_ids"].astype(np.int64) * 4 + flat["categories"].astype(
-                    np.int64
+                # composite key = kmer_id * N_CAT + category. N_CAT must be
+                # >= max(category)+1; we use the upper bound of the category
+                # enum (BASELINE=0, SLOWED=1, NEAR_METH=2 → 3 distinct values,
+                # so a multiplier of 4 leaves one slot for any future
+                # category extension without aliasing).
+                from ..utils.sample_layout import (
+                    CATEGORY_BASELINE,
+                    CATEGORY_NEAR_METH,
+                    CATEGORY_SLOWED,
+                )
+                _N_CAT = max(CATEGORY_BASELINE, CATEGORY_SLOWED, CATEGORY_NEAR_METH) + 1
+                _MULT = max(_N_CAT, 4)  # >=4 keeps the legacy invariant
+                composite = (
+                    flat["kmer_ids"].astype(np.int64) * _MULT
+                    + flat["categories"].astype(np.int64)
                 )
                 counts = np.bincount(composite)
                 row_w = 1.0 / np.sqrt(np.maximum(counts[composite], 1).astype(np.float64))
