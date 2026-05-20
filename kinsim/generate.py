@@ -1361,12 +1361,6 @@ def _process_batch(
         seg.set_tag("fp", array.array("B", pw_vals.tobytes()))
         seg.set_tag("ri", array.array("B", ri_vals.tobytes()))
         seg.set_tag("rp", array.array("B", rp_vals.tobytes()))
-        # Also write ip/pw (= fi/fp) so the bystrandified consumer chain
-        # (pbmm2 → ipdSummary) finds the kinetics directly, without
-        # depending on pbmm2's fi/fp/ri/rp → ip/pw conversion which only
-        # triggers for certain flag combinations.
-        seg.set_tag("ip", array.array("B", ipd_vals.tobytes()))
-        seg.set_tag("pw", array.array("B", pw_vals.tobytes()))
         bam_out.write(seg)
 
     return n_mapped, n_unmapped

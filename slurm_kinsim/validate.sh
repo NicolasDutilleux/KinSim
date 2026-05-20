@@ -3,15 +3,18 @@
 #
 # Each row of the manifest (CSV with header `sample_id,lineage`) gets the
 # chain:
-#   prep → generate (array) → merge → align → ipdSummary → motifmaker
-#                                   │
-#                                   └→ jasmine → final motif merge
+#   prep → generate (array, fi/fp/ri/rp) → merge → bystrandify (ip/pw)
+#                                                       │
+#                                                       ├→ align → ipdSummary → motifmaker
+#                                                       │
+#                                                       └→ jasmine → final motif merge
 #
-# `align` is a pbmm2 alignment of the generated (flag=4 HiFi) BAM against
-# the reference. ipdSummary needs an aligned BAM. Jasmine is fed the
-# UNALIGNED BAM (raw HiFi format with fi/fp/ri/rp): jasmine assumes raw
-# HiFi input and does its own pbmm2 align internally — feeding it an
-# already-aligned BAM caused 10-second crashes.
+# Same chain as the real-data pipeline: raw HiFi (fi/fp/ri/rp) →
+# ccs-kinetics-bystrandify (one record per strand with ip/pw) → pbmm2
+# align (preserves ip/pw) → ipdSummary (consumes ip).
+#
+# jasmine takes the bystrandified BAM (its own pbmm2 align inside the
+# script will preserve ip/pw too).
 #
 # Usage:
 #   bash slurm_kinsim/validate.sh <manifest.csv>
@@ -68,6 +71,7 @@ while IFS=, read -r SAMPLE LINEAGE _rest; do
   SHARD_DIR="$VAL_DIR/shards"
   REGIONS_FILE="$SHARD_DIR/regions.txt"
   SIM_BAM="$VAL_DIR/${SAMPLE}_simulated.bam"
+  SIM_BYS_BAM="$VAL_DIR/${SAMPLE}_simulated_bystrandified.bam"
   SIM_ALIGNED_BAM="$VAL_DIR/${SAMPLE}_simulated_aligned.bam"
   SIM_GFF="$VAL_DIR/${SAMPLE}_simulated.gff"
   SIM_IPD_CSV="$VAL_DIR/${SAMPLE}_simulated_ipdSummary.csv"
@@ -99,36 +103,36 @@ while IFS=, read -r SAMPLE LINEAGE _rest; do
   J_MERGE=$(sbatch --parsable --dependency=afterok:$J_GEN \
     --job-name="val_merge_$SAMPLE" \
     "$VAL_SLURM/merge.slurm" "$SHARD_DIR" "$SIM_BAM")
-  # pbmm2 align — kinsim generate writes flag=4 unmapped HiFi, ipdSummary
-  # needs an aligned BAM with ip/pw tags (pbmm2 converts fi/fp/ri/rp → ip/pw
-  # during alignment). Uses prep/align_pbmm2.slurm (skip-first if output
-  # exists, idempotent pbindex step).
-  J_ALIGN=$(sbatch --parsable --dependency=afterok:$J_MERGE \
+  # bystrandify — converts raw-HiFi (fi/fp/ri/rp on flag=4) to bystrandified
+  # (one record per strand with ip/pw), matching the real-data pipeline.
+  # pbmm2 then preserves ip/pw, and ipdSummary consumes them directly.
+  J_BYS=$(sbatch --parsable --dependency=afterok:$J_MERGE \
+    --job-name="val_bys_$SAMPLE" \
+    "$REPO/slurm_kinsim/prep/bystrandify.slurm" "$SIM_BAM" "$SIM_BYS_BAM")
+  J_ALIGN=$(sbatch --parsable --dependency=afterok:$J_BYS \
     --job-name="val_align_$SAMPLE" \
-    "$REPO/slurm_kinsim/prep/align_pbmm2.slurm" "$SIM_BAM" "$REF" "$SIM_ALIGNED_BAM")
+    "$REPO/slurm_kinsim/prep/align_pbmm2.slurm" "$SIM_BYS_BAM" "$REF" "$SIM_ALIGNED_BAM")
   J_IPD=$(sbatch --parsable --dependency=afterok:$J_ALIGN \
     --job-name="val_ipd_$SAMPLE" \
     "$CALLERS/ipdsummary.slurm" "$SIM_ALIGNED_BAM" "$REF" "$SIM_GFF" "$SIM_IPD_CSV")
   J_MM=$(sbatch --parsable --dependency=afterok:$J_IPD \
     --job-name="val_mm_$SAMPLE" \
     "$CALLERS/pbmotifmaker.slurm" "$REF" "$SIM_GFF" "$SIM_MM_CSV")
-  # Jasmine takes UNALIGNED HiFi (raw format with fi/fp/ri/rp). Feeding it
-  # the aligned BAM crashed jasmine in ~10s. jasmine_modkit.slurm runs its
-  # own pbmm2 align internally before modkit pileup.
-  J_JM=$(sbatch --parsable --dependency=afterok:$J_MERGE \
+  J_JM=$(sbatch --parsable --dependency=afterok:$J_BYS \
     --job-name="val_jm_$SAMPLE" \
-    "$CALLERS/jasmine_modkit.slurm" "$SIM_BAM" "$REF" "$SIM_JM_CSV")
+    "$CALLERS/jasmine_modkit.slurm" "$SIM_BYS_BAM" "$REF" "$SIM_JM_CSV")
   J_FINAL=$(sbatch --parsable --dependency=afterok:${J_MM}:${J_JM} \
     --job-name="val_final_$SAMPLE" \
     "$CALLERS/merge_motifs.slurm" "$SIM_MERGED_CSV" 0.7 "$SIM_MM_CSV" "$SIM_JM_CSV")
 
-  echo "  generate   $J_GEN (array 0-$((N_SHARDS - 1)))"
-  echo "  merge      $J_MERGE"
-  echo "  align      $J_ALIGN"
-  echo "  ipdSummary $J_IPD"
-  echo "  motifmaker $J_MM"
-  echo "  jasmine    $J_JM"
-  echo "  final      $J_FINAL"
+  echo "  generate    $J_GEN (array 0-$((N_SHARDS - 1)))"
+  echo "  merge       $J_MERGE"
+  echo "  bystrandify $J_BYS"
+  echo "  align       $J_ALIGN"
+  echo "  ipdSummary  $J_IPD"
+  echo "  motifmaker  $J_MM"
+  echo "  jasmine     $J_JM"
+  echo "  final       $J_FINAL"
   echo "  output:    $SIM_MERGED_CSV"
   FINAL_JOBS+=("$J_FINAL")
 done < "$MANIFEST"
