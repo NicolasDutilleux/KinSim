@@ -78,7 +78,6 @@ kinsim = ["py.typed"]
 line-length    = 100
 target-version = "py310"
 extend-exclude = [
-    "baseline",          # baselines for comparison, frozen
     "kinsim.egg-info",
 ]
 
@@ -141,7 +140,6 @@ branch = true
 source = ["kinsim"]
 omit   = [
     "*/__main__.py",   # CLI dispatch — covered by integration runs
-    "baseline/*",
 ]
 
 [tool.coverage.report]

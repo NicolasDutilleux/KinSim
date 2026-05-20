@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -142,17 +143,23 @@ def _meth_full_for_scenario(
     k_offset: int,
     num_meth_types: int = 4,
     device: torch.device | str = "cpu",
+    kmer_size: int = K,
+    active_site_index: int = KMER_PRED_IDX,
+    n_rev_meth: int = REV_METH_LEN,
 ) -> torch.Tensor:
-    """Build the ``(B, kmer_size + REV_METH_LEN, num_meth_types)`` tensor.
+    """Build the ``(B, kmer_size + n_rev_meth, num_meth_types)`` tensor.
 
     ``meth_id == 0`` → all-zero tensor (no methylation).
-    Otherwise: methylation is placed at ``KMER_PRED_IDX - k_offset`` (the
-    one-hot encoding the model was trained on for positions != pred_idx).
+    Otherwise: methylation is placed at ``active_site_index - k_offset``.
+
+    All geometry params default to the K=11 legacy constants but can be
+    overridden — predict_all passes the model's actual kmer_size /
+    active_site_index / n_rev_meth so K=21 checkpoints just work.
     """
-    total_pos = K + REV_METH_LEN
+    total_pos = kmer_size + n_rev_meth
     meth_full = torch.zeros(batch_size, total_pos, num_meth_types, dtype=torch.float32)
     if meth_id != 0:
-        pos = KMER_PRED_IDX - int(k_offset)
+        pos = active_site_index - int(k_offset)
         # Use 1.0 to mean "fully methylated" — consistent with the one-hot
         # encoding for non-pred positions. For the pred position the
         # training Dataset uses ``frac`` (stoichiometry); we use 1.0 here
@@ -171,6 +178,9 @@ def _run_scenario(
     batch_size: int,
     num_meth_types: int,
     device: torch.device,
+    kmer_size: int = K,
+    active_site_index: int = KMER_PRED_IDX,
+    n_rev_meth: int = REV_METH_LEN,
 ) -> np.ndarray:
     """Run the model on every kmer for one scenario.
 
@@ -184,6 +194,9 @@ def _run_scenario(
         k_offset,
         num_meth_types,
         device,
+        kmer_size=kmer_size,
+        active_site_index=active_site_index,
+        n_rev_meth=n_rev_meth,
     )
     for start in range(0, n_kmers, batch_size):
         end = min(start + batch_size, n_kmers)
@@ -373,13 +386,31 @@ def predict_all(
     model, config = _load_model(Path(ckpt_dir), device)
     num_meth_types = int(config.get("num_meth_types", 4))
 
+    # K-aware: enumerate from the checkpoint's actual geometry, not the
+    # module-level K=11 constants. A K=21 checkpoint produces 4**21 ≈ 4.4T
+    # kmers — that's too many to fully enumerate. Cap to a sample and warn.
+    ckpt_k = int(config.get("kmer_size", K))
+    ckpt_pred_idx = int(config.get("active_site_index", KMER_PRED_IDX))
+    ckpt_n_rev = int(config.get("n_rev_meth", REV_METH_LEN))
     scenarios = _scenarios_from_yaml()
     log.info("Scenarios: %s", [s[0] for s in scenarios])
-    n_kmers = 4**K
+    log.info(
+        "Checkpoint geometry: K=%d  active_site_index=%d  n_rev_meth=%d",
+        ckpt_k, ckpt_pred_idx, ckpt_n_rev,
+    )
+    n_kmers = 4**ckpt_k
+    if n_kmers > 100_000_000:
+        log.warning(
+            "K=%d implies %.2g kmers — exceeds the 1e8 safety cap. "
+            "Predict-kmers full enumeration is not viable at this scale; "
+            "rewrite to sample-and-extrapolate.",
+            ckpt_k, n_kmers,
+        )
+        sys.exit(1)
     log.info(
         "Enumerating %d kmers (4^%d) for %d scenarios → %d predictions total",
         n_kmers,
-        K,
+        ckpt_k,
         len(scenarios),
         n_kmers * len(scenarios),
     )
@@ -395,6 +426,9 @@ def predict_all(
             batch_size,
             num_meth_types,
             device,
+            kmer_size=ckpt_k,
+            active_site_index=ckpt_pred_idx,
+            n_rev_meth=ckpt_n_rev,
         )
 
     output_prefix = Path(output_prefix)

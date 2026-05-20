@@ -35,6 +35,23 @@ reading the reverse strand encounters the reverse-complement sequence, so the
 11-mer it "sees" at each position is the RC of the forward 11-mer.
 The methylation state (meth_id) is shared: the meth_map (built with revcomp=True)
 already encodes both-strand methylation at each reference position.
+
+YAML reuse
+----------
+generate reads the SAME ``kinsim_config.yaml`` that drove extract / refine /
+train. In particular:
+
+  - ``kinetic_signatures.<T>.signal_offsets`` — drives the per-site Bernoulli
+    firing decision (``_apply_p_fire_to_mc``): a methylation only fires
+    at offsets declared in the YAML, even if the trained model knows
+    about other offsets. Edit the YAML between training and generation
+    only if you understand the consequences.
+  - ``extraction.rev_meth_offsets`` — feeds rev_meth into FiLM. MUST match
+    the values used at training (the model embeds these positions
+    structurally). The shard meta records this; generate cross-checks.
+  - ``generation.use_motif_fraction`` — toggles legacy per-site fraction
+    multiplication. Default ``false`` because p_fire already absorbs
+    occupancy + non-firing in one rate.
 """
 
 from __future__ import annotations

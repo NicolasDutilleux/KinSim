@@ -438,8 +438,13 @@ def plot_kmer_distribution(
         COL_PW,
     )
     _METH_IDS_RUNTIME = _gmi()
-    if len(kmer_str) != _K:
-        raise ValueError(f"kmer_str must be exactly {_K} bases, got {len(kmer_str)}")
+    # K-aware: prefer the model's actual kmer_size, fall back to module K.
+    try:
+        _ckpt_k = int(model.get_config().get("kmer_size", _K))
+    except Exception:
+        _ckpt_k = _K
+    if len(kmer_str) != _ckpt_k:
+        raise ValueError(f"kmer_str must be exactly {_ckpt_k} bases, got {len(kmer_str)}")
     if meth_name not in _METH_IDS_RUNTIME:
         raise ValueError(
             f"meth_name must be one of {list(_METH_IDS_RUNTIME)}, got '{meth_name}'"
