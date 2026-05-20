@@ -166,6 +166,29 @@ generation:
   use_motif_fraction: false
 
 # ─────────────────────────────────────────────────────────────────────────
+# PacBio auxiliary tags written by `kinsim generate`
+# ─────────────────────────────────────────────────────────────────────────
+# Default values for PacBio aux tags applied to every output record. They
+# were CAPTURED from a real PacBio HiFi BAM — not invented — so downstream
+# tools (`ccs-kinetics-bystrandify`, `pbmm2`, `jasmine`, `ipdSummary`) find
+# the metadata they require. Without them ccs-kinetics-bystrandify FATALs
+# on "cannot convert type std::monostate to int" because PacBio-required
+# tags are missing.
+#
+# Update these values if you switch chemistry — capture from your own
+# data with::
+#
+#     samtools view <real.bam> | head -1 | tr '\t' '\n' | grep -E "^(np|rq|sn):"
+#
+# The ZMW number ``zm`` is NOT listed here — generate parses it per-record
+# from the PacBio query_name convention ``<movie>/<zmw>[/ccs]`` because
+# ccs-kinetics-bystrandify groups by zm and needs distinct values.
+pacbio_tags:
+  np:  10                          # number of passes (typical HiFi value)
+  rq:  0.998                       # read quality (typical HiFi value)
+  sn:  [10.5, 10.5, 10.5, 10.5]    # per-channel SNR (A, C, G, T)
+
+# ─────────────────────────────────────────────────────────────────────────
 # Model defaults
 # ─────────────────────────────────────────────────────────────────────────
 # Architecture knobs for `kinsim train`. CLI flags override these; the

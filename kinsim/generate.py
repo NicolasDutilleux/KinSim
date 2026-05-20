@@ -486,6 +486,50 @@ def _build_sig_offsets_by_meth_id() -> dict[int, set[int]]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# PacBio auxiliary tag presets (loaded from kinsim_config.yaml::pacbio_tags)
+# ---------------------------------------------------------------------------
+
+_PACBIO_TAG_PRESETS: list[tuple[str, object, str]] = []
+_ZM_PATTERN = re.compile(r"/(\d+)(?:/[^/]+)?$")
+
+
+def _zm_from_query_name(name: str) -> int | None:
+    """Parse the ZMW number from a PacBio query_name.
+
+    PacBio convention: ``<movie>/<zmw>`` or ``<movie>/<zmw>/ccs``. Returns
+    ``None`` if the pattern doesn't match (caller falls back to omitting
+    the zm tag — only ccs-kinetics-bystrandify cares).
+    """
+    m = _ZM_PATTERN.search(name)
+    return int(m.group(1)) if m else None
+
+
+def _load_pacbio_tag_presets() -> list[tuple[str, object, str]]:
+    """Build the (tag, value, type_letter) tuples from the YAML.
+
+    Tags are hardcoded defaults captured from a real PacBio HiFi BAM (not
+    invented) so downstream tools (ccs-kinetics-bystrandify, jasmine,
+    ipdSummary) find the metadata they require. The ZMW number ``zm`` is
+    NOT preset here — it's parsed per-record from the query_name, since
+    bystrandify groups by zm and needs distinct values.
+    """
+    from .utils.config import load_kinsim_config
+    presets = (load_kinsim_config().get("pacbio_tags") or {})
+    out: list[tuple[str, object, str]] = []
+    if "np" in presets:
+        out.append(("np", int(presets["np"]), "i"))
+    if "rq" in presets:
+        out.append(("rq", float(presets["rq"]), "f"))
+    if "sn" in presets:
+        sn = [float(x) for x in presets["sn"]]
+        out.append(("sn", sn, "f"))
+    return out
+
+
+_PACBIO_TAG_PRESETS = _load_pacbio_tag_presets()
+
+
 def _apply_p_fire_to_mc(
     ctx: np.ndarray,
     p_eff_lookup: dict[tuple[int, int], float],
@@ -1371,16 +1415,16 @@ def _process_batch(
         seg.query_qualities = pysam.qualitystring_to_array(read_data["qual"])
         rg_id = header.to_dict().get("RG", [{}])[0].get("ID", "00000001")
         seg.set_tag("RG", rg_id)
-        # Propagate input PacBio auxiliary tags (np, rq, zm, sn, ...) so
-        # ccs-kinetics-bystrandify finds the metadata it needs. Kinetic
-        # tags and RG were excluded upstream in generate_from_bam.
-        for _tag, _val, _vt in read_data.get("tags", ()) or ():
-            try:
-                seg.set_tag(_tag, _val, _vt)
-            except Exception:
-                # Best-effort: skip any tag that fails (e.g. arrays with
-                # encoding incompatible with this pysam version).
-                pass
+        # PacBio auxiliary tags from the YAML defaults
+        # (kinsim_config.yaml::pacbio_tags). Values were captured from a
+        # real PacBio HiFi BAM — not invented. The ZMW number must be
+        # UNIQUE per record (bystrandify groups by zm), so we parse it
+        # from the PacBio query_name convention "<movie>/<zmw>[/ccs]".
+        for _t, _v, _vt in _PACBIO_TAG_PRESETS:
+            seg.set_tag(_t, _v, _vt)
+        _zm = _zm_from_query_name(read_data["name"])
+        if _zm is not None:
+            seg.set_tag("zm", _zm, "i")
         # Use .tobytes() instead of .tolist() — saves the per-read allocation of
         # 4 × L Python int objects. For a 10 kb read × 1000 reads/batch this
         # removes ~40 s of pure Python overhead per batch.
@@ -1668,28 +1712,12 @@ def generate_from_bam(
             qual = read.query_qualities
             qual_str = pysam.array_to_qualitystring(qual) if qual is not None else "I" * len(seq)
 
-            # Capture ALL auxiliary tags from the input record so we can
-            # propagate np / rq / zm / sn / ... to the output. Otherwise
-            # ccs-kinetics-bystrandify FATALs with "cannot convert type
-            # std::monostate to int" because the PacBio-required tags are
-            # missing. We strip the kinetic tags (we regenerate them) and
-            # RG (we set our own cleaned ID).
-            try:
-                in_tags = read.get_tags(with_value_type=True)
-            except Exception:
-                in_tags = []
-            propagated_tags = [
-                (t, v, vt) for (t, v, vt) in in_tags
-                if t not in {"fi", "fp", "ri", "rp", "ip", "pw", "RG"}
-            ]
-
             batch.append(
                 {
                     "name": read.query_name,
                     "seq": seq,
                     "qual": qual_str,
                     "len": len(seq),
-                    "tags": propagated_tags,
                 }
             )
 
