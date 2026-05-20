@@ -505,7 +505,7 @@ def _zm_from_query_name(name: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _load_pacbio_tag_presets() -> list[tuple[str, object, str]]:
+def _load_pacbio_tag_presets() -> list[tuple[str, object, str | None]]:
     """Build the (tag, value, type_letter) tuples from the YAML.
 
     Tags are hardcoded defaults captured from a real PacBio HiFi BAM (not
@@ -513,17 +513,23 @@ def _load_pacbio_tag_presets() -> list[tuple[str, object, str]]:
     ipdSummary) find the metadata they require. The ZMW number ``zm`` is
     NOT preset here — it's parsed per-record from the query_name, since
     bystrandify groups by zm and needs distinct values.
+
+    For array tags (e.g. ``sn`` per-channel SNR) we pass the value as a
+    Python list and type_letter ``None`` — pysam infers ``B:f`` from the
+    list contents. Passing ``"f"`` would coerce to a single float and
+    raise ``TypeError: must be real number, not list``.
     """
     from .utils.config import load_kinsim_config
     presets = (load_kinsim_config().get("pacbio_tags") or {})
-    out: list[tuple[str, object, str]] = []
+    out: list[tuple[str, object, str | None]] = []
     if "np" in presets:
         out.append(("np", int(presets["np"]), "i"))
     if "rq" in presets:
         out.append(("rq", float(presets["rq"]), "f"))
     if "sn" in presets:
         sn = [float(x) for x in presets["sn"]]
-        out.append(("sn", sn, "f"))
+        # type_letter=None → pysam infers B:f for a float list.
+        out.append(("sn", sn, None))
     return out
 
 
@@ -1421,7 +1427,10 @@ def _process_batch(
         # UNIQUE per record (bystrandify groups by zm), so we parse it
         # from the PacBio query_name convention "<movie>/<zmw>[/ccs]".
         for _t, _v, _vt in _PACBIO_TAG_PRESETS:
-            seg.set_tag(_t, _v, _vt)
+            if _vt is None:
+                seg.set_tag(_t, _v)         # pysam infers type (used for array tags)
+            else:
+                seg.set_tag(_t, _v, _vt)
         _zm = _zm_from_query_name(read_data["name"])
         if _zm is not None:
             seg.set_tag("zm", _zm, "i")
