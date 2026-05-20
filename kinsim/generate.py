@@ -23,7 +23,7 @@ fuzznuc as the primary backend (falls back to Python regex automatically if
 fuzznuc is not installed).  Results are cached in O(1)-lookup arrays,
 avoiding repeated per-read scanning.
 
-Output BAMs use the suffix _mlp.bam: unaligned BAM (flag=4) with all four
+Output BAMs use the suffix _kinsim.bam: unaligned BAM (flag=4) with all four
 PacBio kinetic tags:
   fi:B:C  — forward strand IPD (polymerase on template strand)
   fp:B:C  — forward strand PW
@@ -1371,6 +1371,16 @@ def _process_batch(
         seg.query_qualities = pysam.qualitystring_to_array(read_data["qual"])
         rg_id = header.to_dict().get("RG", [{}])[0].get("ID", "00000001")
         seg.set_tag("RG", rg_id)
+        # Propagate input PacBio auxiliary tags (np, rq, zm, sn, ...) so
+        # ccs-kinetics-bystrandify finds the metadata it needs. Kinetic
+        # tags and RG were excluded upstream in generate_from_bam.
+        for _tag, _val, _vt in read_data.get("tags", ()) or ():
+            try:
+                seg.set_tag(_tag, _val, _vt)
+            except Exception:
+                # Best-effort: skip any tag that fails (e.g. arrays with
+                # encoding incompatible with this pysam version).
+                pass
         # Use .tobytes() instead of .tolist() — saves the per-read allocation of
         # 4 × L Python int objects. For a 10 kb read × 1000 reads/batch this
         # removes ~40 s of pure Python overhead per batch.
@@ -1409,7 +1419,7 @@ def generate_directory(
       - Species subdirectories: pbsim3_dir/Ecoli/, pbsim3_dir/Salmonella/, ...
       - Flat layout: all files directly in pbsim3_dir, matched by basename.
 
-    Output BAMs are written to output_dir as <species_name>_mlp.bam.
+    Output BAMs are written to output_dir as <species_name>_kinsim.bam.
     """
     genomes = find_pbsim3_files(pbsim3_dir)
     if not genomes:
@@ -1427,7 +1437,7 @@ def generate_directory(
 
         motif_string = _apply_meth_types(motif_string, meth_types)
 
-        out_bam = os.path.join(output_dir, species + "_mlp.bam")
+        out_bam = os.path.join(output_dir, species + "_kinsim.bam")
         log.info("--- %s ---", species)
         generate_signals(
             fq_path,
@@ -1658,12 +1668,28 @@ def generate_from_bam(
             qual = read.query_qualities
             qual_str = pysam.array_to_qualitystring(qual) if qual is not None else "I" * len(seq)
 
+            # Capture ALL auxiliary tags from the input record so we can
+            # propagate np / rq / zm / sn / ... to the output. Otherwise
+            # ccs-kinetics-bystrandify FATALs with "cannot convert type
+            # std::monostate to int" because the PacBio-required tags are
+            # missing. We strip the kinetic tags (we regenerate them) and
+            # RG (we set our own cleaned ID).
+            try:
+                in_tags = read.get_tags(with_value_type=True)
+            except Exception:
+                in_tags = []
+            propagated_tags = [
+                (t, v, vt) for (t, v, vt) in in_tags
+                if t not in {"fi", "fp", "ri", "rp", "ip", "pw", "RG"}
+            ]
+
             batch.append(
                 {
                     "name": read.query_name,
                     "seq": seq,
                     "qual": qual_str,
                     "len": len(seq),
+                    "tags": propagated_tags,
                 }
             )
 
