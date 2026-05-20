@@ -1,4 +1,4 @@
-"""Generate kinetic signals for PBSIM3 reads using a trained MLP predictor.
+"""Generate kinetic signals for PBSIM3 reads using a trained model.
 
 The model predicts (μ, σ) per context,
 then either samples from N(μ, σ²) (stochastic, default) or returns μ directly
@@ -518,7 +518,7 @@ def _apply_p_fire_to_mc(
 
 
 # ---------------------------------------------------------------------------
-# Batched MLP inference
+# Batched neural inference
 # ---------------------------------------------------------------------------
 
 
@@ -801,7 +801,7 @@ def generate_signals(
     no_fuzznuc: bool = False,
     deterministic: bool = False,
 ) -> None:
-    """Inject MLP-predicted IPD/PW signals into PBSIM3 reads.
+    """Inject model-predicted IPD/PW signals into PBSIM3 reads.
 
     Pipeline:
       1. Load reference genome
@@ -989,7 +989,7 @@ def _process_batch(
     rev_meth_offsets=(),
     use_motif_fraction: bool = False,
 ):
-    """Process a batch of reads with batched MLP inference.
+    """Process a batch of reads with batched neural inference.
 
     Builds a flat list of (kmer_id, meth_id, fraction) triples for all
     positions across all reads in the batch, runs a single forward pass,
@@ -1846,7 +1846,7 @@ def _main_directory(argv):
     parser = argparse.ArgumentParser(
         prog="kinsim generate",
         description=(
-            "Generate MLP kinetic signals for all PBSIM3 species in a directory.\n\n"
+            "Generate kinetic signals for all PBSIM3 species in a directory.\n\n"
             "Supports two directory layouts (auto-detected):\n\n"
             "  Species subdirectories (recommended):\n"
             "    pbsim3_dir/\n"
@@ -1868,7 +1868,7 @@ def _main_directory(argv):
     parser.add_argument(
         "pbsim3_dir", help="Directory containing species subdirs or flat .fq.gz files"
     )
-    parser.add_argument("checkpoint", help="Trained MLP checkpoint (.pt)")
+    parser.add_argument("checkpoint", help="Trained model checkpoint (.pt)")
     parser.add_argument(
         "motifs",
         help="Motifs: KinSim string (applied to all), PacBio .csv, "
@@ -1955,7 +1955,7 @@ def _main_per_genome(argv):
     parser = argparse.ArgumentParser(
         prog="kinsim generate",
         description=(
-            "Generate kinetic signals for PBSIM3 reads using a trained MLP predictor.\n\n"
+            "Generate kinetic signals for PBSIM3 reads using a trained model.\n\n"
             "Uses the .maf alignment to resolve reference context for edge bases.\n"
             "The reference is pre-scanned once for methylation sites; per-read\n"
             "lookups are O(1). Outputs an unaligned BAM with fi (IPD) and fp (PW) tags.\n\n"
@@ -1969,7 +1969,7 @@ def _main_per_genome(argv):
     parser.add_argument("fastq", help="PBSIM3 simulated reads (.fq or .fq.gz)")
     parser.add_argument("maf", help="PBSIM3 alignment file (.maf or .maf.gz)")
     parser.add_argument("ref", help="Reference genome FASTA (.fna, .fa, or .gz)")
-    parser.add_argument("checkpoint", help="Trained MLP checkpoint (.pt)")
+    parser.add_argument("checkpoint", help="Trained model checkpoint (.pt)")
     parser.add_argument(
         "motifs",
         help="Motif source: KinSim string ('m6A,GATC,1'), "

@@ -141,7 +141,7 @@ def _check_v4_input(data: dict) -> None:
             continue
         if not isinstance(k, (int, np.integer)):
             raise ValueError(
-                f"Input is not in the current 36-col layout: got key type "
+                f"Input is not in the current int-keyed layout: got key type "
                 f"{type(k).__name__}, expected int kmer_id. Re-run "
                 f"`kinsim extract`."
             )

@@ -29,7 +29,6 @@ KinSim — PacBio HiFi kinetic signal simulator.
 Pipeline (one verb per stage; each consumes the previous stage's output):
 
   extract          Aligned BAM + ref + motifs  →  shard.pkl
-                   Use ``kinsim extract --refine`` to chain refine in one step.
   refine           Per-(meth, offset) GMM filter on slowed rows.
   train            Train ConvPredictor on shards.
   generate         Trained model + PBSIM3 reads  →  synthetic BAM with kinetics.

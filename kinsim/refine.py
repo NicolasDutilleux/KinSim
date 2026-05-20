@@ -4,7 +4,7 @@ Input format: ``dict[kmer_id (int)] -> ndarray(N, 20)`` produced by
 ``kinsim extract``. Cols 17/18/19 carry CATEGORY, PARENT_METH and
 PARENT_OFFSET (see ``kinsim.utils.sample_layout``).
 
-Default method — ``--method gmm`` (baseline-anchored)
+Method — baseline-anchored GMM (only method; ``--method`` flag retired)
 -----------------------------------------------------
 Single rule. For each (meth_type T, parent_offset off) bucket:
 
@@ -904,7 +904,7 @@ def slowed_split_gmm(
        so EM keeps it pinned at baseline kinetics. Initialise the
        remaining ``K-1`` components at high-IPD quantiles of the
        slowed pool. Fit on ``baseline_subsample + slowed`` jointly.
-    3. Pick K∈``n_components`` (default ``(2, 3)``) by BIC, **with
+    3. Pick K∈``n_components`` (default ``(1, 2, 3)``) by BIC, **with
        a biological veto on K>2**: any K>2 fit that places a
        non-anchor component at or below the anchor's IPD is
        rejected outright (overfit — methylation never sub-baseline).
@@ -1329,9 +1329,9 @@ def refine_pkl(
         log.error("No int-keyed data found — input is not a kinsim extract pkl.")
         sys.exit(1)
 
-    # Fail fast on the old layout (no PARENT_METH at col 36). Re-extract
-    # is the right answer; both refine methods need the parent column for
-    # per-meth-type behaviour (gmm) or for analyze diagnostics (p95).
+    # Fail fast on the old layout (need PARENT_METH at col 18 of the 20-col
+    # current layout). Re-extract is the right answer; the GMM method needs
+    # the parent column for per-meth-type filtering.
     from .utils.sample_layout import SAMPLE_NCOLS
 
     sample_arr = next(iter(int_keyed.values()))
