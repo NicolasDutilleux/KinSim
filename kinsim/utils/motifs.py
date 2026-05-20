@@ -522,122 +522,16 @@ def scan_sequence(seq, motifs):
 
 
 def parse_motifs_csv(csv_path, min_fraction=0.40, min_detected=20):
-    """Parse a PacBio motifs.csv and return a KinSim motif string.
+    """Thin wrapper kept for back-compat — forwards to PacBioParser.
 
-    Required columns: ``motifString``, ``centerPos``.
-    Optional columns: ``modificationType``, ``fraction``, ``nDetected``.
-
-    Filtering:
-      - fraction  < min_fraction  → skipped (blank fraction bypasses filter)
-      - nDetected < min_detected  → skipped (blank nDetected bypasses filter)
-
-    modificationType handling:
-      - ``m6A`` / ``m4C`` / ``m5C`` → used directly
-      - ``modified_base`` / blank   → inferred from base at centerPos (A→m6A, C→m4C)
-
-    Returns an empty string if the file is not a PacBio CSV (missing required
-    columns), allowing the caller to fall through to alternative parsers.
-
-    Returns:
-        A semicolon-delimited motif string:
-        ``"m6A,GCCGATC,5,3551,0.998;m6A,CTGAAG,5,2891,1.0"``
-        Fields: MOD_TYPE, MOTIF, POS, nDetected, fraction
+    The historical body of this function duplicated PacBioParser.parse() and
+    drifted from it over time. Retired in favour of the registered parser
+    (kinsim.utils.parsers.pacbio.PacBioParser).
     """
-    entries = []
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        fieldnames = set(reader.fieldnames or [])
-
-        # Required columns — return "" if absent (not a PacBio CSV)
-        if "motifString" not in fieldnames or "centerPos" not in fieldnames:
-            return ""
-
-        has_fraction = "fraction" in fieldnames
-        has_ndetected = "nDetected" in fieldnames
-        has_mod_type = "modificationType" in fieldnames
-
-        for lineno, row in enumerate(reader, 2):
-            motif_seq = row.get("motifString", "").strip()
-            center_str = row.get("centerPos", "").strip()
-            if not motif_seq or not center_str:
-                continue
-
-            try:
-                center_pos = int(center_str)
-            except ValueError:
-                log.warning("motifs.csv line %d: invalid centerPos — skipped", lineno)
-                continue
-
-            # fraction — blank → bypass filter
-            fraction: float | None = None
-            if has_fraction:
-                frac_str = row.get("fraction", "").strip()
-                if frac_str:
-                    try:
-                        fraction = float(frac_str)
-                    except ValueError:
-                        pass
-
-            if fraction is not None and fraction < min_fraction:
-                continue
-
-            # nDetected — blank → bypass filter
-            n_detected: int | None = None
-            if has_ndetected:
-                nd_str = row.get("nDetected", "").strip()
-                if nd_str:
-                    try:
-                        n_detected = int(nd_str)
-                    except ValueError:
-                        pass
-
-            if n_detected is not None and n_detected < min_detected:
-                continue
-
-            # modificationType
-            mod_type = row.get("modificationType", "").strip() if has_mod_type else ""
-
-            if mod_type in ("modified_base", ""):
-                idx = center_pos - 1  # centerPos is 1-based in CSV
-                if idx < 0 or idx >= len(motif_seq):
-                    log.warning(
-                        "motifs.csv line %d: centerPos %d OOB for '%s' — skipped",
-                        lineno,
-                        center_pos,
-                        motif_seq,
-                    )
-                    continue
-                base = motif_seq[idx].upper()
-                resolved = _build_base_to_meth().get(base)
-                if resolved is None:
-                    log.warning(
-                        "motifs.csv line %d: cannot infer mod type at %s[%d]='%s' "
-                        "(base not declared in kinsim_config.yaml's "
-                        "kinetic_signatures, or multiple meth types share this "
-                        "base — set modificationType column explicitly) — skipped",
-                        lineno,
-                        motif_seq,
-                        center_pos,
-                        base,
-                    )
-                    continue
-                mod_type = resolved
-
-            if mod_type not in get_meth_ids():
-                log.warning(
-                    "motifs.csv line %d: mod type '%s' for %s not declared "
-                    "in kinsim_config.yaml kinetic_signatures — skipped",
-                    lineno,
-                    mod_type,
-                    motif_seq,
-                )
-                continue
-
-            nd_out = n_detected if n_detected is not None else 0
-            fr_out = fraction if fraction is not None else 1.0
-            entries.append(f"{mod_type},{motif_seq},{center_pos},{nd_out},{fr_out:.6g}")
-
-    return ";".join(entries)
+    from .parsers import create_parser
+    return create_parser("pacbio").parse(
+        csv_path, min_fraction=min_fraction, min_detected=min_detected
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -673,24 +567,19 @@ def load_motif_string(motifs_arg, min_fraction=0.40, min_detected=20, parser_nam
         return parser.parse(motifs_arg, min_fraction=min_fraction, min_detected=min_detected)
 
     if os.path.isfile(motifs_arg):
-        # Try the callers registry first (covers PacBio motifs.csv,
-        # modkit bedMethyl, combined CSV).
+        # Try the parser registry first (covers PacBio motifs.csv, modkit
+        # bedMethyl, combined CSV).
         from .parsers import auto_detect_parser
 
         parser = auto_detect_parser(motifs_arg)
         if parser is not None:
             return parser.parse(motifs_arg, min_fraction=min_fraction, min_detected=min_detected)
 
-        # Legacy PacBio CSV parser (returns "" when columns are missing,
-        # so it is safe to try on any .csv file)
-        if motifs_arg.lower().endswith(".csv"):
-            result = parse_motifs_csv(
-                motifs_arg, min_fraction=min_fraction, min_detected=min_detected
-            )
-            if result:
-                return result
-
-        # Fall through to REBASE
+        # No parser auto-matched → REBASE fallback. The legacy
+        # ``parse_motifs_csv`` was retired in favour of PacBioParser: it
+        # required the same ``motifString`` + ``centerPos`` columns that
+        # PacBioParser checks, so any CSV that fell through here was not
+        # a PacBio motifs.csv anyway.
         from .parsers.rebase import parse_rebase_file
 
         return parse_rebase_file(motifs_arg)

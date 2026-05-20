@@ -383,17 +383,16 @@ def _process_read_unmapped_vec(
     return kmer_ids, rc_kmer_ids, meth_ids, fractions, meth_ctxs, is_n_context
 
 
-def _rc_kmer(kmer_id: int) -> int:
-    """Reverse complement a 22-bit encoded 11-mer.
+def _rc_kmer(kmer_id: int, kmer_size: int = K) -> int:
+    """Reverse complement a (2*kmer_size)-bit encoded kmer.
 
-    Encoding convention (big-endian): seq[0] occupies bits 21-20, seq[10]
-    occupies bits 1-0.  Complement maps A↔T (0↔3) and C↔G (1↔2), i.e.
-    XOR with 3 on each 2-bit unit.  Reversing bit-pair order yields the RC.
-
-    Example: encode_kmer("ACGT...") → _rc_kmer() → encode_kmer(reverse_complement("ACGT..."))
+    Encoding convention (big-endian): seq[0] occupies bits (2K-1, 2K-2),
+    seq[K-1] occupies bits (1, 0). Complement maps A↔T (0↔3) and C↔G (1↔2)
+    via XOR with 3 on each 2-bit unit. Reversing bit-pair order yields the
+    RC. Default ``kmer_size=K`` (=11) keeps legacy callers working.
     """
     rc = 0
-    for _ in range(K):  # K = 11 iterations, one per base
+    for _ in range(kmer_size):
         base = kmer_id & 3
         rc = (rc << 2) | (base ^ 3)  # complement: 0↔3 (A↔T), 1↔2 (C↔G)
         kmer_id >>= 2
@@ -737,26 +736,36 @@ def _load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
     with open(config_path) as f:
         config = json.load(f)
 
-    # Geometry guard — the numpy hot path is K=11-specific.
-    # (Old configs used the key "KMER_PRED_IDX"; current ConvPredictor writes
-    # "active_site_index". The old key is never produced anymore, but kept
-    # as a tolerant read for any legacy pickled config still floating around.)
+    # Geometry — read directly from the checkpoint config. K and
+    # active_site_index are now propagated through _process_batch from
+    # ``model.get_config()`` (no module-level K assumption), and KMER_MASK is
+    # recomputed as ``(1 << 2*K) - 1`` per-call. Refuse only on values
+    # outside the safe int64 range (K > 31 would overflow the 2K-bit kmer
+    # encoding stored as a Python/int64 hybrid).
     ckpt_kmer_size = int(config.get("kmer_size", K))
-    ckpt_active_idx = int(config.get("active_site_index", config.get("KMER_PRED_IDX", 7)))
-    if ckpt_kmer_size != K:
+    ckpt_active_idx = int(config.get("active_site_index", KMER_PRED_IDX))
+    if not 1 <= ckpt_kmer_size <= 31:
         log.error(
-            "Checkpoint kmer_size=%d but generate.py only supports K=%d.",
+            "Checkpoint kmer_size=%d is outside the supported range [1, 31] "
+            "(int64 encoding constraint).",
             ckpt_kmer_size,
-            K,
         )
         sys.exit(1)
-    if ckpt_active_idx != KMER_PRED_IDX:
+    if not 0 <= ckpt_active_idx < ckpt_kmer_size:
         log.error(
-            "Checkpoint active_site_index=%d but generate.py expects %d.",
+            "Checkpoint active_site_index=%d is outside [0, kmer_size=%d).",
             ckpt_active_idx,
-            KMER_PRED_IDX,
+            ckpt_kmer_size,
         )
         sys.exit(1)
+    if ckpt_kmer_size != K:
+        log.warning(
+            "Checkpoint K=%d differs from the encoding module K=%d. "
+            "Generate will run with the checkpoint's K, but the unmapped "
+            "fallback path uses the module K (rolling KMER_MASK is fixed). "
+            "Use only the mapped path (input BAM with alignment) when K!=%d.",
+            ckpt_kmer_size, K, K,
+        )
 
     model = create_from_config(config).to(device)
     model.load_state_dict(load_state_dict_from_ckpt(checkpoint_path))
@@ -1028,16 +1037,20 @@ def _process_batch(
     _ZERO_REV = np.zeros(_N_REV, dtype=np.int64)
     _DO_REV = rev_meth_map is not None and _N_REV > 0
     _STRAND_AWARE = rev_meth_map is not None and fwd_meth_map is not None and _N_REV > 0
-    _K = K
-    # Window geometry comes from the trained model's config. ``_load_model``
-    # already refuses non-K=11 checkpoints (hot path is K=11-specific), but
-    # reading from model_config keeps the indices self-consistent.
+    # All geometry comes from the trained model's config — generate is K-aware
+    # provided the input BAM has alignment (mapped path). The unmapped fallback
+    # path uses the module-level K and is K=11-only (would need a separate
+    # rewrite to handle other K).
     _cfg = model.get_config()
-    _CTX_LEN = int(_cfg.get("kmer_size", 11))
+    _K = int(_cfg.get("kmer_size", K))
+    _CTX_LEN = _K
     _PRED_IDX = int(_cfg.get("active_site_index", 7))
     _LEFT = _PRED_IDX
     _RIGHT = _CTX_LEN - _PRED_IDX - 1
     _ZERO_CTX = np.zeros(_CTX_LEN, dtype=np.int64)  # placeholder for N/unmapped
+    # Dynamic kmer mask — replaces the module-level KMER_MASK (K=11 → 22-bit).
+    # For K=21 we need a 42-bit mask; for K=11 it collapses to the legacy.
+    _KMER_MASK = (1 << (2 * _K)) - 1
 
     n_mapped = n_unmapped = 0
 
@@ -1082,12 +1095,12 @@ def _process_batch(
 
             for i in range(len(ext_context)):
                 base_val = BASE_MAP.get(ext_context[i], 0)
-                current_kmer = ((current_kmer << 2) | base_val) & KMER_MASK
+                current_kmer = ((current_kmer << 2) | base_val) & _KMER_MASK
 
-                if i >= K - 1:
-                    read_pos = i - (K - 1)
+                if i >= _K - 1:
+                    read_pos = i - (_K - 1)
                     if 0 <= read_pos < read_len:
-                        context_window = ext_context[i - (K - 1) : i + 1]
+                        context_window = ext_context[i - (_K - 1) : i + 1]
                         has_n = "N" in context_window
                         r_is_n.append(has_n)
 
@@ -1151,7 +1164,7 @@ def _process_batch(
                             mid_fi = int(mc_fi[_PRED_IDX])
                             mid_ri = int(mc_ri[_PRED_IDX])
                             r_kmer.append(current_kmer)
-                            r_rc_kmer.append(_rc_kmer(current_kmer))
+                            r_rc_kmer.append(_rc_kmer(current_kmer, _K))
                             r_meth_id_fi.append(mid_fi)
                             r_meth_id_ri.append(mid_ri)
                             r_frac_fi.append(1.0 if mid_fi else 0.0)

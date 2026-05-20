@@ -13,13 +13,14 @@ layout from :mod:`kinsim.utils.sample_layout`. Produced by
 
 Loss
 ----
-Default is Gaussian Negative Log-Likelihood (GNLL). The model outputs
-``(μ, log_σ)`` for both IPD and PW in log1p space, so::
+Default is Beta-NLL (``betanll``, β=0.5) — a scale-corrected variant of
+the Gaussian NLL that down-weights samples in regions of high predicted
+σ², avoiding the model gaming σ in place of fitting μ. The model outputs
+``(μ, log_σ)`` for both IPD and PW in log1p space.
 
-    L = 0.5 * [ 2·log_σ + (target − μ)² / exp(2·log_σ) ]
-
-Alternatives (``--loss mse`` / ``--loss huber``) use only the μ head — for
-ablations or when variance modelling isn't needed.
+Alternatives: ``--loss gnll`` (vanilla Gaussian NLL),
+``--loss betanll_0.3 / _0.5 / _1.0`` (β override), ``--loss mse`` /
+``--loss huber`` (only the μ head — for ablations).
 
 Metrics (per epoch on the validation split)
 -------------------------------------------
@@ -808,7 +809,7 @@ class KineticPredictor(L.LightningModule):
         self,
         model: ConvPredictor,
         lr: float = 1e-3,
-        loss_name: str = "gnll",
+        loss_name: str = "betanll",
         lr_schedule: str = "cosine",
         max_epochs: int = 50,
         warmup_epochs: int = 3,
@@ -1248,7 +1249,7 @@ def objective(
     optuna_epochs: int = 20,
     batch_size: int = 4096,
     val_fraction: float = 0.10,
-    loss_name: str = "gnll",
+    loss_name: str = "betanll",
     device: str = "cuda",
 ) -> float:
     """Optuna objective — returns best val_loss (GNLL) for a trial.
@@ -1346,7 +1347,7 @@ def train_mlp(
     head_dim: int = 128,
     meth_proj_dim: int = 8,
     dropout: float = 0.1,
-    loss_name: str = "gnll",
+    loss_name: str = "betanll",
     val_fraction: float = 0.10,
     device: str = "cuda",
     resume_ckpt: str | None = None,
