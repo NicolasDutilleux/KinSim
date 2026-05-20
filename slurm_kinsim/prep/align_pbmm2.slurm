@@ -57,13 +57,24 @@ else
         apptainer exec --bind /data "$SMRT_SIF" pbindex "$IN_BAM"
     fi
 
+    RAW_ALIGNED="${OUT_BAM%.bam}.with_unmapped.bam"
     T=$(date +%s)
     apptainer exec --bind /data "$SMRT_SIF" \
-        pbmm2 align "$REF" "$IN_BAM" "$OUT_BAM" \
+        pbmm2 align "$REF" "$IN_BAM" "$RAW_ALIGNED" \
         --preset CCS --sort --num-threads "${SLURM_CPUS_PER_TASK}"
     echo "Elapsed: $(( $(date +%s) - T ))s"
+    [ -s "$RAW_ALIGNED" ] || { echo "FAILED: pbmm2 empty output"; exit 1; }
 
-    [ -s "$OUT_BAM" ] || { echo "FAILED: pbmm2 empty output"; exit 1; }
+    # Filter out unmapped reads. pbmm2 converts fi/fp/ri/rp → ip/pw ONLY for
+    # aligned reads; unmapped records lack the ``ip`` tag and crash
+    # ipdSummary with ``KeyError: tag 'ip' not present``. Keeping only
+    # mapped reads is correct: ipdSummary needs alignment anyway.
+    N_TOTAL=$(samtools view -c "$RAW_ALIGNED")
+    N_MAPPED=$(samtools view -c -F 4 "$RAW_ALIGNED")
+    echo "Filtering unmapped: $((N_TOTAL - N_MAPPED)) of $N_TOTAL reads dropped"
+    samtools view -F 4 -b -@ "$SLURM_CPUS_PER_TASK" \
+        -o "$OUT_BAM" "$RAW_ALIGNED"
+    rm -f "$RAW_ALIGNED" "${RAW_ALIGNED}.pbi" "${RAW_ALIGNED}.bai"
 fi
 
 # pbindex on the aligned output — ipdSummary requires it. Idempotent: if
