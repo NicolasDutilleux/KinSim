@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=24G
-#SBATCH --time=01:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/%x_%A_%a.log
 #
 # validate/generate — one array task per region. Reads its region from
