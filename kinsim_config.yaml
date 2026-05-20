@@ -184,9 +184,12 @@ generation:
 # from the PacBio query_name convention ``<movie>/<zmw>[/ccs]`` because
 # ccs-kinetics-bystrandify groups by zm and needs distinct values.
 pacbio_tags:
-  np:  10                          # number of passes (typical HiFi value)
-  rq:  0.998                       # read quality (typical HiFi value)
-  sn:  [10.5, 10.5, 10.5, 10.5]    # per-channel SNR (A, C, G, T)
+  # Captured 2026-05-20 from
+  #   /data/projects/p774_MARSD/NDutilleux/training/Strepto/pipeline/bc2045/bc2045_aligned.bam
+  # via `samtools view <bam> | head -1 | tr '\t' '\n' | grep -E "^(np|rq|sn):"`
+  np:  3                                          # number of passes
+  rq:  0.998666                                   # read quality
+  sn:  [8.86098, 13.1297, 3.30454, 5.87372]       # per-channel SNR (A, C, G, T)
 
 # ─────────────────────────────────────────────────────────────────────────
 # Model defaults
