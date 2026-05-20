@@ -817,11 +817,27 @@ class ShardedSignalDataset(IterableDataset):
 def list_shards(shards_dir, glob: str = "*_shard*.pkl") -> list[str]:
     """Return a sorted list of shard pkl paths in ``shards_dir``.
 
-    Default glob ``*_shard*.pkl`` matches both raw extract output
-    (``<sample>_shard.pkl``) and refined output (``<sample>_shard_clean.pkl``)
-    so train can be pointed at either.
+    When BOTH raw and refined shards exist for the same sample_id (i.e.
+    ``<sid>_shard.pkl`` and ``<sid>_shard_clean.pkl``), prefer the
+    refined one and skip the raw — otherwise the dataset would feed the
+    trainer both filtered and unfiltered rows for that sample, doubling
+    some samples and mixing GMM-cleaned with raw motif-FP rows.
+
+    Pass an explicit ``glob`` (e.g. ``"*_shard.pkl"``) to override.
     """
-    return sorted(str(p) for p in Path(shards_dir).glob(glob))
+    paths = sorted(str(p) for p in Path(shards_dir).glob(glob))
+    if glob != "*_shard*.pkl":
+        return paths
+    # Dedup: if <sid>_shard_clean.pkl exists, drop the matching <sid>_shard.pkl.
+    cleaned_ids = {
+        shard_sample_id(p)
+        for p in paths
+        if Path(p).stem.endswith("_shard_clean")
+    }
+    return [
+        p for p in paths
+        if not (Path(p).stem.endswith("_shard") and shard_sample_id(p) in cleaned_ids)
+    ]
 
 
 def shard_sample_id(shard_path: str) -> str:

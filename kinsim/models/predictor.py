@@ -107,7 +107,11 @@ class ConvPredictor(nn.Module):
         dropout: float = 0.1,
         kmer_size: int = _DEFAULT_K,
         kmer_aware_film: bool = True,
-        biology_mask: bool = True,
+        # biology_mask default = False to match create_from_config() + the YAML.
+        # The mask was the source of a subtle synthesized-vs-template-strand
+        # bug in v0.5.0 — extract already enforces base/meth chemistry so
+        # the mask is a redundant safety net (see kinsim_config.yaml notes).
+        biology_mask: bool = False,
         log_sigma_clamp_min: float = -6.0,
         log_sigma_clamp_max: float = 1.5,
         active_site_index: int | None = None,

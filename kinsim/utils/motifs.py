@@ -17,8 +17,10 @@ Motif scanning backends:
     prohibitively slow; the regex backend handles these cases efficiently.
 
 Motif string format:
-  "m6A,GATC,1;m4C,CCWGG,1;m5C,RGATCY,4"
-  Each entry: MOD_TYPE,IUPAC_MOTIF,0-based_MOD_POS[,nDetected[,fraction]]
+  "m6A,GATC,2;m4C,CCWGG,2;m5C,RGATCY,4"
+  Each entry: MOD_TYPE,IUPAC_MOTIF,1-based_MOD_POS[,nDetected[,fraction]]
+  ``MOD_POS`` is 1-based — matches PacBio motifs.csv's ``centerPos`` column.
+  ``parse_motifs`` internally subtracts 1 to convert to a Python index.
   Fields 4 (nDetected) and 5 (fraction) are optional metadata from PacBio CSV.
   They are ignored by train/inject/generate logic but preserved for traceability.
 """

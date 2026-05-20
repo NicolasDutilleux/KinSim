@@ -27,7 +27,7 @@ correctly by standard CSV quoting.
 YAML Training Config
 --------------------
 A YAML config file can pin all training hyperparameters for reproducibility.
-Pass it with ``kinsim train --model mlp --config config.yaml``.
+Pass it with ``kinsim train --config config.yaml``.
 
     # config_mlp.yaml
     pkl:           /data/refined/        # directory of *_clean.pkl shards

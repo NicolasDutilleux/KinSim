@@ -1005,7 +1005,7 @@ def slowed_split_gmm(
     )
 
     stats = {
-        "method": "gmm_anchored_log1p",
+        "method": "gmm_anchored_raw_ipd",
         "min_samples_for_gmm": min_samples_for_gmm,
         "seed": seed,
         "n_baseline_pool": len(baseline_pool),
@@ -1173,7 +1173,7 @@ def slowed_split_gmm_shards(
 
         new_data["__meta__"] = {
             "refined_from": str(shard_path),
-            "method": "gmm_anchored_log1p",
+            "method": "gmm_anchored_raw_ipd",
             "stats": {**counts, "per_bucket": per_bucket_stats},
             "original_meta": orig_meta,
         }
@@ -1195,7 +1195,7 @@ def slowed_split_gmm_shards(
     )
 
     return {
-        "method": "gmm_anchored_log1p",
+        "method": "gmm_anchored_raw_ipd",
         "min_samples_for_gmm": min_samples_for_gmm,
         "seed": seed,
         "n_shards": len(shard_paths),

@@ -71,7 +71,24 @@ from .utils.encoding import METH_IDS, encode_kmer
 
 log = logging.getLogger(__name__)
 
-_SIGMA_CLAMP = (-6.0, 3.0)
+_SIGMA_CLAMP_LEGACY = (-6.0, 3.0)  # legacy default — replaced at runtime by model config
+
+
+def _sigma_clamp_from_model(model) -> tuple[float, float]:
+    """Return (min, max) log-sigma clamp matching what the model produced.
+
+    The trained checkpoint exposes ``log_sigma_clamp_max`` (1.5 by default
+    post-v0.5.0). Calibration / 2σ stats reported by evaluate must use the
+    SAME clamp as the model emitted — otherwise the σ values reported here
+    diverge from those generate consumes. Falls back to the legacy
+    ``(-6, 3)`` if the model lacks the attribute (very old checkpoints).
+    """
+    try:
+        lo = float(getattr(model, "log_sigma_clamp_min", _SIGMA_CLAMP_LEGACY[0]))
+        hi = float(getattr(model, "log_sigma_clamp_max", _SIGMA_CLAMP_LEGACY[1]))
+        return (lo, hi)
+    except Exception:
+        return _SIGMA_CLAMP_LEGACY
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +189,7 @@ def evaluate(
     all_sigma = []
     all_true = []
     all_meth_ids = []
+    sigma_clamp = _sigma_clamp_from_model(model)
 
     for kmer_ids, meth_probs, signals, meth_ids, *_extras in loader:
         kmer_ids = kmer_ids.to(device)
@@ -179,7 +197,7 @@ def evaluate(
 
         params = model(kmer_ids, meth_probs)
         mu = params[:, :2]
-        log_sig = torch.clamp(params[:, 2:], *_SIGMA_CLAMP)
+        log_sig = torch.clamp(params[:, 2:], *sigma_clamp)
         sigma = torch.exp(log_sig)
 
         all_mu.append(mu.cpu().numpy())
@@ -474,7 +492,7 @@ def plot_kmer_distribution(
 
     params = model(kmer_tensor, meth_probs)  # (1, 4)
     mu_log = params[0, :2].cpu().numpy()  # [μ_ipd, μ_pw] log1p
-    log_sig = np.clip(params[0, 2:].cpu().numpy(), *_SIGMA_CLAMP)
+    log_sig = np.clip(params[0, 2:].cpu().numpy(), *_sigma_clamp_from_model(model))
     sigma = np.exp(log_sig)  # [σ_ipd, σ_pw] log1p
 
     # Gaussian PDF (pure numpy, no scipy dependency)

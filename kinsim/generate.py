@@ -5,8 +5,8 @@ then either samples from N(μ, σ²) (stochastic, default) or returns μ directl
 (deterministic, via --deterministic flag).
 
 Two calling modes (auto-detected):
-  Directory mode:   kinsim mlp generate <pbsim3_dir> <checkpoint.pt> <motifs> <output_dir>
-  Per-genome mode:  kinsim mlp generate <fq.gz> <maf.gz> <ref.fna> <ckpt.pt> <motifs> <out.bam>
+  Directory mode:   kinsim generate <pbsim3_dir> <checkpoint.pt> <motifs> <output_dir>
+  Per-genome mode:  kinsim generate <fq.gz> <maf.gz> <ref.fna> <ckpt.pt> <motifs> <out.bam>
 
 Directory mode supports the same two layouts as dictionary inject (auto-detected):
   - Species subdirectories: pbsim3_dir/Ecoli/, pbsim3_dir/Salmonella/, ...
@@ -1831,7 +1831,7 @@ def _main_directory(argv):
     import argparse
 
     parser = argparse.ArgumentParser(
-        prog="kinsim mlp generate",
+        prog="kinsim generate",
         description=(
             "Generate MLP kinetic signals for all PBSIM3 species in a directory.\n\n"
             "Supports two directory layouts (auto-detected):\n\n"
@@ -1848,7 +1848,7 @@ def _main_directory(argv):
             "      Ecoli.fq.gz   Ecoli.maf.gz   Ecoli.fna\n"
             "      Salmonella.fq.gz ...\n\n"
             "Per-genome mode (single genome):\n"
-            "  kinsim mlp generate <fq.gz> <maf.gz> <ref.fna> <ckpt.pt> <motifs> <out.bam>"
+            "  kinsim generate <fq.gz> <maf.gz> <ref.fna> <ckpt.pt> <motifs> <out.bam>"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1940,7 +1940,7 @@ def _main_per_genome(argv):
     import argparse
 
     parser = argparse.ArgumentParser(
-        prog="kinsim mlp generate",
+        prog="kinsim generate",
         description=(
             "Generate kinetic signals for PBSIM3 reads using a trained MLP predictor.\n\n"
             "Uses the .maf alignment to resolve reference context for edge bases.\n"
