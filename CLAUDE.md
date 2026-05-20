@@ -2,61 +2,115 @@
 
 ## Project Summary
 
-KinSim simulates PacBio HiFi kinetic signals (IPD and PW) for metagenomic binning research.
-Given PBSIM3-simulated reads and a reference genome, KinSim injects biologically realistic
-per-base IPD/PW values into unaligned BAM files using a supervised MLP/Conv model that
-predicts N(mu, sigma^2) per 11-mer context with methylation conditioning.
+KinSim simulates PacBio HiFi kinetic signals (IPD and PW) for metagenomic
+binning research. Given reference genomes + methylation motif annotations
++ aligned bystrandified BAMs, KinSim trains a per-context ConvPredictor
+(~140K params, FiLM-conditioned on methylation context) and injects
+biologically realistic per-base IPD/PW values into unaligned BAM files
+using the trained model.
 
-Output BAMs carry standard PacBio tags: `fi:B:C` (IPD) and `fp:B:C` (PW).
+Output BAMs carry standard PacBio raw-HiFi tags `fi:B:C` (forward IPD),
+`fp:B:C` (forward PW), `ri:B:C` (reverse IPD), `rp:B:C` (reverse PW).
+The validate chain runs `ccs-kinetics-bystrandify` on the generated BAM
+to convert to per-strand ip/pw before feeding ipdSummary — exactly
+matching the real-data preprocessing pipeline.
 
 A single CLI is installed:
-- **`kinsim`** — ML pipeline: extract, refine, train, generate, evaluate, analyze, verify-generate
+- **`kinsim`** — ML pipeline: extract, refine, train, generate, evaluate,
+  verify-generate, analyze, predict-kmers
 
-Convenience offline tools live in `scripts/` (run via `python scripts/<name>.py`):
-manifest count/validate/list, balance, filter, rebase fetch/parse, motif_merge.
+Offline tooling lives in `scripts/` and is run via `python scripts/<name>.py`:
+manifest count/validate/list, sample, strip-kinetics, merge_shards,
+compare, inspect_null_model.
+
+The `kinsim_baseline` module (separate CLI: `python -m kinsim_baseline`)
+provides a context-free naive Gaussian baseline as a benchmark for the
+ML model.
+
+---
+
+## YAML — single source of biology truth
+
+`kinsim_config.yaml` at the repo root is read by **every** stage of the
+pipeline (`extract`, `refine`, `train`, `generate`, `predict-kmers`,
+`evaluate`, `analyze`). Edits propagate without code changes — but they
+also propagate **between stages**, so changing the YAML mid-pipeline is
+a known footgun:
+
+- **`kinetic_signatures.<T>.signal_offsets`** declares where each meth
+  type causes pause: m6A=[0,5], m4C=[0], m5C=[2,6] (default). Both
+  extract (which positions get CATEGORY_SLOWED) and generate (which
+  bucket fires the Bernoulli) read this. Editing between train and
+  generate produces a model that disagrees with the generator.
+- **`extraction.kmer_size`, `upstream`, `downstream`** define the K-mer
+  geometry. The shard `__meta__["extraction_params"]` freezes them so
+  refine and train can cross-check. The model's config also records
+  them so generate / predict-kmers / evaluate read them from the
+  checkpoint (K-aware).
+- **`extraction.rev_meth_offsets`** feeds FiLM. Must match training
+  values structurally.
+- **`generation.use_motif_fraction`** is a generate-only toggle. Default
+  `false` because p_fire absorbs occupancy already.
+
+The model checkpoint `model_config.json` carries:
+- Architecture: kmer_size, active_site_index, num_meth_types, biology_mask,
+  log_sigma_clamp_min/max
+- `meth_id_map`: frozen at training time so the generate-side mapping
+  matches even if the YAML was edited afterwards
+- `p_fire[(meth, offset)]` and `mean_occupancy[(meth, offset)]` from
+  refine, used by generate's Bernoulli firing
+
+---
 
 ## Sharded mode (preferred for ≥ 10 strains)
 
-`merge` collapses N shards into a monolithic master.pkl whose RAM footprint
-scales linearly with the corpus. For larger runs the entire pipeline now
-supports a **sharded mode** that never holds the corpus in RAM:
+`scripts/merge_shards.py` collapses N shards into a master pkl whose RAM
+footprint scales linearly with the corpus. For larger runs the entire
+pipeline supports a **sharded mode** that never holds the corpus in RAM:
 
 ```
-extract  ──► <shards>/sample_id_shard.pkl       (one per strain, parallel via SLURM array)
-refine   ──► <refined>/sample_id_shard_clean.pkl
-            (auto-detected when input is a directory; pool-harvest IPDs across
-             shards → fit GMMs once globally → apply per-shard, atomic write)
-train    ──► reads <refined>/ via ShardedSignalDataset (PyTorch IterableDataset).
+extract  ──► <shards>/<sample>_shard.pkl       (one per strain, parallel via SLURM array)
+refine   ──► <refined>/<sample>_clean.pkl      (per-bucket GMM filter, baseline-anchored)
+train    ──► reads <refined>/ via SignalDataset (PyTorch IterableDataset).
              Worker-aware shard partition; per-epoch shard + row shuffling.
-analyze  ──► concatenates shards in-memory before stats (analyze is run once,
-             can afford full-corpus RAM; refine + train are the hot paths)
+analyze  ──► concatenates shards in-memory before stats.
 ```
 
 Train/test splitting (sharded mode):
 
-- `--test-strains bc2080,bc2081,bc2082` — explicit by-sample-id holdout. Those
-  shards never enter training. Real generalisation metric.
-- `--test-fraction 0.10` — random per-shard split, reproducible via `--split-seed`.
+- `--test-strains bc2080,bc2081,bc2082` — explicit by-sample-id holdout.
+  Those shards never enter training. Real generalisation metric.
+- `--test-fraction 0.10` — random per-shard split, reproducible via
+  `--split-seed`.
 
-`merge` and the in-memory `MLPSignalDataset` are kept for small datasets.
-Auto-detection on input path: directory → sharded path; file → in-memory path.
-No CLI changes for the small-data case.
+`scripts/merge_shards.py` is kept for small datasets / debug / baseline.
+Auto-detection on input path: directory → sharded path; file → in-memory
+path. No CLI changes for the small-data case.
 
-## Training Set
+---
+
+## Training set construction
 
 `extract` is a single-pass pipeline that captures **positions of
 expected kinetic signature** in addition to methylation positions
-themselves. Rationale: m6A/m4C/m5C signatures are observed at
-configured downstream offsets (m6A at 0 and +5, m5C at +2 and +6, etc.,
-declared in `kinsim_config.yaml`). Training only on methylation centers
-would deprive the model of the slowing signal at those offsets.
+themselves. m6A/m4C/m5C signatures are observed at configured downstream
+offsets — training only on methylation centers would deprive the model
+of the slowing signal at those offsets.
 
 ```
-  aligned BAM + ref + motifs --> kinsim extract  --> shards/<sample>_shard.pkl
-                             --> kinsim refine   --> refined/<sample>_clean.pkl
-                                                    (per-(meth, offset) GMM filter)
-                             --> kinsim train    --> checkpoints/  (model_config.json
-                                                                    carries p_fire)
+  aligned bystrandified BAM + ref + motifs.csv
+                                ↓
+                          kinsim extract
+                                ↓
+                       shards/<sample>_shard.pkl
+                                ↓
+                          kinsim refine
+                                ↓
+                     refined/<sample>_clean.pkl
+                                ↓
+                          kinsim train
+                                ↓
+              checkpoints/  (model_config.json carries p_fire)
 ```
 
 **Three categories** (col 17 of the 20-col layout):
@@ -68,53 +122,40 @@ would deprive the model of the slowing signal at those offsets.
   but NOT at a signature offset of it. Negative control: meth in mc but
   IPD should look baseline.
 
-**Parent meth attribution** (col 36 PARENT_METH + col 37 PARENT_OFFSET):
-extract knows which methylation produced each SLOWED/NEAR_METH row (it's
-iterating "for each motif match of type T at position p"). Both columns
-are written at emission time, so analyze can bucket rows per
-`(category, parent meth)` cleanly with a vectorised mask — no need to
-re-infer the parent from the mc[] window.
+**Parent meth attribution** (col 18 PARENT_METH + col 19 PARENT_OFFSET):
+extract records which methylation produced each SLOWED/NEAR_METH row.
+This lets analyze bucket rows per `(category, parent meth, parent offset)`
+cleanly with a vectorised mask — no need to re-infer from the mc[] window.
 
 Precedence on overlapping motif claims (rare):
-- SLOWED beats NEAR_METH (existing rule).
-- Within SLOWED: last writer wins (deterministic given the YAML's
-  meth-type iteration order).
-- Within NEAR_METH: first writer wins (only assign where neither
-  `slowed[c]` nor `near[c]` is set yet).
+- SLOWED beats NEAR_METH.
+- Within SLOWED: last writer wins (deterministic given YAML iteration order).
+- Within NEAR_METH: first writer wins.
 
-**Per-position emission rules in `extract`:**
+**Per-position emission rules:**
 For each motif-match position `p` of type `T`:
 - For each `k ∈ signature_offsets[T]` (including 0): position `p+k` →
   CATEGORY_SLOWED.
 - For each `k ∈ [0, near_meth_max_dist]` NOT in `signature_offsets[T]`:
   position `p+k` → CATEGORY_NEAR_METH (slowed wins on conflict).
-Positions far from any methylation (distance ≥ `baseline_min_dist_to_meth`,
-default = K = 11) → CATEGORY_BASELINE candidate, capped per kmer at
-`n_baseline_per_kmer` via streaming reservoir sampling.
+- Positions far from any methylation (distance ≥ `baseline_min_dist_to_meth`,
+  default = K) → CATEGORY_BASELINE candidate, capped per kmer at
+  `n_baseline_per_kmer` via streaming reservoir sampling.
 
-**Refine** has two methods, both keep BASELINE and NEAR_METH unchanged
-and only filter CATEGORY_SLOWED rows:
+**Refine** uses a baseline-anchored 2-3 component Gaussian Mixture per
+(meth_type, parent_offset) bucket, fit on raw IPD/PW (not log1p — that
+empirically gives cleaner cluster separation given the uint8 quantisation).
+The first component is initialised at the global baseline pool's
+(mean, cov), so EM keeps it pinned at baseline kinetics. Free components
+fit the meth signal. K∈{1,2,3} is BIC-picked with a strict biological
+veto on K>2 (any non-anchor component placed at or below the anchor's
+IPD is rejected — methylation never produces sub-baseline kinetics).
 
-- **`--method gmm` (default, `slowed_split_gmm`)** — for each meth type
-  T present in the slowed rows, fit a 2-component GaussianMixture on
-  the combined `baseline + slowed_by_T` IPD pool (baseline subsampled
-  to match `slowed_by_T` count). Validate that ≥ 85 % of the baseline
-  subsample lands in the lower-mean component; if so, drop slowed_by_T
-  rows whose posterior in that component exceeds 0.5. If validation
-  fails or the type has < `min_samples_for_gmm` slowed rows, keep all
-  rows of that type. Per-type GMM params (means, sigmas, weights, lower
-  index, baseline-in-lower fraction) are recorded in
-  `__meta__["stats"]["per_type"]`.
-- **`--method p95` (legacy, `slowed_split`)** — single global threshold
-  = `secondary_percentile`-th percentile of the per-kmer baseline-mean
-  distribution. Same threshold for every meth type. Kept as a fallback
-  / comparison method.
-
-The GMM is the default because the p95 threshold is unfair to
-low-baseline kmers and to weak-signal meth types (m4C with
-fraction 0.5, m5C with sig=[2,6]). Per-type GMM lets each type's
-boundary be chosen by data, and the validation step rejects fits where
-the baseline doesn't cluster cleanly (defensive).
+Refine keeps only slowed rows whose argmax-posterior component has mean
+IPD strictly above the global baseline pool mean. Drops the rest
+(including the initialised anchor if it stayed near baseline). The
+per-bucket `p_fire = n_kept / n_in` is stored in `__meta__` and
+propagates to the trained checkpoint as `model_config.p_fire`.
 
 ---
 
@@ -124,462 +165,362 @@ the baseline doesn't cluster cleanly (defensive).
 KinSim/
 ├── pyproject.toml                  single entry point: kinsim
 │
-├── kinsim/                         ML pipeline package (v0.4.0)
-│   ├── __init__.py
+├── kinsim/                         ML pipeline package
+│   ├── __init__.py                 __version__ (single source)
 │   ├── __main__.py                 CLI router
 │   │
-│   ├── extract.py                  BAM extraction + shard merging (motif-based, manifest-driven)
-│   ├── refine.py                   slowed_split: per-kmer baseline mean p95 filter
-│   ├── train.py                    supervised training loop (ConvPredictor/MLPPredictor)
+│   ├── extract.py                  Aligned bystrandified BAM → shard.pkl
+│   ├── refine.py                   Baseline-anchored GMM per-(meth, offset)
+│   ├── train.py                    Supervised training loop (ConvPredictor)
 │   ├── generate.py                 BAM generation with trained model
-│   ├── evaluate.py                 calibration report + per-kmer distribution plots
-│   ├── verify_generate.py          per-(kmer, meth) reference vs generated BAM comparison
-│   ├── analyze.py                  training data analysis (coverage, signals, sensitivity)
-│   ├── sample.py                   random subsampling of .pkl files
-│   ├── strip_kinetics.py           remove fi/fp/ri/rp tags from BAM copy
+│   ├── evaluate.py                 Calibration report + per-kmer plots
+│   ├── verify_generate.py          Per-(kmer, meth) ref vs gen BAM
+│   ├── analyze.py                  Training-data analysis dashboard
+│   ├── predict_kmers.py            Dump (μ, σ) for every kmer × YAML scenario
 │   │
 │   ├── data/                       dataset classes
 │   │   ├── __init__.py
-│   │   └── dataset.py              log_transform, inv_log_transform, MLPSignalDataset
+│   │   └── dataset.py              log_transform, inv_log_transform,
+│   │                               SignalDataset, KineticDataModule,
+│   │                               list_shards, shard_sample_id
 │   │
 │   ├── models/                     neural model implementations
 │   │   ├── __init__.py
-│   │   └── predictor.py            ConvPredictor + MLPPredictor + create_from_config()
+│   │   └── predictor.py            ConvPredictor + create_from_config()
 │   │
 │   └── utils/                      shared utilities
 │       ├── __init__.py
-│       ├── encoding.py             11-mer bit-packing + get_meth_ids() (YAML-driven)
-│       ├── sample_layout.py        20-col row layout constants (COL_*, CATEGORY_*)
+│       ├── encoding.py             K-mer bit-packing + get_meth_ids() (YAML-driven)
+│       ├── sample_layout.py        20-col row layout + dynamic SampleLayout
 │       ├── motifs.py               IUPAC motif parsing, sequence scanning, meth maps
 │       ├── config.py               manifest CSV loader, YAML config, logging setup
 │       ├── io.py                   FASTA loading, MAF parsing, PBSIM3 discovery
 │       └── parsers/                methylation caller output parsers (plugin registry)
-│           ├── __init__.py         exports: BaseOutputParser, create_parser, list_parsers, auto_detect_parser
+│           ├── __init__.py
 │           ├── base.py             BaseOutputParser ABC
-│           ├── registry.py         @register decorator, factory functions
-│           ├── pacbio.py           PacBioParser -- motifs.csv with variable columns
-│           ├── modkit.py           ModkitParser -- modkit pileup --bedMethyl TSV (per-site, requires post motif discovery)
-│           ├── combined.py         CombinedParser -- mod_type,motif,offset,frac_mod,n_sites,source
-│           ├── rebase.py           REBASE web fetch + file parsing + fuzznuc patterns
-│           └── motif_merge.py      merge/filter/dedup motifs -> standard PacBio CSV
+│           ├── registry.py         @register decorator, factory
+│           ├── pacbio.py           PacBio motifs.csv parser
+│           ├── modkit.py           modkit pileup bedMethyl (per-site, NOT IUPAC)
+│           ├── combined.py         combined-format CSV
+│           ├── rebase.py           REBASE web fetch + parse + fuzznuc patterns
+│           └── motif_merge.py      merge / filter / dedup motifs
+│
+├── kinsim_baseline/                naive-Gaussian benchmark
+│   ├── __main__.py                 CLI router
+│   ├── compute.py                  Walks BAMs → per-(meth_type, offset) histograms
+│   ├── analyze.py                  HTML plots of those histograms
+│   ├── per_kmer.py                 AI vs observed per-kmer null comparison
+│   ├── plot_kmer.py                4-panel dashboard for per_kmer output
+│   └── generate.py                 Naive-Gaussian generation
+│                                   (--format bam → lookup NPZ ; --format pkl → rewrite shard IPD/PW)
 │
 ├── scripts/                        offline utilities (run with python scripts/X.py)
 │   ├── manifest.py                 manifest CSV CLI (count / validate / list)
-│   ├── balance.py                  balance .pkl by methylation type
-│   └── filter.py                   filter .pkl by coverage, mod type, max keys
-│
-├── baseline/                       baseline models for comparison
-│   ├── __init__.py
-│   ├── global_gaussian.py          4 Gaussians (one per meth type, no kmer context)
-│   ├── kmer_gaussian.py            per-kmer Gaussian + global IPD ratio shift
-│   └── conv_no_film.py             ConvPredictor without FiLM (post-hoc ratio shift)
+│   ├── sample.py                   subsample a shard pkl
+│   ├── balance.py                  (legacy: errors out on int-keyed shards)
+│   ├── filter.py                   (legacy: same)
+│   ├── strip_kinetics.py           remove fi/fp/ri/rp from a BAM
+│   ├── merge_shards.py             fuse multiple shard pkl into a master pkl
+│   ├── compare.py                  cross-dataset kinetic comparison
+│   └── inspect_null_model.py       inspect an ipdSummary .npz.gz null model
 │
 └── slurm_kinsim/                   HPC SLURM job scripts
     ├── pbsim3_simulate.slurm       PBSIM3 read simulation
-    ├── jasmine_5mc.slurm           jasmine + modkit 5mC motif discovery (array)
+    ├── ccs_subreads.slurm          ccs → HiFi BAM
+    ├── validate.sh                 per-strain validate chain orchestrator
     │
-    ├── vega/                       PREP pipeline 1 — Vega HiFi → assembly → motifmaker
-    │   ├── 00_assembly.slurm       hifiasm draft assembly
-    │   ├── 01_bystrandify.slurm    ccs-kinetics-bystrandify
-    │   ├── 02_align.slurm          pbmm2 align
-    │   ├── 03_index.slurm          samtools index + pbindex
-    │   ├── 04_ipdsummary.slurm     ipdSummary SP3-C3
-    │   ├── 05_motifmaker.slurm     pbmotifmaker find
-    │   ├── 06_build_manifest.sh    emit manifest_vega_gff.csv
-    │   └── run.sh                  orchestrator (chains all with afterok)
+    ├── prep/                       shared prep modules
+    │   ├── bystrandify.slurm       ccs-kinetics-bystrandify
+    │   ├── align_pbmm2.slurm       pbmm2 align (SKIP-first, filter unmapped, pbindex)
+    │   ├── index_bam.slurm         samtools index + pbindex
+    │   ├── assembly_hifiasm.slurm  hifiasm draft assembly
+    │   └── README.md
     │
-    ├── sequel/                     PREP pipeline 2 — Sequel subreads → CCS → motifmaker
-    │   ├── 00_ccs.slurm            subreads → HiFi
-    │   ├── 01_bystrandify.slurm
-    │   ├── 02_align.slurm
-    │   ├── 03_index.slurm
-    │   ├── 04_ipdsummary.slurm
-    │   ├── 05_motifmaker.slurm
-    │   ├── 06_build_manifest.sh
-    │   └── run.sh
+    ├── callers/                    methylation callers (any aligned BAM)
+    │   ├── ipdsummary.slurm        ipdSummary SP3-C3 (m6A + m4C)
+    │   ├── pbmotifmaker.slurm      motif discovery from ipdSummary GFF
+    │   ├── jasmine_modkit.slurm    jasmine + modkit (5mC via CpG model)
+    │   ├── merge_motifs.slurm      union of caller CSVs with threshold + dedup
+    │   └── README.md
     │
-    ├── strepto/                    PREP pipeline 3 — Strepto HiFi (manifest-driven)
-    │   ├── 00_bystrandify.slurm
-    │   ├── 01_align.slurm
-    │   ├── 02_index.slurm
-    │   ├── 03_ipdsummary.slurm
-    │   ├── 04_motifmaker.slurm
-    │   ├── 05_build_manifest.sh
-    │   └── run.sh
+    ├── validate/                   per-task SLURM for validate chain
+    │   ├── prep.slurm              strip_kinetics + regions.txt
+    │   ├── generate.slurm          kinsim generate (SKIP-first, FORCE_GEN=1 override)
+    │   ├── merge.slurm             samtools merge + pbindex of shards
+    │   └── write_regions.py
     │
-    ├── ml/                         ML pipeline — generic across Vega/Sequel/Strepto
-    │   ├── 00_extract.slurm        kinsim extract per manifest row (array job)
-    │   ├── 02_refine.slurm         kinsim refine shards/ → refined/
+    ├── ml/                         ML pipeline orchestrator
+    │   ├── 00_extract.slurm        kinsim extract (array)
+    │   ├── 02_refine.slurm         kinsim refine
     │   ├── 03_train.slurm          kinsim train (1 GPU)
     │   ├── 04_generate.slurm       kinsim generate on PBSIM3 reads (array)
     │   ├── 05_evaluate.slurm       kinsim evaluate
-    │   ├── 06_verify_generate.slurm   kinsim verify-generate (array)
-    │   └── run.sh                  orchestrator — extract/refine/train/evaluate chain
+    │   ├── 06_verify_generate.slurm
+    │   └── run.sh
     │
-    ├── config/                     example configuration files
-    │   ├── config_example.yaml     training config example
-    │   └── manifest_example.csv    manifest CSV example
-    │
-    └── msa1003/                    MSA1003 data extraction pipeline (legacy reference)
-        ├── prep_rebase.sh          fetch REBASE motifs for each species
-        ├── prep_merge.sh           merge calling + REBASE motifs, build manifest
-        ├── 00_align_split.slurm    align bc2036 BAM + split by species
-        ├── 00b_add_ippw.slurm      convert fi/fp/ri/rp → ip/pw per species
-        ├── 01_ipdsummary.slurm     run ipdSummary per species
-        ├── 01b_modkit.slurm        run modkit as alternative caller
-        └── 02_pbmotifmaker.slurm   detect motifs from ipdSummary GFF
+    ├── vega/                       per-dataset orchestrator
+    ├── sequel/                     idem
+    └── strepto/                    idem
 ```
+
+---
+
+## Validate chain (per-strain)
+
+```
+real_aligned.bam (bystrandified + aligned, ip/pw)
+    │
+    ▼  scripts/strip_kinetics.py
+stripped.bam  (same, fi/fp/ri/rp removed)
+    │
+    ▼  kinsim generate (array, per-region)
+shards/shard_NNN.bam  (flag=4 unmapped HiFi, fi/fp/ri/rp)
+    │
+    ▼  samtools merge + pbindex
+SIM.bam  (one unmapped HiFi BAM, fi/fp/ri/rp)
+    │
+    ▼  ccs-kinetics-bystrandify
+SIM_bystrandified.bam  (2 records per ZMW, ip/pw — matches real-data pipeline)
+    │
+    ├─► pbmm2 align ──► SIM_aligned.bam ──► ipdSummary ──► motifmaker ──► motifs_ipdsummary.csv
+    │                                                                                      │
+    └─► jasmine (re-aligns internally) + modkit ──► motifs_jasmine.csv                     │
+                                                                                           ▼
+                                                       merge_motifs.slurm (threshold=0.7, dedup)
+                                                                                           │
+                                                                                           ▼
+                                                                       SIM_motifs_merged.csv
+```
+
+Final comparison: per-strain `SIM_motifs_merged.csv` ↔
+`real_motifs_merged.csv` (recall, precision, motif-by-motif diff).
 
 ---
 
 ## Key Files — What Each Does
 
 ### `kinsim/utils/encoding.py`
-Pure functions, no external dependencies. The foundation of all k-mer logic.
 
 ```python
-K = 11                          # window size (fixed everywhere)
-KMER_MASK = (1 << 22) - 1      # 22-bit mask for sliding window
+K = 11                          # default kmer size (legacy global)
+KMER_LEFT_PAD = 7               # upstream of active site
+KMER_RIGHT_PAD = 3              # downstream
+KMER_PRED_IDX = KMER_LEFT_PAD   # = 7
+KMER_MASK = (1 << (2 * K)) - 1
 BASE_MAP  = {'A':0,'C':1,'G':2,'T':3}
-METH_IDS  = {'none':0,'m6A':1,'m4C':2,'m5C':3}
+METH_IDS  = {'none':0,'m6A':1,'m4C':2,'m5C':3}  # legacy; runtime → get_meth_ids()
 
-encode_kmer(seq: str) -> int    # 11-char string -> 22-bit integer
-decode_kmer(val: int) -> str    # 22-bit integer -> 11-char string
+encode_kmer(seq: str) -> int    # K-char string -> 2K-bit integer
+decode_kmer(val: int) -> str    # 2K-bit integer -> K-char string
+get_meth_ids() -> dict          # YAML-driven; extends METH_IDS with user types
 ```
+
+Most consumers call `get_meth_ids()` rather than `METH_IDS` directly,
+so YAML-declared meth types propagate.
 
 ### `kinsim/utils/motifs.py`
-Everything methylation-motif related.
 
 ```python
-iupac_to_re(motif)                        # "RGATCY" -> "[AG]GAT[CT][CT]"
-reverse_complement(seq)                    # IUPAC-aware
-parse_motifs(motif_string, revcomp=True)   # "m6A,GATC,1;..." -> list of dicts
-scan_sequence(seq, motifs) -> np.int8[]   # per-base methylation ID array
-parse_motifs_csv(path, min_fraction=0.40)  # PacBio motifs.csv -> KinSim string
-load_motif_string(arg, ..., parser_name=None)  # auto-detect or explicit parser
-build_reference_meth_map(ref_seqs, motif_string)  # genome-wide O(1) lookup array
+iupac_to_re(motif)                                   # "RGATCY" -> "[AG]GAT[CT][CT]"
+reverse_complement(seq)                              # IUPAC-aware
+parse_motifs(motif_string, revcomp=True)             # "m6A,GATC,2;..." -> list of dicts
+parse_motifs_per_strand(motif_string)                # → (fwd_motifs, rev_motifs)
+scan_sequence(seq, motifs) -> np.int8[]              # per-base methylation ID array
+parse_motifs_csv(path, ...)                          # thin wrapper around PacBioParser
+load_motif_string(arg, ..., parser_name=None)        # auto-detect or explicit parser
+build_reference_meth_map(ref_seqs, motif_string)     # genome-wide O(1) lookup array
+build_reference_meth_map_per_strand(ref_seqs, ...)   # → (fwd_map, rev_map)
 ```
 
-**Motif string format**: `"mod_type,pattern,position"` semicolon-delimited.
-Example: `"m6A,GATC,1;m4C,CCWGG,2"`.
-Position is 0-based index of the modified base within the pattern.
-
-`load_motif_string()` uses lazy imports from `kinsim.utils.parsers` for
-file-based motif loading. Lazy because the parser module path was moved
-from the dissolved `prep/` package — the lazy form keeps the import
-graph DAG-safe.
-
-`build_reference_meth_map()` uses EMBOSS fuzznuc as primary backend for genome-wide
-motif scanning, with automatic fallback to Python regex if fuzznuc is not installed
-or returns empty results (fuzznuc can silently fail on some IUPAC patterns).
+**Motif string format**: `"mod_type,pattern,1-based_position[,nDetected[,fraction]]"`
+semicolon-delimited. Position is 1-based (matches PacBio `centerPos`).
+`parse_motifs` subtracts 1 internally.
 
 ### `kinsim/utils/config.py`
-Manifest CSV parsing, YAML config loading, and logging setup.
 
 ```python
 @dataclass
 class SampleEntry:
     sample_id: str
     bam_path:  str
-    motifs:    str    # KinSim string or path (resolved by load_motif_string)
+    motifs:    str   # KinSim string or path
+
+@dataclass
+class ExtractionParams:
+    kmer_size: int
+    upstream: int
+    downstream: int
+    rev_meth_offsets: tuple[int, ...]
+    near_meth_max_dist: int
+    n_baseline_per_kmer: int
+    baseline_min_dist_to_meth: int
+    baseline_sample_rate: float
 
 load_manifest(manifest_path) -> list[SampleEntry]
 validate_manifest(entries, check_files=True) -> list[str]
 load_yaml_config(path) -> dict
-load_kinsim_config(explicit_path=None) -> dict   # parses kinsim_config.yaml
-get_signature_offsets(meth_name) -> list[int]    # signature offsets per meth type
+load_kinsim_config(explicit_path=None) -> dict   # cached
+get_extraction_params() -> ExtractionParams       # cached
+get_signature_offsets(meth_name) -> list[int]
 setup_logging(verbose=False)
 ```
 
-#### Project-wide config — `kinsim_config.yaml`
-
-A single YAML at the repo root holds the biology- and refine-related parameters
-that the user must keep up-to-date. Loaded once and cached by
-`load_kinsim_config()`.
-
-```yaml
-kinetic_signatures:
-  m6A: { signal_offsets: [0, 5] }   # at modified A AND +5 downstream
-  m4C: { signal_offsets: [0] }      # at modified C only
-  m5C: { signal_offsets: [2, 6] }   # +2 and +6, NOT at the C itself
-  # User MUST add an entry per methylation type their data carries.
-  # If a type is missing, KinSim falls back to [0] and logs a warning —
-  # this is correct for m4C, but WRONG for m5C and incomplete for m6A.
-
-meth_context:    { left: 7, right: 3 }    # asymmetric kmer / FiLM window
-
-refine:
-  slowed_split:
-    secondary_percentile: 95   # p95 of per-kmer baseline mean
-
-extract:
-  n_baseline_per_kmer:        50   # per-kmer baseline cap (reservoir)
-  baseline_min_dist_to_meth:  11   # >= K so meth_context never overlaps a meth
-  baseline_sample_rate:       0.10 # front-end skip rate before reservoir
-  near_meth_max_dist:         7    # 1..K-1; positions p+k for k in this range
-                                   # are NEAR_METH unless k in signature_offsets[T]
-```
-
-Strain-specific signatures (e.g. m6A at +8 instead of +5 for some
-methyltransferases) are handled by editing the YAML — no code change.
-
-### `kinsim/utils/io.py`
-File I/O for FASTA references, MAF alignments, and PBSIM3 directory discovery.
-
-```python
-load_reference(fasta_path) -> dict[str, str]       # contig_name -> sequence
-parse_maf(maf_path) -> iterator                     # MAF alignment records
-get_extended_context(ref, pos, k) -> str            # extract 11-mer from reference
-discover_pbsim3_layout(directory) -> list[dict]     # auto-detect flat vs subdirectory
-```
-
 ### `kinsim/utils/sample_layout.py`
-Per-sample column layout, category enum, slice helpers. Pure Python
-(no pysam) so refine/dataset/tests can import it without the
-extract/BAM dependency.
 
 ```python
-SAMPLE_NCOLS = 20
-COL_IPD            = 0
-COL_PW             = 1
-COL_FRACTION       = 2
-COL_METH_CTX_*     = 3..14    # mc_0..mc_10 (offsets [-7..+3])
-COL_REV_METH       = 14..17   # complementary-strand meth at offsets [-1, 0, +1]
-COL_CATEGORY       = 17
-COL_PARENT_METH    = 18       # meth_id of the parent meth (0 for baseline)
-COL_PARENT_OFFSET  = 19       # row_pos − parent_meth_pos (small int, [0, 7])
+SAMPLE_NCOLS = 20                # default K=11 layout
+COL_IPD = 0
+COL_PW = 1
+COL_FRACTION = 2
+COL_METH_CTX_START = 3
+COL_METH_CTX_END = 14
+COL_REV_METH = 14
+COL_CATEGORY = 17
+COL_PARENT_METH = 18
+COL_PARENT_OFFSET = 19
 
-CATEGORY_BASELINE  = 0
-CATEGORY_SLOWED    = 1   # at a signature offset (incl. meth itself if 0 ∈ sig)
-CATEGORY_NEAR_METH = 2   # close to meth but not at signature offset
+CATEGORY_BASELINE = 0
+CATEGORY_SLOWED = 1
+CATEGORY_NEAR_METH = 2
 
-get_categories(arr) -> int8 ndarray  # arr[:, COL_CATEGORY]
-
-slice_meth_context(meth_status, center) -> list[11]
-slice_rev_meth(meth_status_complement, center) -> list[3]
-slice_kinetic_profile(ipds, pws, center) -> list[18]
+# Dynamic for non-default K:
+class SampleLayout:
+    @classmethod
+    def from_params(cls, params: ExtractionParams) -> SampleLayout: ...
+get_sample_layout(params=None) -> SampleLayout
+get_categories(arr) -> int8 ndarray
 ```
-
-**`PARENT_METH` (col 36)** is written by extract at emission time —
-analyze reads it directly to bucket rows per (category, parent meth)
-without inferring from the meth_context window. This both fixes the
-overlapping-motif ambiguity of mc-based attribution and lets analyze
-vectorise per-bucket accumulators (~75 min → seconds on master pkls).
 
 ### `kinsim/data/dataset.py`
-Dataset class and signal transforms. Never import transforms from model files.
 
 ```python
-log_transform(x: Tensor) -> Tensor      # log1p — raw [0,255] -> training space
-inv_log_transform(x: Tensor) -> Tensor  # expm1 clamped to [0,255] — inference
-
-class MLPSignalDataset(Dataset):
-    # Iterates int-keyed kmers, derives meth_id at centre from
-    # mc[KMER_PRED_IDX], pre-flattens all rows into contiguous arrays
-    # so every sample is seen once per epoch.
-    # Returns (kmer_id, meth_full, log_signal, meth_id) tuples.
+log_transform(x) / inv_log_transform(x)
+class SignalDataset(IterableDataset): ...        # walks one shard at a time
+class KineticDataModule(L.LightningDataModule): ...
+list_shards(dir) -> list[str]                   # prefers _clean.pkl when both exist
+shard_sample_id(path) -> str
 ```
 
 ### `kinsim/extract.py`
-The data preparation pipeline. **Motif-based extraction only**: the
-model learns kinetic signatures from the per-position methylation
-context fed to FiLM, so no aligned-BAM path is needed.
 
 ```python
-validate_bam_kinetics(bam_path, n_check=10)
-    # Returns "fi" (unaligned) or "ip" (aligned) — used to route the
-    # forward extraction; reverse-strand pass gated by read.has_tag("ri").
-
-# Single-pass extract emits dict[kmer_id (int)] -> ndarray(N, 20).
-# Per row: IPD, PW, fraction, mc_0..10, rev_meth_-1/0/+1, CATEGORY,
-# PARENT_METH, PARENT_OFFSET (see kinsim.utils.sample_layout).
-extract_samples_from_bam(bam_path, motif_string,
-                         n_baseline_per_kmer=50,
-                         baseline_min_dist_to_meth=K,
-                         baseline_sample_rate=0.10,
-                         near_meth_max_dist=7, ...)
+_check_bystrandified(bam_path)                  # refuses non-bystrandified input
+extract_to_shard(bam_path, motif_string, output_path, params, ...)
 extract_from_manifest_task(manifest_path, task_index, output_dir, ...)
-
-merge_shards(input_dir, output_file, max_samples_per_key=50000)
-    # Concatenates per-sample shards (matching int-keyed kmer dicts).
 ```
 
-**Supported BAM formats:**
-
-| Format | Tags | Reverse-strand support | Recommended |
-|---|---|---|---|
-| Raw HiFi (unaligned) | `fi/fp` + `ri/rp` | ✅ Both strands per read | ✅ Yes |
-| Bystrandified | `ip/pw` (×2 reads) | ✅ Each strand = own read | ✅ Yes (modern) |
-| Aligned post-pbmm2 | `ip/pw` only | ❌ `ri/rp` dropped on alignment | ❌ Not supported — pass an unaligned BAM |
-
-`validate_bam_kinetics()` returns `"fi"` or `"ip"` to auto-route the forward
-extraction; the reverse-strand pass is gated by `read.has_tag("ri")`. Users
-should pass either a **raw HiFi BAM** or a **bystrandified BAM** to get full
-two-strand training data. Aligned BAMs lose `ri/rp` and only the forward path
-is captured (half the data).
+**Input requirements**: aligned bystrandified BAM (2 records per ZMW with
+`ip/pw`). KinSim refuses raw HiFi (fi/fp/ri/rp) — bystrandify it first.
 
 ### `kinsim/models/predictor.py`
-Dual architecture with factory pattern:
 
 ```python
-class ConvPredictor(nn.Module):    # DEFAULT (~140K params)
-    # Per-base embedding (4x16) + positional embedding (11x16)
-    # FiLM conditioning: methylation modulates base embeddings
-    # Conv1D backbone (3 layers, k=3, BatchNorm, GELU)
+class ConvPredictor(nn.Module):
+    # Per-base embedding + positional embedding + FiLM(meth) + Conv1D backbone
     # Dual readout: center position + global average pool
-    # -> [mu_ipd, mu_pw, log_sigma_ipd, log_sigma_pw]
+    # → [mu_ipd, mu_pw, log_sigma_ipd, log_sigma_pw]
+    #
+    # Geometry kwargs (read from YAML / model_config.json):
+    #   kmer_size, active_site_index, n_rev_meth
+    # log_sigma clamp: defaults (-6, 1.5) post-v0.5.0 bug fix
+    # biology_mask: default False (extract already enforces base/meth chemistry)
 
-class MLPPredictor(nn.Module):     # LEGACY (~268M params)
-    # Flat 4.2M-row kmer embedding + 2-layer MLP
-
-def create_from_config(config: dict) -> nn.Module:
-    # Reads "architecture" key ("conv" or "mlp"), defaults to "conv"
+def create_from_config(config: dict) -> nn.Module: ...
 ```
-
-Both share interface: `forward(kmer_ids, meth_probs)`, `sample()`, `predict_mean()`, `get_config()`.
 
 ### `kinsim/train.py`
-Supervised training with Gaussian NLL loss.
+Default loss = **Beta-NLL (β=0.5)** — scale-corrected Gaussian NLL that
+prevents the model from gaming σ in place of fitting μ.
 
-```python
-Loss = 0.5 * (2*log_sigma + (target - mu)^2 / sigma^2)
-```
-
-CLI: `kinsim train <pkl> <output_dir> [--architecture conv|mlp] [--config config.yaml]`
+CLI: `kinsim train <shards_dir> <output_dir> [--loss betanll|gnll|mse|huber]
+[--biology-mask] [--log-sigma-clamp-max 1.5] [--test-strains a,b,c]
+[--test-fraction 0.10] [--config kinsim_config.yaml]`
 
 ### `kinsim/generate.py`
-BAM generation with trained model. Uses `create_from_config()` for loading.
+Three calling modes (auto-detected):
+- Directory mode: `kinsim generate <pbsim3_dir> <ckpt> <motifs> <output_dir>`
+- BAM mode: `kinsim generate <input.bam> <ref.fna> <ckpt> <motifs> <output.bam>`
+- Per-genome mode: `kinsim generate <fq.gz> <maf.gz> <ref.fna> <ckpt> <motifs> <out.bam>`
 
-Three auto-detected calling modes:
-- Directory mode: `kinsim generate <pbsim3_dir> <checkpoint.pt> <motifs> <output_dir>`
-- BAM mode: `kinsim generate <input.bam> <ref.fna> <checkpoint.pt> <motifs> <output.bam>`
-- Per-genome mode: `kinsim generate <fq.gz> <maf.gz> <ref.fna> <ckpt.pt> <motifs> <out.bam>`
+The mapped path is K-aware via the checkpoint's `kmer_size` /
+`active_site_index`. Output is unaligned HiFi (`flag=4`,
+`fi/fp/ri/rp`) — feed to `ccs-kinetics-bystrandify` then `pbmm2 align`
+for downstream PacBio tools.
+
+YAML reuse (see module docstring): per-site `p_fire` from refine drives
+a Bernoulli at each motif site; `signal_offsets` from YAML decides
+which positions in the kmer can fire.
 
 ### `kinsim/evaluate.py`
-Calibration report + per-kmer distribution plots.
+Calibration report + per-kmer distribution plots. Reads
+`log_sigma_clamp_(min,max)` from the model so reported σ match what
+generate emits.
+
 CLI: `kinsim evaluate <ckpt_dir> <pkl>`
+     `kinsim evaluate <ckpt_dir> <pkl> --kmer ACGT...ACGT --meth m6A --plot out.png`
 
 ### `kinsim/analyze.py`
-Training data analysis report (text + optional HTML).
-CLI: `kinsim analyze <pkl> [--output-dir reports/] [--no-html]`
+Diagnostic dashboard for any shard or refined directory.
 
-### `kinsim/utils/parsers/` — Methylation Caller Parsing Library
+CLI: `kinsim analyze <pkl-or-dir> [--output-dir reports/] [--no-html]`
 
-#### `kinsim/utils/parsers/`
-Read-only parsing library for methylation caller output files. Plugin registry
-with `@register` decorator — adding a new format = one file + `@register` class.
+Per-meth-type kmer figures:
+- Top-12 by slowed-meth count (Gaussian fit overlay, μ_b/σ_b/μ_s/σ_s annotated)
+- 12 random kmers (≥ 50 slowed rows; same overlay)
+- Per-kmer baseline-mean distribution
+- 3D (IPD, PW) density per bucket
+
+### `kinsim/predict_kmers.py`
+Dump (μ, σ) for every kmer × every YAML methylation scenario. Outputs:
+- `<prefix>.tsv` — wide human-readable table
+- `<prefix>.npz` — compact binary, consumed by `generate --use-lookup`
+  and by `kinsim_baseline make-lookup`
+- `<prefix>.html` — per-scenario μ_ipd/μ_baseline distribution across
+  all 4^K kmers
+
+K-aware via `model_config.json`. Errors out gracefully if 4^K > 1e8.
+
+### `kinsim/verify_generate.py`
+Per-(kmer, meth) reference vs generated BAM comparison.
+
+CLI: `kinsim verify-generate <ref.bam> <gen.bam> <motifs> <report.tsv>`
+
+### `kinsim/utils/parsers/`
+Plugin registry with `@register` decorator.
 
 ```python
 from kinsim.utils.parsers import create_parser, list_parsers, auto_detect_parser
-
-# Explicit parser
-parser = create_parser("pacbio")       # or "modkit", "combined"
+parser = create_parser("pacbio")     # or "modkit", "combined"
 motif_string = parser.parse("motifs.csv", min_fraction=0.40, min_detected=20)
-
-# Auto-detect from file content
 parser = auto_detect_parser("output.csv")
-
-# List registered parsers
-list_parsers()  # ['combined', 'modkit', 'pacbio']
+list_parsers()                       # ['combined', 'modkit', 'pacbio']
 ```
 
-**BaseOutputParser ABC** (`base.py`):
-- `name: ClassVar[str]` — registry key
-- `supported_mods: ClassVar[list[str]]` — mod types this format carries
-- `parse(filepath, min_fraction, min_detected) -> str` — file -> motif string
-- `is_file_for_this_parser(filepath) -> bool` — heuristic for auto-detection
-
-**PacBioParser** (`pacbio.py`): Handles motifs.csv with variable columns.
-Required: `motifString`, `centerPos`. Optional: `modificationType`, `fraction`, `nDetected`.
-
-**ModkitParser** (`modkit.py`): Handles modkit pileup `--bedMethyl` TSV (11+ columns).
-**Note**: emits per-site pseudo-motifs (`chrom:start:strand`), NOT real motif
-patterns. End users feeding raw modkit output need a separate motif-discovery
-step (or use the upstream PacBio motifmaker output if available).
-
-**CombinedParser** (`combined.py`): Handles combined methylation CSV with columns:
-`mod_type,motif,offset,frac_mod,n_sites,source`. Auto-detected when CSV header
-contains both `mod_type` and `frac_mod`.
-
-**Integration**: `load_motif_string()` in `kinsim/utils/motifs.py` accepts optional
-`parser_name` kwarg. When provided, bypasses auto-detection and uses the named parser.
-
-#### `kinsim/utils/parsers/rebase.py`
-Converts REBASE notation (1-based) to KinSim notation (0-based).
-
-```python
-parse_rebase_annotation(recognition_seq, meth_annotation) -> list[str]
-parse_rebase_simple(filepath)       # 2-column TSV format
-parse_rebase_withrefm(filepath)     # Format #19 tagged fields (RS=, MS=)
-parse_rebase_file(filepath)         # auto-detect format
-parse_rebase_isoschizomers(filepath) -> dict[str, list[str]]
-write_fuzznuc_pattern_file(motif_string, filepath) -> dict
-decode_fuzznuc_pattern_name(name) -> (meth_id, mod_pos)
-fetch_rebase_org(org_num, output_path) -> list[dict]   # web fetch
-```
-
-CLI (run via `python -m kinsim.utils.parsers.rebase ...`):
-- `fetch <org_num> --output <csv>` — fetch from REBASE website, write CSV
-- `parse <file>` — parse local REBASE file, print motif string
-- `patterns <motifs> <outfile>` — write fuzznuc pattern file
-
-#### `kinsim/utils/parsers/motif_merge.py`
-Merges, filters, and deduplicates motifs from calling-derived CSV and REBASE
-into a single standard PacBio `motifs.csv`.
-
-CLI: `python -m kinsim.utils.parsers.motif_merge species_motifs.csv rebase_motifs.csv --output final_motifs.csv`
-
-#### `scripts/filter.py`
-Filter .pkl by coverage, mod type, or max keys.
-
-CLI: `python scripts/filter.py general.pkl training.pkl --min-coverage 50 --mod-type m6A,m5C`
-
-#### `scripts/manifest.py`
-Manifest CSV inspection utilities.
-
-CLI:
-```
-python scripts/manifest.py count <csv>       # prints integer for SLURM --array
-python scripts/manifest.py validate <csv>    # checks duplicates, file existence
-python scripts/manifest.py list <csv>        # tabular display
-```
+**Note**: `modkit` emits per-site pseudo-motifs (`chrom:pos:strand`)
+that are NOT valid IUPAC. Use it for upstream motif-discovery
+(`modkit find-motifs`), not as direct input to `kinsim extract`.
 
 ---
 
-## Data Flow
+## Data Flow (short)
 
 ```
 Aligned bystrandified BAMs (sorted, indexed, ip/pw tags)
-      |
-      +-- Motif discovery (jasmine + ipdSummary + pbmotifmaker, threshold 0.7)
-      |   produces a merged motifs.csv per sample
-      |
-      v  manifest.csv  [sample_id, bam_path, motifs, ref_path]
-      |
-      v  kinsim extract --manifest manifest.csv --task $TASK --output-dir shards/
-strain1_shard.pkl  strain2_shard.pkl  ...
-      |   (38 cols, key=kmer_id only, CATEGORY at col 35,
-      |    PARENT_METH at 36, PARENT_OFFSET at 37)
-      |   Each row tagged 0=baseline / 1=slowed / 2=near_meth
-      |
-      v  kinsim refine shards/ refined/
-      |   Per-(meth, offset) GMM filter on slowed rows;
-      |   baseline + near_meth pass through unchanged;
-      |   p_fire = n_kept / n_in stored per bucket in __meta__.
+      ↓  motif discovery (jasmine + modkit + ipdSummary + pbmotifmaker)
+      ↓  manifest.csv  [sample_id, bam_path, motifs]
+      ↓  kinsim extract → shards/
+strain1_shard.pkl   strain2_shard.pkl   ...
+      ↓   (20 cols, key=kmer_id, CATEGORY at col 17, PARENT_METH 18, PARENT_OFFSET 19)
+      ↓  kinsim refine shards/ refined/
 refined/<sample>_clean.pkl
-      |
-      v  kinsim train refined/ checkpoints/
-      v
-checkpoint_epoch50.pt + model_config.json (carries p_fire)
-      |
-      v  kinsim generate <pbsim3_reads> <ref> <ckpt.pt> <motifs> <output.bam>
-      v
-species_mlp.bam
-  flag=4  fi:B:C (IPD uint8)  fp:B:C (PW uint8)
-      |
-      v  kinsim verify-generate <ref.bam> <gen.bam> <motifs> <report.tsv>
-      v  (per-(kmer, meth) mean/sd comparison — Pearson r + MAE summary)
-verify_report.tsv
+      ↓  kinsim train refined/ checkpoints/
+checkpoint_epochNN.pt + model_config.json (p_fire, meth_id_map)
+      ↓  kinsim generate <stripped.bam> <ref> <ckpt> <motifs> <output.bam>
+SIM.bam  (unmapped HiFi, fi/fp/ri/rp)
+      ↓  ccs-kinetics-bystrandify + pbmm2 align
+      ↓  ipdSummary + motifmaker, jasmine + modkit
+      ↓  merge_motifs (threshold 0.7)
+SIM_motifs_merged.csv  — compare to real_motifs_merged.csv
 ```
 
 ---
@@ -588,116 +529,49 @@ verify_report.tsv
 
 | Field | Value |
 |---|---|
-| `flag` | `4` (unmapped) |
-| `fi:B:C` | IPD per base, uint8, length == read length |
-| `fp:B:C` | PW per base, uint8, length == read length |
-| N-context positions | signal = `1` (not `0`, which means "no data" in PacBio) |
-| Header | `HD VN:1.6 SO:unknown` |
+| `flag` | `4` (unmapped, raw HiFi convention) |
+| `fi:B:C` | IPD forward, uint8, length == read length |
+| `fp:B:C` | PW forward, uint8 |
+| `ri:B:C` | IPD reverse, uint8 |
+| `rp:B:C` | PW reverse, uint8 |
+| N-context positions | signal = `1` (not `0`, which means "no data") |
+| Header `@PG` | KinSim entry with version + training corpus + K + arch, chained to upstream tools |
+| Header `@RG` | inherited from input (suffix-cleaned), or synthetic `00000000/0--0` with full PacBio metadata |
 
 ---
 
 ## CLI Command Map
 
 ```
-# kinsim -- ML pipeline (7 verbs) ----------------------------------------
-kinsim extract                -> kinsim/extract.py            (aligned BAM → shard.pkl)
-kinsim refine                 -> kinsim/refine.py             (per-(meth, offset) GMM)
+# kinsim — ML pipeline ----------------------------------------------------
+kinsim extract                -> kinsim/extract.py            (aligned bystr. BAM → shard.pkl)
+kinsim refine                 -> kinsim/refine.py             (baseline-anchored GMM)
 kinsim train                  -> kinsim/train.py
 kinsim generate               -> kinsim/generate.py
 kinsim evaluate               -> kinsim/evaluate.py
-kinsim verify-generate        -> kinsim/verify_generate.py    (per-(kmer, meth) ref vs gen)
+kinsim verify-generate        -> kinsim/verify_generate.py
 kinsim analyze                -> kinsim/analyze.py
+kinsim predict-kmers          -> kinsim/predict_kmers.py
 
-# Offline tooling (run with python, not via the CLI) --------------------
+# kinsim_baseline — naive Gaussian benchmark -----------------------------
+python -m kinsim_baseline compute        — walks BAMs → per-(T, k) histograms
+python -m kinsim_baseline analyze        — plots those histograms
+python -m kinsim_baseline per-kmer       — AI-baseline vs observed per-kmer
+python -m kinsim_baseline plot-per-kmer  — 4-panel dashboard
+python -m kinsim_baseline generate       — naive BAM (lookup NPZ) or naive shard
+
+# Offline tooling --------------------------------------------------------
 python scripts/manifest.py        — count / validate / list manifest CSV
-python scripts/balance.py         — balance .pkl by mod type
-python scripts/filter.py          — filter .pkl by coverage / mod type / max keys
 python scripts/sample.py          — subsample a shard pkl
 python scripts/strip_kinetics.py  — strip fi/fp/ri/rp from a BAM
+python scripts/merge_shards.py    — fuse shards into a master pkl
 python scripts/compare.py         — cross-dataset kinetic comparison
-python scripts/inspect_null_model.py — inspect an ipdSummary .npz.gz null model
 
 python -m kinsim.utils.parsers.rebase       — REBASE fetch / parse
 python -m kinsim.utils.parsers.motif_merge  — merge + filter + dedup motifs
 ```
 
 Typo suggestions via `difflib.get_close_matches` in `kinsim/__main__.py`.
-The `kinsim-prep` console script was removed during the prep/ dissolution;
-its functionality is in `scripts/` and `kinsim/utils/parsers/`.
-
----
-
-## Import Path Rules
-
-### Within `kinsim/` package
-
-Top-level modules (`extract.py`, `train.py`, `generate.py`, etc.) import from sub-packages:
-
-```python
-# From kinsim/ top-level modules:
-from .utils.encoding import K, KMER_MASK, BASE_MAP, METH_IDS
-from .utils.motifs import parse_motifs, scan_sequence, build_reference_meth_map
-from .utils.config import setup_logging, load_manifest, load_yaml_config
-from .utils.io import load_reference, parse_maf, get_extended_context
-from .data.dataset import log_transform, inv_log_transform, MLPSignalDataset
-from .models.predictor import create_from_config
-```
-
-Files under `kinsim/models/` are **1 level** below `kinsim/`:
-
-```python
-# From kinsim/models/:
-from ..utils.encoding import K, kmer_mask
-from ..data.dataset import log_transform, inv_log_transform
-```
-
-### Within `kinsim/utils/parsers/` package
-
-Use relative imports for sibling modules, and absolute imports for the
-rest of `kinsim`:
-
-```python
-# From kinsim/utils/parsers/<name>.py:
-from kinsim.utils.encoding import METH_IDS, get_meth_ids
-from .base import BaseOutputParser
-from .registry import register
-```
-
-`scripts/` files are run as standalone python scripts, so they import
-`kinsim` absolutely:
-
-```python
-# From scripts/<name>.py:
-from kinsim.utils.encoding import METH_IDS
-from kinsim.utils.motifs import load_motif_string
-from kinsim.utils.config import setup_logging, load_manifest
-```
-
-### Lazy imports in `kinsim/utils/motifs.py`
-
-`load_motif_string()` and `_build_meth_map_fuzznuc()` use lazy imports from
-`kinsim.utils.parsers` to keep the import graph DAG-safe (the parsers
-module can transitively touch `motifs` for IUPAC helpers):
-
-```python
-from kinsim.utils.parsers import create_parser      # lazy, inside function
-from kinsim.utils.parsers import auto_detect_parser # lazy, inside function
-from kinsim.utils.parsers.rebase import parse_rebase_file   # lazy
-from kinsim.utils.parsers.rebase import write_fuzznuc_pattern_file  # lazy
-```
-
-**Never use bare `print()` for operational output.**
-Always use `log = logging.getLogger(__name__)` and `log.info()`, `log.warning()`, `log.error()`.
-
----
-
-## Methylation State IDs
-
-```python
-METH_IDS = {'none': 0, 'm6A': 1, 'm4C': 2, 'm5C': 3}
-```
-
-Consistent everywhere. Defined in `kinsim/utils/encoding.py`.
 
 ---
 
@@ -706,76 +580,65 @@ Consistent everywhere. Defined in `kinsim/utils/encoding.py`.
 ### General
 - Python 3.10+. Type hints on public function signatures in `models/`.
 - No global mutable state. All functions take explicit arguments.
-- `Path` objects for all file I/O (not `os.path.join`), except in SLURM scripts.
-- `sys.exit(1)` on fatal errors; always print a message to `stderr` first.
+- `Path` objects for file I/O, except in SLURM scripts.
+- `sys.exit(1)` on fatal errors with a stderr message.
 - Never catch `Exception` broadly. Catch specific exceptions.
 
 ### Neural Models
 - Xavier uniform init for `nn.Linear`, small normal (`std=0.02`) for `nn.Embedding`.
-- Always write `model.eval()` before inference; `model.train()` at start of epoch.
-- `@torch.no_grad()` on all inference functions (`sample`, `predict_mean`, `generate_signals_batch`).
-- Use `ReduceLROnPlateau` — never `verbose=True` (removed in PyTorch >= 2.1). Log LR drops via `log.info(...)`.
-- Wrap training loops in `try/finally` to ensure CSV and TensorBoard are closed on crash.
-- Always save `model_config.json` **before** the first epoch, not after training.
-- Always include `"scheduler"` key in checkpoint dict for resume support.
-- Use `create_from_config()` factory to load models — never hardcode architecture.
+- Always `model.eval()` before inference; `model.train()` at start of epoch.
+- `@torch.no_grad()` on all inference functions.
+- `ReduceLROnPlateau` — never `verbose=True` (PyTorch ≥ 2.1).
+- Wrap training loops in `try/finally` to ensure CSV/TensorBoard closed on crash.
+- Always save `model_config.json` **before** the first epoch.
+- Include `"scheduler"` in checkpoint dict for resume support.
+- Use `create_from_config()` to load — never hardcode architecture.
 
 ### Logging
-- Every module uses `log = logging.getLogger(__name__)`.
-- Never use bare `print()` for operational output — use `log.info()`, `log.warning()`, `log.error()`.
-- `setup_logging()` from `kinsim.utils.config` is called once in each CLI `main()`.
-- Format: `"%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"` — timestamps for SLURM logs.
-
-### Checkpoints
-```python
-torch.save({
-    'epoch': epoch + 1,
-    'step':  global_step,
-    'model': model.state_dict(),
-    'optimizer': optimizer.state_dict(),
-    'scheduler': scheduler.state_dict(),   # always include
-}, path)
-```
+- Every module: `log = logging.getLogger(__name__)`.
+- Never `print()` for operational output.
+- `setup_logging()` from `kinsim.utils.config` called once in each CLI `main()`.
 
 ### Signal Space
-- **Training**: always in log1p space (`log_transform` applied by `MLPSignalDataset`).
-- **Inference**: model outputs in log1p space → `inv_log_transform` → uint8 [0, 255].
-- **Storage (.pkl)**: raw values (not transformed). 36-col layout from
-  `kinsim.utils.sample_layout`; see col reference there.
-- **Metadata**: every .pkl has a `"__meta__"` string key with provenance.
-  Dataset classes skip it.
+- **Training**: log1p (via `log_transform`).
+- **Inference**: log1p → `inv_log_transform` → uint8 [0, 255].
+- **Storage (.pkl)**: raw values. 20-col layout.
+- **Metadata**: every .pkl has `"__meta__"` (provenance, ExtractionParams).
 
-### SLURM Scripts
-- Array jobs for per-species tasks (`#SBATCH --array=1-N`).
-- Use `kinsim_extract.slurm` with manifest CSV for extract jobs.
-- Auto-detect flat vs subdirectory layout in `generate.py` (not in SLURM scripts).
-- All SLURM scripts include diagnostics: date, hostname, GPU info, timing, exit codes.
+### SLURM
+- Array jobs for per-task / per-region work.
+- SKIP-first by default. `FORCE_X=1` env override.
+- `set +u; source ~/.bashrc; conda activate kinsim_env; set -euo pipefail`
+  preamble (IBU cluster — bashrc trips unbound vars).
+- Diagnostics: date, hostname, GPU info, timing, exit codes.
 
 ### Manifest CSV
-- Manifest columns: `sample_id`, `bam_path`, `motifs` (CSV with header).
-- Count rows for `--array`: `N=$(python scripts/manifest.py count manifest.csv)`.
-- Output shard naming: `shards/<sample_id>_shard.pkl` (derived from manifest `sample_id`).
+- Columns: `sample_id`, `bam_path`, `motifs`. Optional: `ref_path`.
+- Row count: `python scripts/manifest.py count manifest.csv`.
+- Output shard: `shards/<sample_id>_shard.pkl`.
 
 ---
 
 ## What NOT To Do
 
-- **Do not** store log-transformed data in `.pkl` files — raw values only.
-- **Do not** use `verbose=True` in `ReduceLROnPlateau` — crashes on PyTorch >= 2.1.
-- **Do not** hardcode architecture params in `generate.py` — always read from `model_config.json` via `create_from_config()`.
-- **Do not** modify `motifs.py` for stoichiometric fraction handling — fractions are parsed at the storage level (`_build_fraction_lookup` in `extract.py` and `generate.py`).
-- **Do not** add new callers/parsers outside of `kinsim/utils/parsers/` — use the `@register` decorator pattern.
-- **Do not** add data preparation logic to `kinsim/__main__.py` — convenience CLIs live in `scripts/` (run via `python scripts/<name>.py`).
-- **Do not** import parsers eagerly at module top — use lazy imports inside the function that needs them (the parser package transitively touches `kinsim.utils.motifs`).
+- **Do not** store log-transformed data in `.pkl` — raw values only.
+- **Do not** use `verbose=True` in `ReduceLROnPlateau`.
+- **Do not** hardcode architecture in `generate.py` — read `model_config.json`.
+- **Do not** add caller parsers outside `kinsim/utils/parsers/`.
+- **Do not** add pipeline logic to `kinsim/__main__.py` — convenience CLIs
+  live in `scripts/`.
+- **Do not** import parsers eagerly — use lazy imports.
+- **Do not** edit `kinsim_config.yaml` between training and generation
+  unless you understand the implications.
 
 ---
 
 ## Adding a New Motif Parser
 
-1. Create `kinsim/utils/parsers/<name>.py` with a `@register` class inheriting `BaseOutputParser`.
-2. Define `name`, `supported_mods`, `parse()`, and `is_file_for_this_parser()`.
-3. Import the new module in `kinsim/utils/parsers/__init__.py` to trigger registration.
-4. The parser is immediately available via `create_parser("name")` and auto-detection.
+1. Create `kinsim/utils/parsers/<name>.py` with `@register` class
+   inheriting `BaseOutputParser`.
+2. Define `name`, `supported_mods`, `parse()`, `is_file_for_this_parser()`.
+3. Import the new module in `kinsim/utils/parsers/__init__.py`.
 
 ---
 
@@ -783,35 +646,34 @@ torch.save({
 
 | Constant | Value | Where |
 |---|---|---|
-| K (k-mer size) | 11 | `kinsim/utils/encoding.py` |
-| Total possible k-mers | 4,194,304 (4^11) | `kinsim/utils/encoding.py` |
-| Methylation states | 4 (none/m6A/m4C/m5C) | `kinsim/utils/encoding.py` |
-| MID (flanking bases) | 5 | `kinsim/utils/io.py` |
-| Reservoir cap (extract baseline) | 50 per kmer | `kinsim/extract.py` |
-| Reservoir cap (merge) | 50,000 per kmer | `kinsim/extract.py` |
+| K (default kmer size) | 11 | `kinsim_config.yaml` (overridable) |
+| Total kmers at K=11 | 4,194,304 | `4 ** K` |
+| Default meth states | 4 (none/m6A/m4C/m5C) | YAML kinetic_signatures |
+| Default upstream | 7 | YAML |
+| Default downstream | 3 | YAML |
+| Reservoir cap (per-kmer baseline) | 50 | YAML `n_baseline_per_kmer` |
 | BAM signal range | [0, 255] uint8 | `kinsim/generate.py` |
-| N-context default signal | 1 (not 0) | `kinsim/generate.py` |
-| log_sigma clamp range | [-6, 3] | `kinsim/models/predictor.py` |
+| N-context default signal | 1 | `kinsim/generate.py` |
+| log_sigma clamp | [-6, 1.5] | YAML `model.log_sigma_clamp_max` |
 | Train/val split | 90% / 10% | `kinsim/train.py` |
-| LR patience | 5 epochs | `kinsim/train.py` |
-| LR factor | 0.5 | `kinsim/train.py` |
-| meth_proj_dim | 8 | `kinsim/models/predictor.py` |
-| ConvPredictor params | ~140K | `kinsim/models/predictor.py` |
-| MLPPredictor params | ~268M | `kinsim/models/predictor.py` |
+| ConvPredictor params | ~140K (default cd=128, ncl=3, hd=128) | `kinsim/models/predictor.py` |
+| meth_proj_dim | 8 | YAML `model.meth_proj_dim` |
 
 ---
 
 ## Future Work
 
-### Per-occupancy p_fire curve
-Today's decomposition uses ``p_fire(target site) = target_frac × p_efficiency``,
-which is linear in occupancy. For weak-signal types where the relationship
-isn't linear, stratify per-bucket survival by ``frac`` bin (e.g. 0–0.3,
-0.3–0.6, 0.6–1.0) and store a curve. Generate looks up by target frac.
-Worth doing only if cross-strain verify shows occupancy mismatch.
-
-### Wider rev_meth window for distal palindromes
-Today's rev_meth captures only [-1, 0, +1] active-site neighbours.
-8+ bp palindromic motifs (some Type II R-M) can place the partner meth
-at ±3 to ±5. Extending the window is a layout change + retrain — wait
-for evidence the model fails on those motif classes before doing this.
+- **K=21 unmapped path in generate**: mapped path is K-aware, but
+  `_process_read_unmapped_vec` still uses module-level `K` /
+  `KMER_MASK`. Predict-kmers refuses 4^K > 1e8 to avoid OOM — for K=21
+  a sample-and-extrapolate strategy is needed.
+- **Wider rev_meth window**: today captures only `[-1, 0, +1]`. 8+ bp
+  palindromic motifs (some Type II R-M) place the partner meth at
+  ±3 to ±5. Layout change + retrain.
+- **Per-occupancy p_fire curve**: today's decomposition is linear in
+  occupancy. Bin per occupancy could capture non-linearities.
+- **Vectorise the mapped path inner loop**: ~50× slower than the
+  unmapped path. Blocks K=21 experiments at scale.
+- **Pure naive baseline integration in validate.sh**: kinsim_baseline
+  generate emits a lookup NPZ; wire it as an opt-in `--baseline-only`
+  mode for side-by-side ML vs naive recall.

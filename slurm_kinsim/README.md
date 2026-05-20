@@ -67,20 +67,26 @@ dependencies. Each step runs from inside an Apptainer image
 
 ### Per-step scripts (Vega / Strepto / Sequel)
 
-| Step | Script | Tool | Purpose |
-|---|---|---|---|
-| 0 | `00_assembly.slurm` (Vega only) | hifiasm | Draft assembly from raw HiFi |
-| 0/1 | `00_bystrandify.slurm` | ccs-kinetics-bystrandify | Split each read into per-strand reads with ip/pw |
-| 1/2 | `01_align.slurm` | pbmm2 | Align to reference |
-| 2/3 | `02_index.slurm` | samtools + pbindex | Build .bai and .pbi indexes |
-| 3/4 | `03_ipdsummary.slurm` | ipdSummary SP3-C3 | Statistical m6A / m4C calling |
-| 3b | `03_jasmine_modkit.slurm` (Strepto) | jasmine + modkit | 5mC calling from MM/ML tags |
-| 4/5 | `04_motifmaker.slurm` | pbmotifmaker | Consensus motif discovery from ipdSummary GFF |
-| 5/6 | `05_merge_motifs.slurm` | `prep/motif_merge.py` | Merge / filter / dedup at threshold 0.7 |
-| 6/7 | `06_build_manifest.sh` | bash | Emit `manifest_<dataset>.csv` |
+Prep is now structured as **shared modules** that any per-dataset
+orchestrator (`<dataset>/run.sh`) chains together via `sbatch
+--dependency`. The numbered scripts have been replaced by reusable
+named ones:
 
-The exact step numbering varies slightly by dataset (Vega adds an
-assembly step; Strepto skips it since references are pre-existing).
+| Module | Tool | Purpose |
+|---|---|---|
+| `prep/assembly_hifiasm.slurm` | hifiasm | Draft assembly from raw HiFi (Vega only) |
+| `prep/bystrandify.slurm` | ccs-kinetics-bystrandify | Split each HiFi read into per-strand reads with ip/pw |
+| `prep/align_pbmm2.slurm` | pbmm2 | Align to reference (SKIP-first, filter unmapped, pbindex output) |
+| `prep/index_bam.slurm` | samtools + pbindex | Build `.bai` and `.pbi` indexes |
+| `callers/ipdsummary.slurm` | ipdSummary SP3-C3 | Statistical m6A / m4C calling |
+| `callers/jasmine_modkit.slurm` | jasmine + modkit | 5mC calling from MM/ML tags |
+| `callers/pbmotifmaker.slurm` | pbmotifmaker | Consensus motif discovery from ipdSummary GFF |
+| `callers/merge_motifs.slurm` | `python -m kinsim.utils.parsers.motif_merge` | Merge / filter / dedup at threshold 0.7 |
+| `<dataset>/06_build_manifest.sh` | bash | Emit `manifest_<dataset>.csv` |
+
+Each per-dataset orchestrator (`vega/run.sh`, `sequel/run.sh`,
+`strepto/run.sh`) chains the relevant modules in the correct order with
+`afterok` dependencies.
 
 ---
 
@@ -104,7 +110,7 @@ EX=$(sbatch --parsable --array=1-${N}%8 slurm_kinsim/ml/00_extract.slurm \
 RF=$(sbatch --parsable --dependency=afterany:$EX slurm_kinsim/ml/02_refine.slurm \
     $SHARDS $REFINED)
 
-# 3. Train — directory input, ShardedSignalDataset reads from refined/
+# 3. Train — directory input, SignalDataset reads from refined/
 TR=$(sbatch --parsable --dependency=afterok:$RF slurm_kinsim/ml/03_train.slurm \
     $REFINED checkpoints/)
 
@@ -149,35 +155,31 @@ faster than the long `pibu_el8`.
 
 ```
 slurm_kinsim/
-├── pbsim3_simulate.slurm           — PBSIM3 read simulation (input for generate)
-├── jasmine_5mc.slurm               — jasmine + modkit 5mC discovery (array)
+├── pbsim3_simulate.slurm           — PBSIM3 read simulation
+├── ccs_subreads.slurm              — ccs → HiFi BAM with fi/fp/ri/rp
+├── validate.sh                     — per-strain validate chain orchestrator
 │
-├── vega/                           — Vega prep pipeline (15 samples)
-│   ├── 00_assembly.slurm
-│   ├── 01_bystrandify.slurm
-│   ├── 02_align.slurm
-│   ├── 03_index.slurm
-│   ├── 04_ipdsummary.slurm
-│   ├── 05_motifmaker.slurm
-│   ├── 06_build_manifest.sh
-│   └── run.sh                      ← orchestrator
+├── prep/                           — shared prep modules
+│   ├── bystrandify.slurm
+│   ├── align_pbmm2.slurm
+│   ├── index_bam.slurm
+│   ├── assembly_hifiasm.slurm
+│   └── README.md
 │
-├── strepto/                        — Strepto prep pipeline (52 samples)
-│   ├── 00_bystrandify.slurm
-│   ├── 01_align.slurm
-│   ├── 02_index.slurm
-│   ├── 03_ipdsummary.slurm
-│   ├── 04_motifmaker.slurm
-│   ├── 05_build_manifest.sh
-│   └── run.sh
+├── callers/                        — methylation callers (any aligned BAM)
+│   ├── ipdsummary.slurm
+│   ├── pbmotifmaker.slurm
+│   ├── jasmine_modkit.slurm
+│   ├── merge_motifs.slurm
+│   └── README.md
 │
-├── sequel/                         — Sequel prep pipeline (subread-based)
-│   ├── 00_ccs.slurm
-│   ├── 01_bystrandify.slurm
-│   ├── … (same chain as vega)
-│   └── run.sh
+├── validate/                       — per-task SLURM for validate.sh
+│   ├── prep.slurm
+│   ├── generate.slurm
+│   ├── merge.slurm
+│   └── write_regions.py
 │
-├── ml/                             — Shared ML pipeline
+├── ml/                             — shared ML pipeline
 │   ├── 00_extract.slurm
 │   ├── 02_refine.slurm
 │   ├── 03_train.slurm
@@ -186,18 +188,21 @@ slurm_kinsim/
 │   ├── 06_verify_generate.slurm
 │   └── run.sh                      ← orchestrator
 │
-├── config/                         — Example configs
-│   ├── config_example.yaml
-│   └── manifest_example.csv
+├── vega/                           — Vega per-dataset orchestrator
+│   ├── 06_build_manifest.sh
+│   └── run.sh
 │
-└── msa1003/                        — Legacy MSA1003 mock community pipeline
-    ├── prep_rebase.sh
-    ├── prep_merge.sh
-    ├── 00_align_split.slurm
-    ├── 00b_add_ippw.slurm
-    ├── 01_ipdsummary.slurm
-    ├── 01b_modkit.slurm
-    └── 02_pbmotifmaker.slurm
+├── sequel/                         — Sequel per-dataset orchestrator
+│   ├── 06_build_manifest.sh
+│   └── run.sh
+│
+├── strepto/                        — Strepto per-dataset orchestrator
+│   ├── 05_build_manifest.sh
+│   └── run.sh
+│
+└── config/                         — example configs
+    ├── config_example.yaml
+    └── manifest_example.csv
 ```
 
 ---

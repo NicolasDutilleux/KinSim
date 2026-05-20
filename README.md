@@ -91,10 +91,15 @@ pip install -e .
 ```
 
 The main CLI entry point is **`kinsim`** — the full ML pipeline (extract /
-merge / refine / train / generate / evaluate / analyze). A complementary
-`kinsim-prep` CLI is also installed for ancillary data-preparation tools
-(motif parsing, manifest CSV checks, sample filtering / balancing); see
-[`prep/README.md`](prep/README.md) for details.
+refine / train / generate / evaluate / verify-generate / analyze /
+predict-kmers). Data-preparation utilities (motif parsing, manifest CSV
+checks, REBASE fetch, motif merging) live in `scripts/` and
+`kinsim/utils/parsers/`, run via `python scripts/<name>.py` or
+`python -m kinsim.utils.parsers.<module>`.
+
+A separate `kinsim_baseline` module
+(`python -m kinsim_baseline <verb>`) provides a context-free naive
+Gaussian benchmark for the ML model.
 
 ### 2. Discover methylation motifs (upstream callers)
 
@@ -110,7 +115,7 @@ See [`slurm_kinsim/README.md`](slurm_kinsim/README.md) for details.
 ### 3. Run the ML pipeline
 
 ```bash
-N=$(kinsim-prep manifest count manifest.csv)
+N=$(python scripts/manifest.py count manifest.csv)
 SHARDS=/path/to/shards
 REFINED=/path/to/refined
 
@@ -141,20 +146,18 @@ KinSim/
 ├── README.md                ← this file (overview)
 ├── CLAUDE.md                ← in-depth developer reference
 ├── kinsim_config.yaml       ← biology / refine parameters (signature offsets, etc.)
-├── pyproject.toml           ← entry points: kinsim + kinsim-prep
+├── pyproject.toml           ← entry point: kinsim
 │
 ├── kinsim/                  ← ML pipeline package      [docs: kinsim/README.md]
-├── prep/                    ← Data preparation package [docs: prep/README.md]
+├── kinsim_baseline/         ← naive Gaussian benchmark CLI
 ├── slurm_kinsim/            ← HPC SLURM scripts        [docs: slurm_kinsim/README.md]
-├── scripts/                 ← auxiliary one-off tools (compare, sample, strip-kinetics, …)
-├── baseline/                ← baseline models for comparison
+├── scripts/                 ← offline tools (manifest, merge_shards, strip-kinetics, …)
 └── images/                  ← logos / figures
 ```
 
-Each subpackage has its own README with the tools-specific details:
+Each subpackage has its own README with the tool-specific details:
 
 - **[kinsim/README.md](kinsim/README.md)** — ML pipeline, models, refine algorithm, signature profiles
-- **[prep/README.md](prep/README.md)** — caller parsers, motif merging, manifest tools, balance/filter
 - **[slurm_kinsim/README.md](slurm_kinsim/README.md)** — per-dataset prep pipelines, ML SLURM chain, resource defaults
 
 For implementation details (data flow, file format, conventions), see [`CLAUDE.md`](CLAUDE.md).
@@ -216,7 +219,7 @@ After cloning + `pip install -e .` and verifying the cluster paths above:
 # bc2034 single-strain verification (extract → refine, ~1h total)
 PREFIX=/path/to/run_dir
 MANIFEST=/path/to/manifest_bc2034_only.csv
-N=$(kinsim-prep manifest count $MANIFEST)
+N=$(python scripts/manifest.py count $MANIFEST)
 J0=$(sbatch --parsable --array=1-${N} \
     --partition=pshort_el8 --mem=32G --time=02:00:00 \
     slurm_kinsim/ml/00_extract.slurm $MANIFEST $PREFIX/shards)
@@ -237,18 +240,24 @@ sbatch --parsable --dependency=afterok:$J0 \
 
 ## Configuration
 
-A single `kinsim_config.yaml` at the repo root holds the biology- and refine-related parameters that the user must keep up-to-date:
+A single `kinsim_config.yaml` at the repo root holds the biology- and refine-related parameters that the user must keep up-to-date. **Every** pipeline stage (extract, refine, train, generate, predict-kmers, evaluate, analyze) reads this YAML — edits propagate without code changes but also between stages:
 
 ```yaml
 kinetic_signatures:
-  m6A: { signal_offsets: [0, 5] }    # at modified A AND +5 downstream
-  m4C: { signal_offsets: [0] }       # at modified C only
-  m5C: { signal_offsets: [2, 6] }    # +2 and +6 downstream — NOT at the C itself
+  m6A: { modified_base: A, signal_offsets: [0, 5] }   # at modified A AND +5 downstream
+  m4C: { modified_base: C, signal_offsets: [0] }      # at modified C only
+  m5C: { modified_base: C, signal_offsets: [2, 6] }   # +2 and +6 downstream — NOT at the C itself
 
-meth_context:    { left: 7, right: 3 }     # asymmetric kmer / FiLM window
+extraction:
+  kmer_size: 11      # K-mer length
+  upstream:  7       # bases of context BEFORE the prediction position
+  downstream: 3      # bases of context AFTER (upstream + 1 + downstream == kmer_size)
+  rev_meth_offsets: [-1, 0, 1]
 ```
 
-Strain-specific signatures (e.g. m6A at +8 instead of +5 for some methyltransferases) are handled by editing the YAML — no code change.
+Strain-specific signatures (e.g. m6A at +8 instead of +5 for some methyltransferases) are handled by editing the YAML — no code change. The shard `__meta__["extraction_params"]` freezes these for traceability so refine / train cross-check.
+
+**generate** also reads from the YAML at run time: `kinetic_signatures.<T>.signal_offsets` drives the Bernoulli firing decision per site, and `generation.use_motif_fraction` is a generate-only toggle (default `false` because the trained model's `p_fire` already absorbs occupancy).
 
 ---
 
@@ -256,13 +265,17 @@ Strain-specific signatures (e.g. m6A at +8 instead of +5 for some methyltransfer
 
 | Field | Value |
 |---|---|
-| `flag` | `4` (unmapped) |
-| `fi:B:C` | per-base IPD, uint8, length = read length |
-| `fp:B:C` | per-base PW, uint8, length = read length |
-| `ri:B:C` / `rp:B:C` | reverse-strand kinetics (when `--reverse` set during generation) |
-| Header | `HD VN:1.6 SO:unknown` |
+| `flag` | `4` (unmapped, raw HiFi convention) |
+| `fi:B:C` | per-base IPD forward, uint8, length = read length |
+| `fp:B:C` | per-base PW forward |
+| `ri:B:C` | per-base IPD reverse |
+| `rp:B:C` | per-base PW reverse |
+| Header `@PG` | KinSim entry with version, training corpus (Revio HiFi), K, architecture |
+| Header `@RG` | Inherited from input (bystrandify-hex suffix stripped) — full PacBio metadata preserved |
 
-The output is single-read-per-molecule (raw HiFi format). Pass it through `ccs-kinetics-bystrandify` if downstream tools expect a bystrandified BAM.
+The output is single-read-per-molecule (raw HiFi format). The validate
+chain pipes it through `ccs-kinetics-bystrandify` then `pbmm2 align` to
+match the real-data preprocessing path before ipdSummary.
 
 ---
 

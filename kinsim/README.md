@@ -55,8 +55,8 @@ kinsim/
 ├── verify_generate.py     "kinsim verify-generate" — ref vs gen comparison
 ├── analyze.py             "kinsim analyze" — diagnostic dashboard
 │
-├── data/dataset.py        ShardedSignalDataset / MLPSignalDataset
-├── models/predictor.py    ConvPredictor + MLPPredictor
+├── data/dataset.py        SignalDataset + KineticDataModule
+├── models/predictor.py    ConvPredictor + create_from_config()
 └── utils/
     ├── encoding.py        kmer bit-packing (K=11, asymmetric window)
     ├── motifs.py          motif parsing + scan + IUPAC
@@ -102,9 +102,13 @@ CATEGORY  COL_PARENT_METH  COL_PARENT_OFFSET
    2      meth_id          k      → NEAR_METH (close to a motif but not at a signature offset)
 ```
 
-Refine GMM separates per-(meth_type, offset) buckets independently — a
-noisy offset of one meth type can fail validation and pass through
-unfiltered without contaminating a clean offset of the same type.
+Refine GMM separates per-(meth_type, offset) buckets independently. The
+mixture is baseline-anchored: component 0 is initialised at the global
+baseline pool's (mean, cov), so EM keeps it pinned at baseline
+kinetics and free components fit the meth signal. K∈{1,2,3} is
+BIC-picked, with a biological veto on K>2 (any non-anchor component at
+or below the anchor's IPD is rejected — methylation never produces
+sub-baseline kinetics).
 
 ### 4. Sharded mode
 
@@ -132,13 +136,20 @@ kinetic_signatures:
     modified_base:  C
     signal_offsets: [2, 6]
 
-meth_context: { left: 7, right: 3 }
+extraction:
+  kmer_size:        11
+  upstream:         7        # bases of context BEFORE the prediction position
+  downstream:       3        # AFTER (upstream + 1 + downstream == kmer_size)
+  rev_meth_offsets: [-1, 0, 1]
 
 extract:
   n_baseline_per_kmer:        50
   baseline_min_dist_to_meth:  11
   baseline_sample_rate:       0.10
   near_meth_max_dist:         7
+
+generation:
+  use_motif_fraction: false   # generate-only: keep `false` (p_fire absorbs occupancy)
 ```
 
 Adding a new methylation type is a YAML edit only — `extract`, `refine`,
