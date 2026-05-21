@@ -83,6 +83,21 @@ from .models.predictor import ConvPredictor
 log = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Tunables (formerly magic numbers)
+# ─────────────────────────────────────────────────────────────────────────
+# Optuna trials cut short — short runs that don't improve fast aren't
+# worth a full 10-epoch wait.
+EARLY_STOP_PATIENCE_TRIAL: int = 5
+# Full training run — let val_loss plateaus actually exit a saddle.
+EARLY_STOP_PATIENCE_FULL: int = 10
+# Per-epoch budget. IterableDataset has no ``__len__`` so Lightning
+# would iterate the full corpus per epoch (~2.5B rows on a 49-strain
+# Strepto+Vega corpus). 50k batches × ~2048 ≈ 100M rows/epoch.
+TRAIN_BATCHES_PER_EPOCH: int = 50_000
+VAL_BATCHES_PER_EPOCH: int = 2_000
+
+
 # ---------------------------------------------------------------------------
 # Loss functions
 # ---------------------------------------------------------------------------
@@ -1297,7 +1312,9 @@ def objective(
         params=_params,
     )
 
-    callbacks: list = [EarlyStopping(monitor="val_loss", patience=5, mode="min")]
+    callbacks: list = [
+        EarlyStopping(monitor="val_loss", patience=EARLY_STOP_PATIENCE_TRIAL, mode="min")
+    ]
     try:
         from optuna.integration import PyTorchLightningPruningCallback
 
@@ -1330,7 +1347,7 @@ def objective(
 # ---------------------------------------------------------------------------
 
 
-def train_mlp(
+def train_main(
     pkl_path: str,
     output_dir: str,
     test_pkl: str | None = None,
@@ -1570,7 +1587,7 @@ def train_mlp(
     )
 
     # ── Callbacks ─────────────────────────────────────────────────────────
-    early_stop = EarlyStopping(monitor="val_loss", patience=10, mode="min")
+    early_stop = EarlyStopping(monitor="val_loss", patience=EARLY_STOP_PATIENCE_FULL, mode="min")
     lightning_ckpt = ModelCheckpoint(
         dirpath=str(output_dir / "lightning_ckpts"),
         filename="ckpt-{epoch:03d}-{val_loss:.4f}",
@@ -1599,7 +1616,9 @@ def train_mlp(
             _yaml.safe_dump(dict(_load_yaml()), sort_keys=False),
             encoding="utf-8",
         )
-    except Exception as _exc:
+    except (ImportError, OSError, ValueError) as _exc:
+        # ImportError: PyYAML missing; OSError: write failed;
+        # ValueError: YAML round-trip failed.
         log.warning("Could not snapshot kinsim_config.yaml: %s", _exc)
 
     # ── Loggers ───────────────────────────────────────────────────────────
@@ -1631,8 +1650,8 @@ def train_mlp(
     # CPU-bound, GPU precision isn't the bottleneck.
     trainer = L.Trainer(
         max_epochs=epochs,
-        limit_train_batches=50_000,
-        limit_val_batches=2_000,
+        limit_train_batches=TRAIN_BATCHES_PER_EPOCH,
+        limit_val_batches=VAL_BATCHES_PER_EPOCH,
         accelerator=accelerator,
         devices=1,
         gradient_clip_val=0.5,
@@ -1876,7 +1895,7 @@ def main(argv: list[str] | None = None) -> None:
     else:
         test_strains_list = None
 
-    train_mlp(
+    train_main(
         pkl_path=pkl_path,
         output_dir=output_dir,
         test_pkl=args.test_pkl or cfg.get("test_pkl"),

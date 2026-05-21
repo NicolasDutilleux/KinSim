@@ -22,7 +22,7 @@ import logging
 import torch
 import torch.nn as nn
 
-from ..data.dataset import inv_log_transform, log_transform  # noqa: F401
+from ..data.dataset import inv_log_transform
 from ..utils.encoding import KMER_PRED_IDX
 from ..utils.encoding import K as _DEFAULT_K
 from ..utils.sample_layout import REV_METH_LEN as _REV_METH_LEN
@@ -62,7 +62,9 @@ def _build_meth_compat_buffer(num_meth_types: int) -> torch.Tensor:
             bid = _BASE_TO_ID.get(str(base).upper())
             if mid > 0 and 0 <= mid < num_meth_types and bid is not None:
                 compat[bid, mid] = 1.0
-    except Exception as exc:  # pragma: no cover — defensive
+    except (ImportError, OSError, ValueError, KeyError) as exc:
+        # ImportError/OSError: YAML or config module unavailable.
+        # ValueError/KeyError: malformed kinetic_signatures entry.
         log.warning(
             "biology_mask: could not build from YAML (%s) — "
             "falling back to all-ones (no constraint).",

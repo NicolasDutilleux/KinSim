@@ -3,13 +3,13 @@
 Three categories: baseline / slowed / near_meth. The methylation
 centers themselves land in SLOWED or NEAR_METH depending on whether 0
 is a signature offset for that type. Parent meth + offset attribution
-is written at extract time into ``COL_PARENT_METH`` (col 36) and
-``COL_PARENT_OFFSET`` (col 37). Refine and analyze bucket per
-**(meth_type, parent_offset)** so a noisy offset of one meth type
-never contaminates a clean offset of the same type.
+is written at extract time into ``COL_PARENT_METH`` (col 18) and
+``COL_PARENT_OFFSET`` (col 19) of the 20-col K=11 layout. Refine and
+analyze bucket per **(meth_type, parent_offset)** so a noisy offset of
+one meth type never contaminates a clean offset of the same type.
 
 Tests cover:
-  1. Storage constants + get_categories on the 38-col layout.
+  1. Storage constants + get_categories on the 20-col K=11 layout.
   2. Refine: slowed_split_gmm filters CATEGORY_SLOWED rows whose
      per-kmer-mean baseline percentile; CATEGORY_BASELINE and
      CATEGORY_NEAR_METH pass through untouched.
@@ -17,7 +17,7 @@ Tests cover:
   4. Analyze: compute_signature_profiles and
      compute_meth_context_distribution produce
      "baseline" / "slowed_by_<T>_at_+<O>" / "near_meth_by_<T>_at_+<O>"
-     buckets using cols 36/37 directly (no mc[] inference).
+     buckets using cols 18/19 directly (no mc[] inference).
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ def test_category_constants_are_three():
     assert CATEGORY_NAMES[2] == "near_meth"
 
 
-def test_get_categories_reads_col35():
+def test_get_categories_reads_category_col():
     arr = np.zeros((3, SAMPLE_NCOLS), dtype=np.float32)
     arr[0, COL_CATEGORY] = CATEGORY_BASELINE
     arr[1, COL_CATEGORY] = CATEGORY_SLOWED
@@ -81,8 +81,8 @@ def test_analyze_uses_parent_meth_column_not_meth_context():
 
     Two slowed rows: one with PARENT_METH=m6A but NO m6A in mc, another with
     PARENT_METH=m5C and an m6A in mc (red herring). The new vectorised analyze
-    must trust col 36, not the mc inference, so the buckets reflect the
-    explicit parent attribution.
+    must trust col 18 (PARENT_METH), not the mc inference, so the buckets
+    reflect the explicit parent attribution.
     """
     from kinsim.analyze import compute_signature_profiles
 
@@ -974,10 +974,10 @@ def test_concat_shards_in_analyze_merges_per_kmer_arrays():
 if __name__ == "__main__":
     test_category_constants_are_three()
     print("[pass] category constants")
-    test_get_categories_reads_col35()
+    test_get_categories_reads_category_col()
     print("[pass] get_categories")
     test_layout_column_contract()
-    print("[pass] layout column contract (38 cols, 35 cat, 36 parent_meth, 37 parent_off)")
+    print("[pass] layout column contract (20 cols, 17 cat, 18 parent_meth, 19 parent_off)")
     test_refine_fails_fast_on_obsolete_layout()
     print("[pass] refine fails fast on obsolete layout")
     test_gmm_k2_separates_clean_two_distributions()

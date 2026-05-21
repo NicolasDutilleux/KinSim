@@ -78,9 +78,10 @@ def inv_log_transform(x: torch.Tensor) -> torch.Tensor:
         x: Log-transformed signal tensor.
 
     Returns:
-        expm1(x) clamped to [0, 255] — values safe to cast to uint8 for BAM tags.
+        expm1(x) clamped to [0, BAM_TAG_MAX] — values safe to cast to uint8.
     """
-    return torch.clamp(torch.expm1(x), 0, 255)
+    from ..utils._defaults import BAM_TAG_MAX  # noqa: PLC0415
+    return torch.clamp(torch.expm1(x), 0, BAM_TAG_MAX)
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +134,10 @@ def read_shard_extraction_params(data_dict: dict) -> ExtractionParams | None:
         return None
     try:
         return ExtractionParams.from_dict(raw)
-    except Exception as exc:
+    except (TypeError, ValueError, KeyError) as exc:
+        # TypeError: shape mismatch (dict has wrong field types).
+        # ValueError: invalid value (e.g. kmer_size != upstream + 1 + downstream).
+        # KeyError:  a required field is missing.
         log.warning("shard __meta__.extraction_params failed to parse: %s", exc)
         return None
 

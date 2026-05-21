@@ -1,28 +1,45 @@
 """K-mer bit-packing: encode/decode DNA k-mers as 2k-bit integers.
 
-Default k=11 (22-bit integers, 4^11 = 4,194,304 possible k-mers).
-All functions accept an optional ``k`` parameter so the window size
-can be changed without touching call sites that use the default.
+Module-level ``K``, ``KMER_PRED_IDX`` etc. are read from
+``kinsim_config.yaml::extraction`` at import time, falling back to the
+historical K=11 / [-7, +3] window if the YAML is unreachable. Consumers
+that need to mix K across calls should pass an explicit ``k`` arg to
+``encode_kmer`` / ``decode_kmer`` / ``kmer_mask`` — all three accept one.
+
+For shard-level work, prefer ``utils.sample_layout.get_sample_layout``
+which reads ExtractionParams from the shard's __meta__.
 """
 
 import numpy as np
 
-# Default k-mer size — change here to shift the whole pipeline default.
-K = 11
-KMER_BITS = 2 * K  # 22 for K=11
-KMER_MASK = (1 << KMER_BITS) - 1  # mask for default K
 
-# Asymmetric kmer/meth-context window around the prediction position.
-# Window covers [-KMER_LEFT_PAD, +KMER_RIGHT_PAD] from the prediction position.
-# Polymerase has read more bases UPSTREAM than DOWNSTREAM at any moment, and
-# all kinetic signatures are downstream of the modification — so to predict
-# IPD/PW at position Y we want more upstream context than downstream.
-# Inspired by Feng et al. 2013 (kineticsTools/ipdSummary, [-7, +2] for
-# unmodified DNA), extended to 11 bases for our k-mer.
-KMER_LEFT_PAD = 7  # bases before prediction position
-KMER_RIGHT_PAD = 3  # bases after prediction position
-KMER_PRED_IDX = KMER_LEFT_PAD  # = 7
-assert KMER_LEFT_PAD + 1 + KMER_RIGHT_PAD == K, "KMER_PAD must sum to K"
+def _load_kmer_geometry() -> tuple[int, int, int]:
+    """Best-effort read of K / upstream / downstream from the YAML.
+
+    Falls back to the hardcoded ``_defaults`` if the YAML can't be loaded
+    (config.py imports only stdlib, so this is safe at module-init time
+    — no circular).
+    """
+    from ._defaults import DEFAULT_DOWNSTREAM, DEFAULT_KMER_SIZE, DEFAULT_UPSTREAM
+    try:
+        from .config import load_kinsim_config
+        ext = (load_kinsim_config().get("extraction") or {})
+        return (
+            int(ext.get("kmer_size", DEFAULT_KMER_SIZE)),
+            int(ext.get("upstream", DEFAULT_UPSTREAM)),
+            int(ext.get("downstream", DEFAULT_DOWNSTREAM)),
+        )
+    except (ImportError, OSError, ValueError, TypeError):
+        return DEFAULT_KMER_SIZE, DEFAULT_UPSTREAM, DEFAULT_DOWNSTREAM
+
+
+K, KMER_LEFT_PAD, KMER_RIGHT_PAD = _load_kmer_geometry()
+KMER_BITS = 2 * K
+KMER_MASK = (1 << KMER_BITS) - 1
+KMER_PRED_IDX = KMER_LEFT_PAD
+assert KMER_LEFT_PAD + 1 + KMER_RIGHT_PAD == K, (
+    f"KMER_PAD must sum to K: {KMER_LEFT_PAD} + 1 + {KMER_RIGHT_PAD} != {K}"
+)
 
 BASE_MAP = {"A": 0, "C": 1, "G": 2, "T": 3}
 INT_TO_BASE = {0: "A", 1: "C", 2: "G", 3: "T"}
@@ -69,11 +86,10 @@ def get_meth_ids() -> dict:
         from .config import load_kinsim_config
 
         cfg = load_kinsim_config()
-    except Exception as exc:
-        # Fall back to the hardcoded baseline alphabet so the module stays
-        # importable in any state (pre-YAML bootstrap, tests, etc.), but
-        # surface what went wrong — silent falls hid YAML typos in the
-        # past, leading to extract running with a stale meth_id_map.
+    except (ImportError, OSError, ValueError) as exc:
+        # ImportError: lazy import or PyYAML missing.
+        # OSError:     YAML file unreadable / missing.
+        # ValueError:  YAML parse error (yaml.YAMLError subclasses it).
         import logging as _logging
 
         _logging.getLogger(__name__).warning(

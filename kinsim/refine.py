@@ -156,6 +156,7 @@ def _harvest_into(
     slowed_chunks_by_TO: dict,
     slowed_frac_by_TO: dict,
     *,
+    layout,
     max_baseline_pool: int = 0,
     max_slowed_per_bucket: int = 0,
     rng: np.random.Generator | None = None,
@@ -181,22 +182,19 @@ def _harvest_into(
     from .utils.sample_layout import (
         CATEGORY_BASELINE,
         CATEGORY_SLOWED,
-        COL_CATEGORY,
         COL_FRACTION,
         COL_IPD,
-        COL_PARENT_METH,
-        COL_PARENT_OFFSET,
         COL_PW,
     )
 
     for kid, arr in data.items():
         if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
             continue
-        if arr.shape[1] <= COL_PARENT_OFFSET:
+        if arr.shape[1] <= layout.col_parent_offset:
             continue
-        cats = arr[:, COL_CATEGORY].astype(np.int8)
-        parent = arr[:, COL_PARENT_METH].astype(np.int8)
-        offset = arr[:, COL_PARENT_OFFSET].astype(np.int8)
+        cats = arr[:, layout.col_category].astype(np.int8)
+        parent = arr[:, layout.col_parent_meth].astype(np.int8)
+        offset = arr[:, layout.col_parent_offset].astype(np.int8)
         ipd_pw = arr[:, [COL_IPD, COL_PW]]
         frac = arr[:, COL_FRACTION]
 
@@ -769,6 +767,8 @@ def _fit_gmms_per_bucket(
 def _apply_gmm_filter_to_data(
     data: dict,
     fit_params_by_TO: dict,
+    *,
+    layout,
 ) -> tuple[dict, dict]:
     """Apply the per-(meth, offset) GMM drop rule to one in-memory data dict.
 
@@ -781,10 +781,7 @@ def _apply_gmm_filter_to_data(
         CATEGORY_BASELINE,
         CATEGORY_NEAR_METH,
         CATEGORY_SLOWED,
-        COL_CATEGORY,
         COL_IPD,
-        COL_PARENT_METH,
-        COL_PARENT_OFFSET,
         COL_PW,
     )
 
@@ -796,11 +793,11 @@ def _apply_gmm_filter_to_data(
     for kid, arr in data.items():
         if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
             continue
-        if arr.shape[1] <= COL_PARENT_OFFSET:
+        if arr.shape[1] <= layout.col_parent_offset:
             continue
-        cats = arr[:, COL_CATEGORY].astype(np.int8)
-        parent = arr[:, COL_PARENT_METH].astype(np.int8)
-        offset = arr[:, COL_PARENT_OFFSET].astype(np.int8)
+        cats = arr[:, layout.col_category].astype(np.int8)
+        parent = arr[:, layout.col_parent_meth].astype(np.int8)
+        offset = arr[:, layout.col_parent_offset].astype(np.int8)
         # IPD only — refine fit/decision is on the IPD axis.
         ipd_col = arr[:, [COL_IPD]]
         # Kept for backwards-compat with old 2D fit params (fit_dim != 1).
@@ -886,6 +883,8 @@ def _apply_gmm_filter_to_data(
 
 def slowed_split_gmm(
     data: dict,
+    *,
+    layout,
     min_samples_for_gmm: int = 100,
     n_components: int | tuple[int, ...] = (1, 2, 3),
     strict_bic_nats_per_sample: float = 1.0,
@@ -953,6 +952,7 @@ def slowed_split_gmm(
         baseline_chunks,
         slowed_chunks_by_TO,
         slowed_frac_by_TO,
+        layout=layout,
         max_baseline_pool=max_baseline_pool,
         max_slowed_per_bucket=max_slowed_per_bucket,
         rng=rng,
@@ -960,7 +960,7 @@ def slowed_split_gmm(
 
     if not baseline_chunks:
         log.warning("[refine.gmm] no baseline samples — keeping all slowed (no filter)")
-        return _passthrough(data, method="gmm_no_baseline")
+        return _passthrough(data, method="gmm_no_baseline", layout=layout)
 
     baseline_pool = np.concatenate(baseline_chunks).astype(np.float64)  # (N, 2)
     log.info(
@@ -985,7 +985,7 @@ def slowed_split_gmm(
     )
 
     log.info("[refine.gmm] pass 2/2: filtering slowed rows ...")
-    new_data, counts = _apply_gmm_filter_to_data(data, fit_params_by_TO)
+    new_data, counts = _apply_gmm_filter_to_data(data, fit_params_by_TO, layout=layout)
     log.info(
         "[refine.gmm] baseline:  %d in -> %d kept (pass-through)",
         counts["n_baseline_in"],
@@ -1018,6 +1018,8 @@ def slowed_split_gmm(
 def slowed_split_gmm_shards(
     shards_dir: Path,
     output_dir: Path,
+    *,
+    layout,
     min_samples_for_gmm: int = 100,
     n_components: int | tuple[int, ...] = (1, 2, 3),
     strict_bic_nats_per_sample: float = 1.0,
@@ -1097,6 +1099,7 @@ def slowed_split_gmm_shards(
             baseline_chunks,
             slowed_chunks_by_TO,
             slowed_frac_by_TO,
+            layout=layout,
             max_baseline_pool=max_baseline_pool,
             max_slowed_per_bucket=max_slowed_per_bucket,
             rng=rng,
@@ -1167,7 +1170,7 @@ def slowed_split_gmm_shards(
         orig_meta = data.pop("__meta__", None)
         int_keyed = {k: v for k, v in data.items() if isinstance(k, (int, np.integer))}
 
-        new_data, counts = _apply_gmm_filter_to_data(int_keyed, fit_params_by_TO)
+        new_data, counts = _apply_gmm_filter_to_data(int_keyed, fit_params_by_TO, layout=layout)
         for k, v in counts.items():
             aggregate[k] += v
 
@@ -1204,7 +1207,7 @@ def slowed_split_gmm_shards(
     }
 
 
-def _passthrough(data: dict, method: str) -> tuple[dict, dict]:
+def _passthrough(data: dict, method: str, *, layout) -> tuple[dict, dict]:
     """Return ``data`` unchanged (deep-copied at row level) with a stats stub.
 
     Used when GMM cannot be fit at all (e.g. no baseline samples). The
@@ -1214,7 +1217,6 @@ def _passthrough(data: dict, method: str) -> tuple[dict, dict]:
         CATEGORY_BASELINE,
         CATEGORY_NEAR_METH,
         CATEGORY_SLOWED,
-        COL_CATEGORY,
     )
 
     new_data: dict = {}
@@ -1222,10 +1224,10 @@ def _passthrough(data: dict, method: str) -> tuple[dict, dict]:
     for kid, arr in data.items():
         if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
             continue
-        if arr.shape[1] <= COL_CATEGORY:
+        if arr.shape[1] <= layout.col_category:
             continue
         new_data[int(kid)] = arr.copy()
-        cats = arr[:, COL_CATEGORY].astype(np.int8)
+        cats = arr[:, layout.col_category].astype(np.int8)
         n_b += int((cats == CATEGORY_BASELINE).sum())
         n_n += int((cats == CATEGORY_NEAR_METH).sum())
         n_s += int((cats == CATEGORY_SLOWED).sum())
@@ -1272,43 +1274,49 @@ def refine_pkl(
     in_path = Path(in_path)
     out_path = Path(out_path)
 
+    from .data.dataset import read_shard_extraction_params
+    from .utils.sample_layout import get_sample_layout
+
+    def _layout_from_pkl(pkl_dict, src_name: str):
+        """Resolve the SampleLayout for one shard. Fails fast if the shard's
+        column count doesn't match its (declared or YAML-default) geometry."""
+        params = read_shard_extraction_params(pkl_dict)
+        layout = get_sample_layout(params)  # falls back to YAML if params None
+        for k, v in pkl_dict.items():
+            if isinstance(k, (int, np.integer)) and isinstance(v, np.ndarray):
+                if v.shape[1] != layout.n_cols:
+                    log.error(
+                        "%s: shard has %d cols but layout (K=%d) expects %d. "
+                        "Re-run `kinsim extract` under the current YAML, or "
+                        "use a YAML / __meta__ matching the shard.",
+                        src_name, v.shape[1], layout.kmer_size, layout.n_cols,
+                    )
+                    sys.exit(1)
+                break
+        return layout
+
     # ── Sharded mode: in_path is a directory of *_shard.pkl files. ──────
     if in_path.is_dir():
-        from .utils.sample_layout import SAMPLE_NCOLS
-
-        # Quick layout sanity check on the first shard.
         first = next(iter(sorted(in_path.glob("*_shard.pkl"))), None)
         if first is None:
             log.error("No *_shard.pkl files in %s", in_path)
             sys.exit(1)
         with open(first, "rb") as f:
             probe = pickle.load(f)
-        for k, v in probe.items():
-            if isinstance(k, (int, np.integer)) and isinstance(v, np.ndarray):
-                if v.shape[1] < SAMPLE_NCOLS:
-                    log.error(
-                        "Shard %s uses an obsolete %d-col layout; "
-                        "re-run `kinsim extract` (need %d cols).",
-                        first.name,
-                        v.shape[1],
-                        SAMPLE_NCOLS,
-                    )
-                    sys.exit(1)
-                break
+        layout = _layout_from_pkl(probe, first.name)
         del probe
 
         log.info(
-            "Refine (sharded, anchored): in=%s  out=%s  n_components=%s  "
-            "strict_bic=%.2f nats/sample  min_samples_for_gmm=%d",
-            in_path,
-            out_path,
+            "Refine (sharded, anchored, K=%d, %d cols): in=%s  out=%s  "
+            "n_components=%s  strict_bic=%.2f nats/sample  min_samples_for_gmm=%d",
+            layout.kmer_size, layout.n_cols, in_path, out_path,
             n_components if isinstance(n_components, int) else ",".join(map(str, n_components)),
-            strict_bic_nats_per_sample,
-            min_samples_for_gmm,
+            strict_bic_nats_per_sample, min_samples_for_gmm,
         )
         return slowed_split_gmm_shards(
             in_path,
             out_path,
+            layout=layout,
             min_samples_for_gmm=min_samples_for_gmm,
             n_components=n_components,
             strict_bic_nats_per_sample=strict_bic_nats_per_sample,
@@ -1322,28 +1330,12 @@ def refine_pkl(
     log.info("Loading: %s  (%.2f GB)", in_path, in_path.stat().st_size / 1e9)
     with open(in_path, "rb") as f:
         data = pickle.load(f)
+    layout = _layout_from_pkl(data, in_path.name)
     orig_meta = data.pop("__meta__", None)
 
     int_keyed = {k: v for k, v in data.items() if isinstance(k, (int, np.integer))}
     if not int_keyed:
         log.error("No int-keyed data found — input is not a kinsim extract pkl.")
-        sys.exit(1)
-
-    # Fail fast on the old layout (need PARENT_METH at col 18 of the 20-col
-    # current layout). Re-extract is the right answer; the GMM method needs
-    # the parent column for per-meth-type filtering.
-    from .utils.sample_layout import SAMPLE_NCOLS
-
-    sample_arr = next(iter(int_keyed.values()))
-    if sample_arr.shape[1] < SAMPLE_NCOLS:
-        log.error(
-            "Input pkl uses an obsolete %d-col layout; current layout is "
-            "%d cols (CATEGORY at col 17, PARENT_METH at col 18, "
-            "PARENT_OFFSET at col 19). Re-run `kinsim extract` to "
-            "regenerate.",
-            sample_arr.shape[1],
-            SAMPLE_NCOLS,
-        )
         sys.exit(1)
 
     n_comp_summary = (
@@ -1352,14 +1344,14 @@ def refine_pkl(
         else "auto-BIC over " + ",".join(str(k) for k in n_components)
     )
     log.info(
-        "Refine: method=gmm (anchored)  n_components=%s  "
+        "Refine: method=gmm (anchored, K=%d, %d cols)  n_components=%s  "
         "strict_bic=%.2f nats/sample  min_samples_for_gmm=%d",
-        n_comp_summary,
-        strict_bic_nats_per_sample,
-        min_samples_for_gmm,
+        layout.kmer_size, layout.n_cols, n_comp_summary,
+        strict_bic_nats_per_sample, min_samples_for_gmm,
     )
     new_data, stats = slowed_split_gmm(
         int_keyed,
+        layout=layout,
         min_samples_for_gmm=min_samples_for_gmm,
         n_components=n_components,
         strict_bic_nats_per_sample=strict_bic_nats_per_sample,

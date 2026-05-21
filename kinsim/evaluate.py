@@ -77,18 +77,14 @@ _SIGMA_CLAMP_LEGACY = (-6.0, 3.0)  # legacy default — replaced at runtime by m
 def _sigma_clamp_from_model(model) -> tuple[float, float]:
     """Return (min, max) log-sigma clamp matching what the model produced.
 
-    The trained checkpoint exposes ``log_sigma_clamp_max`` (1.5 by default
-    post-v0.5.0). Calibration / 2σ stats reported by evaluate must use the
-    SAME clamp as the model emitted — otherwise the σ values reported here
-    diverge from those generate consumes. Falls back to the legacy
-    ``(-6, 3)`` if the model lacks the attribute (very old checkpoints).
+    ``getattr(model, name, default)`` is total: it never raises. The clamp
+    must match what the model emitted at training time so calibration /
+    2σ stats line up with what ``generate.sample()`` consumes.
     """
-    try:
-        lo = float(getattr(model, "log_sigma_clamp_min", _SIGMA_CLAMP_LEGACY[0]))
-        hi = float(getattr(model, "log_sigma_clamp_max", _SIGMA_CLAMP_LEGACY[1]))
-        return (lo, hi)
-    except Exception:
-        return _SIGMA_CLAMP_LEGACY
+    return (
+        float(getattr(model, "log_sigma_clamp_min", _SIGMA_CLAMP_LEGACY[0])),
+        float(getattr(model, "log_sigma_clamp_max", _SIGMA_CLAMP_LEGACY[1])),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -439,10 +435,7 @@ def plot_kmer_distribution(
     )
     _METH_IDS_RUNTIME = _gmi()
     # K-aware: prefer the model's actual kmer_size, fall back to module K.
-    try:
-        _ckpt_k = int(model.get_config().get("kmer_size", _K))
-    except Exception:
-        _ckpt_k = _K
+    _ckpt_k = int(model.get_config().get("kmer_size", _K))
     if len(kmer_str) != _ckpt_k:
         raise ValueError(f"kmer_str must be exactly {_ckpt_k} bases, got {len(kmer_str)}")
     if meth_name not in _METH_IDS_RUNTIME:
@@ -481,15 +474,9 @@ def plot_kmer_distribution(
     # Mark the active site (slot KMER_PRED_IDX) with the meth_id's full prob.
     from .utils.encoding import KMER_PRED_IDX
     _M = len(_METH_IDS_RUNTIME)  # number of meth types (incl. none)
-    # Active-site row count = K + N_REV (3 by default). Use the model's config
-    # if available to stay K-agnostic.
-    try:
-        mcfg = model.get_config()
-        _kmer_size = int(mcfg.get("kmer_size", _K))
-        _n_rev = int(mcfg.get("n_rev_meth", 3))
-    except Exception:
-        _kmer_size = _K
-        _n_rev = 3
+    mcfg = model.get_config()
+    _kmer_size = int(mcfg.get("kmer_size", _K))
+    _n_rev = int(mcfg.get("n_rev_meth", 3))
     meth_probs = torch.zeros(1, _kmer_size + _n_rev, _M, device=device)
     if meth_id > 0:
         meth_probs[0, KMER_PRED_IDX, meth_id] = 1.0

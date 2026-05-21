@@ -181,7 +181,7 @@ KinSim/
 │   ├── data/                       dataset classes
 │   │   ├── __init__.py
 │   │   └── dataset.py              log_transform, inv_log_transform,
-│   │                               SignalDataset, KineticDataModule,
+│   │                               SignalDataset, ShardedSignalDataset,
 │   │                               list_shards, shard_sample_id
 │   │
 │   ├── models/                     neural model implementations
@@ -244,10 +244,10 @@ KinSim/
     │   └── README.md
     │
     ├── validate/                   per-task SLURM for validate chain
-    │   ├── prep.slurm              strip_kinetics + regions.txt
+    │   ├── prep.slurm              strip_kinetics on raw HiFi + pbindex
     │   ├── generate.slurm          kinsim generate (SKIP-first, FORCE_GEN=1 override)
     │   ├── merge.slurm             samtools merge + pbindex of shards
-    │   └── write_regions.py
+    │   └── write_regions.py        invoked inline by validate.sh after align
     │
     ├── ml/                         ML pipeline orchestrator
     │   ├── 00_extract.slurm        kinsim extract (array)
@@ -395,10 +395,11 @@ get_categories(arr) -> int8 ndarray
 
 ```python
 log_transform(x) / inv_log_transform(x)
-class SignalDataset(IterableDataset): ...        # walks one shard at a time
-class KineticDataModule(L.LightningDataModule): ...
+class SignalDataset(Dataset): ...                # in-memory single-shard
+class ShardedSignalDataset(IterableDataset): ... # walks one shard at a time
 list_shards(dir) -> list[str]                   # prefers _clean.pkl when both exist
 shard_sample_id(path) -> str
+# KineticDataModule lives in kinsim/train.py (Lightning DataModule wrapper).
 ```
 
 ### `kinsim/extract.py`
@@ -474,7 +475,7 @@ Per-meth-type kmer figures:
 Dump (μ, σ) for every kmer × every YAML methylation scenario. Outputs:
 - `<prefix>.tsv` — wide human-readable table
 - `<prefix>.npz` — compact binary, consumed by `generate --use-lookup`
-  and by `kinsim_baseline make-lookup`
+  and by `kinsim_baseline generate --format bam` (lookup-table mode)
 - `<prefix>.html` — per-scenario μ_ipd/μ_baseline distribution across
   all 4^K kmers
 

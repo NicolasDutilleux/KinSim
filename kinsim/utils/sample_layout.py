@@ -24,6 +24,18 @@ below resolve to these indices; for non-default geometries use
     18    | PARENT_METH
     19    | PARENT_OFFSET
 
+Naming convention
+-----------------
+
+* ``UPPERCASE`` (``COL_IPD``, ``SAMPLE_NCOLS``, ``CATEGORY_BASELINE``):
+  module-level integer constants for the **default K=11 layout**.
+  Static — readable in tests / call sites that hard-target K=11.
+* ``lowercase`` dataclass attributes (``layout.col_ipd``, ``layout.n_cols``):
+  K-aware values from a :class:`SampleLayout` instance. Use these
+  whenever the shard's geometry isn't statically known — i.e. read
+  ``layout = get_sample_layout(read_shard_extraction_params(data))``
+  then index ``arr[:, layout.col_category]``.
+
 This module is pure Python (no pysam) so refine, dataset, tests, and
 scripts can import it without the BAM dependency.
 """
@@ -146,10 +158,13 @@ def get_sample_layout(params: ExtractionParams | None = None) -> SampleLayout:
     return SampleLayout.from_params(params)
 
 
-def get_categories(arr):
-    """Return per-sample category as int8 ndarray. Assumes the K=11 layout."""
+def get_categories(arr, layout: SampleLayout | None = None):
+    """Return per-sample category as int8 ndarray. K-aware via ``layout``
+    (falls back to the YAML's current layout when omitted)."""
     import numpy as np
 
     if len(arr) == 0:
         return np.empty(0, dtype=np.int8)
-    return arr[:, COL_CATEGORY].astype(np.int8)
+    if layout is None:
+        layout = get_sample_layout()
+    return arr[:, layout.col_category].astype(np.int8)

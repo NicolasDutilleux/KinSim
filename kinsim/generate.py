@@ -74,11 +74,17 @@ from .models.predictor import (
     create_from_config,
     load_state_dict_from_ckpt,
 )
+from .utils.config import (
+    get_extraction_params,
+    get_signature_offsets,
+    load_kinsim_config,
+)
 from .utils.encoding import (
     BASE_MAP,
     KMER_MASK,
     KMER_PRED_IDX,
     K,
+    get_meth_ids,
 )
 from .utils.io import (
     find_pbsim3_files,
@@ -90,6 +96,7 @@ from .utils.io import (
 from .utils.motifs import (
     build_reference_frac_map,
     build_reference_meth_map,
+    build_reference_meth_map_per_strand,
     filter_motif_string_by_types,
     load_motif_string,
     parse_meth_types_arg,
@@ -98,6 +105,19 @@ from .utils.motifs import (
 )
 
 log = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Tunables (formerly magic numbers)
+# ─────────────────────────────────────────────────────────────────────────
+from .utils._defaults import BAM_TAG_MAX  # noqa: E402,F401 — re-exported
+
+# Positions per GPU forward pass in the mapped path. Keeps peak VRAM
+# bounded; tune down on small GPUs.
+SIGNAL_BATCH_CHUNK: int = 50_000
+# SMRT-Tools `pb:` version stamped into the output BAM @HD line when the
+# input lacks one. Kept in sync with the ipdSummary build chained downstream.
+DEFAULT_PB_VERSION: str = "3.0.7"
 
 
 # ---------------------------------------------------------------------------
@@ -138,10 +158,8 @@ def _load_lookup_table(npz_path: str) -> dict:
                            (meth_id, k_pos); 0 = none/fallback.
         ``scenario_labels`` list[str] for logging.
     """
-    from .utils.encoding import KMER_PRED_IDX as _PI
-    from .utils.encoding import K as _K
-    from .utils.encoding import get_meth_ids
-
+    _PI = KMER_PRED_IDX
+    _K = K
     data = np.load(npz_path, allow_pickle=False)
     required = {"scenarios_label", "scenarios_meth_id", "scenarios_offset"}
     if not required.issubset(set(data.files)):
@@ -289,9 +307,9 @@ def generate_signals_lookup(
         ipd_log = mu_ipd_log + sigma_ipd_log * np.random.randn(N).astype(np.float32)
         pw_log = mu_pw_log + sigma_pw_log * np.random.randn(N).astype(np.float32)
 
-    # inv_log_transform: expm1 clamped to [0, 255]
-    ipd = np.clip(np.expm1(ipd_log), 0.0, 255.0).astype(np.float32)
-    pw = np.clip(np.expm1(pw_log), 0.0, 255.0).astype(np.float32)
+    # inv_log_transform: expm1 clamped to [0, BAM_TAG_MAX]
+    ipd = np.clip(np.expm1(ipd_log), 0.0, float(BAM_TAG_MAX)).astype(np.float32)
+    pw = np.clip(np.expm1(pw_log), 0.0, float(BAM_TAG_MAX)).astype(np.float32)
     return np.stack([ipd, pw], axis=1)
 
 
@@ -434,8 +452,6 @@ def _build_p_efficiency_lookup(
     Returning ``{}`` (empty) makes generate fall back to "always fire" —
     the safe default for checkpoints predating this plumbing.
     """
-    from .utils.encoding import get_meth_ids
-
     if not p_fire_dict:
         return {}
     occ_dict = mean_occupancy_dict or {}
@@ -473,9 +489,6 @@ def _build_sig_offsets_by_meth_id() -> dict[int, set[int]]:
     Bernoulli; non-signature offsets pass through (the model trained on
     them as NEAR_METH-ish).
     """
-    from .utils.config import get_signature_offsets, load_kinsim_config
-    from .utils.encoding import get_meth_ids
-
     cfg = load_kinsim_config()
     ids = get_meth_ids()
     out: dict[int, set[int]] = {}
@@ -484,56 +497,6 @@ def _build_sig_offsets_by_meth_id() -> dict[int, set[int]]:
         if T is not None:
             out[T] = set(get_signature_offsets(name))
     return out
-
-
-# ---------------------------------------------------------------------------
-# PacBio auxiliary tag presets (loaded from kinsim_config.yaml::pacbio_tags)
-# ---------------------------------------------------------------------------
-
-_PACBIO_TAG_PRESETS: list[tuple[str, object, str]] = []
-_ZM_PATTERN = re.compile(r"/(\d+)(?:/[^/]+)?$")
-
-
-def _zm_from_query_name(name: str) -> int | None:
-    """Parse the ZMW number from a PacBio query_name.
-
-    PacBio convention: ``<movie>/<zmw>`` or ``<movie>/<zmw>/ccs``. Returns
-    ``None`` if the pattern doesn't match (caller falls back to omitting
-    the zm tag — only ccs-kinetics-bystrandify cares).
-    """
-    m = _ZM_PATTERN.search(name)
-    return int(m.group(1)) if m else None
-
-
-def _load_pacbio_tag_presets() -> list[tuple[str, object, str | None]]:
-    """Build the (tag, value, type_letter) tuples from the YAML.
-
-    Tags are hardcoded defaults captured from a real PacBio HiFi BAM (not
-    invented) so downstream tools (ccs-kinetics-bystrandify, jasmine,
-    ipdSummary) find the metadata they require. The ZMW number ``zm`` is
-    NOT preset here — it's parsed per-record from the query_name, since
-    bystrandify groups by zm and needs distinct values.
-
-    For array tags (e.g. ``sn`` per-channel SNR) we pass the value as a
-    Python list and type_letter ``None`` — pysam infers ``B:f`` from the
-    list contents. Passing ``"f"`` would coerce to a single float and
-    raise ``TypeError: must be real number, not list``.
-    """
-    from .utils.config import load_kinsim_config
-    presets = (load_kinsim_config().get("pacbio_tags") or {})
-    out: list[tuple[str, object, str | None]] = []
-    if "np" in presets:
-        out.append(("np", int(presets["np"]), "i"))
-    if "rq" in presets:
-        out.append(("rq", float(presets["rq"]), "f"))
-    if "sn" in presets:
-        sn = [float(x) for x in presets["sn"]]
-        # type_letter=None → pysam infers B:f for a float list.
-        out.append(("sn", sn, None))
-    return out
-
-
-_PACBIO_TAG_PRESETS = _load_pacbio_tag_presets()
 
 
 def _apply_p_fire_to_mc(
@@ -618,7 +581,7 @@ def generate_signals_batch(
         np.ndarray of shape (N, 2) with raw [IPD, PW] values in [0, 255].
     """
     N = len(kmer_ids)
-    CHUNK = 50_000  # positions per GPU forward pass — prevents OOM on long reads
+    CHUNK = SIGNAL_BATCH_CHUNK
 
     meth_ids_bin = np.asarray(meth_ids, dtype=np.int64)
     fractions_bin = np.asarray(fractions, dtype=np.float32)
@@ -850,6 +813,119 @@ def _load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
 
 
 # ---------------------------------------------------------------------------
+# Shared generation setup — used by both PBSIM3 (.fq.gz + .maf) and BAM modes.
+# ---------------------------------------------------------------------------
+
+
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass
+class _GenContext:
+    """All the heavy state generate_signals / generate_from_bam need.
+
+    Built once via :func:`_prepare_generation_context`. Holds the device,
+    reference sequences, per-strand methylation maps, fraction map,
+    generation flags, fallback regex motifs, loaded model (or LUT), and
+    p_fire / signal-offset lookups.
+    """
+    device: torch.device
+    ref_seqs: dict
+    meth_map: dict
+    fwd_meth_map: dict
+    rev_meth_map: dict
+    rev_meth_offsets: tuple
+    frac_map: dict
+    use_motif_fraction: bool
+    fallback_motifs: list
+    model: object | None  # ConvPredictor or None in LUT mode
+    lookup_table: dict | None
+    p_eff_lookup: dict
+    sig_offsets: dict
+
+
+def _prepare_generation_context(
+    ref_path: str,
+    checkpoint_path: str,
+    motif_string: str,
+    *,
+    device_str: str = "cuda",
+    no_fuzznuc: bool = False,
+    revcomp: bool = True,
+    use_lookup: str | None = None,
+    deterministic: bool = False,
+) -> _GenContext:
+    """Load + scan + parse everything generate_{signals,from_bam} need.
+
+    Replaces ~80 LOC duplicated between the two callers. Single source
+    keeps them in lockstep.
+    """
+    device = torch.device(device_str if torch.cuda.is_available() else "cpu")
+    log.info("Using device: %s", device)
+
+    log.info("Loading reference: %s", ref_path)
+    ref_seqs = load_reference(ref_path)
+
+    backend = "regex (forced)" if no_fuzznuc else "fuzznuc (primary, regex fallback)"
+    log.info("Pre-scanning reference for methylation sites (%s)...", backend)
+    meth_map = build_reference_meth_map(
+        ref_seqs, motif_string, revcomp=revcomp, no_fuzznuc=no_fuzznuc
+    )
+    fwd_meth_map, rev_meth_map = build_reference_meth_map_per_strand(
+        ref_seqs, motif_string
+    )
+    rev_meth_offsets = tuple(int(o) for o in get_extraction_params().rev_meth_offsets)
+    frac_map = build_reference_frac_map(ref_seqs, motif_string, revcomp=revcomp)
+    use_motif_fraction = bool(
+        (load_kinsim_config().get("generation") or {}).get("use_motif_fraction", False)
+    )
+    log.info(
+        "Per-site motif fraction at generate: %s (false => p_fire alone)",
+        use_motif_fraction,
+    )
+    fallback_motifs = parse_motifs(motif_string, revcomp=revcomp)
+
+    lookup_table = None
+    model: object | None = None
+    if use_lookup:
+        log.info("Loading lookup table: %s", use_lookup)
+        lookup_table = _load_lookup_table(use_lookup)
+    else:
+        log.info("Loading checkpoint: %s", checkpoint_path)
+        model = _load_model(checkpoint_path, device)
+
+    p_eff_lookup = _load_p_efficiency(checkpoint_path)
+    sig_offsets = _build_sig_offsets_by_meth_id()
+    if p_eff_lookup:
+        log.info(
+            "Statistical firing enabled: %d (meth, offset) buckets with p_fire ∈ [%.2f, %.2f]",
+            len(p_eff_lookup), min(p_eff_lookup.values()), max(p_eff_lookup.values()),
+        )
+    else:
+        log.info("No p_fire in checkpoint — every motif site fires deterministically.")
+    log.info(
+        "Inference mode: %s",
+        "deterministic (mean)" if deterministic else "stochastic (sample)",
+    )
+
+    return _GenContext(
+        device=device,
+        ref_seqs=ref_seqs,
+        meth_map=meth_map,
+        fwd_meth_map=fwd_meth_map,
+        rev_meth_map=rev_meth_map,
+        rev_meth_offsets=rev_meth_offsets,
+        frac_map=frac_map,
+        use_motif_fraction=use_motif_fraction,
+        fallback_motifs=fallback_motifs,
+        model=model,
+        lookup_table=lookup_table,
+        p_eff_lookup=p_eff_lookup,
+        sig_offsets=sig_offsets,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main injection
 # ---------------------------------------------------------------------------
 
@@ -890,56 +966,27 @@ def generate_signals(
         deterministic: If True, use predicted μ only (no stochastic sampling).
                        Default False matches natural PacBio signal variability.
     """
-    device = torch.device(device if torch.cuda.is_available() else "cpu")
-    log.info("Using device: %s", device)
-
-    log.info("Loading reference: %s", ref_path)
-    ref_seqs = load_reference(ref_path)
-
-    backend = "regex (forced)" if no_fuzznuc else "fuzznuc (primary, regex fallback)"
-    log.info("Pre-scanning reference for methylation sites (%s)...", backend)
-    meth_map = build_reference_meth_map(
-        ref_seqs, motif_string, revcomp=revcomp, no_fuzznuc=no_fuzznuc
-    )
-    # Separate forward/reverse strand maps — rev_meth_map fills the
-    # complementary-strand block of meth_full at active-site neighbours,
-    # matching how `kinsim extract` builds training data.
-    from .utils.config import get_extraction_params
-    from .utils.motifs import build_reference_meth_map_per_strand
-
-    fwd_meth_map, rev_meth_map = build_reference_meth_map_per_strand(
-        ref_seqs,
+    ctx = _prepare_generation_context(
+        ref_path,
+        checkpoint_path,
         motif_string,
+        device_str=device,
+        no_fuzznuc=no_fuzznuc,
+        revcomp=revcomp,
+        deterministic=deterministic,
     )
-    rev_meth_offsets = tuple(int(o) for o in get_extraction_params().rev_meth_offsets)
-    # Per-position fraction (target-genome occupancy) — pairs with p_efficiency
-    # so the per-site Bernoulli rate at generate is target_frac × p_efficiency.
-    frac_map = build_reference_frac_map(ref_seqs, motif_string, revcomp=revcomp)
-    from .utils.config import load_kinsim_config
-    use_motif_fraction = bool(
-        (load_kinsim_config().get("generation") or {}).get("use_motif_fraction", False)
-    )
-    log.info("Per-site motif fraction at generate: %s (false => p_fire alone)",
-             use_motif_fraction)
-
-    # Keep regex motifs for the fallback path (unmapped reads)
-    fallback_motifs = parse_motifs(motif_string, revcomp=revcomp)
-
-    log.info("Loading checkpoint: %s", checkpoint_path)
-    model = _load_model(checkpoint_path, device)
-    p_eff_lookup = _load_p_efficiency(checkpoint_path)
-    sig_offsets = _build_sig_offsets_by_meth_id()
-    if p_eff_lookup:
-        log.info(
-            "Statistical firing enabled: %d (meth, offset) buckets with p_fire ∈ [%.2f, %.2f]",
-            len(p_eff_lookup),
-            min(p_eff_lookup.values()),
-            max(p_eff_lookup.values()),
-        )
-    else:
-        log.info("No p_fire in checkpoint — every motif site fires deterministically.")
-    mode_label = "deterministic (mean)" if deterministic else "stochastic (sample)"
-    log.info("Inference mode: %s", mode_label)
+    device = ctx.device
+    ref_seqs = ctx.ref_seqs
+    meth_map = ctx.meth_map
+    fwd_meth_map = ctx.fwd_meth_map
+    rev_meth_map = ctx.rev_meth_map
+    rev_meth_offsets = ctx.rev_meth_offsets
+    frac_map = ctx.frac_map
+    use_motif_fraction = ctx.use_motif_fraction
+    fallback_motifs = ctx.fallback_motifs
+    model = ctx.model
+    p_eff_lookup = ctx.p_eff_lookup
+    sig_offsets = ctx.sig_offsets
 
     log.info("Parsing MAF: %s", maf_path)
     maf_mapping = parse_maf(maf_path)
@@ -1400,10 +1447,10 @@ def _process_batch(
         rc_signals = all_rc_signals[start:end]
         is_n = flat_is_n[start:end]
 
-        ipd_vals = np.clip(signals[:, 0], 0, 255).astype(np.uint8)
-        pw_vals = np.clip(signals[:, 1], 0, 255).astype(np.uint8)
-        ri_vals = np.clip(rc_signals[:, 0], 0, 255).astype(np.uint8)
-        rp_vals = np.clip(rc_signals[:, 1], 0, 255).astype(np.uint8)
+        ipd_vals = np.clip(signals[:, 0], 0, BAM_TAG_MAX).astype(np.uint8)
+        pw_vals = np.clip(signals[:, 1], 0, BAM_TAG_MAX).astype(np.uint8)
+        ri_vals = np.clip(rc_signals[:, 0], 0, BAM_TAG_MAX).astype(np.uint8)
+        rp_vals = np.clip(rc_signals[:, 1], 0, BAM_TAG_MAX).astype(np.uint8)
 
         # N-context positions: replace with a safe default of 1 (not 0, which
         # could be mis-interpreted as a missing tag by downstream tools).
@@ -1414,29 +1461,22 @@ def _process_batch(
             ri_vals[is_n] = 1
             rp_vals[is_n] = 1
 
-        seg = pysam.AlignedSegment(header)
-        seg.query_name = read_data["name"]
-        seg.flag = 4  # unmapped
-        seg.query_sequence = read_data["seq"]
-        seg.query_qualities = pysam.qualitystring_to_array(read_data["qual"])
-        rg_id = header.to_dict().get("RG", [{}])[0].get("ID", "00000001")
-        seg.set_tag("RG", rg_id)
-        # PacBio auxiliary tags from the YAML defaults
-        # (kinsim_config.yaml::pacbio_tags). Values were captured from a
-        # real PacBio HiFi BAM — not invented. The ZMW number must be
-        # UNIQUE per record (bystrandify groups by zm), so we parse it
-        # from the PacBio query_name convention "<movie>/<zmw>[/ccs]".
-        for _t, _v, _vt in _PACBIO_TAG_PRESETS:
-            if _vt is None:
-                seg.set_tag(_t, _v)         # pysam infers type (used for array tags)
-            else:
-                seg.set_tag(_t, _v, _vt)
-        _zm = _zm_from_query_name(read_data["name"])
-        if _zm is not None:
-            seg.set_tag("zm", _zm, "i")
-        # Use .tobytes() instead of .tolist() — saves the per-read allocation of
-        # 4 × L Python int objects. For a 10 kb read × 1000 reads/batch this
-        # removes ~40 s of pure Python overhead per batch.
+        # Reuse the input record: keeps every PacBio aux tag (cx, qs, qe,
+        # ec, np, rq, sn, zm, ML, MM, ...) that bystrandify/jasmine/etc.
+        # require. We only override the alignment state and kinetics.
+        seg = read_data["read"]
+        seg.flag = 4
+        seg.reference_id = -1
+        seg.reference_start = -1
+        seg.next_reference_id = -1
+        seg.next_reference_start = -1
+        seg.cigartuples = None
+        seg.mapping_quality = 0
+        # pbmm2 may have converted fi/fp/ri/rp → ip/pw on the aligned input.
+        # Strip ip/pw so downstream tools read our fresh fi/fp/ri/rp.
+        for _t in ("ip", "pw"):
+            if seg.has_tag(_t):
+                seg.set_tag(_t, None)
         seg.set_tag("fi", array.array("B", ipd_vals.tobytes()))
         seg.set_tag("fp", array.array("B", pw_vals.tobytes()))
         seg.set_tag("ri", array.array("B", ri_vals.tobytes()))
@@ -1544,56 +1584,29 @@ def generate_from_bam(
     Use this with a BAM that has had fi/fp/ri/rp tags stripped.
     Output BAM has the same reads + sequences as input, with fresh fi/fp/ri/rp.
     """
-    device_obj = torch.device(device if torch.cuda.is_available() else "cpu")
-    log.info("Using device: %s", device_obj)
-
-    log.info("Loading reference: %s", ref_path)
-    ref_seqs = load_reference(ref_path)
-
-    backend = "regex (forced)" if no_fuzznuc else "fuzznuc (primary, regex fallback)"
-    log.info("Pre-scanning reference for methylation sites (%s)...", backend)
-    meth_map = build_reference_meth_map(
-        ref_seqs, motif_string, revcomp=revcomp, no_fuzznuc=no_fuzznuc
-    )
-    from .utils.config import get_extraction_params
-    from .utils.motifs import build_reference_meth_map_per_strand
-
-    fwd_meth_map, rev_meth_map = build_reference_meth_map_per_strand(
-        ref_seqs,
+    ctx = _prepare_generation_context(
+        ref_path,
+        checkpoint_path,
         motif_string,
+        device_str=device,
+        no_fuzznuc=no_fuzznuc,
+        revcomp=revcomp,
+        use_lookup=use_lookup,
+        deterministic=deterministic,
     )
-    rev_meth_offsets = tuple(int(o) for o in get_extraction_params().rev_meth_offsets)
-    frac_map = build_reference_frac_map(ref_seqs, motif_string, revcomp=revcomp)
-    from .utils.config import load_kinsim_config
-    use_motif_fraction = bool(
-        (load_kinsim_config().get("generation") or {}).get("use_motif_fraction", False)
-    )
-    log.info("Per-site motif fraction at generate: %s (false => p_fire alone)",
-             use_motif_fraction)
-    fallback_motifs = parse_motifs(motif_string, revcomp=revcomp)
-
-    # Either load the trained model (default) or a pre-computed lookup table.
-    lookup_table = None
-    if use_lookup:
-        log.info("Loading lookup table: %s", use_lookup)
-        lookup_table = _load_lookup_table(use_lookup)
-        model = None  # not needed in LUT mode
-    else:
-        log.info("Loading checkpoint: %s", checkpoint_path)
-        model = _load_model(checkpoint_path, device_obj)
-    p_eff_lookup = _load_p_efficiency(checkpoint_path)
-    sig_offsets = _build_sig_offsets_by_meth_id()
-    if p_eff_lookup:
-        log.info(
-            "Statistical firing enabled: %d (meth, offset) buckets with p_fire ∈ [%.2f, %.2f]",
-            len(p_eff_lookup),
-            min(p_eff_lookup.values()),
-            max(p_eff_lookup.values()),
-        )
-    else:
-        log.info("No p_fire in checkpoint — every motif site fires deterministically.")
-    mode_label = "deterministic (mean)" if deterministic else "stochastic (sample)"
-    log.info("Inference mode: %s", mode_label)
+    device_obj = ctx.device
+    ref_seqs = ctx.ref_seqs
+    meth_map = ctx.meth_map
+    fwd_meth_map = ctx.fwd_meth_map
+    rev_meth_map = ctx.rev_meth_map
+    rev_meth_offsets = ctx.rev_meth_offsets
+    frac_map = ctx.frac_map
+    use_motif_fraction = ctx.use_motif_fraction
+    fallback_motifs = ctx.fallback_motifs
+    model = ctx.model
+    lookup_table = ctx.lookup_table
+    p_eff_lookup = ctx.p_eff_lookup
+    sig_offsets = ctx.sig_offsets
 
     n_reads = n_mapped = n_unmapped = 0
     batch: list = []
@@ -1616,9 +1629,7 @@ def generate_from_bam(
         if "pb" in in_hd:
             hd["pb"] = in_hd["pb"]
         else:
-            # SMRT-Tools 25.x default. Matches the version used by ipdSummary
-            # in slurm_kinsim/callers/ipdsummary.slurm.
-            hd["pb"] = "3.0.7"
+            hd["pb"] = DEFAULT_PB_VERSION
         out_dict = {"HD": hd}
         # Inherit the input BAM's RG verbatim. The input is either a raw HiFi
         # BAM (proper PacBio RG with BV/PM/PU/SM/DS) or a bystrandify-mangled
@@ -1664,12 +1675,9 @@ def generate_from_bam(
         while kinsim_id in existing_ids:
             kinsim_id = f"kinsim.{_suffix}"
             _suffix += 1
-        try:
-            _mcfg = model.get_config() if model is not None else {}
-            _arch = _mcfg.get("architecture", "conv")
-            _ksize = int(_mcfg.get("kmer_size", 11))
-        except Exception:
-            _arch, _ksize = "?", 11
+        _mcfg = model.get_config() if model is not None else {}
+        _arch = _mcfg.get("architecture", "conv")
+        _ksize = int(_mcfg.get("kmer_size", 11))
         _n_motifs = motif_string.count(";") + 1 if motif_string else 0
         kinsim_pg = {
             "ID": kinsim_id,
@@ -1727,6 +1735,7 @@ def generate_from_bam(
                     "seq": seq,
                     "qual": qual_str,
                     "len": len(seq),
+                    "read": read,
                 }
             )
 

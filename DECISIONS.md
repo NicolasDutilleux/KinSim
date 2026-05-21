@@ -273,7 +273,7 @@ sequencing corpora — failed assemblies, low coverage, contamination.
 - `kinsim/data/dataset.py` (emit (B, 14, M) meth tensor with rev_meth tail)
 - `kinsim/models/predictor.py` (meth_proj input dim 11*M → 14*M, both architectures)
 - `kinsim/analyze.py` (compute_signature_profiles emits scalar mean_ipd/pw)
-- `tests/test_v4_pipeline.py` (SAMPLE_NCOLS=20 + mean_ipd assertions)
+- `tests/test_pipeline.py` (SAMPLE_NCOLS=20 + mean_ipd assertions)
 - `CLAUDE.md`, `kinsim/README.md` (column reference updates)
 - Deleted: `scripts/diagnose_offset_split.py`
 

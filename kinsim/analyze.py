@@ -59,7 +59,9 @@ def _id_to_name() -> dict[int, str]:
     return {v: k for k, v in get_meth_ids().items()}
 
 
-_ID_TO_NAME = _id_to_name()  # back-compat snapshot for callers that read it directly
+# back-compat snapshot for callers that read it directly. Note: prefer
+# calling `_id_to_name()` per-figure to pick up YAML changes between runs.
+_ID_TO_NAME = _id_to_name()
 
 # Colorblind-safe Wong/Okabe-Ito palette + B&W-friendly anchors.
 # `_COLORS` cycles for any number of meth types; `_CB_*` constants name
@@ -87,7 +89,7 @@ _LINE_DASHES = ["solid", "dash", "dashdot", "dot", "longdash", "longdashdot"]
 
 
 def _meth_name(meth_id: int) -> str:
-    return _ID_TO_NAME.get(meth_id, f"meth_id={meth_id}")
+    return _id_to_name().get(meth_id, f"meth_id={meth_id}")
 
 
 def _meth_color(meth_id: int) -> str:
@@ -144,20 +146,35 @@ class DictStats:
 # ---------------------------------------------------------------------------
 
 
-def _check_v4_input(data: dict) -> None:
-    """Fail fast on inputs that are not in the current 20-col layout."""
+def _check_input_layout(data: dict) -> None:
+    """Fail fast on any non-conformant entry in ``data``.
+
+    Scans every key/value (skipping ``__meta__``). Refuses non-int keys
+    and non-2D ndarrays anywhere — one bad row in shard #427 is enough
+    to corrupt downstream stats, so we don't trust the first probe.
+    """
+    bad: list[str] = []
     for k, v in data.items():
         if k == "__meta__":
             continue
         if not isinstance(k, (int, np.integer)):
-            raise ValueError(
-                f"Input is not in the current int-keyed layout: got key type "
-                f"{type(k).__name__}, expected int kmer_id. Re-run "
-                f"`kinsim extract`."
-            )
-        if not isinstance(v, np.ndarray) or v.ndim != 2:
-            raise ValueError(f"Input value for kmer {k!r} is not a 2D ndarray.")
-        return  # one probe is enough
+            bad.append(f"non-int key {k!r} (type={type(k).__name__})")
+        elif not isinstance(v, np.ndarray) or v.ndim != 2:
+            shape = getattr(v, "shape", None)
+            bad.append(f"kmer {int(k)}: not a 2D ndarray (shape={shape})")
+        if len(bad) >= 5:
+            bad.append("... (more)")
+            break
+    if bad:
+        raise ValueError(
+            "Input is not in the current int-keyed 2D layout:\n  "
+            + "\n  ".join(bad)
+            + "\nRe-run `kinsim extract`."
+        )
+
+
+# Back-compat shim for any callers that import the old name.
+_check_v4_input = _check_input_layout
 
 
 def _detect_kmer_size(data: dict, meta: dict) -> int:
@@ -261,7 +278,7 @@ def compute_category_distributions(data: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def compute_signature_profiles(data: dict, kmer_size: int = 11) -> dict:
+def compute_signature_profiles(data: dict, kmer_size: int | None = None) -> dict:
     """Aggregate IPD/PW means per (category, parent_meth, parent_offset) bucket.
 
     Buckets: ``baseline``, ``slowed_by_<T>_at_+<off>``, ``near_meth_by_<T>_at_+<off>``.
@@ -2038,7 +2055,7 @@ def analyze_pkl(
         log.error("Input is empty: %s", pkl_path)
         return
 
-    _check_v4_input(data)
+    _check_input_layout(data)
 
     log.info("Collecting statistics ...")
     stats = collect_stats(data, pkl_path)

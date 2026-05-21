@@ -123,6 +123,24 @@ def load_manifest(manifest_path: str) -> list[SampleEntry]:
                 f"Found:    {fieldnames}\n"
                 f"File:     {manifest_path}"
             )
+        # Typo detection: any header column outside the known set may be a
+        # misspelling of a real one (e.g. ``ref_pat`` for ``ref_path``).
+        # Warn the user so they don't silently get an empty ref_path.
+        known = _REQUIRED_COLUMNS | _OPTIONAL_COLUMNS
+        unknown = fieldnames - known
+        if unknown:
+            import difflib
+            typos = {
+                u: m[0]
+                for u in unknown
+                for m in [difflib.get_close_matches(u, known, n=1, cutoff=0.7)]
+                if m
+            }
+            if typos:
+                log.warning(
+                    "Manifest header has unknown columns possibly mistyped "
+                    "(suggestions): %s", typos,
+                )
 
         has_ref = "ref_path" in fieldnames
 
@@ -180,6 +198,8 @@ def validate_manifest(
     2. ``bam_path`` file existence (when ``check_files=True``).
     3. ``motifs`` file existence when the field looks like a path (starts with
        ``/``, ``~``, or ends with ``.csv``/``.tsv``/``.txt``).
+    4. ``ref_path`` file existence (when ``check_files=True`` and the entry
+       carries one — required by ``kinsim extract``'s aligned path).
 
     Args:
         entries:     List of :class:`SampleEntry` from :func:`load_manifest`.
@@ -219,6 +239,11 @@ def validate_manifest(
             if motif_looks_like_path and not Path(entry.motifs).expanduser().exists():
                 errors.append(
                     f"Row {idx} ({entry.sample_id}): motifs file does not exist: {entry.motifs}"
+                )
+            # 4. ref_path existence — required by extract's aligned path.
+            if entry.ref_path and not Path(entry.ref_path).expanduser().exists():
+                errors.append(
+                    f"Row {idx} ({entry.sample_id}): ref_path does not exist: {entry.ref_path}"
                 )
 
     return errors
@@ -278,7 +303,8 @@ def load_yaml_config(path: str) -> dict:
 # ---------------------------------------------------------------------------
 
 # Default config — used if kinsim_config.yaml is missing or unreadable.
-# Numbers match the YAML at the repo root; keep in sync.
+# Geometry constants pulled from utils._defaults so the in-memory fallback
+# cannot drift from the import-time defaults.
 _DEFAULT_KINSIM_CONFIG = {
     "kinetic_signatures": {
         "m6A": {"modified_base": "A", "signal_offsets": [0, 5]},
@@ -286,14 +312,14 @@ _DEFAULT_KINSIM_CONFIG = {
         "m5C": {"modified_base": "C", "signal_offsets": [2, 6]},
     },
     "extraction": {
-        "kmer_size": 11,
-        "upstream": 7,
-        "downstream": 3,
-        "rev_meth_offsets": [-1, 0, 1],
+        "kmer_size": _FALLBACK_KMER_SIZE,
+        "upstream": _FALLBACK_UPSTREAM,
+        "downstream": _FALLBACK_DOWNSTREAM,
+        "rev_meth_offsets": list(_FALLBACK_REV_METH_OFFSETS),
     },
     "extract": {
         "n_baseline_per_kmer": 50,
-        "baseline_min_dist_to_meth": 11,
+        "baseline_min_dist_to_meth": _FALLBACK_KMER_SIZE,  # >= K (window safety)
         "baseline_sample_rate": 0.10,
         "near_meth_max_dist": 7,
     },
@@ -332,7 +358,10 @@ def load_kinsim_config(explicit_path: str | None = None) -> dict:
                 cfg = load_yaml_config(str(cand))
                 _CACHED_KINSIM_CONFIG = cfg
                 return cfg
-            except Exception as exc:
+            except (OSError, ImportError, ValueError) as exc:
+                # OSError: file vanished / permission denied
+                # ImportError: PyYAML missing
+                # ValueError: YAML parse error (yaml.YAMLError subclasses it)
                 log.warning("Failed to load kinsim config %s: %s", cand, exc)
 
     log.warning("kinsim_config.yaml not found — using built-in defaults")
@@ -462,12 +491,14 @@ def get_meth_alias_map() -> dict[str, str]:
 # These values come from `kinsim_config.yaml`, the `extraction:` block.
 
 
-# Hardcoded fallbacks — used only if `extraction:` is missing from the YAML.
-# Match the historical K=11 defaults.
-_FALLBACK_KMER_SIZE = 11
-_FALLBACK_UPSTREAM = 7
-_FALLBACK_DOWNSTREAM = 3
-_FALLBACK_REV_METH_OFFSETS = (-1, 0, 1)
+# Hardcoded fallbacks live in ``utils._defaults`` — single source shared
+# with ``utils.encoding`` to prevent drift.
+from ._defaults import (
+    DEFAULT_DOWNSTREAM as _FALLBACK_DOWNSTREAM,
+    DEFAULT_KMER_SIZE as _FALLBACK_KMER_SIZE,
+    DEFAULT_REV_METH_OFFSETS as _FALLBACK_REV_METH_OFFSETS,
+    DEFAULT_UPSTREAM as _FALLBACK_UPSTREAM,
+)
 
 # Practical limits — kmer_size > 31 overflows int64 in the packed encoding.
 _KMER_SIZE_MIN = 3
@@ -682,60 +713,6 @@ def get_extraction_params() -> ExtractionParams:
 # ---------------------------------------------------------------------------
 # Model / training defaults — read by `kinsim train`, overridden by CLI flags.
 # ---------------------------------------------------------------------------
-
-
-# Hardcoded fallbacks — used only when the YAML is missing the relevant block.
-# Kept in lockstep with the defaults documented in `kinsim_config.yaml`.
-_MODEL_FALLBACK = {
-    "architecture": "conv",
-    "base_embed_dim": 16,
-    "n_conv_layers": 3,
-    "conv_channels": 128,
-    "conv_kernel_size": 3,
-    "head_hidden_dim": 128,
-    "head_dropout": 0.1,
-    "meth_proj_dim": 8,
-    "kmer_aware_film": True,
-    "biology_mask": False,  # off by default; see kinsim_config.yaml
-    "log_sigma_clamp_max": 1.5,  # sync with kinsim_config.yaml model.log_sigma_clamp_max
-}
-
-_TRAINING_FALLBACK = {
-    "epochs": 50,
-    "batch_size": 4096,
-    "lr": 1e-3,
-    "loss": "betanll",
-    "lr_schedule": "cosine",
-    "warmup_epochs": 3,
-    "augment": True,
-    "balance_kmers": True,
-    "val_fraction": 0.10,
-    "checkpoint_every": 10,
-}
-
-
-def get_model_defaults() -> dict:
-    """Return the merged model-config dict.
-
-    Order (high → low): ``model:`` block of ``kinsim_config.yaml`` overrides
-    :data:`_MODEL_FALLBACK`. Unknown keys are passed through verbatim — the
-    caller decides what to do with them.
-    """
-    cfg = load_kinsim_config()
-    merged = dict(_MODEL_FALLBACK)
-    merged.update(cfg.get("model") or {})
-    return merged
-
-
-def get_training_defaults() -> dict:
-    """Return the merged training-config dict.
-
-    Same precedence rule as :func:`get_model_defaults`.
-    """
-    cfg = load_kinsim_config()
-    merged = dict(_TRAINING_FALLBACK)
-    merged.update(cfg.get("training") or {})
-    return merged
 
 
 # ---------------------------------------------------------------------------

@@ -131,11 +131,20 @@ See [`kinsim/README.md`](kinsim/README.md) for the full ML pipeline reference.
 
 ### 4. Generate synthetic BAMs
 
+`kinsim generate` has three modes (auto-detected from argument count):
+
 ```bash
-kinsim generate <pbsim3_dir> <ref.fna> checkpoints/best.pt motifs.csv output/
+# Directory mode (PBSIM3 outputs)
+kinsim generate <pbsim3_dir> checkpoints/best.pt motifs.csv output_dir/
+
+# BAM mode (existing aligned BAM, e.g. real raw HiFi)
+kinsim generate <input.bam> <ref.fna> checkpoints/best.pt motifs.csv output.bam
+
+# Per-genome mode (PBSIM3 fq.gz + maf.gz pair)
+kinsim generate <fq.gz> <maf.gz> <ref.fna> checkpoints/best.pt motifs.csv output.bam
 ```
 
-Output: PacBio-style BAMs with `fi:B:C` (IPD) and `fp:B:C` (PW) tags, ready for any kinetics-aware downstream tool.
+Output: unmapped HiFi BAMs (`flag=4`) with `fi:B:C` (IPD) and `fp:B:C` (PW) tags, ready for `ccs-kinetics-bystrandify` then any kinetics-aware downstream tool.
 
 ---
 

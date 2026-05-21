@@ -63,6 +63,11 @@ log = logging.getLogger(__name__)
 # m6A (template A) → T.
 _COMPLEMENT = {"A": "T", "T": "A", "C": "G", "G": "C"}
 
+# Refuse full enumeration above 1e8 kmers — 4^K=4^14 ≈ 270M is already a
+# multi-GB TSV. K=21 (4.4T) would need a sample-and-extrapolate path that
+# doesn't exist yet (see CLAUDE.md "Future Work").
+_KMER_ENUMERATION_CAP: int = 100_000_000
+
 
 # ---------------------------------------------------------------------------
 # Scenario enumeration from kinsim_config.yaml
@@ -241,22 +246,32 @@ def _run_scenario(
 # ---------------------------------------------------------------------------
 
 
-def _to_physical(preds: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Convert raw model output to (mu_ipd, mu_pw, sigma_ipd, sigma_pw) in uint8-like space.
+def _sigma_clamp_from_model(model) -> tuple[float, float]:
+    """Return (min, max) log-sigma clamp matching what the model produced.
 
-    The model emits (μ, log σ) in **log1p space**. We convert μ via
-    ``inv_log_transform`` (expm1 clamped to [0, 255]). For σ we apply the
-    delta-method approximation:
+    ``getattr(x, name, default)`` is total — never raises. The clamp MUST
+    match training-time clamp; predict-kmers feeds it through to TSV / NPZ.
+    """
+    return (
+        float(getattr(model, "log_sigma_clamp_min", -6.0)),
+        float(getattr(model, "log_sigma_clamp_max", 1.5)),
+    )
 
-        σ_raw ≈ |d/dy expm1(y)| · σ_log  =  (μ_raw + 1) · σ_log
 
-    so the returned σ is in the same units as μ (uint8-like frame counts),
-    comparable to the empirical IPD std-dev measured on the BAMs.
+def _to_physical(
+    preds: np.ndarray,
+    sigma_clamp: tuple[float, float] = (-6.0, 1.5),
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Convert raw model output to (mu_ipd, mu_pw, sigma_ipd, sigma_pw) in uint8 space.
+
+    ``sigma_clamp`` MUST match the model's training-time clamp (read it
+    from the checkpoint via ``_sigma_clamp_from_model``). Hardcoding to a
+    different clamp produces a LUT whose σ diverges from ``generate.sample()``.
     """
     mu_ipd_log = preds[:, 0]
     mu_pw_log = preds[:, 1]
-    log_sig_ipd = np.clip(preds[:, 2], -6.0, 3.0)
-    log_sig_pw = np.clip(preds[:, 3], -6.0, 3.0)
+    log_sig_ipd = np.clip(preds[:, 2], *sigma_clamp)
+    log_sig_pw = np.clip(preds[:, 3], *sigma_clamp)
     sigma_ipd_log = np.exp(log_sig_ipd)
     sigma_pw_log = np.exp(log_sig_pw)
     mu_ipd = inv_log_transform(torch.from_numpy(mu_ipd_log)).numpy()
@@ -275,6 +290,7 @@ def _write_tsv(
     output_tsv: Path,
     scenarios: list[tuple[str, int, int, str | None]],
     raw_preds: dict[str, np.ndarray],
+    sigma_clamp: tuple[float, float] = (-6.0, 1.5),
 ) -> None:
     """Wide-format TSV: one row per kmer, all scenarios side by side."""
     n_kmers = next(iter(raw_preds.values())).shape[0]
@@ -283,7 +299,7 @@ def _write_tsv(
     for label, *_ in scenarios:
         if label not in raw_preds:
             continue
-        physical[label] = _to_physical(raw_preds[label])
+        physical[label] = _to_physical(raw_preds[label], sigma_clamp)
 
     none_mu_ipd, none_mu_pw, _, _ = physical["none"]
     none_mu_ipd_safe = np.maximum(none_mu_ipd, 1e-6)
@@ -332,6 +348,7 @@ def _write_npz(
     output_npz: Path,
     scenarios: list[tuple[str, int, int, str | None]],
     raw_preds: dict[str, np.ndarray],
+    sigma_clamp: tuple[float, float] = (-6.0, 1.5),
 ) -> None:
     """Compact binary output. Writes both **physical** (uint8-comparable) and
     **log-space** (model native) arrays per scenario.
@@ -366,15 +383,15 @@ def _write_npz(
         # Log-space (model native — for sampling in generate)
         mu_ipd_log = preds[:, 0].astype(np.float32)
         mu_pw_log = preds[:, 1].astype(np.float32)
-        sigma_ipd_log = np.exp(np.clip(preds[:, 2], -6.0, 3.0)).astype(np.float32)
-        sigma_pw_log = np.exp(np.clip(preds[:, 3], -6.0, 3.0)).astype(np.float32)
+        sigma_ipd_log = np.exp(np.clip(preds[:, 2], *sigma_clamp)).astype(np.float32)
+        sigma_pw_log = np.exp(np.clip(preds[:, 3], *sigma_clamp)).astype(np.float32)
         bundle[f"{sk}__mu_ipd_log"] = mu_ipd_log
         bundle[f"{sk}__mu_pw_log"] = mu_pw_log
         bundle[f"{sk}__sigma_ipd_log"] = sigma_ipd_log
         bundle[f"{sk}__sigma_pw_log"] = sigma_pw_log
 
         # Physical (uint8-comparable — for inspection & legacy consumers)
-        mu_ipd, mu_pw, sig_ipd, sig_pw = _to_physical(preds)
+        mu_ipd, mu_pw, sig_ipd, sig_pw = _to_physical(preds, sigma_clamp)
         bundle[f"{sk}__mu_ipd"] = mu_ipd
         bundle[f"{sk}__mu_pw"] = mu_pw
         bundle[f"{sk}__sigma_ipd"] = sig_ipd
@@ -421,12 +438,12 @@ def predict_all(
         ckpt_k, ckpt_pred_idx, ckpt_n_rev,
     )
     n_kmers = 4**ckpt_k
-    if n_kmers > 100_000_000:
+    if n_kmers > _KMER_ENUMERATION_CAP:
         log.warning(
-            "K=%d implies %.2g kmers — exceeds the 1e8 safety cap. "
+            "K=%d implies %.2g kmers — exceeds the %.0g safety cap. "
             "Predict-kmers full enumeration is not viable at this scale; "
             "rewrite to sample-and-extrapolate.",
-            ckpt_k, n_kmers,
+            ckpt_k, n_kmers, _KMER_ENUMERATION_CAP,
         )
         sys.exit(1)
     log.info(
@@ -464,11 +481,12 @@ def predict_all(
             biology_mask=bio_mask,
         )
 
+    sigma_clamp = _sigma_clamp_from_model(model)
     output_prefix = Path(output_prefix)
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
-    _write_tsv(output_prefix.with_suffix(".tsv"), scenarios, raw_preds)
-    _write_npz(output_prefix.with_suffix(".npz"), scenarios, raw_preds)
-    _write_ratio_html(output_prefix.with_suffix(".html"), scenarios, raw_preds)
+    _write_tsv(output_prefix.with_suffix(".tsv"), scenarios, raw_preds, sigma_clamp)
+    _write_npz(output_prefix.with_suffix(".npz"), scenarios, raw_preds, sigma_clamp)
+    _write_ratio_html(output_prefix.with_suffix(".html"), scenarios, raw_preds, sigma_clamp)
     log.info("Done.")
 
 
@@ -476,6 +494,7 @@ def _write_ratio_html(
     output_html: Path,
     scenarios: list[tuple[str, int, int, str | None]],
     raw_preds: dict[str, np.ndarray],
+    sigma_clamp: tuple[float, float] = (-6.0, 1.5),
 ) -> None:
     """HTML dashboard — per-scenario distribution of μ_ipd / μ_baseline across all kmers.
 
@@ -498,7 +517,7 @@ def _write_ratio_html(
         log.warning("predict-kmers: no 'none' scenario, can't compute ratios — skipping HTML")
         return
 
-    none_mu_ipd, none_mu_pw, _, _ = _to_physical(raw_preds["none"])
+    none_mu_ipd, none_mu_pw, _, _ = _to_physical(raw_preds["none"], sigma_clamp)
     eps = 1e-6
     none_mu_ipd_safe = np.maximum(none_mu_ipd, eps)
     none_mu_pw_safe = np.maximum(none_mu_pw, eps)
@@ -527,7 +546,7 @@ def _write_ratio_html(
 
     for i, (label, m_id, _k_off, _req) in enumerate(meth_scenarios):
         r, c = i // cols + 1, i % cols + 1
-        mu_ipd, _, _, _ = _to_physical(raw_preds[label])
+        mu_ipd, _, _, _ = _to_physical(raw_preds[label], sigma_clamp)
         ratio = mu_ipd / none_mu_ipd_safe
         # Restrict to biology-valid kmers (NaN-filled in _run_scenario).
         valid_ratio = ratio[~np.isnan(ratio)]
