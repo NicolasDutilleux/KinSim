@@ -53,6 +53,7 @@ dev = [
 
 [project.scripts]
 kinsim = "kinsim.__main__:main"
+kinsim2 = "kinsim2.__main__:main"
 
 [project.urls]
 Homepage      = "https://github.com/NicolasDutilleux/KinSim"
@@ -65,10 +66,11 @@ Documentation = "https://github.com/NicolasDutilleux/KinSim#readme"
 # ----------------------------------------------------------------------------
 
 [tool.setuptools.packages.find]
-include = ["kinsim*"]
+include = ["kinsim*", "kinsim2*"]
 
 [tool.setuptools.package-data]
 kinsim = ["py.typed"]
+kinsim2 = ["py.typed"]
 
 # ----------------------------------------------------------------------------
 # Lint / format — ruff (replaces flake8 + isort + pyupgrade + pydocstyle)
@@ -115,7 +117,7 @@ ignore = [
 "tests/**" = ["B011", "SIM117"]  # asserts and nested with-statements are fine in tests
 
 [tool.ruff.lint.isort]
-known-first-party = ["kinsim"]
+known-first-party = ["kinsim", "kinsim2"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -137,7 +139,7 @@ python_files = ["test_*.py"]
 
 [tool.coverage.run]
 branch = true
-source = ["kinsim"]
+source = ["kinsim", "kinsim2"]
 omit   = [
     "*/__main__.py",   # CLI dispatch — covered by integration runs
 ]
