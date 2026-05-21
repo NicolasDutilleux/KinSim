@@ -464,7 +464,7 @@ def _fetch_rebase_html(org_num: int) -> str:
             f"REBASE returned HTTP {e.code} for organism {org_num}. "
             "Check that the organism number is valid."
         ) from e
-    except Exception as e:
+    except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError) as e:
         raise RuntimeError(f"Failed to fetch REBASE page for organism {org_num}: {e}") from e
 
     if "MTases active in the genome" not in html:

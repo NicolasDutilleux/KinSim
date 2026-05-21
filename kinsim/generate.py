@@ -1920,6 +1920,17 @@ def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
 
+    # Global determinism for stochastic sampling (model.sample()). Override
+    # via ``KINSIM_SEED=<int>`` env var; default 42. Same seed + same input
+    # BAM/ref/motifs/checkpoint -> bit-identical output BAM.
+    import random
+    _seed = int(os.environ.get("KINSIM_SEED", "42"))
+    random.seed(_seed)
+    np.random.seed(_seed)
+    torch.manual_seed(_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(_seed)
+
     if argv and os.path.isdir(argv[0]):
         _main_directory(argv)
     elif argv and argv[0].endswith(".bam"):

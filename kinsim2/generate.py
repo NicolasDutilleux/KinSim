@@ -443,9 +443,22 @@ def main(argv: list[str] | None = None) -> None:
         "--region", default=None,
         help="Restrict to a samtools region (e.g. 'chr1:1000-2000').",
     )
+    ap.add_argument(
+        "--seed", type=int, default=42,
+        help="RNG seed for stochastic sampling (default: 42). Same seed + same "
+        "input -> identical output BAM.",
+    )
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     setup_logging(verbose=args.verbose)
+
+    # Seed torch + numpy globally so model.sample() is reproducible across runs.
+    import random
+    random.seed(int(args.seed))
+    np.random.seed(int(args.seed))
+    torch.manual_seed(int(args.seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(args.seed))
 
     generate_from_bam(
         args.input_bam,

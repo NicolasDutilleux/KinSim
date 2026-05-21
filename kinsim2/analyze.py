@@ -58,10 +58,33 @@ def _accumulate_stats(
     slowed_ipd_fwd_by_meth: dict[int, list[np.ndarray]] = defaultdict(list)
     baseline_ipd_fwd = []
 
+    # Fail fast on any non-conformant row — one bad shard is enough to
+    # poison downstream stats. We do NOT silently skip.
+    bad: list[str] = []
     for kid, arr in data.items():
-        if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
+        if kid == "__meta__":
+            continue
+        if not isinstance(kid, (int, np.integer)):
+            bad.append(f"non-int key {kid!r} (type={type(kid).__name__})")
+            continue
+        if not isinstance(arr, np.ndarray) or arr.ndim != 2:
+            bad.append(f"kmer {int(kid)}: not a 2D ndarray "
+                       f"(shape={getattr(arr, 'shape', None)})")
             continue
         if arr.shape[1] != layout.n_cols:
+            bad.append(f"kmer {int(kid)}: width={arr.shape[1]} != layout n_cols={layout.n_cols}")
+            continue
+        if len(bad) >= 5:
+            break
+    if bad:
+        raise ValueError(
+            f"{shard_path.name}: shard rows do not match bilateral v2 layout:\n  "
+            + "\n  ".join(bad)
+            + "\nRe-run `kinsim2 extract` under the current geometry."
+        )
+
+    for kid, arr in data.items():
+        if kid == "__meta__":
             continue
         n_kmers += 1
         cat_fwd = arr[:, layout.col_category_fwd].astype(np.int8)

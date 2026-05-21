@@ -1192,6 +1192,10 @@ def _save_model_config(
     - ``p_fire`` and ``mean_occupancy`` per (meth, offset) bucket — feed
       the statistical-firing decomposition at generate time.
     """
+    import datetime
+    import subprocess
+
+    from . import __version__
     from .utils.encoding import get_meth_ids
 
     cfg = model.get_config()
@@ -1201,14 +1205,29 @@ def _save_model_config(
         cfg["p_fire"] = p_fire
     if mean_occupancy:
         cfg["mean_occupancy"] = mean_occupancy
-    # Freeze the meth_id mapping at train time so generate/evaluate use
-    # the same integer IDs even if kinsim_config.yaml changes later.
     cfg["meth_id_map"] = get_meth_ids()
+    # Provenance: lets a reviewer reconstruct the exact code that produced
+    # this checkpoint. "unknown" when not under a git checkout.
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent.parent,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        sha = "unknown"
+    cfg["git_sha"] = sha
+    cfg["kinsim_version"] = __version__
+    cfg["timestamp_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     path = output_dir / "model_config.json"
     path.write_text(json.dumps(cfg, indent=2))
     log.info(
-        "Model config saved: %s  (meth_types=%s, meth_id_map=%s, p_fire=%s, mean_occ=%s)",
+        "Model config saved: %s  (kinsim=%s  sha=%s  meth_types=%s  meth_id_map=%s  "
+        "p_fire=%s  mean_occ=%s)",
         path,
+        cfg["kinsim_version"],
+        cfg["git_sha"][:10],
         cfg.get("meth_types", "all"),
         cfg["meth_id_map"],
         f"{len(p_fire)} buckets" if p_fire else "none",
@@ -1827,6 +1846,11 @@ def main(argv: list[str] | None = None) -> None:
 
     args = parser.parse_args(argv)
     setup_logging(verbose=args.verbose)
+
+    # Global determinism: torch + numpy + Python random + Lightning DataLoader
+    # workers. Same shard set + same hyperparameters reproduce bit-identical weights.
+    seed = args.split_seed if args.split_seed is not None else 42
+    L.seed_everything(int(seed), workers=True)
 
     # Merge YAML config with CLI flags — precedence: CLI > YAML > hard-coded defaults
     cfg: dict = {}
