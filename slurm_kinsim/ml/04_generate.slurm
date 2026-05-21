@@ -15,7 +15,7 @@
 #   sbatch --array=1-N slurm_kinsim/ml/04_generate.slurm \
 #       <pbsim3_dir> <checkpoint.pt> <motifs> <out_dir>
 #
-# Output: <out_dir>/<species>_mlp.bam
+# Output: <out_dir>/<species>_kinsim.bam
 # ============================================================
 
 set +u
@@ -54,7 +54,7 @@ fi
 [ -f "$MAF" ] || { echo "ERROR: MAF not found: $MAF"; exit 1; }
 [ -f "$REF" ] || { echo "ERROR: Reference not found: $REF"; exit 1; }
 
-BAM_OUT="${OUT}/${SP}_mlp.bam"
+BAM_OUT="${OUT}/${SP}_kinsim.bam"
 
 # Resolve per-species motifs file (species|motif_string lines)
 if [ -f "$MOTIFS" ]; then

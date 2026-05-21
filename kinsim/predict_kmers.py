@@ -51,11 +51,17 @@ import torch
 
 from .data.dataset import inv_log_transform
 from .models.predictor import create_from_config, load_state_dict_from_ckpt
-from .utils.config import load_kinsim_config, setup_logging
-from .utils.encoding import KMER_PRED_IDX, K, decode_kmer, get_meth_ids
+from .utils.config import get_modified_base_map, load_kinsim_config, setup_logging
+from .utils.encoding import BASE_MAP, KMER_PRED_IDX, K, decode_kmer, get_meth_ids
 from .utils.sample_layout import REV_METH_LEN
 
 log = logging.getLogger(__name__)
+
+# Synthesized-strand base required at the meth position, given the meth's
+# modified_base on the TEMPLATE strand (matches the model's biology_mask,
+# which does `bases ^ 3` to get the template). m4C/m5C (template C) → G;
+# m6A (template A) → T.
+_COMPLEMENT = {"A": "T", "T": "A", "C": "G", "G": "C"}
 
 
 # ---------------------------------------------------------------------------
@@ -63,26 +69,28 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _scenarios_from_yaml() -> list[tuple[str, int, int]]:
-    """Return ``[(label, meth_id, signal_offset_k), ...]`` from YAML.
+def _scenarios_from_yaml() -> list[tuple[str, int, int, str | None]]:
+    """Return ``[(label, meth_id, signal_offset_k, required_synth_base), ...]``.
 
-    The first scenario is always the ``none`` baseline (meth_id=0,
-    offset=0). Following entries are per ``(T, k)`` in
-    ``kinetic_signatures.<T>.signal_offsets``.
-
-    Any (T, k) whose ``KMER_PRED_IDX - k`` would fall outside
-    ``[0, K-1]`` is skipped with a warning (the methylation would be
-    outside the model's meth_context window).
+    ``required_synth_base`` is the base the kmer must have at the meth
+    position for the scenario to be biology-valid (complement of the
+    YAML's ``modified_base``). ``None`` for the ``none`` scenario.
     """
     cfg = load_kinsim_config()
     sigs = cfg.get("kinetic_signatures", {}) or {}
     meth_ids = get_meth_ids()
+    base_map = get_modified_base_map()
 
-    out: list[tuple[str, int, int]] = [("none", 0, 0)]
+    out: list[tuple[str, int, int, str | None]] = [("none", 0, 0, None)]
     for T, info in sigs.items():
         m_id = meth_ids.get(T)
         if m_id is None or m_id == 0:
             log.warning("Meth type '%s' has no id in encoding — skipping", T)
+            continue
+        tpl_base = str(base_map.get(T, "")).upper()
+        req_base = _COMPLEMENT.get(tpl_base)
+        if req_base is None:
+            log.warning("Meth type '%s' has no modified_base — skipping", T)
             continue
         for k in info.get("signal_offsets", []) or []:
             k = int(k)
@@ -97,8 +105,25 @@ def _scenarios_from_yaml() -> list[tuple[str, int, int]]:
                     K - 1,
                 )
                 continue
-            out.append((f"{T}@{k:+d}", m_id, k))
+            out.append((f"{T}@{k:+d}", m_id, k, req_base))
     return out
+
+
+def _biology_valid_mask(
+    kmer_size: int,
+    meth_pos: int,
+    required_synth_base: str,
+) -> np.ndarray:
+    """Return bool[4^kmer_size]: True where kmer's base at ``meth_pos`` is the
+    required synthesized base.
+
+    The kmer is encoded with the LEFTMOST base in the top 2 bits, so the
+    base at position ``meth_pos`` sits at bit shift ``2 * (kmer_size - 1 - meth_pos)``.
+    """
+    n_kmers = 4 ** kmer_size
+    shift = 2 * (kmer_size - 1 - meth_pos)
+    base_id = (np.arange(n_kmers, dtype=np.uint64) >> shift) & 3
+    return base_id == BASE_MAP[required_synth_base]
 
 
 # ---------------------------------------------------------------------------
@@ -181,11 +206,12 @@ def _run_scenario(
     kmer_size: int = K,
     active_site_index: int = KMER_PRED_IDX,
     n_rev_meth: int = REV_METH_LEN,
+    biology_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Run the model on every kmer for one scenario.
 
-    Returns ``(n_kmers, 4)`` array with raw model output:
-    ``[mu_ipd_log, mu_pw_log, log_sigma_ipd, log_sigma_pw]``.
+    Returns ``(n_kmers, 4)`` array with ``[mu_ipd_log, mu_pw_log, log_sigma_ipd,
+    log_sigma_pw]``. Biology-invalid rows (per ``biology_mask``) are NaN-filled.
     """
     preds = np.empty((n_kmers, 4), dtype=np.float32)
     template = _meth_full_for_scenario(
@@ -202,10 +228,11 @@ def _run_scenario(
         end = min(start + batch_size, n_kmers)
         n_batch = end - start
         kmer_ids = torch.arange(start, end, dtype=torch.long, device=device)
-        # Slice the template instead of rebuilding when batch is full-size
         mf = template if n_batch == batch_size else template[:n_batch]
         params = model(kmer_ids, mf)
         preds[start:end] = params.detach().cpu().numpy()
+    if biology_mask is not None:
+        preds[~biology_mask] = np.nan
     return preds
 
 
@@ -246,15 +273,14 @@ def _to_physical(preds: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray,
 
 def _write_tsv(
     output_tsv: Path,
-    scenarios: list[tuple[str, int, int]],
+    scenarios: list[tuple[str, int, int, str | None]],
     raw_preds: dict[str, np.ndarray],
 ) -> None:
     """Wide-format TSV: one row per kmer, all scenarios side by side."""
     n_kmers = next(iter(raw_preds.values())).shape[0]
 
-    # Physical units per scenario
     physical: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
-    for label, _, _ in scenarios:
+    for label, *_ in scenarios:
         if label not in raw_preds:
             continue
         physical[label] = _to_physical(raw_preds[label])
@@ -263,9 +289,8 @@ def _write_tsv(
     none_mu_ipd_safe = np.maximum(none_mu_ipd, 1e-6)
     none_mu_pw_safe = np.maximum(none_mu_pw, 1e-6)
 
-    # Header
     cols = ["kmer", "kmer_id"]
-    for label, _, _ in scenarios:
+    for label, *_ in scenarios:
         if label not in physical:
             continue
         sk = label.replace("@", "_at_").replace("+", "p").replace("-", "m")
@@ -274,13 +299,10 @@ def _write_tsv(
             cols += [f"{sk}_ratio_ipd_vs_none", f"{sk}_ratio_pw_vs_none"]
 
     log.info("Writing %s ... (%d cols × %d rows)", output_tsv, len(cols), n_kmers)
-    # Vectorised row formatting — much faster than per-row Python loops.
-    # Decode kmer strings in bulk (still O(N) but cheap).
     kmer_strings = np.array([decode_kmer(i) for i in range(n_kmers)])
 
-    # Build columns array
     col_arrays: list[np.ndarray] = [kmer_strings, np.arange(n_kmers).astype(str)]
-    for label, _, _ in scenarios:
+    for label, *_ in scenarios:
         if label not in physical:
             continue
         mu_ipd, mu_pw, sig_ipd, sig_pw = physical[label]
@@ -308,7 +330,7 @@ def _write_tsv(
 
 def _write_npz(
     output_npz: Path,
-    scenarios: list[tuple[str, int, int]],
+    scenarios: list[tuple[str, int, int, str | None]],
     raw_preds: dict[str, np.ndarray],
 ) -> None:
     """Compact binary output. Writes both **physical** (uint8-comparable) and
@@ -331,7 +353,7 @@ def _write_npz(
     m_ids = []
     offsets = []
 
-    for label, m_id, k_off in scenarios:
+    for label, m_id, k_off, *_ in scenarios:
         if label not in raw_preds:
             continue
         labels.append(label)
@@ -416,8 +438,18 @@ def predict_all(
     )
 
     raw_preds: dict[str, np.ndarray] = {}
-    for label, m_id, k_off in scenarios:
-        log.info("  ▸ %s  (meth_id=%d, offset=%+d)", label, m_id, k_off)
+    for label, m_id, k_off, req_base in scenarios:
+        if req_base is None:
+            bio_mask = None
+            n_valid = n_kmers
+        else:
+            meth_pos = ckpt_pred_idx - k_off
+            bio_mask = _biology_valid_mask(ckpt_k, meth_pos, req_base)
+            n_valid = int(bio_mask.sum())
+        log.info(
+            "  ▸ %s  (meth_id=%d, offset=%+d)  required_base=%s  valid=%d/%d",
+            label, m_id, k_off, req_base or "-", n_valid, n_kmers,
+        )
         raw_preds[label] = _run_scenario(
             model,
             m_id,
@@ -429,6 +461,7 @@ def predict_all(
             kmer_size=ckpt_k,
             active_site_index=ckpt_pred_idx,
             n_rev_meth=ckpt_n_rev,
+            biology_mask=bio_mask,
         )
 
     output_prefix = Path(output_prefix)
@@ -441,7 +474,7 @@ def predict_all(
 
 def _write_ratio_html(
     output_html: Path,
-    scenarios: list[tuple[str, int, int]],
+    scenarios: list[tuple[str, int, int, str | None]],
     raw_preds: dict[str, np.ndarray],
 ) -> None:
     """HTML dashboard — per-scenario distribution of μ_ipd / μ_baseline across all kmers.
@@ -470,10 +503,9 @@ def _write_ratio_html(
     none_mu_ipd_safe = np.maximum(none_mu_ipd, eps)
     none_mu_pw_safe = np.maximum(none_mu_pw, eps)
 
-    # Filter to non-none scenarios that actually have data.
     meth_scenarios = [
-        (label, m_id, k_off)
-        for (label, m_id, k_off) in scenarios
+        (label, m_id, k_off, req_base)
+        for (label, m_id, k_off, req_base) in scenarios
         if label != "none" and label in raw_preds
     ]
     if not meth_scenarios:
@@ -485,23 +517,27 @@ def _write_ratio_html(
     fig = make_subplots(
         rows=rows,
         cols=cols,
-        subplot_titles=[lbl for lbl, _, _ in meth_scenarios],
+        subplot_titles=[lbl for lbl, *_ in meth_scenarios],
         vertical_spacing=0.12,
         horizontal_spacing=0.06,
     )
 
-    color_by_mid = {1: "#d62728", 2: "#9467bd", 3: "#2ca02c", 4: "#ff7f0e"}
+    # Wong/Okabe-Ito colorblind-safe palette (m6A=orange, m4C=sky blue, m5C=bluish green, other=yellow).
+    color_by_mid = {1: "#E69F00", 2: "#56B4E9", 3: "#009E73", 4: "#F0E442"}
 
-    for i, (label, m_id, _k_off) in enumerate(meth_scenarios):
+    for i, (label, m_id, _k_off, _req) in enumerate(meth_scenarios):
         r, c = i // cols + 1, i % cols + 1
         mu_ipd, _, _, _ = _to_physical(raw_preds[label])
         ratio = mu_ipd / none_mu_ipd_safe
+        # Restrict to biology-valid kmers (NaN-filled in _run_scenario).
+        valid_ratio = ratio[~np.isnan(ratio)]
+        if valid_ratio.size == 0:
+            continue
 
-        # Robust stats — full kmer set (4^K ~ 4M rows), report quartiles.
-        q05, q25, q50, q75, q95 = np.percentile(ratio, [5, 25, 50, 75, 95])
+        q05, q25, q50, q75, q95 = np.percentile(valid_ratio, [5, 25, 50, 75, 95])
         fig.add_trace(
             go.Histogram(
-                x=ratio,
+                x=valid_ratio,
                 xbins=dict(start=0, end=6.0, size=0.05),
                 marker_color=color_by_mid.get(m_id, "#888"),
                 opacity=0.75,
@@ -510,7 +546,6 @@ def _write_ratio_html(
             row=r,
             col=c,
         )
-        # μ_ratio = 1 vertical line — visual anchor for "no shift".
         fig.add_vline(x=1.0, line=dict(color="black", dash="dot", width=1), row=r, col=c)
         fig.add_vline(x=q50, line=dict(color="#222", width=2), row=r, col=c)
         fig.add_annotation(
@@ -518,7 +553,7 @@ def _write_ratio_html(
             x=0.98, y=0.98, xanchor="right", yanchor="top",
             text=(
                 f"median={q50:.2f}<br>IQR=[{q25:.2f}, {q75:.2f}]<br>"
-                f"p05={q05:.2f}  p95={q95:.2f}<br>n={len(ratio):,}"
+                f"p05={q05:.2f}  p95={q95:.2f}<br>n_valid={valid_ratio.size:,}/{ratio.size:,}"
             ),
             showarrow=False,
             font=dict(size=10, color="#222"),
@@ -533,8 +568,8 @@ def _write_ratio_html(
 
     fig.update_layout(
         title=(
-            "Per-kmer μ_ipd ratio vs unmethylated baseline — distribution across all "
-            f"{len(none_mu_ipd):,} kmers per methylation scenario. "
+            "Per-kmer μ_ipd ratio vs unmethylated baseline — biology-valid kmers only "
+            "(kmer base at meth position = complement of YAML modified_base). "
             "Dotted line at 1.0 = no shift; solid line = median."
         ),
         height=320 * rows,

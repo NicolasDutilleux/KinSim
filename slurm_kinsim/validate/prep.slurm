@@ -7,31 +7,32 @@
 #SBATCH --time=01:00:00
 #SBATCH --output=/data/projects/p774_MARSD/NDutilleux/logs/%x_%J.log
 #
-# validate/prep — strip kinetics from aligned BAM, index it, and write
-# the per-shard regions file used by validate/generate (array).
-#
-# Usage:
-#   sbatch slurm_kinsim/validate/prep.slurm \
-#          <REAL_BAM> <STRIPPED_BAM> <REGIONS_FILE> <N_SHARDS>
+# Strip fi/fp/ri/rp from a raw HiFi BAM and pbindex the result.
+# Usage: sbatch validate/prep.slurm <RAW_BAM> <STRIPPED_BAM>
 set +u
 source ~/.bashrc
 conda activate kinsim_env
 set -euo pipefail
 
-REAL_BAM=${1:?aligned BAM required}
+RAW_BAM=${1:?raw HiFi BAM required}
 STRIPPED_BAM=${2:?stripped BAM path required}
-REGIONS_FILE=${3:?regions file path required}
-N_SHARDS=${4:?n_shards required}
 REPO=${REPO:-/data/users/ndutilleux/KinSim}
+SMRT_SIF=/containers/apptainer/pacbio-smrt-tools-25.3.sif
 
-mkdir -p "$(dirname "$STRIPPED_BAM")" "$(dirname "$REGIONS_FILE")"
+[ -f "$RAW_BAM" ] || { echo "ERROR: raw BAM missing: $RAW_BAM"; exit 1; }
+mkdir -p "$(dirname "$STRIPPED_BAM")"
 
-if [ ! -f "$STRIPPED_BAM" ]; then
-  python "$REPO/scripts/strip_kinetics.py" "$REAL_BAM" "$STRIPPED_BAM"
+if [ -s "$STRIPPED_BAM" ] && [ "${FORCE_STRIP:-0}" != "1" ]; then
+  echo "SKIP strip — $STRIPPED_BAM exists. Set FORCE_STRIP=1 to re-run."
+else
+  T=$(date +%s)
+  python "$REPO/scripts/strip_kinetics.py" "$RAW_BAM" "$STRIPPED_BAM"
+  echo "strip elapsed: $(( $(date +%s) - T ))s"
 fi
-if [ ! -f "${STRIPPED_BAM}.bai" ]; then
-  samtools index -@ "$SLURM_CPUS_PER_TASK" "$STRIPPED_BAM"
+[ -s "$STRIPPED_BAM" ] || { echo "ERROR: strip produced empty output"; exit 1; }
+
+if [ ! -f "${STRIPPED_BAM}.pbi" ] || [ ! "${STRIPPED_BAM}.pbi" -nt "$STRIPPED_BAM" ]; then
+  apptainer exec --bind /data "$SMRT_SIF" pbindex "$STRIPPED_BAM"
 fi
 
-python3 "$REPO/slurm_kinsim/validate/write_regions.py" \
-        "$STRIPPED_BAM" "$REGIONS_FILE" "$N_SHARDS"
+ls -l "$STRIPPED_BAM"{,.pbi} 2>/dev/null | awk '{print "  "$NF" "$5}'

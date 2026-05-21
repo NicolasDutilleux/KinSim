@@ -146,12 +146,14 @@ def _ratio_above_threshold(
 # ---------------------------------------------------------------------------
 
 
+# Wong/Okabe-Ito colorblind-safe palette. Two shades per meth (light/dark)
+# for sequential offsets within a meth type.
 _METH_BASE = {
-    "m6A": ["#e74c3c", "#c0392b"],
-    "m4C": ["#3498db", "#1f618d"],
-    "m5C": ["#27ae60", "#196f3d"],
+    "m6A": ["#E69F00", "#B47800"],   # orange + dark orange
+    "m4C": ["#56B4E9", "#2A7FB0"],   # sky blue + dark sky blue
+    "m5C": ["#009E73", "#006F50"],   # bluish green + dark green
 }
-_FALLBACK = ["#7f8c8d", "#34495e", "#9b59b6", "#f39c12"]
+_FALLBACK = ["#CC79A7", "#D55E00", "#F0E442", "#0072B2"]  # purple, vermillion, yellow, blue
 
 
 def _color_for(meth_type: str, offset_index: int) -> str:
@@ -397,7 +399,7 @@ def _ratio_bar_figure(signatures: dict, hist_ipd: dict, threshold_factor: float 
         go.Bar(
             x=keys,
             y=ratios,
-            marker={"color": "#e67e22"},
+            marker={"color": "#E69F00"},
             text=[f"{r:.2f}" for r in ratios],
             textposition="outside",
         )
@@ -502,7 +504,7 @@ def _gaussian_vs_empirical_figure(
                 y=emp,
                 mode="lines",
                 name="empirique" if i == 0 else None,
-                line={"color": "#34495e", "width": 2},
+                line={"color": "#000000", "width": 2},
                 showlegend=(i == 0),
             ),
             row=row,
@@ -520,7 +522,7 @@ def _gaussian_vs_empirical_figure(
                 y=gauss_m,
                 mode="lines",
                 name="N(moments) — large car σ>μ" if i == 0 else None,
-                line={"color": "#e74c3c", "width": 1.2, "dash": "dash"},
+                line={"color": "#D55E00", "width": 1.2, "dash": "dash"},
                 showlegend=(i == 0),
             ),
             row=row,
@@ -539,7 +541,7 @@ def _gaussian_vs_empirical_figure(
                 y=gauss_r,
                 mode="lines",
                 name="N(robust IQR) — fit le peak" if i == 0 else None,
-                line={"color": "#f39c12", "width": 1.5, "dash": "dash"},
+                line={"color": "#E69F00", "width": 1.5, "dash": "dashdot"},
                 showlegend=(i == 0),
             ),
             row=row,
@@ -559,7 +561,7 @@ def _gaussian_vs_empirical_figure(
                 y=logn,
                 mode="lines",
                 name="Log-normale (vrai bon fit)" if i == 0 else None,
-                line={"color": "#27ae60", "width": 1.8, "dash": "dot"},
+                line={"color": "#009E73", "width": 1.8, "dash": "dot"},
                 showlegend=(i == 0),
             ),
             row=row,
@@ -626,10 +628,10 @@ def _dilution_illustration_figure(stats_by_key: dict, signatures: dict):
 
     fig = go.Figure()
     for frac, color, name in [
-        (0.0, "#34495e", "0% méthylé  (baseline)"),
-        (0.01, "#e74c3c", "1% méthylé  (signal réel attendu)"),
-        (0.05, "#f39c12", "5% méthylé  (max biologique)"),
-        (0.20, "#9b59b6", "20% méthylé  (impossible — pour comparaison)"),
+        (0.0, "#000000", "0% méthylé  (baseline)"),
+        (0.01, "#D55E00", "1% méthylé  (signal réel attendu)"),
+        (0.05, "#E69F00", "5% méthylé  (max biologique)"),
+        (0.20, "#CC79A7", "20% méthylé  (impossible — pour comparaison)"),
     ]:
         mix = (1 - frac) * base + frac * mod
         fig.add_trace(

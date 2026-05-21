@@ -16,7 +16,7 @@
 #
 # For each manifest row:
 #   ref_bam = manifest.bam_path
-#   gen_bam = <gen_dir>/<sample_id>_mlp.bam
+#   gen_bam = <gen_dir>/<sample_id>_kinsim.bam
 #   motifs  = manifest.motifs
 #   report  = <out_dir>/<sample_id>_verify.tsv
 # ============================================================
@@ -47,7 +47,7 @@ print(f'{x.sample_id}|{x.bam_path}|{x.motifs}')
 SAMPLE_ID=$(echo "$ROW" | cut -d'|' -f1)
 REF_BAM=$(echo "$ROW"   | cut -d'|' -f2)
 MOTIFS=$(echo "$ROW"    | cut -d'|' -f3-)
-GEN_BAM="${GEN_DIR}/${SAMPLE_ID}_mlp.bam"
+GEN_BAM="${GEN_DIR}/${SAMPLE_ID}_kinsim.bam"
 REPORT="${OUT_DIR}/${SAMPLE_ID}_verify.tsv"
 
 echo "=== ML 06/verify-generate — $SAMPLE_ID ==="

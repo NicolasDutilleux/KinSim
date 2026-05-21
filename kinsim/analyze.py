@@ -61,19 +61,29 @@ def _id_to_name() -> dict[int, str]:
 
 _ID_TO_NAME = _id_to_name()  # back-compat snapshot for callers that read it directly
 
-# Plotly palette — cycles for any number of meth types.
+# Colorblind-safe Wong/Okabe-Ito palette + B&W-friendly anchors.
+# `_COLORS` cycles for any number of meth types; `_CB_*` constants name
+# semantic roles used across figures.
 _COLORS = [
-    "#636EFA",
-    "#EF553B",
-    "#00CC96",
-    "#AB63FA",
-    "#FFA15A",
-    "#19D3F3",
-    "#FF6692",
-    "#B6E880",
-    "#FF97FF",
-    "#FECB52",
+    "#E69F00",  # orange
+    "#56B4E9",  # sky blue
+    "#009E73",  # bluish green
+    "#F0E442",  # yellow
+    "#0072B2",  # blue
+    "#D55E00",  # vermillion
+    "#CC79A7",  # reddish purple
+    "#000000",  # black
 ]
+_CB_BASELINE = "#000000"        # baseline anchor — readable in B&W
+_CB_SLOWED_BASE = "#D55E00"     # vermillion (legacy single-color "slowed")
+_CB_NEAR_METH_BASE = "#009E73"  # bluish green (legacy single-color "near_meth")
+_CB_SLOWED_PALETTE = [
+    "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7",
+]
+_CB_NEAR_PALETTE = [
+    "#56B4E9", "#009E73", "#CC79A7", "#0072B2", "#F0E442", "#E69F00",
+]
+_LINE_DASHES = ["solid", "dash", "dashdot", "dot", "longdash", "longdashdot"]
 
 
 def _meth_name(meth_id: int) -> str:
@@ -951,9 +961,9 @@ def _build_html_figures(
 
     figures: list[tuple[str, object]] = []
     cat_palette = {
-        "baseline": "#1f77b4",
-        "slowed": "#d62728",
-        "near_meth": "#2ca02c",
+        "baseline": _CB_BASELINE,
+        "slowed": _CB_SLOWED_BASE,
+        "near_meth": _CB_NEAR_METH_BASE,
     }
 
     threshold = None
@@ -1032,7 +1042,7 @@ def _build_html_figures(
             go.Histogram(
                 x=kmer_means_arr,
                 name=f"per-kmer baseline mean (n={len(kmer_means_arr):,})",
-                marker_color="#1f77b4",
+                marker_color=_CB_BASELINE,
                 xbins=dict(start=0, end=256, size=2),
             )
         )
@@ -1057,7 +1067,7 @@ def _build_html_figures(
         means = [signature_profiles[n]["mean_ipd"] for n in ordered]
         ns = [signature_profiles[n]["n_samples"] for n in ordered]
         colors = [
-            "#1f77b4" if n == "baseline" else "#d62728" if n.startswith("slowed_by_") else "#2ca02c"
+            _CB_BASELINE if n == "baseline" else _CB_SLOWED_BASE if n.startswith("slowed_by_") else _CB_NEAR_METH_BASE
             for n in ordered
         ]
         fig3 = go.Figure(
@@ -1084,7 +1094,7 @@ def _build_html_figures(
         names = sorted(signature_profiles.keys(), key=_bucket_order_key)
         counts = [signature_profiles[n]["n_samples"] for n in names]
         colors = [
-            "#1f77b4" if n == "baseline" else "#d62728" if n.startswith("slowed_by_") else "#2ca02c"
+            _CB_BASELINE if n == "baseline" else _CB_SLOWED_BASE if n.startswith("slowed_by_") else _CB_NEAR_METH_BASE
             for n in names
         ]
         fig4 = go.Figure(
@@ -1107,6 +1117,11 @@ def _build_html_figures(
     fig5 = _build_ipd_pw_density_figure(data)
     if fig5 is not None:
         figures.append(("3D density: joint (IPD, PW) per bucket", fig5))
+
+    # ── Fig 5b: 2D IPD-only density — print-friendly (B&W readable) ─────
+    fig5b = _build_ipd_1d_density_figure(data)
+    if fig5b is not None:
+        figures.append(("2D IPD density (print-friendly) — slowed vs near_meth", fig5b))
 
     # ── Fig 6: per-kmer IPD distribution for top-N kmers with methylation ─
     fig6 = _build_kmer_trend_figure(data, top_n=12)
@@ -1178,7 +1193,7 @@ def _build_kmer_trend_figure(data: dict, top_n: int = 12):
     top = counts[:top_n]
 
     name_by_id = {v: k for k, v in get_meth_ids().items()}
-    color_by_id = {1: "#d62728", 2: "#9467bd", 3: "#2ca02c", 4: "#ff7f0e"}
+    color_by_id = {1: "#E69F00", 2: "#56B4E9", 3: "#009E73", 4: "#F0E442"}
 
     cols = 3
     rows = (len(top) + cols - 1) // cols
@@ -1206,7 +1221,7 @@ def _build_kmer_trend_figure(data: dict, top_n: int = 12):
                 go.Histogram(
                     x=ipds[m_base],
                     name="baseline",
-                    marker_color="#1f77b4",
+                    marker_color=_CB_BASELINE,
                     opacity=0.5,
                     xbins=dict(start=0, end=256, size=4),
                     histnorm="probability density",
@@ -1281,7 +1296,7 @@ def _build_per_meth_kmer_figures(data: dict, top_n: int = 12):
     )
 
     name_by_id = {v: k for k, v in get_meth_ids().items()}
-    color_by_id = {1: "#d62728", 2: "#9467bd", 3: "#2ca02c", 4: "#ff7f0e"}
+    color_by_id = {1: "#E69F00", 2: "#56B4E9", 3: "#009E73", 4: "#F0E442"}
     MIN_RANDOM_N = 50           # min slowed rows for a kmer to be eligible for the random panel
     GAUSS_X = np.arange(0, 201, dtype=np.float32)
 
@@ -1380,7 +1395,7 @@ def _build_per_meth_kmer_figures(data: dict, top_n: int = 12):
                     legend_seen.add("baseline")
                     fig.add_trace(
                         go.Histogram(
-                            x=base_ipds, name="baseline", marker_color="#1f77b4",
+                            x=base_ipds, name="baseline", marker_color=_CB_BASELINE,
                             opacity=0.55, xbins=dict(start=0, end=256, size=4),
                             histnorm="probability density",
                             showlegend=show, legendgroup="baseline",
@@ -1392,7 +1407,7 @@ def _build_per_meth_kmer_figures(data: dict, top_n: int = 12):
                         fig.add_trace(
                             go.Scatter(
                                 x=GAUSS_X, y=y_b, mode="lines",
-                                line=dict(color="#1f77b4", width=2),
+                                line=dict(color=_CB_BASELINE, width=2),
                                 name="baseline fit", legendgroup="baseline",
                                 showlegend=False, hoverinfo="skip",
                             ),
@@ -1548,10 +1563,10 @@ def _build_ipd_pw_density_figure(data: dict):
     grid_pts = np.vstack([ipd_mesh.ravel(), pw_mesh.ravel()])
 
     palette = {
-        "baseline": "#1f77b4",
+        "baseline": _CB_BASELINE,
     }
-    slowed_palette = ["#d62728", "#ff7f0e", "#9467bd", "#8c564b"]
-    near_palette = ["#2ca02c", "#17becf", "#bcbd22", "#7f7f7f"]
+    slowed_palette = _CB_SLOWED_PALETTE
+    near_palette = _CB_NEAR_PALETTE
     s_idx = n_idx = 0
 
     fig = go.Figure()
@@ -1610,6 +1625,193 @@ def _build_ipd_pw_density_figure(data: dict):
         legend=dict(
             x=0.01,
             y=0.99,
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="rgba(0,0,0,0.3)",
+            borderwidth=1,
+        ),
+    )
+    return fig
+
+
+def _build_ipd_1d_density_figure(data: dict):
+    """2-panel 1D KDE on IPD only — print-friendly counterpart to the 3D figure.
+
+    Panel 1 (top): baseline vs every slowed_by_<T>_at_<+k> bucket. Each
+        slowed bucket gets a distinct hue + line dash so the curves stay
+        readable in B&W print.
+    Panel 2 (bottom): baseline vs every near_meth_by_<T>_at_<+k> bucket
+        as thin semi-transparent gray lines — the visual point is that
+        they overlap baseline, not that you can tell them apart.
+    """
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+        from scipy.stats import gaussian_kde
+    except ImportError:
+        log.warning("scipy or plotly not installed — skipping 1D density figure")
+        return None
+
+    from .utils.encoding import get_meth_ids
+    from .utils.sample_layout import (
+        CATEGORY_BASELINE,
+        CATEGORY_NEAR_METH,
+        CATEGORY_SLOWED,
+        COL_CATEGORY,
+        COL_IPD,
+        COL_PARENT_METH,
+        COL_PARENT_OFFSET,
+    )
+
+    name_by_mid = {v: k for k, v in get_meth_ids().items()}
+    rng = np.random.default_rng(0)
+    BUCKET_CAP = 50_000
+    buckets: dict[str, list] = {}
+
+    for kid, arr in data.items():
+        if not isinstance(kid, (int, np.integer)) or not isinstance(arr, np.ndarray):
+            continue
+        if arr.shape[1] <= COL_PARENT_OFFSET:
+            continue
+        cats = arr[:, COL_CATEGORY].astype(np.int8)
+        parent = arr[:, COL_PARENT_METH].astype(np.int8)
+        offset = arr[:, COL_PARENT_OFFSET].astype(np.int8)
+        ipd = arr[:, COL_IPD]
+
+        m_base = cats == CATEGORY_BASELINE
+        if m_base.any():
+            buckets.setdefault("baseline", []).append(ipd[m_base])
+
+        for cat_id, prefix in (
+            (CATEGORY_SLOWED, "slowed_by_"),
+            (CATEGORY_NEAR_METH, "near_meth_by_"),
+        ):
+            m_cat = cats == cat_id
+            if not m_cat.any():
+                continue
+            for T_id in np.unique(parent[m_cat]):
+                T_id_int = int(T_id)
+                if T_id_int == 0:
+                    continue
+                m_T = m_cat & (parent == T_id_int)
+                T_name = name_by_mid.get(T_id_int, f"meth{T_id_int}")
+                for off in np.unique(offset[m_T]):
+                    mask = m_T & (offset == int(off))
+                    if not mask.any():
+                        continue
+                    buckets.setdefault(_bucket_name(prefix, T_name, int(off)), []).append(ipd[mask])
+
+    if not buckets or "baseline" not in buckets:
+        return None
+
+    pooled: dict[str, np.ndarray] = {}
+    for name, chunks in buckets.items():
+        x = np.concatenate(chunks).astype(np.float32)
+        if len(x) > BUCKET_CAP:
+            x = x[rng.choice(len(x), BUCKET_CAP, replace=False)]
+        pooled[name] = x
+
+    all_pts = np.concatenate(list(pooled.values()))
+    ipd_hi = float(np.percentile(all_pts, 99.5))
+    grid = np.linspace(0.0, max(ipd_hi, 80.0), 400)
+
+    def _kde(x):
+        if len(x) < 50:
+            return None
+        try:
+            return gaussian_kde(x, bw_method=0.25)(grid)
+        except np.linalg.LinAlgError:
+            return None
+
+    base_y = _kde(pooled["baseline"])
+    if base_y is None:
+        return None
+
+    slowed_names = sorted(
+        (n for n in pooled if n.startswith("slowed_by_")), key=_bucket_order_key
+    )
+    near_names = sorted(
+        (n for n in pooled if n.startswith("near_meth_by_")), key=_bucket_order_key
+    )
+
+    slowed_palette = _CB_SLOWED_PALETTE
+    slowed_dashes = _LINE_DASHES
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        subplot_titles=(
+            "Slowed buckets — baseline (black, solid) vs per-(meth, offset)",
+            "Near_meth buckets — baseline (black) vs near_meth (gray, overlapping = expected)",
+        ),
+        vertical_spacing=0.14,
+        shared_xaxes=True,
+    )
+
+    # Panel 1: baseline + slowed
+    fig.add_trace(
+        go.Scatter(
+            x=grid, y=base_y, mode="lines",
+            line=dict(color=_CB_BASELINE, width=2.5, dash="solid"),
+            name=f"baseline (n={len(pooled['baseline']):,})",
+            legendgroup="p1",
+        ),
+        row=1, col=1,
+    )
+    for i, name in enumerate(slowed_names):
+        y = _kde(pooled[name])
+        if y is None:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=grid, y=y, mode="lines",
+                line=dict(
+                    color=slowed_palette[i % len(slowed_palette)],
+                    width=2.0,
+                    dash=slowed_dashes[i % len(slowed_dashes)],
+                ),
+                name=f"{name} (n={len(pooled[name]):,})",
+                legendgroup="p1",
+            ),
+            row=1, col=1,
+        )
+
+    # Panel 2: baseline + near_meth (gray overlap)
+    fig.add_trace(
+        go.Scatter(
+            x=grid, y=base_y, mode="lines",
+            line=dict(color=_CB_BASELINE, width=2.5, dash="solid"),
+            name=f"baseline (n={len(pooled['baseline']):,})",
+            legendgroup="p2",
+            showlegend=True,
+        ),
+        row=2, col=1,
+    )
+    for name in near_names:
+        y = _kde(pooled[name])
+        if y is None:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=grid, y=y, mode="lines",
+                line=dict(color="rgba(80,80,80,0.45)", width=1.2, dash="solid"),
+                name=name,
+                legendgroup="p2",
+                showlegend=True,
+            ),
+            row=2, col=1,
+        )
+
+    fig.update_xaxes(title_text="IPD (uint8 [0, 255])", row=2, col=1, range=[0, max(ipd_hi, 80.0)])
+    fig.update_xaxes(range=[0, max(ipd_hi, 80.0)], row=1, col=1)
+    fig.update_yaxes(title_text="density", row=1, col=1)
+    fig.update_yaxes(title_text="density", row=2, col=1)
+    fig.update_layout(
+        title=(
+            "1D IPD density per bucket — print-friendly. Solid black = baseline; "
+            "Wong/Okabe-Ito colorblind-safe palette + distinct dashes for slowed. "
+            "Slowed buckets shift right (panel 1); near_meth overlaps baseline (panel 2)."
+        ),
+        height=720,
+        legend=dict(
             bgcolor="rgba(255,255,255,0.85)",
             bordercolor="rgba(0,0,0,0.3)",
             borderwidth=1,

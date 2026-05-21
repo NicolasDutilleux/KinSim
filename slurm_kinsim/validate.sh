@@ -1,32 +1,10 @@
 #!/bin/bash
-# validate.sh — submit a validation chain for every strain in a manifest.
+# Submit validate chain per strain: raw HiFi → strip → align → kinsim generate
+# → merge → jasmine ‖ bystrandify+align+ipdSummary+motifmaker → merge_motifs.
 #
-# Each row of the manifest (CSV with header `sample_id,lineage`) gets the
-# chain:
-#   prep → generate (array, fi/fp/ri/rp) → merge → bystrandify (ip/pw)
-#                                                       │
-#                                                       ├→ align → ipdSummary → motifmaker
-#                                                       │
-#                                                       └→ jasmine → final motif merge
-#
-# Same chain as the real-data pipeline: raw HiFi (fi/fp/ri/rp) →
-# ccs-kinetics-bystrandify (one record per strand with ip/pw) → pbmm2
-# align (preserves ip/pw) → ipdSummary (consumes ip).
-#
-# jasmine takes the bystrandified BAM (its own pbmm2 align inside the
-# script will preserve ip/pw too).
-#
-# Usage:
-#   bash slurm_kinsim/validate.sh <manifest.csv>
-#
-# Manifest:
-#   sample_id,lineage
-#   bc2034,Strepto
-#   bc2046,Vega
-#
-# Env (optional):
-#   CKPT_DIR    Default: $PREFIX/checkpoints/v12_run3
-#   N_SHARDS    Default: 10  (kinsim generate array width per strain)
+# Usage: bash slurm_kinsim/validate.sh <manifest.csv>
+# manifest columns: sample_id,lineage  (lineage in {Strepto,Vega})
+# Env: CKPT_DIR (default $PREFIX/checkpoints/v12_run3), N_SHARDS (default 10)
 set -euo pipefail
 
 MANIFEST=${1:?"usage: bash $0 <manifest.csv>"}
@@ -43,9 +21,9 @@ ls "$CKPT_DIR"/checkpoint_epoch*.pt >/dev/null 2>&1 \
 VAL_LABEL=$(basename "$CKPT_DIR")
 REPO=/data/users/ndutilleux/KinSim
 VAL_SLURM="$REPO/slurm_kinsim/validate"
+PREP_SLURM="$REPO/slurm_kinsim/prep"
 CALLERS="$REPO/slurm_kinsim/callers"
 
-# Walk the manifest. Skip header + comment + empty lines.
 declare -a FINAL_JOBS=()
 while IFS=, read -r SAMPLE LINEAGE _rest; do
   SAMPLE="${SAMPLE//[$'\t\r\n ']/}"
@@ -64,10 +42,18 @@ while IFS=, read -r SAMPLE LINEAGE _rest; do
   REF="$PIPE_DIR/${SAMPLE}_assembly.fasta"
   [ -f "$REF" ] || REF="$LINEAGE_DIR/$SAMPLE/final_assembly.fasta"
   MOTIFS="$PIPE_DIR/${SAMPLE}_motifs_merged.csv"
-  REAL_BAM="$PIPE_DIR/${SAMPLE}_aligned.bam"
+
+  LINEAGE_LC=$(echo "$LINEAGE" | tr '[:upper:]' '[:lower:]')
+  RAW_MANIFEST="$LINEAGE_DIR/manifest_${LINEAGE_LC}.csv"
+  [ -f "$RAW_MANIFEST" ] || { echo "ERROR: $SAMPLE: lineage manifest missing: $RAW_MANIFEST" >&2; exit 1; }
+  RAW_BAM=$(awk -F, -v s="$SAMPLE" '$1==s {print $2; exit}' "$RAW_MANIFEST")
+  [ -n "$RAW_BAM" ] || { echo "ERROR: $SAMPLE not found in $RAW_MANIFEST" >&2; exit 1; }
+  [ -f "$RAW_BAM" ] || { echo "ERROR: $SAMPLE: raw BAM missing: $RAW_BAM" >&2; exit 1; }
 
   VAL_DIR="$PREFIX/validate_${SAMPLE}_${VAL_LABEL}"
-  STRIPPED_BAM="$VAL_DIR/${SAMPLE}_stripped.bam"
+  # Rename vs old chain (used to be ${SAMPLE}_stripped.bam) so old artifacts can't be reused.
+  STRIPPED_BAM="$VAL_DIR/${SAMPLE}_raw_stripped.bam"
+  STRIPPED_ALIGNED_BAM="$VAL_DIR/${SAMPLE}_raw_stripped_aligned.bam"
   SHARD_DIR="$VAL_DIR/shards"
   REGIONS_FILE="$SHARD_DIR/regions.txt"
   SIM_BAM="$VAL_DIR/${SAMPLE}_simulated.bam"
@@ -82,58 +68,73 @@ while IFS=, read -r SAMPLE LINEAGE _rest; do
   for f in "$REF" "$MOTIFS"; do
     [ -f "$f" ] || { echo "ERROR: $SAMPLE: missing $f" >&2; exit 1; }
   done
-  [ -f "$STRIPPED_BAM" ] || [ -f "$REAL_BAM" ] \
-    || { echo "ERROR: $SAMPLE: neither $STRIPPED_BAM nor $REAL_BAM present" >&2; exit 1; }
   mkdir -p "$VAL_DIR" "$SHARD_DIR"
 
-  echo "── $SAMPLE ($LINEAGE) ──────────────────────────────────"
+  echo "── $SAMPLE ($LINEAGE) — raw: $RAW_BAM"
 
   PREP_DEP=""
-  if [ ! -f "$STRIPPED_BAM" ] || [ ! -f "${STRIPPED_BAM}.bai" ] || [ ! -f "$REGIONS_FILE" ]; then
+  if [ ! -s "$STRIPPED_BAM" ] || [ ! -f "${STRIPPED_BAM}.pbi" ]; then
     J_PREP=$(sbatch --parsable --job-name="val_prep_$SAMPLE" \
-      "$VAL_SLURM/prep.slurm" "$REAL_BAM" "$STRIPPED_BAM" "$REGIONS_FILE" "$N_SHARDS")
+      "$VAL_SLURM/prep.slurm" "$RAW_BAM" "$STRIPPED_BAM")
     PREP_DEP="--dependency=afterok:${J_PREP}"
-    echo "  prep       $J_PREP"
+    echo "  prep        $J_PREP"
   fi
 
-  J_GEN=$(sbatch --parsable $PREP_DEP --array=0-$((N_SHARDS - 1)) \
+  ALIGN_DEP=""
+  if [ ! -s "$STRIPPED_ALIGNED_BAM" ] || [ ! -f "${STRIPPED_ALIGNED_BAM}.pbi" ]; then
+    J_ALIGN_RAW=$(sbatch --parsable $PREP_DEP --job-name="val_align_raw_$SAMPLE" \
+      "$PREP_SLURM/align_pbmm2.slurm" "$STRIPPED_BAM" "$REF" "$STRIPPED_ALIGNED_BAM")
+    ALIGN_DEP="--dependency=afterok:${J_ALIGN_RAW}"
+    echo "  align_raw   $J_ALIGN_RAW"
+  fi
+
+  REGIONS_DEP=""
+  if [ ! -f "${STRIPPED_ALIGNED_BAM}.bai" ] || [ ! -s "$REGIONS_FILE" ]; then
+    J_REGIONS=$(sbatch --parsable $ALIGN_DEP --job-name="val_regions_$SAMPLE" \
+      --partition=pshort_el8 --account=p774 \
+      --cpus-per-task=2 --mem=4G --time=00:15:00 \
+      --output=/data/projects/p774_MARSD/NDutilleux/logs/%x_%J.log \
+      --wrap="set +u; source ~/.bashrc; conda activate kinsim_env; set -euo pipefail; \
+              [ -f ${STRIPPED_ALIGNED_BAM}.bai ] || samtools index -@ 2 ${STRIPPED_ALIGNED_BAM}; \
+              python3 $VAL_SLURM/write_regions.py ${STRIPPED_ALIGNED_BAM} ${REGIONS_FILE} ${N_SHARDS}")
+    REGIONS_DEP="--dependency=afterok:${J_REGIONS}"
+    echo "  regions     $J_REGIONS"
+  fi
+
+  J_GEN=$(sbatch --parsable $REGIONS_DEP --array=0-$((N_SHARDS - 1)) \
     --job-name="val_gen_$SAMPLE" \
     "$VAL_SLURM/generate.slurm" \
-    "$STRIPPED_BAM" "$REF" "$CKPT_DIR" "$MOTIFS" "$REGIONS_FILE" "$SHARD_DIR")
+    "$STRIPPED_ALIGNED_BAM" "$REF" "$CKPT_DIR" "$MOTIFS" "$REGIONS_FILE" "$SHARD_DIR")
+
   J_MERGE=$(sbatch --parsable --dependency=afterok:$J_GEN \
     --job-name="val_merge_$SAMPLE" \
     "$VAL_SLURM/merge.slurm" "$SHARD_DIR" "$SIM_BAM")
-  # bystrandify — converts raw-HiFi (fi/fp/ri/rp on flag=4) to bystrandified
-  # (one record per strand with ip/pw), matching the real-data pipeline.
-  # pbmm2 then preserves ip/pw, and ipdSummary consumes them directly.
+
+  J_JM=$(sbatch --parsable --dependency=afterok:$J_MERGE \
+    --job-name="val_jm_$SAMPLE" \
+    "$CALLERS/jasmine_modkit.slurm" "$SIM_BAM" "$REF" "$SIM_JM_CSV")
+
   J_BYS=$(sbatch --parsable --dependency=afterok:$J_MERGE \
     --job-name="val_bys_$SAMPLE" \
-    "$REPO/slurm_kinsim/prep/bystrandify.slurm" "$SIM_BAM" "$SIM_BYS_BAM")
-  J_ALIGN=$(sbatch --parsable --dependency=afterok:$J_BYS \
-    --job-name="val_align_$SAMPLE" \
-    "$REPO/slurm_kinsim/prep/align_pbmm2.slurm" "$SIM_BYS_BAM" "$REF" "$SIM_ALIGNED_BAM")
-  J_IPD=$(sbatch --parsable --dependency=afterok:$J_ALIGN \
+    "$PREP_SLURM/bystrandify.slurm" "$SIM_BAM" "$SIM_BYS_BAM")
+  J_ALIGN_BYS=$(sbatch --parsable --dependency=afterok:$J_BYS \
+    --job-name="val_align_bys_$SAMPLE" \
+    "$PREP_SLURM/align_pbmm2.slurm" "$SIM_BYS_BAM" "$REF" "$SIM_ALIGNED_BAM")
+  J_IPD=$(sbatch --parsable --dependency=afterok:$J_ALIGN_BYS \
     --job-name="val_ipd_$SAMPLE" \
     "$CALLERS/ipdsummary.slurm" "$SIM_ALIGNED_BAM" "$REF" "$SIM_GFF" "$SIM_IPD_CSV")
   J_MM=$(sbatch --parsable --dependency=afterok:$J_IPD \
     --job-name="val_mm_$SAMPLE" \
     "$CALLERS/pbmotifmaker.slurm" "$REF" "$SIM_GFF" "$SIM_MM_CSV")
-  J_JM=$(sbatch --parsable --dependency=afterok:$J_BYS \
-    --job-name="val_jm_$SAMPLE" \
-    "$CALLERS/jasmine_modkit.slurm" "$SIM_BYS_BAM" "$REF" "$SIM_JM_CSV")
+
   J_FINAL=$(sbatch --parsable --dependency=afterok:${J_MM}:${J_JM} \
     --job-name="val_final_$SAMPLE" \
     "$CALLERS/merge_motifs.slurm" "$SIM_MERGED_CSV" 0.7 "$SIM_MM_CSV" "$SIM_JM_CSV")
 
   echo "  generate    $J_GEN (array 0-$((N_SHARDS - 1)))"
-  echo "  merge       $J_MERGE"
-  echo "  bystrandify $J_BYS"
-  echo "  align       $J_ALIGN"
-  echo "  ipdSummary  $J_IPD"
-  echo "  motifmaker  $J_MM"
-  echo "  jasmine     $J_JM"
-  echo "  final       $J_FINAL"
-  echo "  output:    $SIM_MERGED_CSV"
+  echo "  merge       $J_MERGE   jasmine $J_JM"
+  echo "  bys $J_BYS   align $J_ALIGN_BYS   ipd $J_IPD   mm $J_MM"
+  echo "  final       $J_FINAL → $SIM_MERGED_CSV"
   FINAL_JOBS+=("$J_FINAL")
 done < "$MANIFEST"
 
