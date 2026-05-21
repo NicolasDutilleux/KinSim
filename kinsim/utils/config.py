@@ -302,6 +302,15 @@ def load_yaml_config(path: str) -> dict:
 # Project-wide config (kinsim_config.yaml at repo root)
 # ---------------------------------------------------------------------------
 
+# Hardcoded fallbacks live in ``utils._defaults`` — single source shared
+# with ``utils.encoding`` to prevent drift.
+from ._defaults import (
+    DEFAULT_DOWNSTREAM as _FALLBACK_DOWNSTREAM,
+    DEFAULT_KMER_SIZE as _FALLBACK_KMER_SIZE,
+    DEFAULT_REV_METH_OFFSETS as _FALLBACK_REV_METH_OFFSETS,
+    DEFAULT_UPSTREAM as _FALLBACK_UPSTREAM,
+)
+
 # Default config — used if kinsim_config.yaml is missing or unreadable.
 # Geometry constants pulled from utils._defaults so the in-memory fallback
 # cannot drift from the import-time defaults.
@@ -490,15 +499,6 @@ def get_meth_alias_map() -> dict[str, str]:
 #
 # These values come from `kinsim_config.yaml`, the `extraction:` block.
 
-
-# Hardcoded fallbacks live in ``utils._defaults`` — single source shared
-# with ``utils.encoding`` to prevent drift.
-from ._defaults import (
-    DEFAULT_DOWNSTREAM as _FALLBACK_DOWNSTREAM,
-    DEFAULT_KMER_SIZE as _FALLBACK_KMER_SIZE,
-    DEFAULT_REV_METH_OFFSETS as _FALLBACK_REV_METH_OFFSETS,
-    DEFAULT_UPSTREAM as _FALLBACK_UPSTREAM,
-)
 
 # Practical limits — kmer_size > 31 overflows int64 in the packed encoding.
 _KMER_SIZE_MIN = 3
