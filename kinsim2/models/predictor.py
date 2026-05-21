@@ -1,8 +1,10 @@
 """Bilateral ConvPredictor — predicts (ipd_fwd, pw_fwd, ipd_rev, pw_rev) jointly.
 
-Forward kmer + reverse kmer (revcomp, derived) both embedded; cross-meth
-FiLM modulators (both meth contexts feed both branches); 2 strand-specific
-conv backbones; merged readout -> 8 outputs (4 mu + 4 log sigma).
+Forward kmer + reverse kmer (revcomp, derived) both embedded; 2 strand-
+specific conv backbones learn sequence motifs unconditioned on
+methylation; cross-meth FiLM modulators (both meth contexts feed both
+branches) then shift/scale the conv FEATURE maps; merged readout ->
+8 outputs (4 mu + 4 log sigma).
 
 Outputs are reference-strand-relative; ``generate.py`` routes them back
 to BAM fi/fp/ri/rp tags based on ``read.is_reverse``.
@@ -95,11 +97,17 @@ class ConvPredictor(nn.Module):
 
         meth_input_dim = 2 * kmer_size * num_meth_types
         self.meth_proj = nn.Linear(meth_input_dim, meth_proj_dim, bias=False)
-        film_in_dim = meth_proj_dim + (base_embed_dim if kmer_aware_film else 0)
-        self.film_gamma_fwd = nn.Linear(film_in_dim, base_embed_dim)
-        self.film_beta_fwd = nn.Linear(film_in_dim, base_embed_dim)
-        self.film_gamma_rev = nn.Linear(film_in_dim, base_embed_dim)
-        self.film_beta_rev = nn.Linear(film_in_dim, base_embed_dim)
+        # FiLM modulates the conv backbone OUTPUT, not the input embedding —
+        # conv first learns sequence motifs unconditionally, then meth context
+        # shifts/scales the high-level features (standard FiLM placement,
+        # Perez et al. 2018). film_gamma/beta therefore output ``conv_dim``
+        # channels (was ``base_embed_dim`` in the pre-conv variant).
+        # kmer-aware FiLM concatenates the pooled conv output (also conv_dim).
+        film_in_dim = meth_proj_dim + (conv_dim if kmer_aware_film else 0)
+        self.film_gamma_fwd = nn.Linear(film_in_dim, conv_dim)
+        self.film_beta_fwd = nn.Linear(film_in_dim, conv_dim)
+        self.film_gamma_rev = nn.Linear(film_in_dim, conv_dim)
+        self.film_beta_rev = nn.Linear(film_in_dim, conv_dim)
 
         def _make_conv_stack() -> nn.Sequential:
             layers: list[nn.Module] = []
@@ -188,27 +196,32 @@ class ConvPredictor(nn.Module):
         x_fwd = self.base_embed(bases_fwd) + self.pos_embed_fwd
         x_rev = self.base_embed(bases_rev) + self.pos_embed_rev
 
+        # Conv on unconditioned embeddings — backbone learns sequence motifs
+        # independently of methylation. FiLM (below) modulates the high-level
+        # features.
+        h_fwd = self.conv_fwd(x_fwd.transpose(1, 2))  # (B, conv_dim, K)
+        h_rev = self.conv_rev(x_rev.transpose(1, 2))  # (B, conv_dim, K)
+
         meth_concat = torch.cat([meth_ctx_fwd, meth_ctx_rev], dim=1)
         meth_flat = meth_concat.reshape(meth_concat.shape[0], -1)
         meth_feat = self.meth_proj(meth_flat)
 
         if self.kmer_aware_film:
-            film_in_fwd = torch.cat([meth_feat, x_fwd.mean(dim=1)], dim=-1)
-            film_in_rev = torch.cat([meth_feat, x_rev.mean(dim=1)], dim=-1)
+            film_in_fwd = torch.cat([meth_feat, h_fwd.mean(dim=2)], dim=-1)
+            film_in_rev = torch.cat([meth_feat, h_rev.mean(dim=2)], dim=-1)
         else:
             film_in_fwd = meth_feat
             film_in_rev = meth_feat
 
-        gamma_fwd = self.film_gamma_fwd(film_in_fwd).unsqueeze(1)
-        beta_fwd = self.film_beta_fwd(film_in_fwd).unsqueeze(1)
-        gamma_rev = self.film_gamma_rev(film_in_rev).unsqueeze(1)
-        beta_rev = self.film_beta_rev(film_in_rev).unsqueeze(1)
+        # Broadcast (B, conv_dim) -> (B, conv_dim, 1) so FiLM applies the same
+        # scale/shift at every K position of the conv feature map.
+        gamma_fwd = self.film_gamma_fwd(film_in_fwd).unsqueeze(2)
+        beta_fwd = self.film_beta_fwd(film_in_fwd).unsqueeze(2)
+        gamma_rev = self.film_gamma_rev(film_in_rev).unsqueeze(2)
+        beta_rev = self.film_beta_rev(film_in_rev).unsqueeze(2)
 
-        x_fwd = (1.0 + gamma_fwd) * x_fwd + beta_fwd
-        x_rev = (1.0 + gamma_rev) * x_rev + beta_rev
-
-        h_fwd = self.conv_fwd(x_fwd.transpose(1, 2))
-        h_rev = self.conv_rev(x_rev.transpose(1, 2))
+        h_fwd = (1.0 + gamma_fwd) * h_fwd + beta_fwd
+        h_rev = (1.0 + gamma_rev) * h_rev + beta_rev
 
         center_fwd = h_fwd[:, :, self.active_site_index]
         pool_fwd = h_fwd.mean(dim=2)
@@ -282,7 +295,7 @@ class ConvPredictor(nn.Module):
             "biology_mask": self.biology_mask,
             "log_sigma_clamp_min": self.log_sigma_clamp_min,
             "log_sigma_clamp_max": self.log_sigma_clamp_max,
-            "architecture": "conv_bilateral_v2",
+            "architecture": "conv_bilateral_v2_postfilm",
         }
 
 
