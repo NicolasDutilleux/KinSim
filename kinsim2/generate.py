@@ -207,6 +207,99 @@ def _predict_for_positions(
     return out
 
 
+def _resolve_p_fire_lookup(cfg: dict) -> dict[tuple[int, int], float]:
+    """Pull ``{(meth_id, signal_offset_k): p_fire}`` from the model_config.
+
+    The checkpoint's ``p_fire`` dict uses string keys
+    ``"<meth_name>@<+offset>"`` (e.g. ``"m6A@+5"``) written by refine.
+    Convert to ``(int meth_id, int k)`` via the checkpoint's frozen
+    meth_id_map. Returns ``{}`` if the checkpoint predates refine
+    (generate will then use the global default rate).
+    """
+    raw = cfg.get("p_fire") or {}
+    meth_id_map = cfg.get("meth_id_map") or get_meth_ids()
+    out: dict[tuple[int, int], float] = {}
+    for label, p in raw.items():
+        if "@" not in label:
+            continue
+        t_name, off_str = label.split("@", 1)
+        m_id = meth_id_map.get(t_name)
+        if m_id is None:
+            continue
+        try:
+            k = int(off_str)
+        except ValueError:
+            continue
+        out[(int(m_id), k)] = float(p)
+    return out
+
+
+def _build_sig_offsets_by_meth_id() -> dict[int, set[int]]:
+    """``{meth_id: {signature_offsets}}`` from kinsim_config.yaml.
+
+    Only signature offsets are subject to the firing Bernoulli — at
+    non-signature offsets the model already learned to emit baseline-
+    like kinetics, so they pass through.
+    """
+    from .utils.config import get_signature_offsets, load_kinsim_config
+    cfg = load_kinsim_config()
+    ids = get_meth_ids()
+    out: dict[int, set[int]] = {}
+    for name in cfg.get("kinetic_signatures") or {}:
+        m_id = ids.get(name)
+        if m_id is not None:
+            out[m_id] = set(get_signature_offsets(name))
+    return out
+
+
+def _build_pfire_rate_table(
+    p_fire_lookup: dict[tuple[int, int], float],
+    sig_offsets_by_meth: dict[int, set[int]],
+    kmer_size: int,
+    active_site_index: int,
+    num_meth_types: int,
+    default_rate: float,
+) -> np.ndarray:
+    """``(K, M)`` Bernoulli rate per (k_pos, meth_id) for the firing roll.
+
+    Non-signature positions get rate=1.0 (always fire — model emits its
+    learned signature there unmodified). Signature positions
+    ``(meth_id, signal_offset_k)`` get either:
+      - the per-bucket survival rate from ``p_fire_lookup`` (refine meta),
+      - or ``default_rate`` if that bucket isn't in the lookup.
+
+    Applied in-place to the one-hot meth context: roll U ~ U(0,1) per
+    entry, zero out the meth code where ``U >= rate``. The signal at
+    that row drops to the baseline kinetics emitted by the model.
+    """
+    rate_table = np.ones((kmer_size, num_meth_types), dtype=np.float32)
+    for m_id in range(1, num_meth_types):
+        offsets = sig_offsets_by_meth.get(m_id, set())
+        for k_off in offsets:
+            k_pos = active_site_index - k_off
+            if 0 <= k_pos < kmer_size:
+                rate_table[k_pos, m_id] = float(
+                    p_fire_lookup.get((m_id, k_off), default_rate)
+                )
+    return rate_table
+
+
+def _apply_p_fire_inplace(
+    meth_ctx: np.ndarray, rate_table: np.ndarray, rng: np.random.Generator,
+) -> None:
+    """Roll Bernoulli per (L, K, M) one-hot entry; zero the non-firing positions.
+
+    Vectorised. Independent rolls per row × position × meth-channel —
+    every read sees a fresh draw, so motif occupancy realisations differ
+    read-to-read at the same site (matches PacBio biology).
+    """
+    if meth_ctx.size == 0:
+        return
+    rolls = rng.random(meth_ctx.shape, dtype=np.float32)
+    keep = rolls < rate_table[None, :, :]
+    meth_ctx *= keep
+
+
 def _process_read(
     read: pysam.AlignedSegment,
     model,
@@ -218,12 +311,17 @@ def _process_read(
     num_meth_types: int,
     device: torch.device,
     deterministic: bool,
+    rate_table: np.ndarray,
+    rng: np.random.Generator,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Generate fi/fp/ri/rp arrays for one aligned read.
 
     For mapped reads, the active-site position runs along the reference
     region the read covers. For unmapped reads (and N-context positions),
-    kinetics fall back to a baseline value of 1.
+    kinetics fall back to a baseline value of 1. ``rate_table`` drives
+    the per-row Bernoulli firing on signature offsets — non-firing
+    methylations are zeroed in the meth context so the model emits
+    baseline kinetics at that row.
     """
     seq_len = read.query_length or 0
     fi = np.ones(seq_len, dtype=np.uint8)
@@ -257,6 +355,11 @@ def _process_read(
     kmer_ids, is_n = _encode_kmer_vec_fast(seq_int, kmer_size, upstream)
     mc_fwd = _build_meth_one_hot(fwd_window, kmer_size, upstream, num_meth_types)
     mc_rev = _build_meth_one_hot(rev_window, kmer_size, upstream, num_meth_types)
+    # Per-row Bernoulli firing on the one-hot meth tensors. Independent
+    # draws on fwd vs rev strand so cross-strand non-coincident firing
+    # is preserved.
+    _apply_p_fire_inplace(mc_fwd, rate_table, rng)
+    _apply_p_fire_inplace(mc_rev, rate_table, rng)
 
     preds = _predict_for_positions(
         model, kmer_ids, mc_fwd, mc_rev, device, deterministic,
@@ -264,23 +367,26 @@ def _process_read(
     preds[is_n] = 1  # N context falls back to baseline signal
 
     # Project predictions into read coordinates via the CIGAR / pairs.
+    # Vectorised — fancy index instead of the per-position Python loop.
     fi_arr, fp_arr, ri_arr, rp_arr = _route_strands(
         bool(read.is_reverse),
         preds[:, 0], preds[:, 1], preds[:, 2], preds[:, 3],
     )
 
-    aligned_pairs = read.get_aligned_pairs(matches_only=True)
-    for q_pos, r_pos in aligned_pairs:
-        if q_pos is None or r_pos is None:
-            continue
+    pairs = np.array(read.get_aligned_pairs(matches_only=True), dtype=np.int64)
+    if pairs.size:
+        q_pos = pairs[:, 0]
+        r_pos = pairs[:, 1]
         rel = r_pos - ref_start
-        if rel < 0 or rel >= len(fi_arr):
-            continue
-        ref_idx_after_orient = (len(fi_arr) - 1 - rel) if read.is_reverse else rel
-        fi[q_pos] = fi_arr[ref_idx_after_orient]
-        fp[q_pos] = fp_arr[ref_idx_after_orient]
-        ri[q_pos] = ri_arr[ref_idx_after_orient]
-        rp[q_pos] = rp_arr[ref_idx_after_orient]
+        valid = (rel >= 0) & (rel < len(fi_arr))
+        if valid.any():
+            q_pos = q_pos[valid]
+            rel = rel[valid]
+            ref_idx = (len(fi_arr) - 1 - rel) if read.is_reverse else rel
+            fi[q_pos] = fi_arr[ref_idx]
+            fp[q_pos] = fp_arr[ref_idx]
+            ri[q_pos] = ri_arr[ref_idx]
+            rp[q_pos] = rp_arr[ref_idx]
 
     return fi, fp, ri, rp
 
@@ -334,12 +440,20 @@ def generate_from_bam(
     deterministic: bool = False,
     device_str: str = "cuda",
     region: str | None = None,
+    p_fire_default: float = 0.5,
+    seed: int = 42,
 ) -> None:
     """Generate bilateral kinetics for every read in ``input_bam``.
 
     The output BAM is unaligned-style raw HiFi (flag=4) with the four
     PacBio tags injected. Feed the output to ``ccs-kinetics-bystrandify``
     then ``pbmm2 align`` for ipdSummary downstream.
+
+    Per-row Bernoulli firing on signature offsets uses the per-bucket
+    ``p_fire`` table from the checkpoint's ``model_config.json`` when
+    present (written by ``refine``); buckets not in the lookup fall back
+    to ``p_fire_default``. Independent draws per read mean motif
+    occupancy realisations vary across reads at the same site.
     """
     device = torch.device(device_str if (device_str == "cuda" and torch.cuda.is_available()) else "cpu")
     log.info("Loading model: %s", checkpoint_path)
@@ -352,6 +466,23 @@ def generate_from_bam(
         kmer_size, upstream, num_meth_types,
         cfg.get("architecture", "?"),
     )
+
+    # Build the (K, M) firing-rate table. Pull per-bucket survival rates
+    # from the checkpoint's p_fire dict (refine meta carried through
+    # train); fall back to the default for unseen buckets.
+    p_fire_lookup = _resolve_p_fire_lookup(cfg)
+    sig_offsets_by_meth = _build_sig_offsets_by_meth_id()
+    rate_table = _build_pfire_rate_table(
+        p_fire_lookup, sig_offsets_by_meth,
+        kmer_size=kmer_size, active_site_index=upstream,
+        num_meth_types=num_meth_types, default_rate=p_fire_default,
+    )
+    log.info(
+        "p_fire rate table: default=%.2f  per-bucket buckets=%d  signature buckets=%d",
+        p_fire_default, len(p_fire_lookup),
+        sum(len(v) for v in sig_offsets_by_meth.values()),
+    )
+    rng = np.random.default_rng(int(seed))
 
     log.info("Loading reference: %s", ref_path)
     ref_seqs = _load_reference(ref_path)
@@ -392,6 +523,7 @@ def generate_from_bam(
             kmer_size=kmer_size, upstream=upstream,
             num_meth_types=num_meth_types, device=device,
             deterministic=deterministic,
+            rate_table=rate_table, rng=rng,
         )
         _strip_existing_kinetics(read)
         _set_kinetic_tags(read, fi, fp, ri, rp)
@@ -445,8 +577,16 @@ def main(argv: list[str] | None = None) -> None:
     )
     ap.add_argument(
         "--seed", type=int, default=42,
-        help="RNG seed for stochastic sampling (default: 42). Same seed + same "
-        "input -> identical output BAM.",
+        help="RNG seed for stochastic sampling AND Bernoulli firing "
+        "(default: 42). Same seed + same input -> identical output BAM.",
+    )
+    ap.add_argument(
+        "--p-fire", dest="p_fire", type=float, default=0.5,
+        help="Bernoulli firing rate at signature offsets when the checkpoint's "
+        "p_fire dict is empty or doesn't cover the (meth, offset) bucket "
+        "(default: 0.5 — half of motif sites visibly fire per read, matching "
+        "the typical range refine reports across the Strepto+Vega corpus). "
+        "Set to 1.0 to disable firing (always emit the model's learned signal).",
     )
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
@@ -469,6 +609,8 @@ def main(argv: list[str] | None = None) -> None:
         deterministic=args.deterministic,
         device_str=args.device,
         region=args.region,
+        p_fire_default=float(args.p_fire),
+        seed=int(args.seed),
     )
 
 
