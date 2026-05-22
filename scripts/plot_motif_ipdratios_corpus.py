@@ -49,29 +49,59 @@ def safe_float(s):
         return None
 
 
-def read_motifs(path: Path) -> list[tuple[str, float]]:
-    """Return [(mod_type, meanIpdRatio), ...] from a motif CSV."""
+def read_motifs(path: Path, min_fraction: float) -> tuple[list[tuple[str, float]], int, int, bool]:
+    """Return ([(mod_type, meanIpdRatio), ...], n_kept, n_dropped_by_fraction, no_ipd_col).
+
+    Skips rows without IPDRatio (returns ``no_ipd_col=True`` if file format
+    doesn't carry IPDRatio at all). Drops rows with ``fraction < min_fraction``
+    when a fraction column is present.
+    """
     out: list[tuple[str, float]] = []
+    n_kept = 0
+    n_dropped = 0
+    no_ipd_col = False
     if not path.is_file():
-        return out
+        return out, 0, 0, False
     try:
         with open(path) as f:
             reader = csv.DictReader(f)
-            for r in reader:
-                mt = (r.get("modificationType") or r.get("type") or "").strip()
-                ipd = safe_float(r.get("meanIpdRatio") or r.get("ipd_ratio"))
-                if ipd is not None and mt:
-                    out.append((mt, ipd))
+            # Detect IPDRatio column presence on first peek
+            first_row = next(reader, None)
+            if first_row is None:
+                return out, 0, 0, False
+            ipd_field = (
+                "meanIpdRatio" if "meanIpdRatio" in first_row
+                else ("ipd_ratio" if "ipd_ratio" in first_row else None)
+            )
+            if ipd_field is None:
+                no_ipd_col = True
+                return out, 0, 0, True
+            for r in [first_row] + list(reader):
+                mt = (r.get("modificationType") or r.get("mod_type") or r.get("type") or "").strip()
+                ipd = safe_float(r.get(ipd_field))
+                frac = safe_float(r.get("fraction") or r.get("frac_mod"))
+                if ipd is None or not mt:
+                    continue
+                if frac is not None and frac < min_fraction:
+                    n_dropped += 1
+                    continue
+                out.append((mt, ipd))
+                n_kept += 1
     except (OSError, csv.Error):
         pass
-    return out
+    return out, n_kept, n_dropped, no_ipd_col
 
 
-def collect_from_manifest(manifest_path: Path, motifs_col: str) -> tuple[int, int, dict[str, list[float]]]:
-    """Returns (n_rows, n_csvs_found, {mod_type: [ipd_ratios]})."""
+def collect_from_manifest(manifest_path: Path, motifs_col: str,
+                          min_fraction: float) -> tuple[int, int, dict[str, list[float]], int, int, int]:
+    """Returns (n_rows, n_csvs_found, {mod_type: [ipd_ratios]},
+                n_kept_total, n_dropped_total, n_files_no_ipd)."""
     by_type: dict[str, list[float]] = defaultdict(list)
     n_rows = 0
     n_found = 0
+    n_kept = 0
+    n_dropped = 0
+    n_no_ipd = 0
     with open(manifest_path) as f:
         for row in csv.DictReader(f):
             n_rows += 1
@@ -82,9 +112,15 @@ def collect_from_manifest(manifest_path: Path, motifs_col: str) -> tuple[int, in
             if not csv_path.is_file():
                 continue
             n_found += 1
-            for mt, ipd in read_motifs(csv_path):
+            rows, k, d, no_ipd = read_motifs(csv_path, min_fraction)
+            if no_ipd:
+                n_no_ipd += 1
+                continue
+            n_kept += k
+            n_dropped += d
+            for mt, ipd in rows:
                 by_type[mt].append(ipd)
-    return n_rows, n_found, by_type
+    return n_rows, n_found, by_type, n_kept, n_dropped, n_no_ipd
 
 
 def parse_manifests_arg(spec: str) -> list[tuple[str, Path]]:
@@ -111,6 +147,8 @@ def main(argv=None):
     )
     ap.add_argument("--motifs-column", default="motifs",
                     help="Name of the motifs path column in the manifest CSV. Default 'motifs'.")
+    ap.add_argument("--min-fraction", type=float, default=0.0,
+                    help="Drop motif rows with fraction (or frac_mod) below this. Default 0.0 (no filter).")
     ap.add_argument("--output", required=True, help="Output PNG path.")
     args = ap.parse_args(argv)
 
@@ -122,11 +160,19 @@ def main(argv=None):
             sys.exit(f"Manifest not found: {p}  (label={label!r})")
 
     data: dict[str, dict[str, list[float]]] = {}
-    print("Reading manifests:")
+    print(f"Reading manifests (min_fraction filter: {args.min_fraction:.2f}):")
     for label, p in manifests:
-        n_rows, n_found, by_type = collect_from_manifest(p, args.motifs_column)
+        n_rows, n_found, by_type, n_kept, n_dropped, n_no_ipd = collect_from_manifest(
+            p, args.motifs_column, args.min_fraction,
+        )
         data[label] = by_type
-        print(f"  [{label}] {p}: {n_rows} manifest rows, {n_found} motif CSVs read")
+        suffix = ""
+        if n_no_ipd:
+            suffix += f", {n_no_ipd} files had no IPDRatio column (skipped)"
+        if n_dropped:
+            suffix += f", dropped {n_dropped} rows (fraction < {args.min_fraction:.2f})"
+        print(f"  [{label}] {p}: {n_rows} manifest rows, "
+              f"{n_found} CSVs read, {n_kept} motif rows kept{suffix}")
 
     print("\n=== meanIpdRatio stats by source × modification type ===")
     print(f"  {'source':<26} {'type':>14} {'n':>6} {'median':>8} {'q25':>8} {'q75':>8} {'max':>8}")
@@ -175,8 +221,11 @@ def main(argv=None):
                      fontsize=11)
         ax.grid(axis="y", alpha=0.3)
 
-    fig.suptitle("Training corpus meanIpdRatio — per-strain motif CSVs from manifest(s)",
-                 fontsize=13)
+    suptitle_extra = f"  (fraction ≥ {args.min_fraction:.2f})" if args.min_fraction > 0 else ""
+    fig.suptitle(
+        f"Training corpus meanIpdRatio — per-strain motif CSVs from manifest(s){suptitle_extra}",
+        fontsize=13,
+    )
     plt.tight_layout(rect=(0, 0, 1, 0.96))
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
