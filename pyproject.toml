@@ -54,6 +54,7 @@ dev = [
 [project.scripts]
 kinsim = "kinsim.__main__:main"
 kinsim2 = "kinsim2.__main__:main"
+kinsim_nn = "kinsim_NN.__main__:main"
 
 [project.urls]
 Homepage      = "https://github.com/NicolasDutilleux/KinSim"
@@ -66,11 +67,12 @@ Documentation = "https://github.com/NicolasDutilleux/KinSim#readme"
 # ----------------------------------------------------------------------------
 
 [tool.setuptools.packages.find]
-include = ["kinsim*", "kinsim2*"]
+include = ["kinsim*", "kinsim2*", "kinsim_NN*"]
 
 [tool.setuptools.package-data]
 kinsim = ["py.typed"]
 kinsim2 = ["py.typed"]
+kinsim_NN = ["py.typed"]
 
 # ----------------------------------------------------------------------------
 # Lint / format — ruff (replaces flake8 + isort + pyupgrade + pydocstyle)

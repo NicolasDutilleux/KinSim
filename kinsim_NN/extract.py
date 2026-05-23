@@ -1,0 +1,409 @@
+"""``kinsim_nn extract`` — labeler-driven extraction → shards.
+
+For each strain in the manifest, this:
+  1. Loads the reference FASTA.
+  2. Runs the chain of labelers (configured in YAML) to produce
+     ``(ref_id, pos, meth_id, strand)`` records.
+  3. Samples baseline positions ≥ ``baseline_min_dist`` bp from any
+     labeled meth position.
+  4. For each (position, strand) labelled, walks the aligned BAM and
+     extracts the bilateral 4-channel signal for up to
+     ``reads_cap_per_position`` reads.
+  5. Writes a single ``shards/<sample_id>_shard.pkl`` file.
+
+Designed for SLURM array execution: pass ``--task <i>`` to process
+manifest row ``i`` only.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as _dt
+import hashlib
+import logging
+import random
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+import pysam
+
+from . import __version__
+from .data.shard import (
+    SHARD_CONFIG_VERSION,
+    empty_shard,
+    finalize_shard,
+    write_shard,
+    _hash_zmw,
+)
+from .labelers import create_labeler
+from .utils.bam_io import (
+    detect_bam_format,
+    iter_window_samples,
+)
+from .utils.config import KinsimNNConfig, load_config, setup_logging
+
+
+log = logging.getLogger(__name__)
+
+
+_BASE_TO_CODE = {b: i for i, b in enumerate("ACGT")}
+_BASE_TO_CODE.update({b: i for i, b in enumerate("acgt")})
+
+
+def _encode_seq(seq: str) -> np.ndarray:
+    """Encode a K-mer (case-insensitive ACGT) → uint8 (K,). N → 0 (A) silently."""
+    return np.fromiter(
+        (_BASE_TO_CODE.get(b, 0) for b in seq),
+        dtype=np.uint8,
+        count=len(seq),
+    )
+
+
+def _git_sha() -> str:
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        return sha or "unknown"
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return "unknown"
+
+
+def _load_manifest(manifest_path: Path) -> list[dict]:
+    """Return list of {sample_id, bam_path, ref_path, strain_dir, ...} dicts."""
+    out = []
+    with open(manifest_path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if not row.get("sample_id"):
+                continue
+            out.append(dict(row))
+    return out
+
+
+def _resolve_strain_dir(row: dict) -> Path:
+    """Heuristic: parent of the bam_path; the labeler's ``file_pattern``
+    is resolved against this directory."""
+    bam = Path(row["bam_path"])
+    return bam.parent
+
+
+def _load_ref_fasta(ref_path: Path) -> dict[str, str]:
+    """Load all contigs from a FASTA → {contig_id: seq}. Uses pysam.FastaFile
+    for indexed random access; falls back to a full read otherwise."""
+    try:
+        fa = pysam.FastaFile(str(ref_path))
+        out = {ref: fa.fetch(ref) for ref in fa.references}
+        fa.close()
+        return out
+    except (OSError, ValueError) as e:
+        log.warning("FastaFile failed (%s) — falling back to plain reader", e)
+        out = {}
+        with open(ref_path) as f:
+            cur_id, parts = None, []
+            for line in f:
+                line = line.rstrip()
+                if line.startswith(">"):
+                    if cur_id is not None:
+                        out[cur_id] = "".join(parts)
+                    cur_id = line[1:].split()[0]
+                    parts = []
+                else:
+                    parts.append(line)
+            if cur_id is not None:
+                out[cur_id] = "".join(parts)
+        return out
+
+
+def _build_labelers(cfg: KinsimNNConfig) -> list:
+    """Instantiate labelers from the YAML config in order."""
+    labelers = []
+    for entry in cfg.labelers:
+        t = entry.get("type")
+        kwargs = {k: v for k, v in entry.items() if k != "type"}
+        labeler = create_labeler(t, **kwargs)
+        labelers.append(labeler)
+    return labelers
+
+
+def _collect_labels(
+    labelers: list,
+    cfg: KinsimNNConfig,
+    ref_seqs: dict[str, str],
+    strain_dir: Path,
+) -> dict[tuple[str, int, str], int]:
+    """Run all labelers, merge labels.
+
+    Returns ``{(ref_id, pos_0based, strand): meth_id}``. Earlier labelers
+    win on conflicts. Labelers loop OUTER so each source file (GFF, BAM)
+    is parsed only ONCE per strain — the labeler itself iterates the
+    contigs internally.
+    """
+    result: dict[tuple[str, int, str], int] = {}
+    meth_id_by_name = cfg.meth_id_by_name
+    for labeler in labelers:
+        for ref_id, ref_seq in ref_seqs.items():
+            for rid, pos, mid, strand in labeler.label(
+                ref_id, ref_seq, strain_dir,
+                meth_id_by_name=meth_id_by_name,
+                treat_modified_base_as=cfg.treat_modified_base_as,
+            ):
+                key = (rid, pos, strand)
+                if key not in result:
+                    result[key] = mid
+    return result
+
+
+def _sample_baselines(
+    label_positions: set[tuple[str, int, str]],
+    ref_seqs: dict[str, str],
+    n_samples: int,
+    min_dist: int,
+    half_width: int,
+    rng: random.Random,
+) -> list[tuple[str, int, str]]:
+    """Sample baseline positions ≥ ``min_dist`` bp from any labelled
+    methylation position."""
+    # Build per-contig labelled-set for fast lookups (kept compact via bitarrays
+    # using numpy).
+    forbidden_by_ref: dict[str, np.ndarray] = {}
+    for ref_id, seq in ref_seqs.items():
+        forbidden = np.zeros(len(seq), dtype=bool)
+        forbidden_by_ref[ref_id] = forbidden
+
+    for (rid, pos, _strand) in label_positions:
+        if rid not in forbidden_by_ref:
+            continue
+        f = forbidden_by_ref[rid]
+        lo = max(0, pos - min_dist)
+        hi = min(f.size, pos + min_dist + 1)
+        f[lo:hi] = True
+
+    refs = list(ref_seqs.keys())
+    out = []
+    tries = 0
+    max_tries = max(n_samples * 50, 1000)
+    while len(out) < n_samples and tries < max_tries:
+        tries += 1
+        rid = rng.choice(refs)
+        L = len(ref_seqs[rid])
+        if L < 2 * half_width + 10:
+            continue
+        pos = rng.randint(half_width, L - half_width - 1)
+        if forbidden_by_ref[rid][pos]:
+            continue
+        strand = rng.choice(["+", "-"])
+        out.append((rid, pos, strand))
+    if len(out) < n_samples:
+        log.warning(
+            "Baseline sampling reached only %d/%d after %d tries",
+            len(out), n_samples, tries,
+        )
+    return out
+
+
+def _extract_position(
+    bam: pysam.AlignmentFile,
+    bam_fmt,
+    seqid: str,
+    pos: int,
+    strand: str,
+    meth_id: int,
+    ref_seq: str,
+    cfg: KinsimNNConfig,
+    rng: random.Random,
+    builder: dict,
+    ref_id_idx: int,
+    labels: dict[tuple[str, int, str], int],
+) -> int:
+    """Walk reads covering ``pos`` and emit up to ``reads_cap_per_position``
+    samples into ``builder``. Returns the number of samples added.
+
+    Overlays *all* labels that fall inside the window onto meth_fwd /
+    meth_rev (per strand). Neighbouring methylations within ±half are
+    real biological events that influence kinetics — they must be
+    present in the condition, otherwise the model learns a wrong
+    mapping (this was the v12_run3 mis-conditioning bug).
+    """
+    half = cfg.window.half_width
+    K = cfg.window.k
+    if pos - half < 0 or pos + half + 1 > len(ref_seq):
+        return 0
+    base_fwd = _encode_seq(ref_seq[pos - half: pos + half + 1])
+    meth_fwd = np.zeros(K, dtype=np.uint8)
+    meth_rev = np.zeros(K, dtype=np.uint8)
+    # Overlay every labelled position in the window onto the appropriate strand
+    for k in range(K):
+        win_pos = pos - half + k
+        fwd_id = labels.get((seqid, win_pos, "+"))
+        if fwd_id is not None:
+            meth_fwd[k] = fwd_id
+        rev_id = labels.get((seqid, win_pos, "-"))
+        if rev_id is not None:
+            meth_rev[k] = rev_id
+    # For baseline samples (meth_id == 0), the center is far from labels by
+    # construction (≥ baseline_min_dist); meth_fwd[half]==meth_rev[half]==0.
+    # For meth samples, the center label is already set by the overlay above.
+
+    n_added = 0
+    samples = []
+    for sample in iter_window_samples(
+        bam, bam_fmt, seqid, pos, half, min_mapq=cfg.extract.min_read_qv,
+    ):
+        samples.append(sample)
+    if not samples:
+        return 0
+    # Cap reads per position (random subsample)
+    if len(samples) > cfg.extract.reads_cap_per_position:
+        samples = rng.sample(samples, cfg.extract.reads_cap_per_position)
+    for sample in samples:
+        signal = np.stack(
+            [sample.ipd_fwd, sample.pw_fwd, sample.ipd_rev, sample.pw_rev],
+            axis=-1,
+        ).astype(np.uint8)  # (K, 4)
+        builder["base_fwd"].append(base_fwd)
+        builder["meth_fwd"].append(meth_fwd)
+        builder["meth_rev"].append(meth_rev)
+        builder["signal"].append(signal)
+        builder["category"].append(0 if meth_id == 0 else 1)
+        builder["ref_id"].append(ref_id_idx)
+        builder["ref_pos"].append(pos)
+        builder["strand"].append(1 if strand == "+" else -1)
+        builder["zmw"].append(_hash_zmw(sample.zmw_id))
+        n_added += 1
+    return n_added
+
+
+def extract_strain(
+    manifest_row: dict,
+    output_dir: Path,
+    cfg: KinsimNNConfig,
+) -> None:
+    """Extract a single strain → ``<output_dir>/<sample_id>_shard.pkl``."""
+    sample_id = manifest_row["sample_id"]
+    bam_path = Path(manifest_row["bam_path"])
+    ref_path = Path(manifest_row.get("ref_path", ""))
+    strain_dir = _resolve_strain_dir(manifest_row)
+
+    if not bam_path.is_file():
+        log.error("[%s] BAM missing: %s", sample_id, bam_path)
+        return
+    if not ref_path.is_file():
+        log.error("[%s] Reference missing: %s", sample_id, ref_path)
+        return
+
+    log.info("[%s] BAM=%s  ref=%s  strain_dir=%s", sample_id, bam_path, ref_path, strain_dir)
+
+    ref_seqs = _load_ref_fasta(ref_path)
+    ref_names = list(ref_seqs.keys())
+    ref_name_to_idx = {n: i for i, n in enumerate(ref_names)}
+    log.info("[%s] %d contigs", sample_id, len(ref_seqs))
+
+    # Labels
+    labelers = _build_labelers(cfg)
+    labels = _collect_labels(labelers, cfg, ref_seqs, strain_dir)
+    log.info("[%s] %d labelled positions", sample_id, len(labels))
+
+    # Baselines — use a stable hash so seeding is reproducible across processes
+    # (CPython's builtin hash() of strings is randomized per process).
+    stable_hash = int(hashlib.sha1(sample_id.encode("utf-8")).hexdigest()[:8], 16)
+    rng = random.Random(cfg.train.seed + stable_hash)
+    baseline_positions = _sample_baselines(
+        set(labels.keys()),
+        ref_seqs,
+        cfg.extract.baseline_per_strain,
+        cfg.extract.baseline_min_dist,
+        cfg.window.half_width,
+        rng,
+    )
+    log.info("[%s] %d baseline positions sampled", sample_id, len(baseline_positions))
+
+    # BAM I/O
+    bam_fmt = detect_bam_format(bam_path)
+    log.info("[%s] BAM format: bystrandified=%s tags=(%s, %s, %s, %s)",
+             sample_id, bam_fmt.is_bystrandified,
+             bam_fmt.ipd_fwd_tag, bam_fmt.pw_fwd_tag,
+             bam_fmt.ipd_rev_tag, bam_fmt.pw_rev_tag)
+
+    builder = empty_shard(cfg.window.k)
+    bam = pysam.AlignmentFile(str(bam_path), "rb")
+
+    # Methylated positions
+    n_meth_samples = 0
+    for (rid, pos, strand), mid in labels.items():
+        if rid not in ref_seqs:
+            continue
+        n_meth_samples += _extract_position(
+            bam, bam_fmt, rid, pos, strand, mid,
+            ref_seqs[rid], cfg, rng, builder, ref_name_to_idx[rid], labels,
+        )
+
+    # Baseline positions (meth_id=0)
+    n_baseline_samples = 0
+    for (rid, pos, strand) in baseline_positions:
+        if rid not in ref_seqs:
+            continue
+        n_baseline_samples += _extract_position(
+            bam, bam_fmt, rid, pos, strand, 0,
+            ref_seqs[rid], cfg, rng, builder, ref_name_to_idx[rid], labels,
+        )
+
+    bam.close()
+
+    meta = {
+        "config_version": SHARD_CONFIG_VERSION,
+        "k": cfg.window.k,
+        "half_width": cfg.window.half_width,
+        "n_channels": cfg.window.n_channels,
+        "n_meth_types": cfg.n_meth_types,
+        "meth_id_by_name": cfg.meth_id_by_name,
+        "ref_names": ref_names,
+        "strain_id": sample_id,
+        "git_sha": _git_sha(),
+        "kinsim_nn_version": __version__,
+        "timestamp_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "label_sources": [e.get("type") for e in cfg.labelers],
+        "n_meth_samples": n_meth_samples,
+        "n_baseline_samples": n_baseline_samples,
+    }
+
+    shard = finalize_shard(builder, meta, cfg.window.k)
+    out_path = output_dir / f"{sample_id}_shard.pkl"
+    write_shard(out_path, shard)
+    log.info(
+        "[%s] Done. meth_samples=%d  baseline_samples=%d  shard=%s",
+        sample_id, n_meth_samples, n_baseline_samples, out_path,
+    )
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="kinsim_nn extract", description=__doc__)
+    ap.add_argument("--manifest", required=True, help="Manifest CSV (sample_id, bam_path, motifs, ref_path)")
+    ap.add_argument("--output-dir", required=True, help="Directory to write shards")
+    ap.add_argument("--config", default=None, help="kinsim_nn_config.yaml path")
+    ap.add_argument("--task", type=int, default=None,
+                    help="If set, process ONLY manifest row at this index (0-based, for SLURM array).")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args(argv)
+    setup_logging(verbose=args.verbose)
+
+    cfg = load_config(args.config)
+    manifest = _load_manifest(Path(args.manifest))
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.task is not None:
+        if not (0 <= args.task < len(manifest)):
+            sys.exit(f"--task {args.task} out of range (manifest has {len(manifest)} rows)")
+        extract_strain(manifest[args.task], out_dir, cfg)
+    else:
+        for row in manifest:
+            extract_strain(row, out_dir, cfg)
+
+
+if __name__ == "__main__":
+    main()

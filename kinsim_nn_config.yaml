@@ -1,0 +1,100 @@
+# kinsim_NN — default config
+#
+# All defaults documented here. CLI flags override. See kinsim_NN/DESIGN.md.
+
+# -- Window geometry -----------------------------------------------------
+window:
+  half_width: 10        # window = ±10 ref positions
+  k: 21                 # K = 2*half_width + 1
+  n_channels: 4         # IPD_fwd, PW_fwd, IPD_rev, PW_rev
+
+# -- Methylation types (extensible) --------------------------------------
+# id MUST be unique and start at 0 for 'none'. M = max(id)+1.
+methylation_types:
+  none:
+    id: 0
+  m6A:
+    id: 1
+    modified_base: A
+    label_sources: [gff]
+  m4C:
+    id: 2
+    modified_base: C
+    label_sources: [gff]
+  m5C:
+    id: 3
+    modified_base: C
+    label_sources: [gff, jasmine_mm_ml]
+
+# Treat GFF 'modified_base' (unclassified) as which type? Set to null to ignore.
+treat_modified_base_as: m5C
+
+# -- Labelers (modular) --------------------------------------------------
+# Each entry has a `type` (registered name) and free-form kwargs. Order
+# matters: earlier labelers win on conflicts.
+labelers:
+  - type: gff
+    qv_threshold: 10            # GFF score (modificationQv) cutoff
+    file_pattern: "{strain_dir}/motifs.gff"
+  # Optional second pass for 5mC from jasmine MM/ML tags. Disable by
+  # commenting out if no jasmine output is available.
+  # - type: jasmine_mm_ml
+  #   ml_threshold: 200          # 0-255 scale (~78% confidence)
+  #   file_pattern: "{strain_dir}/jasmine_5mC.bam"
+
+# -- Extract ------------------------------------------------------------
+extract:
+  baseline_min_dist: 20         # min bp from any meth position
+  baseline_per_strain: 50000    # number of baseline samples per strain
+  reads_cap_per_position: 20    # max reads emitted per labeled position
+  min_read_qv: 20               # skip reads with low map quality
+  # Bystrandified pair combination: required if input BAM is bystrandified
+  # (2 records/ZMW). Disabled if raw HiFi aligned (1 record/ZMW with fi/fp/ri/rp).
+  bystrandify_pairing: true
+
+# -- Train / test split -------------------------------------------------
+split:
+  test_strains: [bc2034, bc2045, bc2048, bc2082]
+  # Alternative: random per-shard split
+  # test_fraction: 0.10
+  # split_seed: 42
+
+# -- Model architecture --------------------------------------------------
+model:
+  generator:
+    d_model: 192
+    n_layers: 6
+    n_heads: 6
+    z_dim: 64
+    drop_rate: 0.0
+    pos_embed_dim: 16
+  discriminator:
+    d_model: 128
+    n_layers: 4
+    n_heads: 4
+    spectral_norm: true
+    pos_embed_dim: 16
+
+# -- Training -----------------------------------------------------------
+train:
+  loss: wgan_gp                 # only WGAN-GP supported for now
+  batch_size: 256
+  n_critic: 5                   # D updates per G update
+  gradient_penalty_lambda: 10.0
+  lr_g: 0.0001
+  lr_d: 0.0004                  # TTUR: D is 4x faster
+  beta1: 0.0                    # WGAN-GP standard
+  beta2: 0.9
+  n_steps: 200000
+  checkpoint_every: 5000
+  eval_every: 5000
+  log_every: 100
+  seed: 42
+  num_workers: 4                # DataLoader workers (per-process)
+  pin_memory: true
+
+# -- Generation ---------------------------------------------------------
+generate:
+  use_fraction_bernoulli: true  # Bernoulli sample at each motif site with motif's fraction
+  n_context_skip: 10            # skip first/last K/2 query positions per read (no full window)
+  default_fi_for_unknown: 1     # uint8 value for N-context positions (1 = "no data")
