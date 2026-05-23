@@ -78,10 +78,19 @@ def _load_manifest(manifest_path: Path) -> list[dict]:
 
 
 def _resolve_strain_dir(row: dict) -> Path:
-    """Heuristic: parent of the bam_path; the labeler's ``file_pattern``
-    is resolved against this directory."""
-    bam = Path(row["bam_path"])
-    return bam.parent
+    """Resolve the per-strain "home" directory used by labeler file_patterns.
+
+    Prefers ``parent(ref_path)`` because per-strain artefacts (motifs.gff,
+    motifs.csv, REBASE annotations, jasmine_5mC.bam) are typically placed
+    next to the reference FASTA — not next to the pipeline-produced BAM
+    (which lives under ``pipeline/<strain>/``).
+
+    Falls back to ``parent(bam_path)`` if ``ref_path`` is missing.
+    """
+    ref = row.get("ref_path")
+    if ref:
+        return Path(ref).parent
+    return Path(row["bam_path"]).parent
 
 
 def _load_ref_fasta(ref_path: Path) -> dict[str, str]:
