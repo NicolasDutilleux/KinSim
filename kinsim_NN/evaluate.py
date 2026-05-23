@@ -24,24 +24,11 @@ from .data.dataset import ShardedDataset
 from .data.shard import read_shard
 from .models.generator import TransformerGenerator
 from .utils.config import load_config, setup_logging
+from .utils.metrics import wasserstein_1d as _wasserstein_1d
 from .utils.pacbio_codec import log1p_frames_to_uint8
 
 
 log = logging.getLogger(__name__)
-
-
-def _wasserstein_1d(a: np.ndarray, b: np.ndarray) -> float:
-    """1D Wasserstein-1 distance between two empirical distributions."""
-    if a.size == 0 or b.size == 0:
-        return float("nan")
-    a_sorted = np.sort(a)
-    b_sorted = np.sort(b)
-    # Align lengths by linear interpolation onto a common quantile grid
-    n = min(a_sorted.size, b_sorted.size, 1024)
-    qs = np.linspace(0, 1, n)
-    a_q = np.interp(qs, np.linspace(0, 1, a_sorted.size), a_sorted)
-    b_q = np.interp(qs, np.linspace(0, 1, b_sorted.size), b_sorted)
-    return float(np.mean(np.abs(a_q - b_q)))
 
 
 def _load_generator(ckpt_dir: Path, device: torch.device):

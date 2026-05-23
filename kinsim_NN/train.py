@@ -38,6 +38,7 @@ from .models.discriminator import TransformerDiscriminator
 from .models.generator import TransformerGenerator
 from .utils.config import KinsimNNConfig, load_config, setup_logging
 from .utils.losses import gradient_penalty, wgan_g_loss, wgan_gp_d_loss
+from .utils.metrics import wasserstein_1d as _wasserstein_1d
 from .utils.pacbio_codec import log1p_frames_to_uint8
 
 
@@ -100,7 +101,7 @@ def _build_models(cfg: KinsimNNConfig, device: torch.device):
         n_heads=cfg.model.discriminator.n_heads,
         spectral_norm=cfg.model.discriminator.spectral_norm,
         pos_embed_dim=cfg.model.discriminator.pos_embed_dim,
-        drop_rate=0.0,
+        drop_rate=cfg.model.discriminator.drop_rate,
     ).to(device)
     n_g = sum(p.numel() for p in g.parameters())
     n_d = sum(p.numel() for p in d.parameters())
@@ -152,23 +153,13 @@ def _cond_kwargs(batch):
     }
 
 
-def _save_checkpoint(path: Path, model, optimizer, step: int) -> None:
+def _save_checkpoint(path: Path, model, optimizer, step: int, epoch: int = 0) -> None:
     torch.save({
         "state_dict": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "step": step,
+        "epoch": epoch,
     }, path)
-
-
-def _wasserstein_1d(a: np.ndarray, b: np.ndarray) -> float:
-    """1D Wasserstein-1 distance via sorted-quantile interpolation."""
-    if a.size == 0 or b.size == 0:
-        return float("nan")
-    n = min(a.size, b.size, 1024)
-    qs = np.linspace(0.0, 1.0, n)
-    aq = np.interp(qs, np.linspace(0.0, 1.0, a.size), np.sort(a))
-    bq = np.interp(qs, np.linspace(0.0, 1.0, b.size), np.sort(b))
-    return float(np.mean(np.abs(aq - bq)))
 
 
 @torch.no_grad()
@@ -187,8 +178,9 @@ def _evaluate_on_shards(
     g.eval()
     real_by_m: dict[int, list[int]] = {}
     gen_by_m: dict[int, list[int]] = {}
+    cap_total = max_samples * n_meth_types
     for p in test_shard_paths:
-        if sum(len(v) for v in real_by_m.values()) >= max_samples * 4:
+        if sum(len(v) for v in real_by_m.values()) >= cap_total:
             break
         try:
             shard = read_shard(p)
@@ -272,13 +264,15 @@ def train(
         shuffle_rows=True,
         seed=cfg.train.seed,
     )
+    # ``drop_last`` is ignored by PyTorch for IterableDataset (≤ 2.4) — we
+    # don't set it. The training loop handles the partial-batch case via
+    # try/except StopIteration on the iterator.
     loader = DataLoader(
         dataset,
         batch_size=cfg.train.batch_size,
         num_workers=cfg.train.num_workers,
         pin_memory=cfg.train.pin_memory,
         collate_fn=_collate,
-        drop_last=True,
     )
 
     # Models
@@ -289,6 +283,7 @@ def train(
                              betas=(cfg.train.beta1, cfg.train.beta2))
 
     start_step = 0
+    start_epoch = 0
     if resume:
         g_path = ckpt_dir / "G.pt"
         d_path = ckpt_dir / "D.pt"
@@ -307,7 +302,9 @@ def train(
             model.load_state_dict(ckpt["state_dict"])
             opt.load_state_dict(ckpt["optimizer"])
             start_step = max(start_step, int(ckpt.get("step", 0)))
-            log.info("Resumed %s from %s (step %d)", label, p, start_step)
+            start_epoch = max(start_epoch, int(ckpt.get("epoch", 0)))
+            log.info("Resumed %s from %s (step %d, epoch %d)",
+                     label, p, start_step, start_epoch)
 
     # Don't overwrite model_config.json on resume — silently bumping it can
     # break a checkpoint if the YAML changed between runs.
@@ -341,9 +338,9 @@ def train(
     n_steps = cfg.train.n_steps
     best_w1 = float("inf")
 
-    # On resume, jump the epoch counter forward so shuffle order differs from
-    # the freshly-loaded shard order. Otherwise stay at 0 (the default).
-    epoch = start_step // 1000 if start_step > 0 else 0
+    # Restore the EXACT epoch counter saved at the previous checkpoint, so
+    # the per-epoch shuffle is reproducible across pause/resume.
+    epoch = start_epoch
     if epoch > 0:
         dataset.set_epoch(epoch)
     data_iter = iter(loader)
@@ -431,9 +428,9 @@ def train(
 
             # Checkpoint
             if step % cfg.train.checkpoint_every == 0:
-                _save_checkpoint(ckpt_dir / "G.pt", g, opt_g, step)
-                _save_checkpoint(ckpt_dir / "D.pt", d, opt_d, step)
-                log.info("Checkpointed at step %d", step)
+                _save_checkpoint(ckpt_dir / "G.pt", g, opt_g, step, epoch)
+                _save_checkpoint(ckpt_dir / "D.pt", d, opt_d, step, epoch)
+                log.info("Checkpointed at step %d (epoch %d)", step, epoch)
 
             # Held-out evaluation (Wasserstein-1 per meth type)
             if (
@@ -456,12 +453,12 @@ def train(
                 )
                 if w1_overall < best_w1 and not np.isnan(w1_overall):
                     best_w1 = w1_overall
-                    _save_checkpoint(ckpt_dir / "best_G.pt", g, opt_g, step)
+                    _save_checkpoint(ckpt_dir / "best_G.pt", g, opt_g, step, epoch)
                     log.info("New best G (w1_overall=%.3f) at step %d", best_w1, step)
 
     finally:
-        _save_checkpoint(ckpt_dir / "G.pt", g, opt_g, step)
-        _save_checkpoint(ckpt_dir / "D.pt", d, opt_d, step)
+        _save_checkpoint(ckpt_dir / "G.pt", g, opt_g, step, epoch)
+        _save_checkpoint(ckpt_dir / "D.pt", d, opt_d, step, epoch)
         csv_f.close()
         tb.close()
 

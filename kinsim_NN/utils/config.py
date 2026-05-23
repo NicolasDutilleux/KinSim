@@ -70,6 +70,7 @@ class DiscriminatorParams:
     n_heads: int = 4
     spectral_norm: bool = True
     pos_embed_dim: int = 16
+    drop_rate: float = 0.0
 
 
 @dataclass(frozen=True)

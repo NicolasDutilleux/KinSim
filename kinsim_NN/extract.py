@@ -29,8 +29,6 @@ from pathlib import Path
 import numpy as np
 import pysam
 
-from kinsim.utils.encoding import BASE_MAP
-
 from . import __version__
 from .data.shard import (
     SHARD_CONFIG_VERSION,
@@ -45,39 +43,14 @@ from .utils.bam_io import (
     iter_window_samples,
 )
 from .utils.config import KinsimNNConfig, load_config, setup_logging
+from .utils.encoding import N_BASE_COUNT, encode_seq
 
 
 log = logging.getLogger(__name__)
 
 
-# Single source of truth: kinsim's BASE_MAP {A:0, C:1, G:2, T:3}. Lowercase
-# aliases for case-insensitive input.
-_BASE_TO_CODE = dict(BASE_MAP)
-_BASE_TO_CODE.update({b.lower(): i for b, i in BASE_MAP.items()})
-
-# Global counter of non-ACGT bases encountered (logged at end of extract run).
-_N_BASE_COUNT = [0]
-
-
-def _encode_seq(seq: str) -> np.ndarray:
-    """Encode a K-mer (case-insensitive ACGT) → uint8 (K,).
-
-    Non-ACGT bases (N, masked, IUPAC ambiguity codes) are encoded as A
-    (code 0). The total count is tracked in :data:`_N_BASE_COUNT` and
-    reported at the end of each strain's extract run so the user can
-    catch hard-masked genomes.
-    """
-    arr = np.empty(len(seq), dtype=np.uint8)
-    n_count = 0
-    for i, b in enumerate(seq):
-        c = _BASE_TO_CODE.get(b)
-        if c is None:
-            arr[i] = 0
-            n_count += 1
-        else:
-            arr[i] = c
-    _N_BASE_COUNT[0] += n_count
-    return arr
+# Base encoding lives in kinsim_NN.utils.encoding (single source of truth).
+_encode_seq = encode_seq
 
 
 def _git_sha() -> str:
@@ -406,16 +379,16 @@ def extract_strain(
     log.info(
         "[%s] Done. meth_samples=%d  baseline_samples=%d  shard=%s  "
         "non_ACGT_bases_silently_encoded_as_A=%d",
-        sample_id, n_meth_samples, n_baseline_samples, out_path, _N_BASE_COUNT[0],
+        sample_id, n_meth_samples, n_baseline_samples, out_path, N_BASE_COUNT[0],
     )
-    if _N_BASE_COUNT[0] > 1000:
+    if N_BASE_COUNT[0] > 1000:
         log.warning(
             "[%s] %d non-ACGT bases were silently encoded as A. "
             "Consider hard-masking ambiguity to N in the reference or adding "
             "a 5th class to the base alphabet.",
-            sample_id, _N_BASE_COUNT[0],
+            sample_id, N_BASE_COUNT[0],
         )
-    _N_BASE_COUNT[0] = 0  # reset for next strain in batched runs
+    N_BASE_COUNT[0] = 0  # reset for next strain in batched runs
 
 
 def main(argv=None):

@@ -21,10 +21,20 @@ import torch.nn.functional as F
 
 
 def maybe_spectral_norm(module: nn.Module, apply: bool = True) -> nn.Module:
-    """Apply ``nn.utils.spectral_norm`` in-place if ``apply`` is True."""
-    if apply:
-        return nn.utils.spectral_norm(module)
-    return module
+    """Apply spectral normalisation in-place if ``apply`` is True.
+
+    Prefers the modern :func:`torch.nn.utils.parametrizations.spectral_norm`
+    API (PyTorch ≥ 1.12) which composes cleanly with double-backward (needed
+    for WGAN-GP's gradient penalty). Falls back to the legacy
+    :func:`torch.nn.utils.spectral_norm` if the new API is unavailable.
+    """
+    if not apply:
+        return module
+    try:
+        from torch.nn.utils.parametrizations import spectral_norm as _sn
+    except ImportError:
+        _sn = nn.utils.spectral_norm
+    return _sn(module)
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:

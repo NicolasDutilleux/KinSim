@@ -39,7 +39,6 @@ import numpy as np
 import pysam
 import torch
 
-from kinsim.utils.encoding import BASE_MAP
 from kinsim.utils.motifs import (
     load_motif_string,
     parse_motifs_per_strand,
@@ -50,6 +49,7 @@ from kinsim.utils.motifs import (
 from . import __version__
 from .models.generator import TransformerGenerator
 from .utils.config import load_config, setup_logging
+from .utils.encoding import encode_seq
 from .utils.pacbio_codec import log1p_frames_to_uint8
 
 
@@ -165,18 +165,8 @@ def _load_generator(ckpt_dir: Path, device: torch.device) -> tuple[TransformerGe
 # ---------------------------------------------------------------------------
 
 
-# Reuse kinsim's BASE_MAP {A:0, C:1, G:2, T:3} for consistency with extract
-# and with shard storage. Lowercase aliases for case-insensitive input.
-_BASE_TO_CODE = dict(BASE_MAP)
-_BASE_TO_CODE.update({b.lower(): i for b, i in BASE_MAP.items()})
-
-
-def _encode_seq(seq: str) -> np.ndarray:
-    """Encode an ACGT(case-insensitive) string to uint8 codes. N → A (0)."""
-    return np.fromiter(
-        (_BASE_TO_CODE.get(b, 0) for b in seq),
-        dtype=np.uint8, count=len(seq),
-    )
+# Single source of truth: kinsim_NN.utils.encoding (delegates to kinsim's BASE_MAP).
+_encode_seq = encode_seq
 
 
 _RC_TABLE = np.array([3, 2, 1, 0], dtype=np.uint8)
