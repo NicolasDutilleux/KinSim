@@ -20,21 +20,37 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+_LEGACY_SN_WARNED = False
+
+
 def maybe_spectral_norm(module: nn.Module, apply: bool = True) -> nn.Module:
     """Apply spectral normalisation in-place if ``apply`` is True.
 
     Prefers the modern :func:`torch.nn.utils.parametrizations.spectral_norm`
     API (PyTorch ≥ 1.12) which composes cleanly with double-backward (needed
-    for WGAN-GP's gradient penalty). Falls back to the legacy
-    :func:`torch.nn.utils.spectral_norm` if the new API is unavailable.
+    for WGAN-GP's gradient penalty). The legacy
+    :func:`torch.nn.utils.spectral_norm` is known to leak / break with
+    create_graph=True on some torch versions — we use it only as a last
+    resort and warn loudly so a silent fallback can't ship to a training
+    run unnoticed.
     """
     if not apply:
         return module
     try:
         from torch.nn.utils.parametrizations import spectral_norm as _sn
+        return _sn(module)
     except ImportError:
-        _sn = nn.utils.spectral_norm
-    return _sn(module)
+        global _LEGACY_SN_WARNED
+        if not _LEGACY_SN_WARNED:
+            import logging
+            logging.getLogger(__name__).warning(
+                "torch.nn.utils.parametrizations.spectral_norm is unavailable "
+                "(torch < 1.12). Falling back to legacy nn.utils.spectral_norm — "
+                "this is known to be flaky with WGAN-GP's double-backward. "
+                "Upgrade torch ≥ 1.12 if D loss diverges in the first ~100 steps."
+            )
+            _LEGACY_SN_WARNED = True
+        return nn.utils.spectral_norm(module)
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:

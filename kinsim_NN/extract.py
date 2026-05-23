@@ -242,16 +242,24 @@ def _extract_position(
     # For meth samples, the center label is already set by the overlay above.
 
     n_added = 0
-    samples = []
+    # Reservoir sampling: keep at most ``reads_cap_per_position`` samples
+    # without materialising all of them in memory. Memory is O(cap), not
+    # O(coverage) — useful at high-coverage strains.
+    cap = int(cfg.extract.reads_cap_per_position)
+    samples: list = []
+    n_seen = 0
     for sample in iter_window_samples(
         bam, bam_fmt, seqid, pos, half, min_mapq=cfg.extract.min_mapq,
     ):
-        samples.append(sample)
+        n_seen += 1
+        if len(samples) < cap:
+            samples.append(sample)
+        else:
+            j = rng.randrange(n_seen)
+            if j < cap:
+                samples[j] = sample
     if not samples:
         return 0
-    # Cap reads per position (random subsample)
-    if len(samples) > cfg.extract.reads_cap_per_position:
-        samples = rng.sample(samples, cfg.extract.reads_cap_per_position)
     for sample in samples:
         signal = np.stack(
             [sample.ipd_fwd, sample.pw_fwd, sample.ipd_rev, sample.pw_rev],

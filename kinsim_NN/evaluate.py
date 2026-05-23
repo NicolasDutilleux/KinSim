@@ -126,20 +126,23 @@ def evaluate(
             mf_center = shard.meth_fwd[start:stop, half]
             mr_center = shard.meth_rev[start:stop, half]
             # Pool from the IPD channel matching the strand of the methylation:
-            # meth_fwd > 0 → IPD_fwd (channel 0); meth_rev > 0 → IPD_rev (channel 2).
-            # Baseline (both zero) → IPD_fwd by convention.
+            # meth_fwd > 0 → IPD_fwd (ch 0); meth_rev > 0 → IPD_rev (ch 2).
+            # Baseline (both zero) → BOTH channels (pool fwd AND rev so under-fit
+            # of either is visible in W1).
             for i in range(real_centers.shape[0]):
                 if mf_center[i] > 0:
                     m_id = int(mf_center[i])
-                    ch = 0
+                    pooled_real[m_id].append(int(real_centers[i, 0]))
+                    pooled_gen[m_id].append(int(gen_centers[i, 0]))
                 elif mr_center[i] > 0:
                     m_id = int(mr_center[i])
-                    ch = 2
+                    pooled_real[m_id].append(int(real_centers[i, 2]))
+                    pooled_gen[m_id].append(int(gen_centers[i, 2]))
                 else:
-                    m_id = 0
-                    ch = 0
-                pooled_real[m_id].append(int(real_centers[i, ch]))
-                pooled_gen[m_id].append(int(gen_centers[i, ch]))
+                    pooled_real[0].append(int(real_centers[i, 0]))
+                    pooled_gen[0].append(int(gen_centers[i, 0]))
+                    pooled_real[0].append(int(real_centers[i, 2]))
+                    pooled_gen[0].append(int(gen_centers[i, 2]))
 
     # Write summary TSV
     out = Path(str(output_prefix) + "_stats.tsv")

@@ -31,19 +31,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, IterableDataset
 
+from ..utils.encoding import BASE_RC as _BASE_RC
 from ..utils.pacbio_codec import FRAMES_TABLE
 from .shard import ShardData, read_shard
 
 
 log = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Static lookup tables (numpy)
-# ---------------------------------------------------------------------------
-
-# Base codes: A=0, C=1, G=2, T=3
-_BASE_RC = np.array([3, 2, 1, 0], dtype=np.uint8)  # A↔T, C↔G
 
 # log1p(frames) per uint8 byte (uses PacBio codec lookup)
 _LOG1P_FRAMES = np.log1p(FRAMES_TABLE.astype(np.float32))

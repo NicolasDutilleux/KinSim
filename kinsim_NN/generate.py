@@ -49,6 +49,7 @@ from kinsim.utils.motifs import (
 from . import __version__
 from .models.generator import TransformerGenerator
 from .utils.config import load_config, setup_logging
+from .utils.encoding import BASE_RC as _RC_TABLE
 from .utils.encoding import encode_seq
 from .utils.pacbio_codec import log1p_frames_to_uint8
 
@@ -169,9 +170,6 @@ def _load_generator(ckpt_dir: Path, device: torch.device) -> tuple[TransformerGe
 _encode_seq = encode_seq
 
 
-_RC_TABLE = np.array([3, 2, 1, 0], dtype=np.uint8)
-
-
 @torch.no_grad()
 def _generate_signal_batched(
     g: TransformerGenerator,
@@ -207,32 +205,57 @@ def _generate_signal_batched(
     return out_np[:, K // 2].astype(np.float32)           # (B, 4)
 
 
-def _build_meth_window(
-    fwd_map: np.ndarray,                # (L_ref,) uint8 — meth_id per fwd-strand position
-    rev_map: np.ndarray,                # (L_ref,) uint8 — meth_id per rev-strand position (fwd coords)
+def _draw_read_effective_meth(
+    fwd_map: np.ndarray,                # (L_ref,) uint8
+    rev_map: np.ndarray,                # (L_ref,) uint8
     fwd_frac: np.ndarray,               # (L_ref,) float32
     rev_frac: np.ndarray,               # (L_ref,) float32
-    ref_pos_window: np.ndarray,         # (K,) int64 — reference positions in window
     rng: random.Random,
     use_bernoulli: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Slice the per-contig meth/frac maps to the window, then apply per-site
-    Bernoulli on ``fraction`` if requested. Returns (meth_fwd[K], meth_rev[K])."""
+    """Draw ONE Bernoulli per labelled site for this read.
+
+    Returns ``(eff_fwd, eff_rev)``: same shape as the input maps but with
+    non-firing labelled sites zeroed out. The drawn maps are kept for
+    the WHOLE read so adjacent sliding-window queries see consistent
+    conditioning (the bug C1 from the audit: previously rng was rolled
+    once per (window, site) which made the same site flip on/off as the
+    window slid).
+
+    For long contigs the copy is O(L) but L≪corpus size and we do this
+    once per read, not per query position.
+    """
+    eff_fwd = fwd_map.copy()
+    eff_rev = rev_map.copy()
+    if not use_bernoulli:
+        return eff_fwd, eff_rev
+    fwd_idx = np.flatnonzero(eff_fwd)
+    rev_idx = np.flatnonzero(eff_rev)
+    for i in fwd_idx:
+        if rng.random() > float(fwd_frac[i]):
+            eff_fwd[i] = 0
+    for i in rev_idx:
+        if rng.random() > float(rev_frac[i]):
+            eff_rev[i] = 0
+    return eff_fwd, eff_rev
+
+
+def _build_meth_window(
+    eff_fwd: np.ndarray,                # (L_ref,) uint8 — per-read effective fwd meth
+    eff_rev: np.ndarray,                # (L_ref,) uint8 — per-read effective rev meth
+    ref_pos_window: np.ndarray,         # (K,) int64 — reference positions in window
+) -> tuple[np.ndarray, np.ndarray]:
+    """Slice the per-read effective meth maps to the window. No Bernoulli
+    here — :func:`_draw_read_effective_meth` already applied it."""
     K = ref_pos_window.shape[0]
     meth_fwd = np.zeros(K, dtype=np.uint8)
     meth_rev = np.zeros(K, dtype=np.uint8)
-    L = fwd_map.shape[0]
-    for i in range(K):
-        rp = int(ref_pos_window[i])
-        if rp < 0 or rp >= L:
-            continue
-        mf, mr = int(fwd_map[rp]), int(rev_map[rp])
-        if mf > 0:
-            if (not use_bernoulli) or rng.random() <= float(fwd_frac[rp]):
-                meth_fwd[i] = mf
-        if mr > 0:
-            if (not use_bernoulli) or rng.random() <= float(rev_frac[rp]):
-                meth_rev[i] = mr
+    L = eff_fwd.shape[0]
+    valid = (ref_pos_window >= 0) & (ref_pos_window < L)
+    if valid.any():
+        valid_pos = ref_pos_window[valid]
+        meth_fwd[valid] = eff_fwd[valid_pos]
+        meth_rev[valid] = eff_rev[valid_pos]
     return meth_fwd, meth_rev
 
 
@@ -278,6 +301,12 @@ def _process_mapped_read(
     pair_arr = np.asarray(pairs, dtype=np.int64)
     is_rev = bool(read.is_reverse)
 
+    # ONE Bernoulli draw per (read, labelled site) — fixed for the duration
+    # of this read so adjacent window queries see consistent conditioning.
+    eff_fwd, eff_rev = _draw_read_effective_meth(
+        fwd_map, rev_map, fwd_frac, rev_frac, rng, use_bernoulli,
+    )
+
     # Gather all windows that pass filtering, then batch G calls
     windows = []
     for q_pos, r_pos in pair_arr:
@@ -287,9 +316,7 @@ def _process_mapped_read(
             continue
         base_fwd = _encode_seq(ref_seq[r_pos - half_width: r_pos + half_width + 1])
         ref_window = np.arange(r_pos - half_width, r_pos + half_width + 1, dtype=np.int64)
-        meth_fwd, meth_rev = _build_meth_window(
-            fwd_map, rev_map, fwd_frac, rev_frac, ref_window, rng, use_bernoulli,
-        )
+        meth_fwd, meth_rev = _build_meth_window(eff_fwd, eff_rev, ref_window)
         windows.append((int(q_pos), base_fwd, meth_fwd, meth_rev))
     if not windows:
         return fi, fp, ri, rp
@@ -319,7 +346,6 @@ def _process_mapped_read(
 def _process_unmapped_read(
     read: pysam.AlignedSegment,
     motif_string: str,
-    meth_id_by_name: dict[str, int],
     g: TransformerGenerator,
     n_meth_types: int,
     half_width: int,
@@ -353,14 +379,17 @@ def _process_unmapped_read(
     fmap, rmap = fwd_map_q["_query"], rev_map_q["_query"]
     ffrac, rfrac = fwd_frac_q["_query"], rev_frac_q["_query"]
 
+    # ONE Bernoulli draw per (read, labelled site) — fixed for this read.
+    eff_fwd, eff_rev = _draw_read_effective_meth(
+        fmap, rmap, ffrac, rfrac, rng, use_bernoulli,
+    )
+
     windows = []
     for q_pos in range(max(half_width, n_context_skip),
                        qlen - max(half_width, n_context_skip)):
         base_fwd = _encode_seq(qseq[q_pos - half_width: q_pos + half_width + 1])
         ref_window = np.arange(q_pos - half_width, q_pos + half_width + 1, dtype=np.int64)
-        meth_fwd, meth_rev = _build_meth_window(
-            fmap, rmap, ffrac, rfrac, ref_window, rng, use_bernoulli,
-        )
+        meth_fwd, meth_rev = _build_meth_window(eff_fwd, eff_rev, ref_window)
         windows.append((q_pos, base_fwd, meth_fwd, meth_rev))
     if not windows:
         return fi, fp, ri, rp
@@ -464,7 +493,6 @@ def generate(
             result = _process_unmapped_read(
                 read=read,
                 motif_string=motif_string,
-                meth_id_by_name=model_cfg["meth_id_by_name"],
                 g=g,
                 n_meth_types=n_meth_types,
                 half_width=half_width,

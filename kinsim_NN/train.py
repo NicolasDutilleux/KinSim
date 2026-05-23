@@ -214,14 +214,22 @@ def _evaluate_on_shards(
         mf = shard.meth_fwd[idxs, half]
         mr = shard.meth_rev[idxs, half]
         for i in range(real_u8.shape[0]):
+            # Bilateral pooling: meth on a strand → that strand's IPD only.
+            # Baseline (both zero) → BOTH channels so under-fit of either is
+            # visible in W1.
             if mf[i] > 0:
-                m_id, ch = int(mf[i]), 0
+                m_id = int(mf[i])
+                real_by_m.setdefault(m_id, []).append(int(real_u8[i, 0]))
+                gen_by_m.setdefault(m_id, []).append(int(gen_u8[i, 0]))
             elif mr[i] > 0:
-                m_id, ch = int(mr[i]), 2
+                m_id = int(mr[i])
+                real_by_m.setdefault(m_id, []).append(int(real_u8[i, 2]))
+                gen_by_m.setdefault(m_id, []).append(int(gen_u8[i, 2]))
             else:
-                m_id, ch = 0, 0
-            real_by_m.setdefault(m_id, []).append(int(real_u8[i, ch]))
-            gen_by_m.setdefault(m_id, []).append(int(gen_u8[i, ch]))
+                real_by_m.setdefault(0, []).append(int(real_u8[i, 0]))
+                gen_by_m.setdefault(0, []).append(int(gen_u8[i, 0]))
+                real_by_m.setdefault(0, []).append(int(real_u8[i, 2]))
+                gen_by_m.setdefault(0, []).append(int(gen_u8[i, 2]))
     g.train()
     out: dict[str, float] = {}
     all_real, all_gen = [], []
