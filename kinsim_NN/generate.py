@@ -69,7 +69,6 @@ log = logging.getLogger(__name__)
 def _build_strand_meth_maps(
     ref_seqs: dict[str, str],
     motif_string: str,
-    meth_id_by_name: dict[str, int],
 ) -> tuple[
     dict[str, np.ndarray],
     dict[str, np.ndarray],
@@ -266,11 +265,16 @@ def _process_mapped_read(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Generate fi/fp/ri/rp for all query positions of an aligned read.
 
-    Strand handling: for reverse-mapped reads, BAM stores B:C tag arrays
-    in synthesis-strand orientation (which is the reverse complement of
-    forward-ref direction). We therefore (a) flip the query index
-    (synthesis_q = qlen - 1 - q) and (b) swap the channel pairs so the
-    forward-ref signal channel 0/1 lands on what BAM calls ri/rp.
+    Strand routing matches ``kinsim2.generate._route_strands``: the model
+    emits (ipd_fwd, pw_fwd, ipd_rev, pw_rev) where ipd_fwd is + strand
+    methylation kinetics. PacBio BAM convention:
+
+      * is_reverse=False : fi←ipd_rev, fp←pw_rev, ri←ipd_fwd, rp←pw_fwd
+      * is_reverse=True  : fi←ipd_fwd, fp←pw_fwd, ri←ipd_rev, rp←pw_rev
+
+    No query-position flip is needed: pysam's get_aligned_pairs returns
+    q_pos already in BAM-storage order, and we want to write tags in the
+    same BAM-storage order.
     """
     qlen = read.query_length
     fi = np.full(qlen, default_value, dtype=np.uint8)
@@ -307,19 +311,18 @@ def _process_mapped_read(
         mr = np.stack([w[3] for w in chunk], axis=0)
         centers = _generate_signal_batched(g, bf, mf, mr, n_meth_types, device)
         u8 = log1p_frames_to_uint8(centers)                  # (B, 4) uint8
+        # Channel layout in u8: (IPD_fwd=+, PW_fwd=+, IPD_rev=−, PW_rev=−)
         for j, (q_pos, _, _, _) in enumerate(chunk):
             if is_rev:
-                # BAM stores arrays in synthesis-strand orientation for rev reads
-                idx = qlen - 1 - q_pos
-                fi[idx] = u8[j, 2]   # ref's IPD_rev → synthesis-fwd's fi
-                fp[idx] = u8[j, 3]
-                ri[idx] = u8[j, 0]
-                rp[idx] = u8[j, 1]
+                fi[q_pos] = u8[j, 0]   # ipd_fwd
+                fp[q_pos] = u8[j, 1]   # pw_fwd
+                ri[q_pos] = u8[j, 2]   # ipd_rev
+                rp[q_pos] = u8[j, 3]   # pw_rev
             else:
-                fi[q_pos] = u8[j, 0]
-                fp[q_pos] = u8[j, 1]
-                ri[q_pos] = u8[j, 2]
-                rp[q_pos] = u8[j, 3]
+                fi[q_pos] = u8[j, 2]   # ipd_rev (BAM fi = − strand kinetics)
+                fp[q_pos] = u8[j, 3]   # pw_rev
+                ri[q_pos] = u8[j, 0]   # ipd_fwd
+                rp[q_pos] = u8[j, 1]   # pw_fwd
     return fi, fp, ri, rp
 
 
@@ -355,7 +358,7 @@ def _process_unmapped_read(
     # Scan motifs against THIS read's sequence (it serves as the "reference"
     # for an unaligned read).
     fwd_map_q, rev_map_q, fwd_frac_q, rev_frac_q = _build_strand_meth_maps(
-        {"_query": qseq}, motif_string, meth_id_by_name,
+        {"_query": qseq}, motif_string,
     )
     fmap, rmap = fwd_map_q["_query"], rev_map_q["_query"]
     ffrac, rfrac = fwd_frac_q["_query"], rev_frac_q["_query"]
@@ -379,11 +382,15 @@ def _process_unmapped_read(
         mr = np.stack([w[3] for w in chunk], axis=0)
         centers = _generate_signal_batched(g, bf, mf, mr, n_meth_types, device)
         u8 = log1p_frames_to_uint8(centers)
+        # Unmapped reads have no alignment direction. Treat the query
+        # sequence as the molecule's natural synthesis-order strand, so
+        # fi (pass 1) captures − strand kinetics and ri captures +. Same
+        # as the forward-mapped branch.
         for j, (q_pos, _, _, _) in enumerate(chunk):
-            fi[q_pos] = u8[j, 0]
-            fp[q_pos] = u8[j, 1]
-            ri[q_pos] = u8[j, 2]
-            rp[q_pos] = u8[j, 3]
+            fi[q_pos] = u8[j, 2]   # ipd_rev
+            fp[q_pos] = u8[j, 3]   # pw_rev
+            ri[q_pos] = u8[j, 0]   # ipd_fwd
+            rp[q_pos] = u8[j, 1]   # pw_fwd
     return fi, fp, ri, rp
 
 
@@ -427,11 +434,12 @@ def generate(
     if not motif_string:
         log.warning("Empty motif string from %s — generate will produce baseline-only kinetics",
                     motifs_csv)
-    n_motifs = motif_string.count(";") + 1 if motif_string else 0
+    # Count entries by splitting on ; and dropping empties (handles trailing ;).
+    n_motifs = sum(1 for e in motif_string.split(";") if e.strip()) if motif_string else 0
     log.info("Loaded %d motifs from %s", n_motifs, motifs_csv)
 
     fwd_maps, rev_maps, fwd_fracs, rev_fracs = _build_strand_meth_maps(
-        ref_seqs, motif_string, model_cfg["meth_id_by_name"],
+        ref_seqs, motif_string,
     )
     total_sites = sum(
         int(np.count_nonzero(fwd_maps[r])) + int(np.count_nonzero(rev_maps[r]))

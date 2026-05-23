@@ -84,9 +84,15 @@ def uint8_to_log1p_frames(arr: np.ndarray) -> np.ndarray:
 
 def log1p_frames_to_uint8(arr: np.ndarray) -> np.ndarray:
     """Convenience: log1p(frames) → uint8 BAM byte. Inverse of
-    :func:`uint8_to_log1p_frames` up to bucket-rounding precision."""
+    :func:`uint8_to_log1p_frames` up to bucket-rounding precision.
+
+    The log1p input is clipped to ``[0, log1p(MAX_FRAMES)] ≈ [0, 6.86]``
+    before exponentiation so an unbounded generator early in training
+    can't push expm1 into int32 overflow.
+    """
+    max_log = float(np.log1p(FRAMES_TABLE[-1]))   # log1p(952) ≈ 6.86
+    arr = np.clip(arr, 0.0, max_log)
     frames = np.expm1(arr)
-    frames = np.maximum(frames, 0.0)
     return frames_to_uint8(np.rint(frames).astype(np.int32))
 
 

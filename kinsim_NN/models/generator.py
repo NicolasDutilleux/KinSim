@@ -55,9 +55,10 @@ class TransformerGenerator(nn.Module):
         )
         self.input_proj = nn.Linear(in_features, d_model, bias=True)
 
-        # Learned positional embedding (K positions)
-        self.pos_embed = nn.Parameter(torch.zeros(k, pos_embed_dim))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        # Learned positional embedding (K positions) — trunc-normal init.
+        self.pos_embed = nn.Parameter(
+            nn.init.trunc_normal_(torch.empty(k, pos_embed_dim), std=0.02)
+        )
 
         # z → conditioning vector for AdaLN
         # We give a fairly rich z embedding: sinusoidal of each z dim

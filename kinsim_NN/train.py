@@ -7,12 +7,11 @@ training benefits from fine control over optimizer steps, EMA, and
 checkpoint policy.
 
 Outputs (under ``--ckpt-dir``):
-    G.pt                       latest generator state
-    D.pt                       latest discriminator state
-    optG.pt / optD.pt          optimizer states
-    best_G.pt                  generator with best held-out Wasserstein
+    G.pt                       latest generator state + Adam state + step
+    D.pt                       latest discriminator state + Adam state + step
+    best_G.pt                  generator at the lowest held-out W1
     model_config.json          frozen architecture + config (for generate/evaluate)
-    metrics.csv                per-step losses
+    metrics.csv                per-step losses + per-eval W1
     tb/...                     TensorBoard logs
 """
 from __future__ import annotations
@@ -198,6 +197,9 @@ def _evaluate_on_shards(
         if shard.n == 0:
             continue
         ds = ShardedDataset(shard, n_meth_types)
+        # Deterministic per-shard index choice (seed 0) so consecutive eval
+        # calls compare W1 on the SAME subset → drift across steps reflects
+        # model change, not sampling noise.
         idxs = np.random.default_rng(0).permutation(shard.n)[:max_samples]
         batch_items = [ds[int(i)] for i in idxs]
         batch = {
@@ -391,12 +393,19 @@ def train(
             batch = _to_device(batch, device)
             bsz = batch["signal"].size(0)
             z = g.sample_z(bsz, device=device)
+            # Freeze D params during G step — autograd still flows back to G
+            # but D's grads (which we'd zero anyway next D step) don't allocate
+            # memory or accumulate. Re-enable right after.
+            for p in d.parameters():
+                p.requires_grad_(False)
             fake = _g_forward(g, batch, z)
             d_fake = _d_forward(d, fake, batch)
             g_loss = wgan_g_loss(d_fake)
             opt_g.zero_grad(set_to_none=True)
             g_loss.backward()
             opt_g.step()
+            for p in d.parameters():
+                p.requires_grad_(True)
 
             step += 1
 

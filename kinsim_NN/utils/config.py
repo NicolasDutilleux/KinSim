@@ -181,13 +181,21 @@ def load_config(path: str | Path | None = None) -> KinsimNNConfig:
     if not any(t.name == "none" for t in meth_types):
         raise ValueError("methylation_types must include 'none' (id=0)")
 
+    # Normalise split.test_strains to a tuple of stripped strings (YAML
+    # returns a list which would diverge from the CLI tuple).
+    split_raw = dict(raw.get("split") or {})
+    if "test_strains" in split_raw and split_raw["test_strains"] is not None:
+        split_raw["test_strains"] = tuple(
+            str(s).strip() for s in split_raw["test_strains"] if str(s).strip()
+        )
+
     return KinsimNNConfig(
         window=win,
         methylation_types=tuple(meth_types),
         treat_modified_base_as=raw.get("treat_modified_base_as"),
         labelers=tuple(raw.get("labelers") or []),
         extract=ExtractParams(**(raw.get("extract") or {})),
-        split=SplitParams(**(raw.get("split") or {})),
+        split=SplitParams(**split_raw),
         model=ModelParams(
             generator=GeneratorParams(**(raw.get("model", {}).get("generator") or {})),
             discriminator=DiscriminatorParams(**(raw.get("model", {}).get("discriminator") or {})),

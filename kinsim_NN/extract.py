@@ -420,7 +420,12 @@ def extract_strain(
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="kinsim_nn extract", description=__doc__)
-    ap.add_argument("--manifest", required=True, help="Manifest CSV (sample_id, bam_path, motifs, ref_path)")
+    ap.add_argument(
+        "--manifest", required=True,
+        help="Manifest CSV with sample_id + bam_path + ref_path columns. "
+             "Methylation labels are located via labeler file_pattern (typically "
+             "{strain_dir}/motifs.gff), not via a 'motifs' column.",
+    )
     ap.add_argument("--output-dir", required=True, help="Directory to write shards")
     ap.add_argument("--config", default=None, help="kinsim_nn_config.yaml path")
     ap.add_argument("--task", type=int, default=None,

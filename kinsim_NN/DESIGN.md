@@ -121,7 +121,37 @@ Output of D:
 Plus a CLS token prepended to the sequence (D only) so attention can
 aggregate global info into one slot for the final scalar.
 
-## 5. Bilateral BAM extraction (no raw HiFi re-alignment)
+## 5. Bilateral BAM extraction & strand convention
+
+**Canonical convention (matches `kinsim2/extract.py` and `kinsim2/generate.py`):**
+
+```
+ipd_fwd[ref_pos] = IPD measured during synthesis when the polymerase used
+                   the + reference strand as template
+                   (i.e. + strand methylation kinetics)
+ipd_rev[ref_pos] = IPD on the − strand template
+                   (i.e. − strand methylation kinetics)
+```
+
+**PacBio raw HiFi tag mapping** (per read, depending on alignment direction):
+
+| `read.is_reverse` | Pass-1 reads | fi captures | ri captures |
+|---|---|---|---|
+| False (SEQ = + ref) | − strand template | `ipd_REV` | `ipd_FWD` |
+| True (SEQ = − ref)  | + strand template | `ipd_FWD` | `ipd_REV` |
+
+So `extract` writes into the `signal[K, 4]` shard in normalised form (always
+`ipd_fwd = +` strand kinetics) by inverting the mapping above on a per-read
+basis. `generate` does the reverse: takes G's output in the same normalised
+form and writes BAM tags through the same routing.
+
+For **bystrandified pairs** (2 records / ZMW), `ccs/fwd.ip ≡ fi` and
+`ccs/rev.ip ≡ ri`, so the same routing applies to the (fwd-record,
+rev-record) pair. Both records of a ZMW are required to share the same
+alignment direction (pbmm2 is deterministic per-ZMW); mixed-orientation
+pairs are skipped.
+
+## 5b. No raw HiFi re-alignment
 
 We have bystrandified+aligned BAMs (2 records per ZMW: `ccs/fwd` and
 `ccs/rev`, each with `ip` + `pw`), NOT raw HiFi aligned BAMs (which

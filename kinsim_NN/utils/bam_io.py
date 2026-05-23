@@ -178,18 +178,27 @@ def iter_window_samples(
 ) -> Iterator[WindowSample]:
     """Iterate per-ZMW bilateral samples covering the requested window.
 
-    Args:
-        bam: opened ``pysam.AlignmentFile``.
-        fmt: BAM format descriptor from :func:`detect_bam_format`.
-        seqid: reference contig name.
-        center_pos: 0-based reference position (window center).
-        half_width: window radius (K = 2*half_width + 1 positions).
-        min_mapq: skip reads with map QV below this.
+    **Canonical strand convention** (matches ``kinsim2/extract.py``):
 
-    Yields:
-        :class:`WindowSample` per ZMW that covers at least the center
-        position with both strands (bystrandified) or with one record
-        (raw HiFi). Reads that fail coverage are skipped.
+        ``ipd_fwd[ref_pos]`` = IPD measured during synthesis when the
+        polymerase used the **+ reference strand** as template, i.e.
+        + strand methylation kinetics.
+
+        ``ipd_rev[ref_pos]`` = IPD on the − strand template, i.e. −
+        strand methylation kinetics.
+
+    PacBio raw HiFi tags map to this convention via ``read.is_reverse``:
+
+        is_reverse=False (read SEQ = + ref strand):
+            fi reads − strand template  →  fi[..]  is ipd_REV
+            ri reads + strand template  →  ri[..]  is ipd_FWD
+        is_reverse=True (read SEQ = − ref strand):
+            fi reads + strand template  →  fi[..]  is ipd_FWD
+            ri reads − strand template  →  ri[..]  is ipd_REV
+
+    For bystrandified pairs, ``ccs/fwd`` record's ``ip`` ≡ ``fi`` (pass 1)
+    and ``ccs/rev`` record's ``ip`` ≡ ``ri`` (pass 2), so the same routing
+    rules apply to (fwd_record, rev_record) ↔ (fi-like, ri-like).
     """
     K = 2 * half_width + 1
     ref_positions = np.arange(center_pos - half_width, center_pos + half_width + 1,
@@ -222,44 +231,70 @@ def iter_window_samples(
         for zmw_id, pair in zmw_pairs.items():
             if "fwd" not in pair or "rev" not in pair:
                 continue
-            fwd = pair["fwd"]
-            rev = pair["rev"]
-            ipd_f, pw_f, mask_f = extract_window_from_read(
-                fwd, fmt.ipd_fwd_tag, fmt.pw_fwd_tag, ref_positions
+            fwd_rec = pair["fwd"]
+            rev_rec = pair["rev"]
+            # Extract ip/pw from both records at the requested ref positions.
+            # These are RAW per-record values (fi-like from /fwd, ri-like from /rev).
+            ip_fi, pw_fi, mask_fi = extract_window_from_read(
+                fwd_rec, fmt.ipd_fwd_tag, fmt.pw_fwd_tag, ref_positions,
             )
-            ipd_r, pw_r, mask_r = extract_window_from_read(
-                rev, fmt.ipd_rev_tag, fmt.pw_rev_tag, ref_positions
+            ip_ri, pw_ri, mask_ri = extract_window_from_read(
+                rev_rec, fmt.ipd_rev_tag, fmt.pw_rev_tag, ref_positions,
             )
+            # Both records of a ZMW must agree on alignment direction (pbmm2
+            # is deterministic per-ZMW). Use the /fwd record's direction.
+            if fwd_rec.is_reverse != rev_rec.is_reverse:
+                # Pathological mixed-orientation pair: skip rather than
+                # silently route into the wrong channel.
+                continue
+            if fwd_rec.is_reverse:
+                # reverse-mapped: fi-like (ip from /fwd) is + strand kinetics
+                ipd_fwd_w, pw_fwd_w = ip_fi, pw_fi
+                ipd_rev_w, pw_rev_w = ip_ri, pw_ri
+                mask_fwd_w, mask_rev_w = mask_fi, mask_ri
+            else:
+                # forward-mapped: ri-like (ip from /rev) is + strand kinetics
+                ipd_fwd_w, pw_fwd_w = ip_ri, pw_ri
+                ipd_rev_w, pw_rev_w = ip_fi, pw_fi
+                mask_fwd_w, mask_rev_w = mask_ri, mask_fi
             # Require both strands to cover the centre
-            if not (mask_f[half_width] and mask_r[half_width]):
+            if not (mask_fwd_w[half_width] and mask_rev_w[half_width]):
                 continue
             yield WindowSample(
                 zmw_id=zmw_id,
-                ipd_fwd=ipd_f, pw_fwd=pw_f,
-                ipd_rev=ipd_r, pw_rev=pw_r,
-                mask_fwd=mask_f, mask_rev=mask_r,
+                ipd_fwd=ipd_fwd_w, pw_fwd=pw_fwd_w,
+                ipd_rev=ipd_rev_w, pw_rev=pw_rev_w,
+                mask_fwd=mask_fwd_w, mask_rev=mask_rev_w,
             )
     else:
-        # Raw HiFi: 1 record per ZMW with all 4 tags
+        # Raw HiFi: 1 record per ZMW with fi/fp/ri/rp tags
         for r in bam.fetch(seqid, max(0, center_pos - half_width),
                            center_pos + half_width + 1):
             if r.is_unmapped or r.is_secondary or r.is_supplementary:
                 continue
             if r.mapping_quality < min_mapq:
                 continue
-            ipd_f, pw_f, mask_f = extract_window_from_read(
-                r, fmt.ipd_fwd_tag, fmt.pw_fwd_tag, ref_positions
+            ip_fi, pw_fi, mask_fi = extract_window_from_read(
+                r, fmt.ipd_fwd_tag, fmt.pw_fwd_tag, ref_positions,  # 'fi', 'fp'
             )
-            ipd_r, pw_r, mask_r = extract_window_from_read(
-                r, fmt.ipd_rev_tag, fmt.pw_rev_tag, ref_positions
+            ip_ri, pw_ri, mask_ri = extract_window_from_read(
+                r, fmt.ipd_rev_tag, fmt.pw_rev_tag, ref_positions,  # 'ri', 'rp'
             )
-            if not (mask_f[half_width] and mask_r[half_width]):
+            if r.is_reverse:
+                ipd_fwd_w, pw_fwd_w = ip_fi, pw_fi
+                ipd_rev_w, pw_rev_w = ip_ri, pw_ri
+                mask_fwd_w, mask_rev_w = mask_fi, mask_ri
+            else:
+                ipd_fwd_w, pw_fwd_w = ip_ri, pw_ri
+                ipd_rev_w, pw_rev_w = ip_fi, pw_fi
+                mask_fwd_w, mask_rev_w = mask_ri, mask_fi
+            if not (mask_fwd_w[half_width] and mask_rev_w[half_width]):
                 continue
             yield WindowSample(
                 zmw_id=r.query_name or "",
-                ipd_fwd=ipd_f, pw_fwd=pw_f,
-                ipd_rev=ipd_r, pw_rev=pw_r,
-                mask_fwd=mask_f, mask_rev=mask_r,
+                ipd_fwd=ipd_fwd_w, pw_fwd=pw_fwd_w,
+                ipd_rev=ipd_rev_w, pw_rev=pw_rev_w,
+                mask_fwd=mask_fwd_w, mask_rev=mask_rev_w,
             )
 
 
