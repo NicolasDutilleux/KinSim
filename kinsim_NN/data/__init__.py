@@ -1,10 +1,13 @@
-"""kinsim_NN data layer: shard schema + PyTorch datasets."""
-from .dataset import (
-    ShardedDataset,
-    MultiShardDataset,
-    list_shards,
-    shard_sample_id,
-)
+"""kinsim_NN data layer: shard schema (numpy-only) + PyTorch datasets.
+
+The dataset classes (``ShardedDataset``, ``MultiShardDataset``) require
+``torch`` at import time. To keep ``extract`` runnable on CPU-only,
+torch-less nodes, this package does NOT eagerly import ``dataset``. Use
+the explicit import paths:
+
+    from kinsim_NN.data.shard import read_shard, write_shard         # numpy + pickle only
+    from kinsim_NN.data.dataset import ShardedDataset, MultiShardDataset  # needs torch
+"""
 from .shard import (
     SHARD_CONFIG_VERSION,
     ShardData,
@@ -15,10 +18,6 @@ from .shard import (
 )
 
 __all__ = [
-    "ShardedDataset",
-    "MultiShardDataset",
-    "list_shards",
-    "shard_sample_id",
     "SHARD_CONFIG_VERSION",
     "ShardData",
     "read_shard",

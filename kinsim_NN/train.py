@@ -33,11 +33,13 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from . import __version__
-from .data.dataset import MultiShardDataset, list_shards
+from .data.dataset import MultiShardDataset, ShardedDataset, list_shards
+from .data.shard import read_shard
 from .models.discriminator import TransformerDiscriminator
 from .models.generator import TransformerGenerator
 from .utils.config import KinsimNNConfig, load_config, setup_logging
 from .utils.losses import gradient_penalty, wgan_g_loss, wgan_gp_d_loss
+from .utils.pacbio_codec import log1p_frames_to_uint8
 
 
 log = logging.getLogger(__name__)
@@ -159,6 +161,89 @@ def _save_checkpoint(path: Path, model, optimizer, step: int) -> None:
     }, path)
 
 
+def _wasserstein_1d(a: np.ndarray, b: np.ndarray) -> float:
+    """1D Wasserstein-1 distance via sorted-quantile interpolation."""
+    if a.size == 0 or b.size == 0:
+        return float("nan")
+    n = min(a.size, b.size, 1024)
+    qs = np.linspace(0.0, 1.0, n)
+    aq = np.interp(qs, np.linspace(0.0, 1.0, a.size), np.sort(a))
+    bq = np.interp(qs, np.linspace(0.0, 1.0, b.size), np.sort(b))
+    return float(np.mean(np.abs(aq - bq)))
+
+
+@torch.no_grad()
+def _evaluate_on_shards(
+    g: TransformerGenerator,
+    test_shard_paths: list[Path],
+    n_meth_types: int,
+    device: torch.device,
+    max_samples: int = 4000,
+) -> dict[str, float]:
+    """Compute per-meth-type Wasserstein-1 on held-out test shards.
+
+    Returns ``{"w1_overall": ..., "w1_baseline": ..., "w1_m6A": ...}`` etc.
+    Capped at ``max_samples`` per type to keep eval fast (~seconds).
+    """
+    g.eval()
+    real_by_m: dict[int, list[int]] = {}
+    gen_by_m: dict[int, list[int]] = {}
+    for p in test_shard_paths:
+        if sum(len(v) for v in real_by_m.values()) >= max_samples * 4:
+            break
+        try:
+            shard = read_shard(p)
+        except (OSError, EOFError, ValueError):
+            continue
+        if shard.n == 0:
+            continue
+        ds = ShardedDataset(shard, n_meth_types)
+        idxs = np.random.default_rng(0).permutation(shard.n)[:max_samples]
+        batch_items = [ds[int(i)] for i in idxs]
+        batch = {
+            k: torch.stack([b[k] for b in batch_items]) if k != "category"
+            else torch.tensor([b[k] for b in batch_items])
+            for k in batch_items[0]
+        }
+        z = g.sample_z(batch["signal"].size(0), device=device)
+        gen = g(
+            z,
+            batch["base_fwd_onehot"].to(device),
+            batch["base_rev_onehot"].to(device),
+            batch["meth_fwd_onehot"].to(device),
+            batch["meth_rev_onehot"].to(device),
+        )
+        half = shard.k // 2
+        gen_center = gen[:, half].cpu().numpy()                     # (B, 4)
+        gen_u8 = log1p_frames_to_uint8(gen_center)
+        real_u8 = shard.signal[idxs, half]                          # (B, 4)
+        mf = shard.meth_fwd[idxs, half]
+        mr = shard.meth_rev[idxs, half]
+        for i in range(real_u8.shape[0]):
+            if mf[i] > 0:
+                m_id, ch = int(mf[i]), 0
+            elif mr[i] > 0:
+                m_id, ch = int(mr[i]), 2
+            else:
+                m_id, ch = 0, 0
+            real_by_m.setdefault(m_id, []).append(int(real_u8[i, ch]))
+            gen_by_m.setdefault(m_id, []).append(int(gen_u8[i, ch]))
+    g.train()
+    out: dict[str, float] = {}
+    all_real, all_gen = [], []
+    for m_id in sorted(set(real_by_m) | set(gen_by_m)):
+        r = np.asarray(real_by_m.get(m_id, []), dtype=np.float32)
+        gg = np.asarray(gen_by_m.get(m_id, []), dtype=np.float32)
+        out[f"w1_meth{m_id}"] = _wasserstein_1d(r, gg)
+        all_real.extend(r.tolist())
+        all_gen.extend(gg.tolist())
+    out["w1_overall"] = _wasserstein_1d(
+        np.asarray(all_real, dtype=np.float32),
+        np.asarray(all_gen, dtype=np.float32),
+    )
+    return out
+
+
 def train(
     shards_dir: Path,
     ckpt_dir: Path,
@@ -214,21 +299,43 @@ def train(
                 start_step = max(start_step, int(ckpt.get("step", 0)))
                 log.info("Resumed %s from %s (step %d)", label, p, start_step)
 
-    _save_model_config(ckpt_dir, cfg)
+    # Don't overwrite model_config.json on resume — silently bumping it can
+    # break a checkpoint if the YAML changed between runs.
+    cfg_json = ckpt_dir / "model_config.json"
+    if not (resume and cfg_json.is_file()):
+        _save_model_config(ckpt_dir, cfg)
+    else:
+        log.info("Resume: keeping existing %s (skipping rewrite)", cfg_json)
+
+    # Held-out test shards for periodic eval
+    test_shard_paths: list[Path] = []
+    for sid in test_strains:
+        p = Path(shards_dir) / f"{sid}_shard.pkl"
+        if p.is_file():
+            test_shard_paths.append(p)
+    if test_shard_paths:
+        log.info("Eval shards: %d", len(test_shard_paths))
+    else:
+        log.warning("No eval shards found for test_strains=%s", test_strains)
 
     tb = SummaryWriter(str(ckpt_dir / "tb"))
     csv_path = ckpt_dir / "metrics.csv"
     csv_f = open(csv_path, "a", newline="")
     csv_w = csv.writer(csv_f)
     if start_step == 0:
-        csv_w.writerow(["step", "phase", "d_loss", "g_loss", "d_real", "d_fake", "gp"])
+        csv_w.writerow(["step", "phase", "d_loss", "g_loss", "d_real",
+                        "d_fake", "gp", "w1_overall"])
 
     g.train(); d.train()
     step = start_step
     n_steps = cfg.train.n_steps
+    best_w1 = float("inf")
 
-    epoch = 0
-    dataset.set_epoch(epoch)
+    # On resume, jump the epoch counter forward so shuffle order differs from
+    # the freshly-loaded shard order. Otherwise stay at 0 (the default).
+    epoch = start_step // 1000 if start_step > 0 else 0
+    if epoch > 0:
+        dataset.set_epoch(epoch)
     data_iter = iter(loader)
     try:
         while step < n_steps:
@@ -310,6 +417,30 @@ def train(
                 _save_checkpoint(ckpt_dir / "G.pt", g, opt_g, step)
                 _save_checkpoint(ckpt_dir / "D.pt", d, opt_d, step)
                 log.info("Checkpointed at step %d", step)
+
+            # Held-out evaluation (Wasserstein-1 per meth type)
+            if (
+                step % cfg.train.eval_every == 0
+                and test_shard_paths
+            ):
+                eval_metrics = _evaluate_on_shards(
+                    g, test_shard_paths, cfg.n_meth_types, device,
+                )
+                w1_overall = eval_metrics.get("w1_overall", float("nan"))
+                for k, v in eval_metrics.items():
+                    tb.add_scalar(f"eval/{k}", v, step)
+                csv_w.writerow([step, "eval", "", "", "", "", "", w1_overall])
+                csv_f.flush()
+                log.info(
+                    "EVAL step %d  w1_overall=%.3f  %s",
+                    step, w1_overall,
+                    "  ".join(f"{k}={v:.2f}" for k, v in eval_metrics.items()
+                              if k != "w1_overall"),
+                )
+                if w1_overall < best_w1 and not np.isnan(w1_overall):
+                    best_w1 = w1_overall
+                    _save_checkpoint(ckpt_dir / "best_G.pt", g, opt_g, step)
+                    log.info("New best G (w1_overall=%.3f) at step %d", best_w1, step)
 
     finally:
         _save_checkpoint(ckpt_dir / "G.pt", g, opt_g, step)

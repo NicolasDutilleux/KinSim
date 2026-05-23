@@ -28,6 +28,7 @@ Process:
 from __future__ import annotations
 
 import argparse
+import array
 import json
 import logging
 import random
@@ -142,15 +143,16 @@ def _build_ref_meth_map(
 
 
 def _find_checkpoint(ckpt_dir: Path) -> Path:
-    candidates = list(ckpt_dir.glob("G.pt")) + list(ckpt_dir.glob("best_G.pt"))
-    if not candidates:
-        candidates = list(ckpt_dir.glob("*.pt"))
+    """Prefer best_G.pt > G.pt > most recent .pt by mtime."""
+    best = ckpt_dir / "best_G.pt"
+    if best.is_file():
+        return best
+    latest = ckpt_dir / "G.pt"
+    if latest.is_file():
+        return latest
+    candidates = list(ckpt_dir.glob("*.pt"))
     if not candidates:
         raise FileNotFoundError(f"No .pt in {ckpt_dir}")
-    # Prefer best_G.pt then G.pt then most recent
-    best = [c for c in candidates if "best" in c.name.lower()]
-    if best:
-        return max(best, key=lambda p: p.stat().st_mtime)
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
@@ -484,10 +486,12 @@ def generate(
                 read.set_tag(tag, None)
             except KeyError:
                 pass
-        read.set_tag("fi", list(fi.tolist()), value_type="B")
-        read.set_tag("fp", list(fp.tolist()), value_type="B")
-        read.set_tag("ri", list(ri.tolist()), value_type="B")
-        read.set_tag("rp", list(rp.tolist()), value_type="B")
+        # Explicit array.array("B", ...) so the subtype is unambiguously uint8
+        # (avoids fragile inference from a list of ints).
+        read.set_tag("fi", array.array("B", fi.tolist()))
+        read.set_tag("fp", array.array("B", fp.tolist()))
+        read.set_tag("ri", array.array("B", ri.tolist()))
+        read.set_tag("rp", array.array("B", rp.tolist()))
         out_bam.write(read)
         n_reads += 1
         if n_reads % 100 == 0:

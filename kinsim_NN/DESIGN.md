@@ -251,8 +251,11 @@ One pkl file per strain, located at `shards/<strain>_shard.pkl`. Format:
 strain ≈ 500 MB. Total corpus (65 strains) ≈ 32 GB.
 
 The arrays are sharded as a `dict[str, np.ndarray]` pickled with
-protocol 5. At training time, `Dataset` numpy-memmaps each array → O(1)
-random access without loading all in RAM.
+protocol 5. At training time, `MultiShardDataset` loads ONE shard into
+RAM at a time and walks its rows (worker-aware): peak per-worker RAM
+≈ 500 MB. With `num_workers=4` expect ~2 GB of training-process RAM
+just for shards. If this is too much for the GPU node, reduce
+`num_workers` to 1 or shrink `reads_cap_per_position`.
 
 ## 10. Architecture
 
@@ -302,7 +305,9 @@ Parameter count: ~1.5M.
 
 ## 11. Loss & optimization
 
-- **Loss:** WGAN-GP (Wasserstein with gradient penalty, λ=10).
+- **Loss:** WGAN-GP — Wasserstein distance with two-sided gradient
+  penalty `(‖∇_x D(x_interp, c)‖₂ − 1)²`, λ=10 (Gulrajani et al.
+  2017, standard recipe).
 - **n_critic:** 5 D updates per G update.
 - **Optimizer:** Adam(β1=0.0, β2=0.9) for both G and D — WGAN-GP standard.
 - **LR:** G = 1e-4, D = 4e-4 (TTUR: D learns 4× faster).

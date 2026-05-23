@@ -92,9 +92,14 @@ class JasmineMMMLLabeler(BaseLabeler):
                 if c_idx >= len(c_positions_query):
                     break
                 q_pos = c_positions_query[c_idx]
-                score = int(ml[ml_idx]) if ml_idx < len(ml) else 0
+                if ml_idx >= len(ml):
+                    raise ValueError(
+                        f"ML tag truncated for read {read.query_name!r}: "
+                        f"MM declares more modifications than ML provides "
+                        f"({ml_idx + 1} > {len(ml)}). BAM may be corrupted."
+                    )
+                out.append((q_pos, int(ml[ml_idx])))
                 ml_idx += 1
-                out.append((q_pos, score))
                 c_idx += 1
         return out
 

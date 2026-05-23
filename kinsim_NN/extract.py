@@ -51,14 +51,29 @@ log = logging.getLogger(__name__)
 _BASE_TO_CODE = {b: i for i, b in enumerate("ACGT")}
 _BASE_TO_CODE.update({b: i for i, b in enumerate("acgt")})
 
+# Global counter of non-ACGT bases encountered (logged at end of extract run).
+_N_BASE_COUNT = [0]
+
 
 def _encode_seq(seq: str) -> np.ndarray:
-    """Encode a K-mer (case-insensitive ACGT) → uint8 (K,). N → 0 (A) silently."""
-    return np.fromiter(
-        (_BASE_TO_CODE.get(b, 0) for b in seq),
-        dtype=np.uint8,
-        count=len(seq),
-    )
+    """Encode a K-mer (case-insensitive ACGT) → uint8 (K,).
+
+    Non-ACGT bases (N, masked, IUPAC ambiguity codes) are encoded as A
+    (code 0). The total count is tracked in :data:`_N_BASE_COUNT` and
+    reported at the end of each strain's extract run so the user can
+    catch hard-masked genomes.
+    """
+    arr = np.empty(len(seq), dtype=np.uint8)
+    n_count = 0
+    for i, b in enumerate(seq):
+        c = _BASE_TO_CODE.get(b)
+        if c is None:
+            arr[i] = 0
+            n_count += 1
+        else:
+            arr[i] = c
+    _N_BASE_COUNT[0] += n_count
+    return arr
 
 
 def _git_sha() -> str:
@@ -332,9 +347,19 @@ def extract_strain(
     builder = empty_shard(cfg.window.k)
     bam = pysam.AlignmentFile(str(bam_path), "rb")
 
-    # Methylated positions
+    # Methylated positions — dedup by (rid, pos) so palindromic motifs that
+    # contribute BOTH "+" and "-" labels at the same position only produce ONE
+    # training sample. Strand info is encoded in the overlay tensors anyway.
     n_meth_samples = 0
+    unique_meth_positions: dict[tuple[str, int], tuple[int, str]] = {}
     for (rid, pos, strand), mid in labels.items():
+        key = (rid, pos)
+        # First encounter wins (deterministic order via dict iteration in Py 3.7+);
+        # when both strands label the same position, the chosen strand is used only
+        # for the stored metadata (the overlay sees both strands regardless).
+        if key not in unique_meth_positions:
+            unique_meth_positions[key] = (mid, strand)
+    for (rid, pos), (mid, strand) in unique_meth_positions.items():
         if rid not in ref_seqs:
             continue
         n_meth_samples += _extract_position(
@@ -375,9 +400,18 @@ def extract_strain(
     out_path = output_dir / f"{sample_id}_shard.pkl"
     write_shard(out_path, shard)
     log.info(
-        "[%s] Done. meth_samples=%d  baseline_samples=%d  shard=%s",
-        sample_id, n_meth_samples, n_baseline_samples, out_path,
+        "[%s] Done. meth_samples=%d  baseline_samples=%d  shard=%s  "
+        "non_ACGT_bases_silently_encoded_as_A=%d",
+        sample_id, n_meth_samples, n_baseline_samples, out_path, _N_BASE_COUNT[0],
     )
+    if _N_BASE_COUNT[0] > 1000:
+        log.warning(
+            "[%s] %d non-ACGT bases were silently encoded as A. "
+            "Consider hard-masking ambiguity to N in the reference or adding "
+            "a 5th class to the base alphabet.",
+            sample_id, _N_BASE_COUNT[0],
+        )
+    _N_BASE_COUNT[0] = 0  # reset for next strain in batched runs
 
 
 def main(argv=None):
