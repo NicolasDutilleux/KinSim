@@ -32,13 +32,20 @@ import array
 import json
 import logging
 import random
-import re
 import sys
 from pathlib import Path
 
 import numpy as np
 import pysam
 import torch
+
+from kinsim.utils.encoding import BASE_MAP
+from kinsim.utils.motifs import (
+    load_motif_string,
+    parse_motifs_per_strand,
+    reverse_complement,
+    scan_sequence,
+)
 
 from . import __version__
 from .models.generator import TransformerGenerator
@@ -49,92 +56,67 @@ from .utils.pacbio_codec import log1p_frames_to_uint8
 log = logging.getLogger(__name__)
 
 
-_BASE_TO_CODE = {b: i for i, b in enumerate("ACGT")}
-_BASE_TO_CODE.update({b: i for i, b in enumerate("acgt")})
-_IUPAC = {
-    "A": "A", "C": "C", "G": "G", "T": "T",
-    "R": "[AG]", "Y": "[CT]", "S": "[GC]", "W": "[AT]",
-    "K": "[GT]", "M": "[AC]", "B": "[CGT]", "D": "[AGT]",
-    "H": "[ACT]", "V": "[ACG]", "N": "[ACGT]",
-}
-
-
 # ---------------------------------------------------------------------------
-# Motif scanning
+# Motif scanning — REUSE kinsim's canonical parsers.
+#
+# This module previously hand-rolled centerPos/fraction/IUPAC handling and
+# got the centerPos 1-based → 0-based conversion wrong (every meth was off
+# by one base in generation). kinsim/utils/parsers/pacbio.py + motifs.py
+# have been doing this correctly for years; we delegate to them.
 # ---------------------------------------------------------------------------
 
 
-def _iupac_to_regex(motif: str) -> str:
-    return "".join(_IUPAC.get(b.upper(), b) for b in motif)
+def _build_strand_meth_maps(
+    ref_seqs: dict[str, str],
+    motif_string: str,
+    meth_id_by_name: dict[str, int],
+) -> tuple[
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+]:
+    """Return per-contig ``(fwd_map, rev_map, fwd_frac, rev_frac)``.
 
+    * ``fwd_map[contig][p]`` = meth_id on the + strand at ref pos ``p`` (0 if none)
+    * ``rev_map[contig][p]`` = meth_id on the − strand at ref pos ``p`` (0 if none),
+      in **forward-ref coordinates** (so it can be indexed alongside fwd_map).
+    * ``fwd_frac``, ``rev_frac`` = the per-motif fraction at the same positions.
 
-def _revcomp(seq: str) -> str:
-    rc = str.maketrans("ACGTacgtRYSWKMBDHVN", "TGCAtgcaYRSWMKVHDBN")
-    return seq.translate(rc)[::-1]
-
-
-def _parse_motifs_csv(path: Path, meth_id_by_name: dict[str, int]) -> list[dict]:
-    """Return list of motif dicts: {pattern_fwd, pattern_rev, center_offset,
-    meth_id, fraction, name}. center_offset is the 0-based index inside the
-    motif where the methylation lies."""
-    import csv
-
-    motifs: list[dict] = []
-    with open(path) as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            name = r.get("motifString") or r.get("motif") or r.get("Motif")
-            if not name:
-                continue
-            mod = r.get("modificationType") or r.get("mod_type") or r.get("type") or ""
-            if mod not in meth_id_by_name:
-                continue
-            try:
-                center = int(r.get("centerPos") or r.get("offset") or 0)
-            except ValueError:
-                center = 0
-            try:
-                fraction = float(r.get("fraction") or r.get("frac_mod") or 1.0)
-            except ValueError:
-                fraction = 1.0
-            motifs.append({
-                "name": name,
-                "pattern_fwd": _iupac_to_regex(name),
-                "pattern_rev": _iupac_to_regex(_revcomp(name)),
-                "len": len(name),
-                "center_offset": center,
-                "meth_id": meth_id_by_name[mod],
-                "fraction": fraction,
-            })
-    return motifs
-
-
-def _build_ref_meth_map(
-    ref_seq: str,
-    motifs: list[dict],
-) -> dict[tuple[str, int], tuple[int, float]]:
-    """Scan ref for motif matches. Returns ``{(strand, pos): (meth_id, fraction)}``.
-
-    The position is the absolute reference coordinate of the methylated base
-    (motif start + center_offset).
+    Uses :func:`kinsim.utils.motifs.parse_motifs_per_strand` for the canonical
+    per-strand handling (palindromic motifs, IUPAC, centerPos→0-based).
     """
-    out: dict[tuple[str, int], tuple[int, float]] = {}
-    for m in motifs:
-        # forward strand
-        for match in re.finditer(m["pattern_fwd"], ref_seq, flags=re.IGNORECASE):
-            pos = match.start() + m["center_offset"]
-            key = ("+", pos)
-            if key not in out:
-                out[key] = (m["meth_id"], m["fraction"])
-        # reverse strand: scan ref for revcomp pattern
-        for match in re.finditer(m["pattern_rev"], ref_seq, flags=re.IGNORECASE):
-            # Position of the methylated base on the rev-strand template, in
-            # forward-ref coordinates: match.end() - 1 - center_offset
-            pos = match.end() - 1 - m["center_offset"]
-            key = ("-", pos)
-            if key not in out:
-                out[key] = (m["meth_id"], m["fraction"])
-    return out
+    fwd_motifs, rev_motifs = parse_motifs_per_strand(motif_string)
+    fwd_map: dict[str, np.ndarray] = {}
+    rev_map: dict[str, np.ndarray] = {}
+    fwd_frac: dict[str, np.ndarray] = {}
+    rev_frac: dict[str, np.ndarray] = {}
+    for name, seq in ref_seqs.items():
+        L = len(seq)
+        fmap = scan_sequence(seq, fwd_motifs).astype(np.uint8)
+        # Per-motif fraction overlay on the fwd map
+        ffrac = np.zeros(L, dtype=np.float32)
+        for motif in fwd_motifs:
+            for match in motif["pattern"].finditer(seq):
+                target = match.start() + motif["pos"]
+                if 0 <= target < L:
+                    ffrac[target] = motif["frac"]
+        # Reverse strand: scan rc(seq), then flip to forward coords
+        rc_seq = reverse_complement(seq)
+        rc_hits = scan_sequence(rc_seq, rev_motifs).astype(np.uint8)
+        rmap = rc_hits[::-1].copy()
+        rfrac_rc = np.zeros(L, dtype=np.float32)
+        for motif in rev_motifs:
+            for match in motif["pattern"].finditer(rc_seq):
+                target = match.start() + motif["pos"]
+                if 0 <= target < L:
+                    rfrac_rc[target] = motif["frac"]
+        rfrac = rfrac_rc[::-1].copy()
+        fwd_map[name] = fmap
+        rev_map[name] = rmap
+        fwd_frac[name] = ffrac
+        rev_frac[name] = rfrac
+    return fwd_map, rev_map, fwd_frac, rev_frac
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +166,14 @@ def _load_generator(ckpt_dir: Path, device: torch.device) -> tuple[TransformerGe
 # ---------------------------------------------------------------------------
 
 
+# Reuse kinsim's BASE_MAP {A:0, C:1, G:2, T:3} for consistency with extract
+# and with shard storage. Lowercase aliases for case-insensitive input.
+_BASE_TO_CODE = dict(BASE_MAP)
+_BASE_TO_CODE.update({b.lower(): i for b, i in BASE_MAP.items()})
+
+
 def _encode_seq(seq: str) -> np.ndarray:
+    """Encode an ACGT(case-insensitive) string to uint8 codes. N → A (0)."""
     return np.fromiter(
         (_BASE_TO_CODE.get(b, 0) for b in seq),
         dtype=np.uint8, count=len(seq),
@@ -230,33 +219,41 @@ def _generate_signal_batched(
 
 
 def _build_meth_window(
-    meth_map: dict[tuple[str, int], tuple[int, float]],
-    ref_pos_window: np.ndarray,
+    fwd_map: np.ndarray,                # (L_ref,) uint8 — meth_id per fwd-strand position
+    rev_map: np.ndarray,                # (L_ref,) uint8 — meth_id per rev-strand position (fwd coords)
+    fwd_frac: np.ndarray,               # (L_ref,) float32
+    rev_frac: np.ndarray,               # (L_ref,) float32
+    ref_pos_window: np.ndarray,         # (K,) int64 — reference positions in window
     rng: random.Random,
     use_bernoulli: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build (meth_fwd[K], meth_rev[K]) by overlaying motif map entries
-    that fall inside the window. Bernoulli sampling per motif site."""
+    """Slice the per-contig meth/frac maps to the window, then apply per-site
+    Bernoulli on ``fraction`` if requested. Returns (meth_fwd[K], meth_rev[K])."""
     K = ref_pos_window.shape[0]
     meth_fwd = np.zeros(K, dtype=np.uint8)
     meth_rev = np.zeros(K, dtype=np.uint8)
-    for i, rp in enumerate(ref_pos_window):
-        rp = int(rp)
-        for strand, arr in [("+", meth_fwd), ("-", meth_rev)]:
-            entry = meth_map.get((strand, rp))
-            if entry is None:
-                continue
-            mid, frac = entry
-            if use_bernoulli and rng.random() > frac:
-                continue
-            arr[i] = mid
+    L = fwd_map.shape[0]
+    for i in range(K):
+        rp = int(ref_pos_window[i])
+        if rp < 0 or rp >= L:
+            continue
+        mf, mr = int(fwd_map[rp]), int(rev_map[rp])
+        if mf > 0:
+            if (not use_bernoulli) or rng.random() <= float(fwd_frac[rp]):
+                meth_fwd[i] = mf
+        if mr > 0:
+            if (not use_bernoulli) or rng.random() <= float(rev_frac[rp]):
+                meth_rev[i] = mr
     return meth_fwd, meth_rev
 
 
 def _process_mapped_read(
     read: pysam.AlignedSegment,
     ref_seq: str,
-    meth_map: dict[tuple[str, int], tuple[int, float]],
+    fwd_map: np.ndarray,
+    rev_map: np.ndarray,
+    fwd_frac: np.ndarray,
+    rev_frac: np.ndarray,
     g: TransformerGenerator,
     n_meth_types: int,
     half_width: int,
@@ -296,7 +293,9 @@ def _process_mapped_read(
             continue
         base_fwd = _encode_seq(ref_seq[r_pos - half_width: r_pos + half_width + 1])
         ref_window = np.arange(r_pos - half_width, r_pos + half_width + 1, dtype=np.int64)
-        meth_fwd, meth_rev = _build_meth_window(meth_map, ref_window, rng, use_bernoulli)
+        meth_fwd, meth_rev = _build_meth_window(
+            fwd_map, rev_map, fwd_frac, rev_frac, ref_window, rng, use_bernoulli,
+        )
         windows.append((int(q_pos), base_fwd, meth_fwd, meth_rev))
     if not windows:
         return fi, fp, ri, rp
@@ -326,7 +325,8 @@ def _process_mapped_read(
 
 def _process_unmapped_read(
     read: pysam.AlignedSegment,
-    motifs: list[dict],
+    motif_string: str,
+    meth_id_by_name: dict[str, int],
     g: TransformerGenerator,
     n_meth_types: int,
     half_width: int,
@@ -352,15 +352,22 @@ def _process_unmapped_read(
     ri = np.full(qlen, default_value, dtype=np.uint8)
     rp = np.full(qlen, default_value, dtype=np.uint8)
 
-    # Build per-(strand, query-pos) meth map by scanning the read sequence
-    query_meth_map = _build_ref_meth_map(qseq, motifs)
+    # Scan motifs against THIS read's sequence (it serves as the "reference"
+    # for an unaligned read).
+    fwd_map_q, rev_map_q, fwd_frac_q, rev_frac_q = _build_strand_meth_maps(
+        {"_query": qseq}, motif_string, meth_id_by_name,
+    )
+    fmap, rmap = fwd_map_q["_query"], rev_map_q["_query"]
+    ffrac, rfrac = fwd_frac_q["_query"], rev_frac_q["_query"]
 
     windows = []
     for q_pos in range(max(half_width, n_context_skip),
                        qlen - max(half_width, n_context_skip)):
         base_fwd = _encode_seq(qseq[q_pos - half_width: q_pos + half_width + 1])
         ref_window = np.arange(q_pos - half_width, q_pos + half_width + 1, dtype=np.int64)
-        meth_fwd, meth_rev = _build_meth_window(query_meth_map, ref_window, rng, use_bernoulli)
+        meth_fwd, meth_rev = _build_meth_window(
+            fmap, rmap, ffrac, rfrac, ref_window, rng, use_bernoulli,
+        )
         windows.append((q_pos, base_fwd, meth_fwd, meth_rev))
     if not windows:
         return fi, fp, ri, rp
@@ -412,14 +419,25 @@ def generate(
     fa.close()
     log.info("Reference contigs: %d", len(ref_seqs))
 
-    motifs = _parse_motifs_csv(motifs_csv, model_cfg["meth_id_by_name"])
-    log.info("Loaded %d motifs", len(motifs))
-
-    meth_maps = {r: _build_ref_meth_map(seq, motifs) for r, seq in ref_seqs.items()}
-    log.info(
-        "Total motif sites: %d",
-        sum(len(m) for m in meth_maps.values()),
+    # Use kinsim's canonical loader (handles PacBio CSV, REBASE, KinSim string;
+    # converts centerPos 1-based → 0-based correctly; validates IUPAC base).
+    motif_string = load_motif_string(
+        str(motifs_csv), min_fraction=0.0, min_detected=0,
     )
+    if not motif_string:
+        log.warning("Empty motif string from %s — generate will produce baseline-only kinetics",
+                    motifs_csv)
+    n_motifs = motif_string.count(";") + 1 if motif_string else 0
+    log.info("Loaded %d motifs from %s", n_motifs, motifs_csv)
+
+    fwd_maps, rev_maps, fwd_fracs, rev_fracs = _build_strand_meth_maps(
+        ref_seqs, motif_string, model_cfg["meth_id_by_name"],
+    )
+    total_sites = sum(
+        int(np.count_nonzero(fwd_maps[r])) + int(np.count_nonzero(rev_maps[r]))
+        for r in ref_seqs
+    )
+    log.info("Total methylation sites across reference: %d", total_sites)
 
     rng = random.Random(seed)
     np.random.seed(seed)
@@ -447,7 +465,8 @@ def generate(
             # the query sequence directly.
             result = _process_unmapped_read(
                 read=read,
-                motifs=motifs,
+                motif_string=motif_string,
+                meth_id_by_name=model_cfg["meth_id_by_name"],
                 g=g,
                 n_meth_types=n_meth_types,
                 half_width=half_width,
@@ -470,7 +489,10 @@ def generate(
             fi, fp, ri, rp = _process_mapped_read(
                 read=read,
                 ref_seq=ref_seqs[ref_id],
-                meth_map=meth_maps[ref_id],
+                fwd_map=fwd_maps[ref_id],
+                rev_map=rev_maps[ref_id],
+                fwd_frac=fwd_fracs[ref_id],
+                rev_frac=rev_fracs[ref_id],
                 g=g,
                 n_meth_types=n_meth_types,
                 half_width=half_width,
@@ -480,14 +502,11 @@ def generate(
                 rng=rng,
                 device=device,
             )
-        # Strip any existing kinetics tags before writing fresh ones
-        for tag in ("fi", "fp", "ri", "rp", "ip", "pw"):
-            try:
-                read.set_tag(tag, None)
-            except KeyError:
-                pass
-        # Explicit array.array("B", ...) so the subtype is unambiguously uint8
-        # (avoids fragile inference from a list of ints).
+        # Strip any existing kinetics tags before writing fresh ones.
+        # ``set_tag(name, None)`` removal landed in pysam 0.17; older versions
+        # raise TypeError. Use the version-stable ``has_tag`` + nothing-to-do
+        # pattern: simply overwriting via set_tag is safe for tag replacement.
+        # Explicit array.array("B", ...) so the subtype is unambiguously uint8.
         read.set_tag("fi", array.array("B", fi.tolist()))
         read.set_tag("fp", array.array("B", fp.tolist()))
         read.set_tag("ri", array.array("B", ri.tolist()))

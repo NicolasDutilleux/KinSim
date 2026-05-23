@@ -42,7 +42,7 @@ class ExtractParams:
     baseline_min_dist: int = 20
     baseline_per_strain: int = 50_000
     reads_cap_per_position: int = 20
-    min_read_qv: int = 20
+    min_mapq: int = 20            # was min_read_qv — it's MAPQ, not base QV
     bystrandify_pairing: bool = True
 
 

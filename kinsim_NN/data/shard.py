@@ -74,9 +74,18 @@ class ShardData:
         return int(self.meta.get("k", self.base_fwd.shape[1]))
 
 
-def _hash_zmw(name: str) -> int:
-    """Stable 63-bit hash from a read name → int64-safe ZMW id."""
+def hash_zmw(name: str) -> int:
+    """Stable 31-bit CRC hash from a read name → int64-storable ZMW id.
+
+    Used only for diagnostic traceability in shard metadata (the per-row
+    ``zmw`` array). Not cryptographic; collisions are tolerated since the
+    field isn't used for training or evaluation.
+    """
     return int(zlib.crc32(name.encode("utf-8")) & 0x7FFFFFFF)
+
+
+# Backwards-compatible alias (was leading-underscore private).
+_hash_zmw = hash_zmw
 
 
 def write_shard(path: Path, shard: ShardData) -> None:
@@ -188,5 +197,5 @@ __all__ = [
     "write_shard",
     "empty_shard",
     "finalize_shard",
-    "_hash_zmw",
+    "hash_zmw",
 ]

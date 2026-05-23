@@ -57,8 +57,14 @@ def _load_generator(ckpt_dir: Path, device: torch.device):
         pos_embed_dim=cfg["generator"]["pos_embed_dim"],
         drop_rate=cfg["generator"].get("drop_rate", 0.0),
     ).to(device)
-    ckpt_path = ckpt_dir / "G.pt"
-    if not ckpt_path.is_file():
+    # Prefer best_G.pt > G.pt > most recent .pt (same precedence as generate.py)
+    best = ckpt_dir / "best_G.pt"
+    latest = ckpt_dir / "G.pt"
+    if best.is_file():
+        ckpt_path = best
+    elif latest.is_file():
+        ckpt_path = latest
+    else:
         candidates = sorted(ckpt_dir.glob("*.pt"))
         if not candidates:
             raise FileNotFoundError(f"No checkpoints in {ckpt_dir}")

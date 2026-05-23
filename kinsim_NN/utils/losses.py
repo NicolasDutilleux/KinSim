@@ -43,12 +43,13 @@ def gradient_penalty(
     cond_kwargs: dict,
     device: torch.device | str = "cpu",
 ) -> torch.Tensor:
-    """One-sided gradient penalty for WGAN-GP.
+    """Standard two-sided gradient penalty for WGAN-GP (Gulrajani 2017).
 
-    Interpolates between real and fake samples and penalises the
-    deviation of ‖∇_x D(x_interp, cond)‖₂ from 1. ``cond_kwargs`` is the
-    dict of conditioning tensors passed unchanged to ``discriminator``
-    (e.g. ``base_fwd``, ``base_rev``, ``meth_fwd``, ``meth_rev``).
+    Interpolates between real and fake samples conditioned on ``cond_kwargs``
+    and penalises the squared deviation of ``‖∇_x D(x_interp, cond)‖₂`` from
+    1.0 — i.e. ``mean((‖∇‖₂ − 1)²)``. ``cond_kwargs`` is forwarded
+    unchanged to the discriminator (e.g. ``base_fwd_onehot``, ``base_rev_onehot``,
+    ``meth_fwd_onehot``, ``meth_rev_onehot``).
     """
     if real.shape != fake.shape:
         raise ValueError(f"shape mismatch real {real.shape} vs fake {fake.shape}")

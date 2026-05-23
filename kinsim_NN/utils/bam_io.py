@@ -198,16 +198,26 @@ def iter_window_samples(
     if fmt.is_bystrandified:
         # Collect both fwd and rev records per ZMW, then emit paired samples.
         zmw_pairs: dict[str, dict[str, pysam.AlignedSegment]] = defaultdict(dict)
+        n_reads_seen = 0
         for r in bam.fetch(seqid, max(0, center_pos - half_width),
                            center_pos + half_width + 1):
             if r.is_unmapped or r.is_secondary or r.is_supplementary:
                 continue
             if r.mapping_quality < min_mapq:
                 continue
+            n_reads_seen += 1
             key, suffix = _zmw_key(r.query_name or "")
             if suffix not in ("fwd", "rev"):
                 continue
             zmw_pairs[key][suffix] = r
+
+        if n_reads_seen > 0 and not zmw_pairs:
+            log.warning(
+                "Bystrandified-mode iter at %s:%d saw %d reads but none had "
+                "/fwd or /rev suffix in their name. Naming convention may "
+                "have changed — check ZMW read naming in this BAM.",
+                seqid, center_pos, n_reads_seen,
+            )
 
         for zmw_id, pair in zmw_pairs.items():
             if "fwd" not in pair or "rev" not in pair:

@@ -288,16 +288,24 @@ def train(
 
     start_step = 0
     if resume:
+        g_path = ckpt_dir / "G.pt"
+        d_path = ckpt_dir / "D.pt"
+        if not (g_path.is_file() and d_path.is_file()):
+            raise FileNotFoundError(
+                f"--resume requires BOTH G.pt and D.pt under {ckpt_dir} "
+                f"(found G.pt={g_path.is_file()} D.pt={d_path.is_file()}). "
+                f"Resuming G alone breaks WGAN-GP's critic Lipschitz constraint. "
+                f"Either copy the missing file or start fresh (drop --resume)."
+            )
         for label, model, opt, fname in [
             ("G", g, opt_g, "G.pt"), ("D", d, opt_d, "D.pt")
         ]:
             p = ckpt_dir / fname
-            if p.is_file():
-                ckpt = torch.load(p, map_location=device, weights_only=False)
-                model.load_state_dict(ckpt["state_dict"])
-                opt.load_state_dict(ckpt["optimizer"])
-                start_step = max(start_step, int(ckpt.get("step", 0)))
-                log.info("Resumed %s from %s (step %d)", label, p, start_step)
+            ckpt = torch.load(p, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["state_dict"])
+            opt.load_state_dict(ckpt["optimizer"])
+            start_step = max(start_step, int(ckpt.get("step", 0)))
+            log.info("Resumed %s from %s (step %d)", label, p, start_step)
 
     # Don't overwrite model_config.json on resume — silently bumping it can
     # break a checkpoint if the YAML changed between runs.

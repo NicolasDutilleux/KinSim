@@ -29,13 +29,15 @@ from pathlib import Path
 import numpy as np
 import pysam
 
+from kinsim.utils.encoding import BASE_MAP
+
 from . import __version__
 from .data.shard import (
     SHARD_CONFIG_VERSION,
     empty_shard,
     finalize_shard,
+    hash_zmw,
     write_shard,
-    _hash_zmw,
 )
 from .labelers import create_labeler
 from .utils.bam_io import (
@@ -48,8 +50,10 @@ from .utils.config import KinsimNNConfig, load_config, setup_logging
 log = logging.getLogger(__name__)
 
 
-_BASE_TO_CODE = {b: i for i, b in enumerate("ACGT")}
-_BASE_TO_CODE.update({b: i for i, b in enumerate("acgt")})
+# Single source of truth: kinsim's BASE_MAP {A:0, C:1, G:2, T:3}. Lowercase
+# aliases for case-insensitive input.
+_BASE_TO_CODE = dict(BASE_MAP)
+_BASE_TO_CODE.update({b.lower(): i for b, i in BASE_MAP.items()})
 
 # Global counter of non-ACGT bases encountered (logged at end of extract run).
 _N_BASE_COUNT = [0]
@@ -267,7 +271,7 @@ def _extract_position(
     n_added = 0
     samples = []
     for sample in iter_window_samples(
-        bam, bam_fmt, seqid, pos, half, min_mapq=cfg.extract.min_read_qv,
+        bam, bam_fmt, seqid, pos, half, min_mapq=cfg.extract.min_mapq,
     ):
         samples.append(sample)
     if not samples:
@@ -288,7 +292,7 @@ def _extract_position(
         builder["ref_id"].append(ref_id_idx)
         builder["ref_pos"].append(pos)
         builder["strand"].append(1 if strand == "+" else -1)
-        builder["zmw"].append(_hash_zmw(sample.zmw_id))
+        builder["zmw"].append(hash_zmw(sample.zmw_id))
         n_added += 1
     return n_added
 
