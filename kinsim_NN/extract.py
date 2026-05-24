@@ -310,10 +310,12 @@ def _extract_chunk_batched(
     pos_samples: dict[int, list] = {p: [] for p in pos_tensors}
     pos_n_seen: dict[int, int] = {p: 0 for p in pos_tensors}
 
+    n_yields = 0
     for center_pos, sample in iter_chunk_samples(
         bam, bam_fmt, seqid, sorted_positions, half,
         min_mapq=cfg.extract.min_mapq,
     ):
+        n_yields += 1
         if center_pos not in pos_samples:
             continue
         n = pos_n_seen[center_pos] + 1
@@ -325,6 +327,19 @@ def _extract_chunk_batched(
             j = rng.randrange(n)
             if j < cap:
                 samples[j] = sample
+
+    # Diagnostic: log a warning if a non-empty chunk got zero yields. Means
+    # iter_chunk_samples filtered EVERY ZMW pair out — usually a min_mapq
+    # threshold too high, or strand-mismatch dominating, or empty tag arrays.
+    if n_yields == 0 and len(pos_tensors) > 0:
+        log.warning(
+            "[chunk %s:%d-%d] %d centers but iter_chunk_samples yielded 0 "
+            "samples — check min_mapq, strand orientation, or tag presence.",
+            seqid,
+            int(sorted_positions[0]),
+            int(sorted_positions[-1]),
+            len(pos_tensors),
+        )
 
     # Flush per-position
     n_added = 0

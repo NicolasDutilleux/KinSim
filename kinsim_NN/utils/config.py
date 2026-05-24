@@ -42,7 +42,11 @@ class ExtractParams:
     baseline_min_dist: int = 20
     baseline_per_strain: int = 50_000
     reads_cap_per_position: int = 20
-    min_mapq: int = 20            # was min_read_qv — it's MAPQ, not base QV
+    min_mapq: int = 0             # was min_read_qv — it's MAPQ, not base QV.
+                                  # Default 0 = no filter; pbmm2 sometimes assigns
+                                  # mapq=0 to all unique alignments (config-dependent).
+                                  # Bump to 20+ only if you've verified the BAM has
+                                  # actual MAPQ values > 0.
     bystrandify_pairing: bool = True
     meth_per_strain_cap: int = 0  # 0 = no cap; else random subsample meth positions
 

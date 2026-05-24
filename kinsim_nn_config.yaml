@@ -47,7 +47,10 @@ extract:
   baseline_min_dist: 20         # min bp from any meth position
   baseline_per_strain: 50000    # number of baseline samples per strain
   reads_cap_per_position: 20    # max reads emitted per labeled position
-  min_mapq: 20                  # skip reads with mapping quality below this
+  min_mapq: 0                   # skip reads with mapping quality below this
+                                # (0 = no filter; pbmm2 often assigns mapq=0
+                                # on unique-only alignments which would otherwise
+                                # be filtered out at >0 thresholds)
   # 0 = no cap (all GFF-labelled positions). For dense-meth strains (e.g.
   # Strepto ~400k positions per strain) BAM I/O dominates extract walltime;
   # cap to a random subsample to bound walltime. 100k is a sane default.
