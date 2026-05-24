@@ -134,19 +134,21 @@ def extract_window_from_read(
     ip_arr = np.asarray(read.get_tag(ipd_tag), dtype=np.uint8)
     pw_arr = np.asarray(read.get_tag(pw_tag), dtype=np.uint8)
 
-    # Build a dict ref_pos → query_pos. For K small (~21) this loop is fine.
     ref_pairs = pairs[:, 1]
     qry_pairs = pairs[:, 0]
-    # vectorise: searchsorted only if pairs is sorted by ref_pos (it is in pysam)
-    for k, rp in enumerate(ref_positions):
-        idx = np.searchsorted(ref_pairs, rp)
-        if idx >= ref_pairs.size or ref_pairs[idx] != rp:
-            continue
-        q = int(qry_pairs[idx])
-        if 0 <= q < ip_arr.size:
-            ipd_out[k] = ip_arr[q]
-            pw_out[k] = pw_arr[q]
-            mask[k] = True
+    # Vectorised: one C-level searchsorted instead of K Python iterations.
+    # pairs are sorted by ref_pos in pysam (matches_only=True guarantees that).
+    idxs = np.searchsorted(ref_pairs, ref_positions)
+    clamped = np.minimum(idxs, ref_pairs.size - 1)
+    found = (idxs < ref_pairs.size) & (ref_pairs[clamped] == ref_positions)
+    q_pos = qry_pairs[clamped]
+    in_bounds = found & (q_pos >= 0) & (q_pos < ip_arr.size)
+    if in_bounds.any():
+        # Fancy-index into the tag arrays where the read covers the ref position.
+        valid_q = q_pos[in_bounds]
+        ipd_out[in_bounds] = ip_arr[valid_q]
+        pw_out[in_bounds] = pw_arr[valid_q]
+        mask[in_bounds] = True
     return ipd_out, pw_out, mask
 
 
@@ -214,6 +216,12 @@ def iter_window_samples(
                 continue
             if r.mapping_quality < min_mapq:
                 continue
+            # Skip reads that don't actually cover the centre — pysam returns
+            # any read overlapping the [center-half, center+half+1) window, but
+            # we strictly require coverage of center_pos itself. Cheap reference-
+            # bound check avoids the expensive get_aligned_pairs downstream.
+            if r.reference_start > center_pos or r.reference_end <= center_pos:
+                continue
             n_reads_seen += 1
             key, suffix = _zmw_key(r.query_name or "")
             if suffix not in ("fwd", "rev"):
@@ -273,6 +281,12 @@ def iter_window_samples(
             if r.is_unmapped or r.is_secondary or r.is_supplementary:
                 continue
             if r.mapping_quality < min_mapq:
+                continue
+            # Skip reads that don't actually cover the centre — pysam returns
+            # any read overlapping the [center-half, center+half+1) window, but
+            # we strictly require coverage of center_pos itself. Cheap reference-
+            # bound check avoids the expensive get_aligned_pairs downstream.
+            if r.reference_start > center_pos or r.reference_end <= center_pos:
                 continue
             ip_fi, pw_fi, mask_fi = extract_window_from_read(
                 r, fmt.ipd_fwd_tag, fmt.pw_fwd_tag, ref_positions,  # 'fi', 'fp'
