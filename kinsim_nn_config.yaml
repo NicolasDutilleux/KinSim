@@ -71,11 +71,13 @@ extract:
   # expand into emission candidates at offsets [0, near_meth_max_dist]:
   #   k ∈ signal_offsets[T] → CATEGORY_SLOWED
   #   k ∉ signal_offsets[T] → CATEGORY_NEAR_METH
-  # Per-category caps bound total emission points so the shard size stays
-  # sane after expansion (each cap × reads_cap_per_position = samples).
+  # Defaults: NO cap on SLOWED/NEAR_METH (keep everything — they're precious
+  # signal and ~complete-genome-coverage control respectively). meth_per_strain_cap
+  # is left at 0 so the parent expansion sees every labelled position. If you
+  # need to bound BAM I/O on a 12 GB Strepto BAM, set meth_per_strain_cap > 0.
   near_meth_max_dist: 10
-  slowed_per_strain_cap: 100000        # 0 = no cap on SLOWED emission points
-  near_meth_per_strain_cap: 100000     # 0 = no cap on NEAR_METH emission points
+  slowed_per_strain_cap: 0             # 0 = no cap (keep all SLOWED)
+  near_meth_per_strain_cap: 0          # 0 = no cap
 
 # -- Train / test split -------------------------------------------------
 split:
