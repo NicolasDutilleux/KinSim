@@ -5,6 +5,8 @@ Subcommands:
     train       cGAN training loop (WGAN-GP).
     generate    motifs.csv + ref + input BAM → unmapped BAM with fi/fp/ri/rp.
     evaluate    Distribution-level metrics on held-out shards.
+    analyze     HTML dashboard of per-category / per-meth / per-offset
+                distributions across all shards.
 """
 from __future__ import annotations
 
@@ -17,6 +19,7 @@ COMMANDS = {
     "train": "kinsim_NN.train",
     "generate": "kinsim_NN.generate",
     "evaluate": "kinsim_NN.evaluate",
+    "analyze": "kinsim_NN.analyze",
 }
 
 
