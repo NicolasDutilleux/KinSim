@@ -78,6 +78,14 @@ extract:
   near_meth_max_dist: 10
   slowed_per_strain_cap: 0             # 0 = no cap (keep all SLOWED)
   near_meth_per_strain_cap: 0          # 0 = no cap
+  # Optional ambiguous-position avoidance. Points at the UNFILTERED GFF
+  # (motifs_full.gff = backup made before the motif=-only filter). High-QV
+  # positions there without motif support are AMBIGUOUS — not used as meth
+  # labels (not in motifs.gff anymore), but ALSO excluded from the baseline
+  # pool, so we don't contaminate negative-control samples with marginal
+  # ipdSummary calls. Set to null to disable.
+  avoid_gff_pattern: "{strain_dir}/motifs_full.gff"
+  avoid_gff_qv_threshold: 10.0
 
 # -- Train / test split -------------------------------------------------
 split:

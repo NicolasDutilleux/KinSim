@@ -57,6 +57,13 @@ class ExtractParams:
     near_meth_max_dist: int = 10
     slowed_per_strain_cap: int = 0
     near_meth_per_strain_cap: int = 0
+    # Optional: also exclude positions in a second GFF (typically the full
+    # unfiltered motifs.gff) from baseline sampling. Use when motifs.gff has
+    # been filtered to motif-confirmed lines only and the original (with
+    # ambiguous high-QV ipdSummary calls) is kept as motifs_full.gff —
+    # baseline pool then avoids BOTH motif-confirmed AND ambiguous positions.
+    avoid_gff_pattern: str | None = None
+    avoid_gff_qv_threshold: float = 10.0
 
 
 @dataclass(frozen=True)

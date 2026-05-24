@@ -163,6 +163,45 @@ def _collect_labels(
     return result
 
 
+def _parse_gff_avoid_positions(
+    path: Path,
+    qv_threshold: float,
+) -> set[tuple[str, int]]:
+    """Parse a GFF and return ``{(seqid, pos_0based)}`` for every line whose
+    score (modificationQv) ≥ ``qv_threshold``. Used to feed baseline sampling
+    with an avoidance set beyond the strict meth labels — for example, the
+    full pre-filter motifs.gff so baselines don't fall on AMBIGUOUS ipdSummary
+    calls that lack motif support."""
+    out: set[tuple[str, int]] = set()
+    if not path.is_file():
+        log.warning("avoid_gff not found: %s", path)
+        return out
+    n_kept = 0
+    n_skipped_qv = 0
+    with open(path) as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 9:
+                continue
+            try:
+                qv = float(parts[5])
+                start_1based = int(parts[3])
+            except ValueError:
+                continue
+            if qv < qv_threshold:
+                n_skipped_qv += 1
+                continue
+            out.add((parts[0], start_1based - 1))
+            n_kept += 1
+    log.info(
+        "[avoid_gff] %s parsed: %d positions kept (qv≥%g, %d skipped qv<)",
+        path.name, n_kept, qv_threshold, n_skipped_qv,
+    )
+    return out
+
+
 def _sample_baselines(
     label_positions: set[tuple[str, int, str]],
     ref_seqs: dict[str, str],
@@ -170,6 +209,7 @@ def _sample_baselines(
     min_dist: int,
     half_width: int,
     rng: random.Random,
+    extra_avoid: set[tuple[str, int]] | None = None,
 ) -> list[tuple[str, int, str]]:
     """Sample baseline positions ≥ ``min_dist`` bp from any labelled
     methylation position."""
@@ -187,6 +227,15 @@ def _sample_baselines(
         lo = max(0, pos - min_dist)
         hi = min(f.size, pos + min_dist + 1)
         f[lo:hi] = True
+
+    if extra_avoid:
+        for (rid, pos) in extra_avoid:
+            if rid not in forbidden_by_ref:
+                continue
+            f = forbidden_by_ref[rid]
+            lo = max(0, pos - min_dist)
+            hi = min(f.size, pos + min_dist + 1)
+            f[lo:hi] = True
 
     refs = list(ref_seqs.keys())
     out = []
@@ -404,6 +453,18 @@ def extract_strain(
     # (CPython's builtin hash() of strings is randomized per process).
     stable_hash = int(hashlib.sha1(sample_id.encode("utf-8")).hexdigest()[:8], 16)
     rng = random.Random(cfg.train.seed + stable_hash)
+    # Optional: parse a second GFF (typically the unfiltered pre-grep
+    # motifs.gff) and add those high-QV positions to the baseline avoidance
+    # set, so baselines don't fall on AMBIGUOUS (no-motif) ipdSummary calls.
+    extra_avoid: set[tuple[str, int]] | None = None
+    avoid_pattern = getattr(cfg.extract, "avoid_gff_pattern", None)
+    if avoid_pattern:
+        avoid_path = Path(str(avoid_pattern).format(strain_dir=str(strain_dir)))
+        extra_avoid = _parse_gff_avoid_positions(
+            avoid_path,
+            float(getattr(cfg.extract, "avoid_gff_qv_threshold", 10.0)),
+        )
+
     baseline_positions = _sample_baselines(
         set(labels.keys()),
         ref_seqs,
@@ -411,8 +472,12 @@ def extract_strain(
         cfg.extract.baseline_min_dist,
         cfg.window.half_width,
         rng,
+        extra_avoid=extra_avoid,
     )
-    log.info("[%s] %d baseline positions sampled", sample_id, len(baseline_positions))
+    log.info("[%s] %d baseline positions sampled (avoid set: %d meth + %d ambiguous)",
+             sample_id, len(baseline_positions),
+             len(labels),
+             len(extra_avoid) if extra_avoid else 0)
 
     # BAM I/O
     bam_fmt = detect_bam_format(bam_path)
