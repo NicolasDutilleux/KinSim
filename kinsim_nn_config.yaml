@@ -64,10 +64,13 @@ extract:
                                 # (0 = no filter; pbmm2 often assigns mapq=0
                                 # on unique-only alignments which would otherwise
                                 # be filtered out at >0 thresholds)
-  # 0 = no cap (all GFF-labelled positions). For dense-meth strains (e.g.
-  # Strepto ~400k positions per strain) BAM I/O dominates extract walltime;
-  # cap to a random subsample to bound walltime. 100k is a sane default.
-  meth_per_strain_cap: 0
+  # Cap on motif-confirmed parents per strain BEFORE expansion. Bounds BAM
+  # I/O walltime. Default 15000: a balance between (a) keeping all data for
+  # small strains (most Vega + low-meth Strepto are well under this) and
+  # (b) capping monster strains (some Vega recovery strains have 400k+
+  # motif-confirmed positions which would take 80+ hours to extract).
+  # 0 = no cap.
+  meth_per_strain_cap: 15000
   # Bystrandified pair combination: required if input BAM is bystrandified
   # (2 records/ZMW). Disabled if raw HiFi aligned (1 record/ZMW with fi/fp/ri/rp).
   bystrandify_pairing: true
