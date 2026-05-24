@@ -252,6 +252,9 @@ def train(
     cfg: KinsimNNConfig,
     test_strains: tuple[str, ...] | None,
     resume: bool = False,
+    n_steps_override: int | None = None,
+    checkpoint_every_override: int | None = None,
+    eval_every_override: int | None = None,
 ) -> None:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     _seed_all(cfg.train.seed)
@@ -343,7 +346,18 @@ def train(
 
     g.train(); d.train()
     step = start_step
-    n_steps = cfg.train.n_steps
+    n_steps = n_steps_override if n_steps_override is not None else cfg.train.n_steps
+    checkpoint_every = (
+        checkpoint_every_override if checkpoint_every_override is not None
+        else cfg.train.checkpoint_every
+    )
+    eval_every = (
+        eval_every_override if eval_every_override is not None
+        else cfg.train.eval_every
+    )
+    if (n_steps_override or checkpoint_every_override or eval_every_override):
+        log.info("CLI overrides: n_steps=%d checkpoint_every=%d eval_every=%d",
+                 n_steps, checkpoint_every, eval_every)
     best_w1 = float("inf")
 
     # Restore the EXACT epoch counter saved at the previous checkpoint, so
@@ -435,14 +449,14 @@ def train(
                 )
 
             # Checkpoint
-            if step % cfg.train.checkpoint_every == 0:
+            if step % checkpoint_every == 0:
                 _save_checkpoint(ckpt_dir / "G.pt", g, opt_g, step, epoch)
                 _save_checkpoint(ckpt_dir / "D.pt", d, opt_d, step, epoch)
                 log.info("Checkpointed at step %d (epoch %d)", step, epoch)
 
             # Held-out evaluation (Wasserstein-1 per meth type)
             if (
-                step % cfg.train.eval_every == 0
+                step % eval_every == 0
                 and test_shard_paths
             ):
                 eval_metrics = _evaluate_on_shards(
@@ -479,6 +493,12 @@ def main(argv=None):
     ap.add_argument("--test-strains", default=None,
                     help="Comma-separated sample_ids to exclude from training (overrides YAML)")
     ap.add_argument("--resume", action="store_true", help="Resume from existing G.pt / D.pt")
+    ap.add_argument("--n-steps", type=int, default=None,
+                    help="Override cfg.train.n_steps (useful for mini/smoke runs)")
+    ap.add_argument("--checkpoint-every", type=int, default=None,
+                    help="Override cfg.train.checkpoint_every")
+    ap.add_argument("--eval-every", type=int, default=None,
+                    help="Override cfg.train.eval_every")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     setup_logging(verbose=args.verbose)
@@ -495,6 +515,9 @@ def main(argv=None):
         cfg=cfg,
         test_strains=test_strains,
         resume=args.resume,
+        n_steps_override=args.n_steps,
+        checkpoint_every_override=args.checkpoint_every,
+        eval_every_override=args.eval_every,
     )
 
 
