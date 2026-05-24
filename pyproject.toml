@@ -9,7 +9,7 @@ description     = "PacBio HiFi kinetic signal simulator for methylation-aware me
 readme          = "README.md"
 license         = "MIT"
 license-files   = ["LICENSE"]
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 authors         = [{ name = "Nicolas Dutilleux", email = "nicolas.dutilleux@unifr.ch" }]
 keywords        = ["pacbio", "kinetics", "methylation", "metagenomics", "simulator", "bioinformatics"]
 classifiers     = [
@@ -80,7 +80,7 @@ kinsim_NN = ["py.typed"]
 
 [tool.ruff]
 line-length    = 100
-target-version = "py310"
+target-version = "py39"
 extend-exclude = [
     "kinsim.egg-info",
 ]
