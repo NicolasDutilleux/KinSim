@@ -34,6 +34,7 @@ dependencies = [
 ml = [
     "torch>=2.0",
     "pytorch-lightning>=2.0",
+    "tensorboard>=2.10",   # hard-imported in kinsim_NN/train.py
 ]
 plot = [
     "plotly>=5.20",
@@ -42,7 +43,6 @@ plot = [
     "kaleido",         # static image export from plotly
 ]
 hpo = ["optuna"]
-tb  = ["tensorboard"]
 dev = [
     "ruff>=0.6",
     "pre-commit>=3.6",
