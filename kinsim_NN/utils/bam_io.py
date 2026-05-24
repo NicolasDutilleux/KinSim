@@ -249,11 +249,14 @@ def iter_window_samples(
             ip_ri, pw_ri, mask_ri = extract_window_from_read(
                 rev_rec, fmt.ipd_rev_tag, fmt.pw_rev_tag, ref_positions,
             )
-            # Both records of a ZMW must agree on alignment direction (pbmm2
-            # is deterministic per-ZMW). Use the /fwd record's direction.
-            if fwd_rec.is_reverse != rev_rec.is_reverse:
-                # Pathological mixed-orientation pair: skip rather than
-                # silently route into the wrong channel.
+            # Bystrandified pairs are reverse-complementary by construction:
+            # /fwd carries the original CCS SEQ, /rev carries its
+            # reverse-complement. pbmm2 therefore aligns them to OPPOSITE
+            # reference strands → /fwd.is_reverse != /rev.is_reverse is the
+            # expected invariant. A pair sharing the same orientation is
+            # pathological — skip it. (The routing below uses /fwd's
+            # orientation as the canonical direction.)
+            if fwd_rec.is_reverse == rev_rec.is_reverse:
                 continue
             if fwd_rec.is_reverse:
                 # reverse-mapped: fi-like (ip from /fwd) is + strand kinetics
@@ -402,7 +405,10 @@ def iter_chunk_samples(
                 continue
             fwd_rec = pair["fwd"]
             rev_rec = pair["rev"]
-            if fwd_rec.is_reverse != rev_rec.is_reverse:
+            # Bystrandified pairs are reverse-complementary by construction
+            # → expected /fwd.is_reverse != /rev.is_reverse. SAME orientation
+            # is the pathological case.
+            if fwd_rec.is_reverse == rev_rec.is_reverse:
                 n_pairs_strand_mismatch += 1
                 continue
             is_rev = fwd_rec.is_reverse
