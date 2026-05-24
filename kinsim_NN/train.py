@@ -170,14 +170,25 @@ def _evaluate_on_shards(
     device: torch.device,
     max_samples: int = 4000,
 ) -> dict[str, float]:
-    """Compute per-meth-type Wasserstein-1 on held-out test shards.
+    """Compute Wasserstein-1 on held-out test shards, bucketed two ways:
 
-    Returns ``{"w1_overall": ..., "w1_baseline": ..., "w1_m6A": ...}`` etc.
-    Capped at ``max_samples`` per type to keep eval fast (~seconds).
+    * **per meth_id at center** (``w1_meth0``, ``w1_meth1``, ...) — diagnoses
+      conditioning on the centre's meth label
+    * **per category** (``w1_baseline``, ``w1_slowed``, ``w1_near_meth``) —
+      diagnoses whether the model learned the SLOWED-vs-NEAR_METH distinction
+      from the v3 emission expansion
+
+    Returns a dict including ``w1_overall`` as the global metric, used as the
+    best-model selector.
     """
     g.eval()
+    # Per-meth-id bucketing (existing axis: meth label at the centre position)
     real_by_m: dict[int, list[int]] = {}
     gen_by_m: dict[int, list[int]] = {}
+    # Per-category bucketing (new axis: emission category from extract)
+    cat_names = {0: "baseline", 1: "slowed", 2: "near_meth"}
+    real_by_cat: dict[int, list[int]] = {0: [], 1: [], 2: []}
+    gen_by_cat: dict[int, list[int]] = {0: [], 1: [], 2: []}
     cap_total = max_samples * n_meth_types
     for p in test_shard_paths:
         if sum(len(v) for v in real_by_m.values()) >= cap_total:
@@ -213,6 +224,7 @@ def _evaluate_on_shards(
         real_u8 = shard.signal[idxs, half]                          # (B, 4)
         mf = shard.meth_fwd[idxs, half]
         mr = shard.meth_rev[idxs, half]
+        cats = shard.category[idxs]
         for i in range(real_u8.shape[0]):
             # Bilateral pooling: meth on a strand → that strand's IPD only.
             # Baseline (both zero) → BOTH channels so under-fit of either is
@@ -221,15 +233,26 @@ def _evaluate_on_shards(
                 m_id = int(mf[i])
                 real_by_m.setdefault(m_id, []).append(int(real_u8[i, 0]))
                 gen_by_m.setdefault(m_id, []).append(int(gen_u8[i, 0]))
+                strand_real = int(real_u8[i, 0])
+                strand_gen = int(gen_u8[i, 0])
             elif mr[i] > 0:
                 m_id = int(mr[i])
                 real_by_m.setdefault(m_id, []).append(int(real_u8[i, 2]))
                 gen_by_m.setdefault(m_id, []).append(int(gen_u8[i, 2]))
+                strand_real = int(real_u8[i, 2])
+                strand_gen = int(gen_u8[i, 2])
             else:
                 real_by_m.setdefault(0, []).append(int(real_u8[i, 0]))
                 gen_by_m.setdefault(0, []).append(int(gen_u8[i, 0]))
                 real_by_m.setdefault(0, []).append(int(real_u8[i, 2]))
                 gen_by_m.setdefault(0, []).append(int(gen_u8[i, 2]))
+                strand_real = int(real_u8[i, 0])  # arbitrary; baseline either-strand
+                strand_gen = int(gen_u8[i, 0])
+            # Per-category bucketing (uses the SAME strand pick as per-meth-id)
+            cat = int(cats[i])
+            if cat in real_by_cat:
+                real_by_cat[cat].append(strand_real)
+                gen_by_cat[cat].append(strand_gen)
     g.train()
     out: dict[str, float] = {}
     all_real, all_gen = [], []
@@ -239,6 +262,13 @@ def _evaluate_on_shards(
         out[f"w1_meth{m_id}"] = _wasserstein_1d(r, gg)
         all_real.extend(r.tolist())
         all_gen.extend(gg.tolist())
+    for cat_id, cat_name in cat_names.items():
+        r = np.asarray(real_by_cat.get(cat_id, []), dtype=np.float32)
+        gg = np.asarray(gen_by_cat.get(cat_id, []), dtype=np.float32)
+        if r.size == 0:
+            out[f"w1_{cat_name}"] = float("nan")
+        else:
+            out[f"w1_{cat_name}"] = _wasserstein_1d(r, gg)
     out["w1_overall"] = _wasserstein_1d(
         np.asarray(all_real, dtype=np.float32),
         np.asarray(all_gen, dtype=np.float32),

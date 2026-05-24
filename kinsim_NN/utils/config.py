@@ -35,6 +35,7 @@ class MethylationType:
     id: int
     modified_base: str | None = None
     label_sources: tuple[str, ...] = ()
+    signal_offsets: tuple[int, ...] = ()   # bp offsets where IPD slowdown is seen
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,13 @@ class ExtractParams:
                                   # actual MAPQ values > 0.
     bystrandify_pairing: bool = True
     meth_per_strain_cap: int = 0  # 0 = no cap; else random subsample meth positions
+    # 3-category expansion: each meth position p of type T spawns emission
+    # candidates at p+k for k in [0, near_meth_max_dist]. Category depends on
+    # whether k is in T.signal_offsets (SLOWED) or not (NEAR_METH). Per-category
+    # caps bound total emission points (0 = no cap).
+    near_meth_max_dist: int = 10
+    slowed_per_strain_cap: int = 0
+    near_meth_per_strain_cap: int = 0
 
 
 @dataclass(frozen=True)
@@ -181,6 +189,7 @@ def load_config(path: str | Path | None = None) -> KinsimNNConfig:
             id=int(body["id"]),
             modified_base=body.get("modified_base"),
             label_sources=tuple(body.get("label_sources") or ()),
+            signal_offsets=tuple(int(o) for o in (body.get("signal_offsets") or ())),
         ))
     if not meth_types:
         raise ValueError("methylation_types must define at least 'none'")

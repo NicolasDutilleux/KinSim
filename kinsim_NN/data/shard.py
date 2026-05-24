@@ -6,20 +6,22 @@ Each strain's training data lives in a single pickle file:
 
 The pickle contains a dict with these arrays (all length N):
 
-    base_fwd   uint8  (N, K)            A/C/G/T codes 0..3
-    meth_fwd   uint8  (N, K)            meth_id 0..M-1 (0 = none)
-    meth_rev   uint8  (N, K)            meth_id 0..M-1 on reverse strand
-    signal     uint8  (N, K, 4)         IPD_fwd, PW_fwd, IPD_rev, PW_rev (uint8 codec)
-    category   uint8  (N,)              0 = baseline, 1 = meth-positive
-    ref_id     uint16 (N,)              indexed into __meta__["ref_names"]
-    ref_pos    int32  (N,)              0-based position of window center
-    strand     int8   (N,)              +1 / -1
-    zmw        int64  (N,)              ZMW number (16-byte read name hash if non-numeric)
+    base_fwd      uint8  (N, K)         A/C/G/T codes 0..3
+    meth_fwd      uint8  (N, K)         meth_id 0..M-1 (0 = none)
+    meth_rev      uint8  (N, K)         meth_id 0..M-1 on reverse strand
+    signal        uint8  (N, K, 4)      IPD_fwd, PW_fwd, IPD_rev, PW_rev (uint8 codec)
+    category      uint8  (N,)           0 = BASELINE, 1 = SLOWED, 2 = NEAR_METH
+    parent_meth   uint8  (N,)           parent methylation id (0 if baseline)
+    parent_offset int8   (N,)           offset from parent meth (0 if baseline)
+    ref_id        uint16 (N,)           indexed into __meta__["ref_names"]
+    ref_pos       int32  (N,)           0-based position of window center
+    strand        int8   (N,)           +1 / -1
+    zmw           int64  (N,)           ZMW number (16-byte read name hash if non-numeric)
 
 plus a metadata dict::
 
     __meta__ = {
-        "config_version": "kinsim_NN-1",
+        "config_version": "kinsim_NN-2",
         "k": 21, "half_width": 10, "n_channels": 4,
         "n_meth_types": M,
         "meth_id_by_name": {"none": 0, "m6A": 1, ...},
@@ -47,22 +49,29 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-SHARD_CONFIG_VERSION = "kinsim_NN-1"
+SHARD_CONFIG_VERSION = "kinsim_NN-2"
+
+# Category codes (single source of truth)
+CATEGORY_BASELINE = 0
+CATEGORY_SLOWED = 1
+CATEGORY_NEAR_METH = 2
 
 
 @dataclass
 class ShardData:
     """In-memory shard contents. All arrays length N."""
 
-    base_fwd: np.ndarray   # (N, K) uint8
-    meth_fwd: np.ndarray   # (N, K) uint8
-    meth_rev: np.ndarray   # (N, K) uint8
-    signal: np.ndarray     # (N, K, 4) uint8
-    category: np.ndarray   # (N,) uint8
-    ref_id: np.ndarray     # (N,) uint16
-    ref_pos: np.ndarray    # (N,) int32
-    strand: np.ndarray     # (N,) int8
-    zmw: np.ndarray        # (N,) int64
+    base_fwd: np.ndarray       # (N, K) uint8
+    meth_fwd: np.ndarray       # (N, K) uint8
+    meth_rev: np.ndarray       # (N, K) uint8
+    signal: np.ndarray         # (N, K, 4) uint8
+    category: np.ndarray       # (N,) uint8
+    parent_meth: np.ndarray    # (N,) uint8
+    parent_offset: np.ndarray  # (N,) int8
+    ref_id: np.ndarray         # (N,) uint16
+    ref_pos: np.ndarray        # (N,) int32
+    strand: np.ndarray         # (N,) int8
+    zmw: np.ndarray            # (N,) int64
     meta: dict[str, Any]
 
     @property
@@ -99,6 +108,8 @@ def write_shard(path: Path, shard: ShardData) -> None:
         "meth_rev": shard.meth_rev,
         "signal": shard.signal,
         "category": shard.category,
+        "parent_meth": shard.parent_meth,
+        "parent_offset": shard.parent_offset,
         "ref_id": shard.ref_id,
         "ref_pos": shard.ref_pos,
         "strand": shard.strand,
@@ -133,6 +144,8 @@ def read_shard(path: Path) -> ShardData:
         meth_rev=payload["meth_rev"],
         signal=payload["signal"],
         category=payload["category"],
+        parent_meth=payload["parent_meth"],
+        parent_offset=payload["parent_offset"],
         ref_id=payload["ref_id"],
         ref_pos=payload["ref_pos"],
         strand=payload["strand"],
@@ -153,6 +166,8 @@ def empty_shard(k: int) -> dict[str, list]:
         "meth_rev": [],
         "signal": [],
         "category": [],
+        "parent_meth": [],
+        "parent_offset": [],
         "ref_id": [],
         "ref_pos": [],
         "strand": [],
@@ -170,6 +185,8 @@ def finalize_shard(builder: dict[str, list], meta: dict[str, Any], k: int) -> Sh
             meth_rev=np.empty((0, k), dtype=np.uint8),
             signal=np.empty((0, k, 4), dtype=np.uint8),
             category=np.empty(0, dtype=np.uint8),
+            parent_meth=np.empty(0, dtype=np.uint8),
+            parent_offset=np.empty(0, dtype=np.int8),
             ref_id=np.empty(0, dtype=np.uint16),
             ref_pos=np.empty(0, dtype=np.int32),
             strand=np.empty(0, dtype=np.int8),
@@ -182,6 +199,8 @@ def finalize_shard(builder: dict[str, list], meta: dict[str, Any], k: int) -> Sh
         meth_rev=np.stack(builder["meth_rev"]).astype(np.uint8),
         signal=np.stack(builder["signal"]).astype(np.uint8),
         category=np.asarray(builder["category"], dtype=np.uint8),
+        parent_meth=np.asarray(builder["parent_meth"], dtype=np.uint8),
+        parent_offset=np.asarray(builder["parent_offset"], dtype=np.int8),
         ref_id=np.asarray(builder["ref_id"], dtype=np.uint16),
         ref_pos=np.asarray(builder["ref_pos"], dtype=np.int32),
         strand=np.asarray(builder["strand"], dtype=np.int8),
@@ -192,6 +211,9 @@ def finalize_shard(builder: dict[str, list], meta: dict[str, Any], k: int) -> Sh
 
 __all__ = [
     "SHARD_CONFIG_VERSION",
+    "CATEGORY_BASELINE",
+    "CATEGORY_SLOWED",
+    "CATEGORY_NEAR_METH",
     "ShardData",
     "read_shard",
     "write_shard",

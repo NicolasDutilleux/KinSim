@@ -10,6 +10,12 @@ window:
 
 # -- Methylation types (extensible) --------------------------------------
 # id MUST be unique and start at 0 for 'none'. M = max(id)+1.
+#
+# signal_offsets: per meth type, the +k bp offsets relative to the meth
+# position where the polymerase IPD slowdown is observed (v3 kinsim default
+# values from SP3-C3 model). Used by `extract` to split samples into
+# CATEGORY_SLOWED (at a signature offset of a meth) vs CATEGORY_NEAR_METH
+# (close to a meth but NOT at a signature offset — control samples).
 methylation_types:
   none:
     id: 0
@@ -17,14 +23,17 @@ methylation_types:
     id: 1
     modified_base: A
     label_sources: [gff]
+    signal_offsets: [0, 5]
   m4C:
     id: 2
     modified_base: C
     label_sources: [gff]
+    signal_offsets: [0]
   m5C:
     id: 3
     modified_base: C
     label_sources: [gff, jasmine_mm_ml]
+    signal_offsets: [2, 6]
 
 # Treat GFF 'modified_base' (unclassified) as which type? Set to null to ignore.
 treat_modified_base_as: m5C
@@ -58,6 +67,15 @@ extract:
   # Bystrandified pair combination: required if input BAM is bystrandified
   # (2 records/ZMW). Disabled if raw HiFi aligned (1 record/ZMW with fi/fp/ri/rp).
   bystrandify_pairing: true
+  # 3-category labeling (v3-style). For each meth position p of type T,
+  # expand into emission candidates at offsets [0, near_meth_max_dist]:
+  #   k ∈ signal_offsets[T] → CATEGORY_SLOWED
+  #   k ∉ signal_offsets[T] → CATEGORY_NEAR_METH
+  # Per-category caps bound total emission points so the shard size stays
+  # sane after expansion (each cap × reads_cap_per_position = samples).
+  near_meth_max_dist: 10
+  slowed_per_strain_cap: 100000        # 0 = no cap on SLOWED emission points
+  near_meth_per_strain_cap: 100000     # 0 = no cap on NEAR_METH emission points
 
 # -- Train / test split -------------------------------------------------
 split:

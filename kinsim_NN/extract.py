@@ -31,6 +31,9 @@ import pysam
 
 from . import __version__
 from .data.shard import (
+    CATEGORY_BASELINE,
+    CATEGORY_NEAR_METH,
+    CATEGORY_SLOWED,
     SHARD_CONFIG_VERSION,
     empty_shard,
     finalize_shard,
@@ -214,14 +217,21 @@ def _flush_position_to_builder(
     base_fwd: np.ndarray,
     meth_fwd: np.ndarray,
     meth_rev: np.ndarray,
-    meth_id_center: int,
+    category: int,
+    parent_meth: int,
+    parent_offset: int,
     strand_center: str,
     builder: dict,
     ref_id_idx: int,
 ) -> int:
-    """Append all collected samples for one ref position into the shard builder."""
+    """Append all collected samples for one ref position into the shard builder.
+
+    ``category`` is one of CATEGORY_{BASELINE,SLOWED,NEAR_METH}. ``parent_meth``
+    is the meth id of the methylation that this position originated from
+    (0 for baseline). ``parent_offset`` is the bp offset from that parent
+    meth's centre (0 for baseline).
+    """
     n = 0
-    cat = 0 if meth_id_center == 0 else 1
     strand_int = 1 if strand_center == "+" else -1
     for sample in samples:
         signal = np.stack(
@@ -232,7 +242,9 @@ def _flush_position_to_builder(
         builder["meth_fwd"].append(meth_fwd)
         builder["meth_rev"].append(meth_rev)
         builder["signal"].append(signal)
-        builder["category"].append(cat)
+        builder["category"].append(category)
+        builder["parent_meth"].append(parent_meth)
+        builder["parent_offset"].append(parent_offset)
         builder["ref_id"].append(ref_id_idx)
         builder["ref_pos"].append(int(pos))
         builder["strand"].append(strand_int)
@@ -272,7 +284,8 @@ def _extract_chunk_batched(
     bam: pysam.AlignmentFile,
     bam_fmt,
     seqid: str,
-    chunk_positions: list[tuple[int, int, str]],   # [(ref_pos, meth_id, strand), ...] sorted by ref_pos
+    chunk_positions: list[tuple[int, str, int, int, int]],
+    # [(ref_pos, strand, category, parent_meth, parent_offset), ...] sorted by ref_pos
     ref_seq: str,
     cfg: KinsimNNConfig,
     rng: random.Random,
@@ -294,13 +307,13 @@ def _extract_chunk_batched(
 
     # Pre-build window tensors per position (cheap CPU work, no I/O).
     pos_tensors: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-    pos_meta: dict[int, tuple[int, str]] = {}
-    for p, mid, strand in chunk_positions:
+    pos_meta: dict[int, tuple[str, int, int, int]] = {}  # strand, category, parent_meth, parent_offset
+    for p, strand, category, parent_meth, parent_offset in chunk_positions:
         t = _build_window_tensors(p, seqid, ref_seq, cfg, labels)
         if t is None:
             continue
         pos_tensors[p] = t
-        pos_meta[p] = (mid, strand)
+        pos_meta[p] = (strand, category, parent_meth, parent_offset)
     if not pos_tensors:
         return 0
 
@@ -348,91 +361,12 @@ def _extract_chunk_batched(
         if not pos_samples[p]:
             continue
         base_fwd, meth_fwd, meth_rev = pos_tensors[p]
-        mid, strand = pos_meta[p]
+        strand, category, parent_meth, parent_offset = pos_meta[p]
         n_added += _flush_position_to_builder(
             p, pos_samples[p], base_fwd, meth_fwd, meth_rev,
-            mid, strand, builder, ref_id_idx,
+            category, parent_meth, parent_offset, strand,
+            builder, ref_id_idx,
         )
-    return n_added
-
-
-def _extract_position(
-    bam: pysam.AlignmentFile,
-    bam_fmt,
-    seqid: str,
-    pos: int,
-    strand: str,
-    meth_id: int,
-    ref_seq: str,
-    cfg: KinsimNNConfig,
-    rng: random.Random,
-    builder: dict,
-    ref_id_idx: int,
-    labels: dict[tuple[str, int, str], int],
-) -> int:
-    """Walk reads covering ``pos`` and emit up to ``reads_cap_per_position``
-    samples into ``builder``. Returns the number of samples added.
-
-    Overlays *all* labels that fall inside the window onto meth_fwd /
-    meth_rev (per strand). Neighbouring methylations within ±half are
-    real biological events that influence kinetics — they must be
-    present in the condition, otherwise the model learns a wrong
-    mapping (this was the v12_run3 mis-conditioning bug).
-    """
-    half = cfg.window.half_width
-    K = cfg.window.k
-    if pos - half < 0 or pos + half + 1 > len(ref_seq):
-        return 0
-    base_fwd = _encode_seq(ref_seq[pos - half: pos + half + 1])
-    meth_fwd = np.zeros(K, dtype=np.uint8)
-    meth_rev = np.zeros(K, dtype=np.uint8)
-    # Overlay every labelled position in the window onto the appropriate strand
-    for k in range(K):
-        win_pos = pos - half + k
-        fwd_id = labels.get((seqid, win_pos, "+"))
-        if fwd_id is not None:
-            meth_fwd[k] = fwd_id
-        rev_id = labels.get((seqid, win_pos, "-"))
-        if rev_id is not None:
-            meth_rev[k] = rev_id
-    # For baseline samples (meth_id == 0), the center is far from labels by
-    # construction (≥ baseline_min_dist); meth_fwd[half]==meth_rev[half]==0.
-    # For meth samples, the center label is already set by the overlay above.
-
-    n_added = 0
-    # Reservoir sampling: keep at most ``reads_cap_per_position`` samples
-    # without materialising all of them in memory. Memory is O(cap), not
-    # O(coverage) — useful at high-coverage strains.
-    cap = int(cfg.extract.reads_cap_per_position)
-    samples: list = []
-    n_seen = 0
-    for sample in iter_window_samples(
-        bam, bam_fmt, seqid, pos, half, min_mapq=cfg.extract.min_mapq,
-    ):
-        n_seen += 1
-        if len(samples) < cap:
-            samples.append(sample)
-        else:
-            j = rng.randrange(n_seen)
-            if j < cap:
-                samples[j] = sample
-    if not samples:
-        return 0
-    for sample in samples:
-        signal = np.stack(
-            [sample.ipd_fwd, sample.pw_fwd, sample.ipd_rev, sample.pw_rev],
-            axis=-1,
-        ).astype(np.uint8)  # (K, 4)
-        builder["base_fwd"].append(base_fwd)
-        builder["meth_fwd"].append(meth_fwd)
-        builder["meth_rev"].append(meth_rev)
-        builder["signal"].append(signal)
-        builder["category"].append(0 if meth_id == 0 else 1)
-        builder["ref_id"].append(ref_id_idx)
-        builder["ref_pos"].append(pos)
-        builder["strand"].append(1 if strand == "+" else -1)
-        builder["zmw"].append(hash_zmw(sample.zmw_id))
-        n_added += 1
     return n_added
 
 
@@ -492,16 +426,16 @@ def extract_strain(
 
     # Methylated positions — dedup by (rid, pos) so palindromic motifs that
     # contribute BOTH "+" and "-" labels at the same position only produce ONE
-    # training sample. Strand info is encoded in the overlay tensors anyway.
-    n_meth_samples = 0
+    # parent for the expansion.
     unique_meth_positions: dict[tuple[str, int], tuple[int, str]] = {}
     for (rid, pos, strand), mid in labels.items():
         key = (rid, pos)
         if key not in unique_meth_positions:
             unique_meth_positions[key] = (mid, strand)
 
-    # Optional random subsample of meth positions per strain. Strepto strains can
-    # have 400k+ labelled positions which makes BAM I/O dominate wall time.
+    # Optional random subsample of meth POSITIONS per strain (before expansion).
+    # Strepto strains can have 400k+ labelled positions; capping here bounds
+    # BAM I/O without changing the SLOWED/NEAR_METH ratio.
     meth_items = list(unique_meth_positions.items())
     cap = int(getattr(cfg.extract, "meth_per_strain_cap", 0) or 0)
     if cap and len(meth_items) > cap:
@@ -510,14 +444,62 @@ def extract_strain(
         log.info("[%s] Subsampled %d meth positions to %d (cap)",
                  sample_id, len(unique_meth_positions), cap)
 
-    # Sort meth items by (ref_id, ref_pos) so adjacent BAM regions are visited
-    # consecutively. This lets the OS page cache keep the BAM region hot for
-    # ~hundreds of positions in a row — empirically a 5-10x speedup vs random
-    # access on a 80x coverage 4 GB bystrandified BAM.
-    meth_items.sort(key=lambda item: (item[0][0], item[0][1]))
+    # ----------------------------------------------------------------------
+    # v3-style emission expansion: each meth position p of type T spawns
+    # emission candidates at p+k for k in [0, near_meth_max_dist]. Category
+    # is SLOWED if k in T.signal_offsets, else NEAR_METH. Conflicts resolved
+    # with SLOWED-beats-NEAR_METH precedence; within same category last
+    # writer wins (deterministic by iteration order).
+    # ----------------------------------------------------------------------
+    signal_offsets_by_id: dict[int, frozenset[int]] = {
+        t.id: frozenset(t.signal_offsets) for t in cfg.methylation_types
+    }
+    near_meth_max_dist = int(getattr(cfg.extract, "near_meth_max_dist", 10))
 
-    log.info("[%s] Processing %d unique meth positions (sorted by ref_pos, batched) ...",
-             sample_id, len(meth_items))
+    # key=(rid, emit_pos, strand) → (category, parent_meth, parent_offset)
+    emissions: dict[tuple[str, int, str], tuple[int, int, int]] = {}
+    for (rid, p), (mid, strand) in meth_items:
+        if rid not in ref_seqs:
+            continue
+        sig_offs = signal_offsets_by_id.get(mid, frozenset())
+        for k in range(0, near_meth_max_dist + 1):
+            emit_pos = p + k
+            key = (rid, emit_pos, strand)
+            if k in sig_offs:
+                emissions[key] = (CATEGORY_SLOWED, mid, k)
+            else:
+                existing = emissions.get(key)
+                if existing is not None and existing[0] == CATEGORY_SLOWED:
+                    continue  # SLOWED stays; don't downgrade
+                emissions[key] = (CATEGORY_NEAR_METH, mid, k)
+
+    # Split by category for independent caps
+    slowed_items: list[tuple[str, int, str, int, int]] = []     # (rid, pos, strand, parent_meth, parent_offset)
+    near_meth_items: list[tuple[str, int, str, int, int]] = []
+    for (rid, pos, strand), (cat, pmeth, poff) in emissions.items():
+        if cat == CATEGORY_SLOWED:
+            slowed_items.append((rid, pos, strand, pmeth, poff))
+        else:
+            near_meth_items.append((rid, pos, strand, pmeth, poff))
+
+    n_slowed_total = len(slowed_items)
+    n_near_meth_total = len(near_meth_items)
+    slowed_cap = int(getattr(cfg.extract, "slowed_per_strain_cap", 0) or 0)
+    near_meth_cap = int(getattr(cfg.extract, "near_meth_per_strain_cap", 0) or 0)
+    if slowed_cap and len(slowed_items) > slowed_cap:
+        rng.shuffle(slowed_items)
+        slowed_items = slowed_items[:slowed_cap]
+    if near_meth_cap and len(near_meth_items) > near_meth_cap:
+        rng.shuffle(near_meth_items)
+        near_meth_items = near_meth_items[:near_meth_cap]
+    log.info(
+        "[%s] Emission expansion: %d meth positions → %d SLOWED (cap→%d) + "
+        "%d NEAR_METH (cap→%d); near_meth_max_dist=%d",
+        sample_id, len(meth_items),
+        n_slowed_total, len(slowed_items),
+        n_near_meth_total, len(near_meth_items),
+        near_meth_max_dist,
+    )
 
     # Chunk positions by spatial locality (same contig, span ≤ CHUNK_SPAN_BP).
     # Each chunk → ONE bam.fetch, ONE get_aligned_pairs per record. Massive
@@ -529,86 +511,68 @@ def extract_strain(
     import time as _time
     from collections import defaultdict as _dd
 
-    # Group meth items per ref_id (each chunk is within one contig)
-    meth_by_ref: dict[str, list[tuple[int, int, str]]] = _dd(list)
-    for (rid, pos), (mid, strand) in meth_items:
-        if rid in ref_seqs:
-            meth_by_ref[rid].append((pos, mid, strand))
-    # already sorted by (ref_id, ref_pos) above, so per-ref lists are sorted
-
-    t0 = _time.time()
-    n_chunks_done = 0
-    total_positions = sum(len(v) for v in meth_by_ref.values())
-    positions_done = 0
-    for rid, items in meth_by_ref.items():
-        i = 0
-        while i < len(items):
-            chunk_start_pos = items[i][0]
-            j = i + 1
-            while (j < len(items)
-                   and items[j][0] - chunk_start_pos < CHUNK_SPAN_BP
-                   and (j - i) < CHUNK_MAX_POSITIONS):
-                j += 1
-            chunk = items[i:j]
-            n_meth_samples += _extract_chunk_batched(
-                bam, bam_fmt, rid, chunk, ref_seqs[rid], cfg, rng, builder,
-                ref_name_to_idx[rid], labels,
-            )
-            positions_done += len(chunk)
-            i = j
-            n_chunks_done += 1
-            if n_chunks_done % PROGRESS_EVERY_CHUNKS == 0:
-                elapsed = _time.time() - t0
-                rate = positions_done / max(elapsed, 1e-3)
-                eta = (total_positions - positions_done) / max(rate, 1e-3)
-                log.info(
-                    "[%s] meth chunks=%d positions=%d/%d (%.0f pos/s, ETA %.0f min, samples=%d)",
-                    sample_id, n_chunks_done, positions_done, total_positions,
-                    rate, eta / 60, n_meth_samples,
+    def _run_chunked(
+        items: list[tuple[str, int, str, int, int]],
+        category: int,
+        phase_label: str,
+    ) -> int:
+        """Chunk a list of (rid, pos, strand, parent_meth, parent_offset) by
+        spatial locality and run them through _extract_chunk_batched."""
+        # Sort by (rid, pos) for OS pagecache locality
+        items_sorted = sorted(items, key=lambda x: (x[0], x[1]))
+        by_ref: dict[str, list[tuple[int, str, int, int, int]]] = _dd(list)
+        for rid, pos, strand, pmeth, poff in items_sorted:
+            by_ref[rid].append((pos, strand, category, pmeth, poff))
+        n_samples = 0
+        t0 = _time.time()
+        n_chunks_done = 0
+        total = sum(len(v) for v in by_ref.values())
+        done = 0
+        for rid, ritems in by_ref.items():
+            i = 0
+            while i < len(ritems):
+                chunk_start_pos = ritems[i][0]
+                j = i + 1
+                while (j < len(ritems)
+                       and ritems[j][0] - chunk_start_pos < CHUNK_SPAN_BP
+                       and (j - i) < CHUNK_MAX_POSITIONS):
+                    j += 1
+                chunk = ritems[i:j]
+                n_samples += _extract_chunk_batched(
+                    bam, bam_fmt, rid, chunk, ref_seqs[rid], cfg, rng, builder,
+                    ref_name_to_idx[rid], labels,
                 )
-    log.info("[%s] Meth phase done: %d chunks, %d samples in %.1f min",
-             sample_id, n_chunks_done, n_meth_samples, (_time.time() - t0) / 60)
+                done += len(chunk)
+                i = j
+                n_chunks_done += 1
+                if n_chunks_done % PROGRESS_EVERY_CHUNKS == 0:
+                    elapsed = _time.time() - t0
+                    rate = done / max(elapsed, 1e-3)
+                    eta = (total - done) / max(rate, 1e-3)
+                    log.info(
+                        "[%s] %s chunks=%d positions=%d/%d (%.0f pos/s, ETA %.0f min, samples=%d)",
+                        sample_id, phase_label, n_chunks_done, done, total,
+                        rate, eta / 60, n_samples,
+                    )
+        log.info(
+            "[%s] %s phase done: %d chunks, %d samples in %.1f min",
+            sample_id, phase_label, n_chunks_done, n_samples,
+            (_time.time() - t0) / 60,
+        )
+        return n_samples
 
-    # Baseline positions (meth_id=0) — same chunked path.
-    baseline_positions = sorted(baseline_positions, key=lambda p: (p[0], p[1]))
-    baseline_by_ref: dict[str, list[tuple[int, int, str]]] = _dd(list)
-    for rid, pos, strand in baseline_positions:
-        if rid in ref_seqs:
-            baseline_by_ref[rid].append((pos, 0, strand))
+    n_slowed_samples = _run_chunked(slowed_items, CATEGORY_SLOWED, "SLOWED")
+    n_near_meth_samples = _run_chunked(near_meth_items, CATEGORY_NEAR_METH, "NEAR_METH")
 
-    n_baseline_samples = 0
-    t0 = _time.time()
-    n_chunks_done = 0
-    total_bl = sum(len(v) for v in baseline_by_ref.values())
-    bl_done = 0
-    for rid, items in baseline_by_ref.items():
-        i = 0
-        while i < len(items):
-            chunk_start_pos = items[i][0]
-            j = i + 1
-            while (j < len(items)
-                   and items[j][0] - chunk_start_pos < CHUNK_SPAN_BP
-                   and (j - i) < CHUNK_MAX_POSITIONS):
-                j += 1
-            chunk = items[i:j]
-            n_baseline_samples += _extract_chunk_batched(
-                bam, bam_fmt, rid, chunk, ref_seqs[rid], cfg, rng, builder,
-                ref_name_to_idx[rid], labels,
-            )
-            bl_done += len(chunk)
-            i = j
-            n_chunks_done += 1
-            if n_chunks_done % PROGRESS_EVERY_CHUNKS == 0:
-                elapsed = _time.time() - t0
-                rate = bl_done / max(elapsed, 1e-3)
-                eta = (total_bl - bl_done) / max(rate, 1e-3)
-                log.info(
-                    "[%s] baseline chunks=%d positions=%d/%d (%.0f pos/s, ETA %.0f min, samples=%d)",
-                    sample_id, n_chunks_done, bl_done, total_bl,
-                    rate, eta / 60, n_baseline_samples,
-                )
-    log.info("[%s] Baseline phase done: %d chunks, %d samples in %.1f min",
-             sample_id, n_chunks_done, n_baseline_samples, (_time.time() - t0) / 60)
+    # Baseline positions — same chunked path, category=BASELINE, no parent.
+    baseline_emission_items = [
+        (rid, pos, strand, 0, 0) for (rid, pos, strand) in baseline_positions
+    ]
+    n_baseline_samples = _run_chunked(
+        baseline_emission_items, CATEGORY_BASELINE, "baseline",
+    )
+
+    n_meth_samples = n_slowed_samples + n_near_meth_samples
 
     bam.close()
 
@@ -627,15 +591,22 @@ def extract_strain(
         "label_sources": [e.get("type") for e in cfg.labelers],
         "n_meth_samples": n_meth_samples,
         "n_baseline_samples": n_baseline_samples,
+        "n_slowed_samples": n_slowed_samples,
+        "n_near_meth_samples": n_near_meth_samples,
+        "signal_offsets_by_id": {
+            t.id: list(t.signal_offsets) for t in cfg.methylation_types
+        },
+        "near_meth_max_dist": int(getattr(cfg.extract, "near_meth_max_dist", 10)),
     }
 
     shard = finalize_shard(builder, meta, cfg.window.k)
     out_path = output_dir / f"{sample_id}_shard.pkl"
     write_shard(out_path, shard)
     log.info(
-        "[%s] Done. meth_samples=%d  baseline_samples=%d  shard=%s  "
+        "[%s] Done. SLOWED=%d  NEAR_METH=%d  BASELINE=%d  shard=%s  "
         "non_ACGT_bases_silently_encoded_as_A=%d",
-        sample_id, n_meth_samples, n_baseline_samples, out_path, N_BASE_COUNT[0],
+        sample_id, n_slowed_samples, n_near_meth_samples, n_baseline_samples,
+        out_path, N_BASE_COUNT[0],
     )
     if N_BASE_COUNT[0] > 1000:
         log.warning(
