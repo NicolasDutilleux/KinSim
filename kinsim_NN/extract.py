@@ -576,68 +576,71 @@ def extract_strain(
     import time as _time
     from collections import defaultdict as _dd
 
-    def _run_chunked(
-        items: list[tuple[str, int, str, int, int]],
-        category: int,
-        phase_label: str,
-    ) -> int:
-        """Chunk a list of (rid, pos, strand, parent_meth, parent_offset) by
-        spatial locality and run them through _extract_chunk_batched."""
-        # Sort by (rid, pos) for OS pagecache locality
-        items_sorted = sorted(items, key=lambda x: (x[0], x[1]))
-        by_ref: dict[str, list[tuple[int, str, int, int, int]]] = _dd(list)
-        for rid, pos, strand, pmeth, poff in items_sorted:
-            by_ref[rid].append((pos, strand, category, pmeth, poff))
-        n_samples = 0
-        t0 = _time.time()
-        n_chunks_done = 0
-        total = sum(len(v) for v in by_ref.values())
-        done = 0
-        for rid, ritems in by_ref.items():
-            i = 0
-            while i < len(ritems):
-                chunk_start_pos = ritems[i][0]
-                j = i + 1
-                while (j < len(ritems)
-                       and ritems[j][0] - chunk_start_pos < CHUNK_SPAN_BP
-                       and (j - i) < CHUNK_MAX_POSITIONS):
-                    j += 1
-                chunk = ritems[i:j]
-                n_samples += _extract_chunk_batched(
-                    bam, bam_fmt, rid, chunk, ref_seqs[rid], cfg, rng, builder,
-                    ref_name_to_idx[rid], labels,
+    # Merge all 3 categories (SLOWED + NEAR_METH + BASELINE) into ONE list and
+    # process in a SINGLE chunked pass over the BAM. Earlier code split into 3
+    # phases — each region containing both a meth and its adjacent NEAR_METH
+    # neighbours got bam.fetch'd 2-3× redundantly. Merging cuts BAM I/O ~2×
+    # for high-meth-density strains (Strepto, Vega).
+    all_items: list[tuple[str, int, str, int, int, int]] = []
+    for rid, pos, strand, pmeth, poff in slowed_items:
+        all_items.append((rid, pos, strand, CATEGORY_SLOWED, pmeth, poff))
+    for rid, pos, strand, pmeth, poff in near_meth_items:
+        all_items.append((rid, pos, strand, CATEGORY_NEAR_METH, pmeth, poff))
+    for rid, pos, strand in baseline_positions:
+        all_items.append((rid, pos, strand, CATEGORY_BASELINE, 0, 0))
+
+    # Sort by (rid, pos) — keeps OS pagecache hot across adjacent regions
+    all_items.sort(key=lambda x: (x[0], x[1]))
+    by_ref: dict[str, list[tuple[int, str, int, int, int]]] = _dd(list)
+    for rid, pos, strand, cat, pmeth, poff in all_items:
+        by_ref[rid].append((pos, strand, cat, pmeth, poff))
+
+    n_samples_total = 0
+    t0 = _time.time()
+    n_chunks_done = 0
+    total_positions = sum(len(v) for v in by_ref.values())
+    positions_done = 0
+    for rid, ritems in by_ref.items():
+        i = 0
+        while i < len(ritems):
+            chunk_start_pos = ritems[i][0]
+            j = i + 1
+            while (j < len(ritems)
+                   and ritems[j][0] - chunk_start_pos < CHUNK_SPAN_BP
+                   and (j - i) < CHUNK_MAX_POSITIONS):
+                j += 1
+            chunk = ritems[i:j]
+            n_samples_total += _extract_chunk_batched(
+                bam, bam_fmt, rid, chunk, ref_seqs[rid], cfg, rng, builder,
+                ref_name_to_idx[rid], labels,
+            )
+            positions_done += len(chunk)
+            i = j
+            n_chunks_done += 1
+            if n_chunks_done % PROGRESS_EVERY_CHUNKS == 0:
+                elapsed = _time.time() - t0
+                rate = positions_done / max(elapsed, 1e-3)
+                eta = (total_positions - positions_done) / max(rate, 1e-3)
+                log.info(
+                    "[%s] MERGED chunks=%d positions=%d/%d (%.0f pos/s, ETA %.0f min, samples=%d)",
+                    sample_id, n_chunks_done, positions_done, total_positions,
+                    rate, eta / 60, n_samples_total,
                 )
-                done += len(chunk)
-                i = j
-                n_chunks_done += 1
-                if n_chunks_done % PROGRESS_EVERY_CHUNKS == 0:
-                    elapsed = _time.time() - t0
-                    rate = done / max(elapsed, 1e-3)
-                    eta = (total - done) / max(rate, 1e-3)
-                    log.info(
-                        "[%s] %s chunks=%d positions=%d/%d (%.0f pos/s, ETA %.0f min, samples=%d)",
-                        sample_id, phase_label, n_chunks_done, done, total,
-                        rate, eta / 60, n_samples,
-                    )
-        log.info(
-            "[%s] %s phase done: %d chunks, %d samples in %.1f min",
-            sample_id, phase_label, n_chunks_done, n_samples,
-            (_time.time() - t0) / 60,
-        )
-        return n_samples
-
-    n_slowed_samples = _run_chunked(slowed_items, CATEGORY_SLOWED, "SLOWED")
-    n_near_meth_samples = _run_chunked(near_meth_items, CATEGORY_NEAR_METH, "NEAR_METH")
-
-    # Baseline positions — same chunked path, category=BASELINE, no parent.
-    baseline_emission_items = [
-        (rid, pos, strand, 0, 0) for (rid, pos, strand) in baseline_positions
-    ]
-    n_baseline_samples = _run_chunked(
-        baseline_emission_items, CATEGORY_BASELINE, "baseline",
+    log.info(
+        "[%s] MERGED phase done: %d chunks, %d samples in %.1f min",
+        sample_id, n_chunks_done, n_samples_total, (_time.time() - t0) / 60,
     )
 
+    # Per-category sample counts from the builder (for the final log + meta)
+    cat_arr = np.asarray(builder["category"], dtype=np.uint8) if builder["category"] else np.zeros(0, dtype=np.uint8)
+    n_baseline_samples = int((cat_arr == CATEGORY_BASELINE).sum())
+    n_slowed_samples = int((cat_arr == CATEGORY_SLOWED).sum())
+    n_near_meth_samples = int((cat_arr == CATEGORY_NEAR_METH).sum())
     n_meth_samples = n_slowed_samples + n_near_meth_samples
+    log.info(
+        "[%s] Per-category counts: BASELINE=%d  SLOWED=%d  NEAR_METH=%d",
+        sample_id, n_baseline_samples, n_slowed_samples, n_near_meth_samples,
+    )
 
     bam.close()
 
