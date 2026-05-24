@@ -370,32 +370,53 @@ def iter_chunk_samples(
     span_end = int(sorted_ref_positions[-1]) + half_width + 1
 
     if fmt.is_bystrandified:
+        # Diagnostic counters (logged at the end of this chunk if 0 yields)
+        n_reads_total = 0
+        n_skipped_mapq = 0
+        n_skipped_suffix = 0
+        n_pairs_incomplete = 0
+        n_pairs_strand_mismatch = 0
+        n_pairs_missing_tags = 0
+        n_pairs_empty_alignments = 0
+        n_centers_no_coverage = 0
+        n_centers_mask_fail = 0
+        n_yields_local = 0
+
         zmw_pairs: dict[str, dict[str, pysam.AlignedSegment]] = defaultdict(dict)
         for r in bam.fetch(seqid, span_start, span_end):
             if r.is_unmapped or r.is_secondary or r.is_supplementary:
                 continue
+            n_reads_total += 1
             if r.mapping_quality < min_mapq:
+                n_skipped_mapq += 1
                 continue
             key, suffix = _zmw_key(r.query_name or "")
-            if suffix in ("fwd", "rev"):
-                zmw_pairs[key][suffix] = r
+            if suffix not in ("fwd", "rev"):
+                n_skipped_suffix += 1
+                continue
+            zmw_pairs[key][suffix] = r
 
         for zmw_id, pair in zmw_pairs.items():
             if "fwd" not in pair or "rev" not in pair:
+                n_pairs_incomplete += 1
                 continue
             fwd_rec = pair["fwd"]
             rev_rec = pair["rev"]
             if fwd_rec.is_reverse != rev_rec.is_reverse:
+                n_pairs_strand_mismatch += 1
                 continue
             is_rev = fwd_rec.is_reverse
             # Decode aligned pairs + tag arrays ONCE per record.
             if not (fwd_rec.has_tag(fmt.ipd_fwd_tag) and fwd_rec.has_tag(fmt.pw_fwd_tag)):
+                n_pairs_missing_tags += 1
                 continue
             if not (rev_rec.has_tag(fmt.ipd_rev_tag) and rev_rec.has_tag(fmt.pw_rev_tag)):
+                n_pairs_missing_tags += 1
                 continue
             fwd_pairs = _aligned_pairs_array(fwd_rec)
             rev_pairs = _aligned_pairs_array(rev_rec)
             if fwd_pairs.size == 0 or rev_pairs.size == 0:
+                n_pairs_empty_alignments += 1
                 continue
             fwd_ref_pairs = fwd_pairs[:, 1]
             fwd_qry_pairs = fwd_pairs[:, 0]
@@ -412,6 +433,7 @@ def iter_chunk_samples(
                 cpos = int(center_pos)
                 # Quick coverage check (~50ns) before vectorized extraction
                 if not (fwd_rs <= cpos < fwd_re and rev_rs <= cpos < rev_re):
+                    n_centers_no_coverage += 1
                     continue
                 ref_positions = np.arange(
                     cpos - half_width, cpos + half_width + 1, dtype=np.int64,
@@ -431,12 +453,29 @@ def iter_chunk_samples(
                     ipd_rev_w, pw_rev_w = ip_fi, pw_fi
                     mask_fwd_w, mask_rev_w = mask_ri, mask_fi
                 if mask_fwd_w[half_width] and mask_rev_w[half_width]:
+                    n_yields_local += 1
                     yield cpos, WindowSample(
                         zmw_id=zmw_id,
                         ipd_fwd=ipd_fwd_w, pw_fwd=pw_fwd_w,
                         ipd_rev=ipd_rev_w, pw_rev=pw_rev_w,
                         mask_fwd=mask_fwd_w, mask_rev=mask_rev_w,
                     )
+                else:
+                    n_centers_mask_fail += 1
+
+        if n_yields_local == 0 and n_reads_total > 0:
+            log.warning(
+                "iter_chunk_samples yielded 0 for %s:%d-%d (%d positions): "
+                "reads=%d, skipped(mapq<%d)=%d, skipped(no /fwd|/rev suffix)=%d, "
+                "pairs_incomplete=%d, pairs_strand_mismatch=%d, "
+                "pairs_missing_tags=%d, pairs_empty_alignments=%d, "
+                "centers_no_coverage=%d, centers_mask_fail=%d",
+                seqid, span_start, span_end, sorted_ref_positions.size,
+                n_reads_total, min_mapq, n_skipped_mapq, n_skipped_suffix,
+                n_pairs_incomplete, n_pairs_strand_mismatch,
+                n_pairs_missing_tags, n_pairs_empty_alignments,
+                n_centers_no_coverage, n_centers_mask_fail,
+            )
     else:
         # Raw HiFi — 1 record per ZMW with all four tags.
         for r in bam.fetch(seqid, span_start, span_end):
