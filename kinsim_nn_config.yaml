@@ -43,12 +43,12 @@ treat_modified_base_as: m5C
 # matters: earlier labelers win on conflicts.
 labelers:
   - type: gff
-    qv_threshold: 10            # GFF score (modificationQv) cutoff
-    # motifs_clean.gff = motif-confirmed subset of motifs.gff (the original
-    # is owned by upstream pipeline / read-only on cluster, so we keep both).
-    # If only motifs.gff exists, point at it and the labeler will use everything
-    # ≥ qv_threshold (mixes motif-confirmed + ambiguous noise).
-    file_pattern: "{strain_dir}/motifs_clean.gff"
+    qv_threshold: 10                            # GFF score (modificationQv) cutoff
+    file_pattern: "{strain_dir}/motifs.gff"
+    require_motif: true                         # only keep lines with motif= attribute
+                                                # (pbmotifmaker reprocess motif-confirmed
+                                                # positions — filters out the ~96% noise
+                                                # ipdSummary calls without motif support)
   # Optional second pass for 5mC from jasmine MM/ML tags. Disable by
   # commenting out if no jasmine output is available.
   # - type: jasmine_mm_ml
@@ -82,12 +82,12 @@ extract:
   near_meth_max_dist: 10
   slowed_per_strain_cap: 0             # 0 = no cap (keep all SLOWED)
   near_meth_per_strain_cap: 0          # 0 = no cap
-  # Optional ambiguous-position avoidance. Points at the ORIGINAL unfiltered
-  # motifs.gff (which holds both motif-confirmed and high-QV ipdSummary calls
-  # without motif support). The labelers above only label the motif-confirmed
-  # subset (motifs_clean.gff), so positions present in motifs.gff but NOT in
-  # motifs_clean.gff are AMBIGUOUS — they're excluded from the baseline pool
-  # but never become training labels. Set to null to disable.
+  # Optional ambiguous-position avoidance. Reads motifs.gff WITHOUT the
+  # require_motif filter — so it picks up ALL high-QV positions (both
+  # motif-confirmed AND ambiguous ipdSummary calls). Baseline sampling
+  # excludes the union. Result: 3 corpus tiers — METH (motif-confirmed,
+  # labelled), AMBIGUOUS (high-QV no motif, neither labelled nor sampled),
+  # BASELINE (≥baseline_min_dist from both). Set to null to disable.
   avoid_gff_pattern: "{strain_dir}/motifs.gff"
   avoid_gff_qv_threshold: 10.0
 
