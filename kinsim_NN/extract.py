@@ -40,6 +40,7 @@ from .data.shard import (
 from .labelers import create_labeler
 from .utils.bam_io import (
     detect_bam_format,
+    iter_chunk_samples,
     iter_window_samples,
 )
 from .utils.config import KinsimNNConfig, load_config, setup_logging
@@ -207,6 +208,139 @@ def _sample_baselines(
     return out
 
 
+def _flush_position_to_builder(
+    pos: int,
+    samples: list,
+    base_fwd: np.ndarray,
+    meth_fwd: np.ndarray,
+    meth_rev: np.ndarray,
+    meth_id_center: int,
+    strand_center: str,
+    builder: dict,
+    ref_id_idx: int,
+) -> int:
+    """Append all collected samples for one ref position into the shard builder."""
+    n = 0
+    cat = 0 if meth_id_center == 0 else 1
+    strand_int = 1 if strand_center == "+" else -1
+    for sample in samples:
+        signal = np.stack(
+            [sample.ipd_fwd, sample.pw_fwd, sample.ipd_rev, sample.pw_rev],
+            axis=-1,
+        ).astype(np.uint8)
+        builder["base_fwd"].append(base_fwd)
+        builder["meth_fwd"].append(meth_fwd)
+        builder["meth_rev"].append(meth_rev)
+        builder["signal"].append(signal)
+        builder["category"].append(cat)
+        builder["ref_id"].append(ref_id_idx)
+        builder["ref_pos"].append(int(pos))
+        builder["strand"].append(strand_int)
+        builder["zmw"].append(hash_zmw(sample.zmw_id))
+        n += 1
+    return n
+
+
+def _build_window_tensors(
+    pos: int,
+    seqid: str,
+    ref_seq: str,
+    cfg: KinsimNNConfig,
+    labels: dict[tuple[str, int, str], int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Return ``(base_fwd, meth_fwd, meth_rev)`` for one window center, or
+    None if the window goes off the contig edge."""
+    half = cfg.window.half_width
+    K = cfg.window.k
+    if pos - half < 0 or pos + half + 1 > len(ref_seq):
+        return None
+    base_fwd = _encode_seq(ref_seq[pos - half: pos + half + 1])
+    meth_fwd = np.zeros(K, dtype=np.uint8)
+    meth_rev = np.zeros(K, dtype=np.uint8)
+    for k in range(K):
+        win_pos = int(pos) - half + k
+        fwd_id = labels.get((seqid, win_pos, "+"))
+        if fwd_id is not None:
+            meth_fwd[k] = fwd_id
+        rev_id = labels.get((seqid, win_pos, "-"))
+        if rev_id is not None:
+            meth_rev[k] = rev_id
+    return base_fwd, meth_fwd, meth_rev
+
+
+def _extract_chunk_batched(
+    bam: pysam.AlignmentFile,
+    bam_fmt,
+    seqid: str,
+    chunk_positions: list[tuple[int, int, str]],   # [(ref_pos, meth_id, strand), ...] sorted by ref_pos
+    ref_seq: str,
+    cfg: KinsimNNConfig,
+    rng: random.Random,
+    builder: dict,
+    ref_id_idx: int,
+    labels: dict[tuple[str, int, str], int],
+) -> int:
+    """Process a spatially-coherent batch of positions with one BAM fetch.
+
+    Per-position state (window tensors + reservoir of samples) is kept in
+    dicts keyed by ref_pos. ``iter_chunk_samples`` walks each ZMW pair ONCE
+    and yields per-(center_pos, ZMW); we route into the right position's
+    reservoir.
+    """
+    if not chunk_positions:
+        return 0
+    half = cfg.window.half_width
+    cap = int(cfg.extract.reads_cap_per_position)
+
+    # Pre-build window tensors per position (cheap CPU work, no I/O).
+    pos_tensors: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    pos_meta: dict[int, tuple[int, str]] = {}
+    for p, mid, strand in chunk_positions:
+        t = _build_window_tensors(p, seqid, ref_seq, cfg, labels)
+        if t is None:
+            continue
+        pos_tensors[p] = t
+        pos_meta[p] = (mid, strand)
+    if not pos_tensors:
+        return 0
+
+    sorted_positions = np.array(sorted(pos_tensors.keys()), dtype=np.int64)
+
+    # Reservoir accumulator per position
+    pos_samples: dict[int, list] = {p: [] for p in pos_tensors}
+    pos_n_seen: dict[int, int] = {p: 0 for p in pos_tensors}
+
+    for center_pos, sample in iter_chunk_samples(
+        bam, bam_fmt, seqid, sorted_positions, half,
+        min_mapq=cfg.extract.min_mapq,
+    ):
+        if center_pos not in pos_samples:
+            continue
+        n = pos_n_seen[center_pos] + 1
+        pos_n_seen[center_pos] = n
+        samples = pos_samples[center_pos]
+        if len(samples) < cap:
+            samples.append(sample)
+        else:
+            j = rng.randrange(n)
+            if j < cap:
+                samples[j] = sample
+
+    # Flush per-position
+    n_added = 0
+    for pos in sorted_positions:
+        p = int(pos)
+        if not pos_samples[p]:
+            continue
+        base_fwd, meth_fwd, meth_rev = pos_tensors[p]
+        mid, strand = pos_meta[p]
+        n_added += _flush_position_to_builder(
+            p, pos_samples[p], base_fwd, meth_fwd, meth_rev,
+            mid, strand, builder, ref_id_idx,
+        )
+    return n_added
+
+
 def _extract_position(
     bam: pysam.AlignmentFile,
     bam_fmt,
@@ -367,53 +501,99 @@ def extract_strain(
     # access on a 80x coverage 4 GB bystrandified BAM.
     meth_items.sort(key=lambda item: (item[0][0], item[0][1]))
 
-    log.info("[%s] Processing %d unique meth positions (sorted by ref_pos) ...",
+    log.info("[%s] Processing %d unique meth positions (sorted by ref_pos, batched) ...",
              sample_id, len(meth_items))
 
-    PROGRESS_EVERY = 10_000
-    import time as _time
-    t0 = _time.time()
-    for i, ((rid, pos), (mid, strand)) in enumerate(meth_items, start=1):
-        if rid not in ref_seqs:
-            continue
-        n_meth_samples += _extract_position(
-            bam, bam_fmt, rid, pos, strand, mid,
-            ref_seqs[rid], cfg, rng, builder, ref_name_to_idx[rid], labels,
-        )
-        if i % PROGRESS_EVERY == 0:
-            elapsed = _time.time() - t0
-            rate = i / max(elapsed, 1e-3)
-            eta = (len(meth_items) - i) / max(rate, 1e-3)
-            log.info(
-                "[%s] meth progress %d/%d (%.0f pos/s, ETA %.0f min, samples=%d)",
-                sample_id, i, len(meth_items), rate, eta / 60, n_meth_samples,
-            )
-    log.info("[%s] Meth phase done: %d samples in %.0f min",
-             sample_id, n_meth_samples, (_time.time() - t0) / 60)
+    # Chunk positions by spatial locality (same contig, span ≤ CHUNK_SPAN_BP).
+    # Each chunk → ONE bam.fetch, ONE get_aligned_pairs per record. Massive
+    # speedup vs per-position fetch on bystrandified BAMs.
+    CHUNK_SPAN_BP = 5000      # max ref-distance between first and last pos in a chunk
+    CHUNK_MAX_POSITIONS = 256  # cap so memory stays bounded (~200kb of sample buffers)
+    PROGRESS_EVERY_CHUNKS = 50
 
-    # Baseline positions (meth_id=0) — sort by (ref_id, ref_pos) for the same
-    # OS-cache locality win as the meth phase.
+    import time as _time
+    from collections import defaultdict as _dd
+
+    # Group meth items per ref_id (each chunk is within one contig)
+    meth_by_ref: dict[str, list[tuple[int, int, str]]] = _dd(list)
+    for (rid, pos), (mid, strand) in meth_items:
+        if rid in ref_seqs:
+            meth_by_ref[rid].append((pos, mid, strand))
+    # already sorted by (ref_id, ref_pos) above, so per-ref lists are sorted
+
+    t0 = _time.time()
+    n_chunks_done = 0
+    total_positions = sum(len(v) for v in meth_by_ref.values())
+    positions_done = 0
+    for rid, items in meth_by_ref.items():
+        i = 0
+        while i < len(items):
+            chunk_start_pos = items[i][0]
+            j = i + 1
+            while (j < len(items)
+                   and items[j][0] - chunk_start_pos < CHUNK_SPAN_BP
+                   and (j - i) < CHUNK_MAX_POSITIONS):
+                j += 1
+            chunk = items[i:j]
+            n_meth_samples += _extract_chunk_batched(
+                bam, bam_fmt, rid, chunk, ref_seqs[rid], cfg, rng, builder,
+                ref_name_to_idx[rid], labels,
+            )
+            positions_done += len(chunk)
+            i = j
+            n_chunks_done += 1
+            if n_chunks_done % PROGRESS_EVERY_CHUNKS == 0:
+                elapsed = _time.time() - t0
+                rate = positions_done / max(elapsed, 1e-3)
+                eta = (total_positions - positions_done) / max(rate, 1e-3)
+                log.info(
+                    "[%s] meth chunks=%d positions=%d/%d (%.0f pos/s, ETA %.0f min, samples=%d)",
+                    sample_id, n_chunks_done, positions_done, total_positions,
+                    rate, eta / 60, n_meth_samples,
+                )
+    log.info("[%s] Meth phase done: %d chunks, %d samples in %.1f min",
+             sample_id, n_chunks_done, n_meth_samples, (_time.time() - t0) / 60)
+
+    # Baseline positions (meth_id=0) — same chunked path.
     baseline_positions = sorted(baseline_positions, key=lambda p: (p[0], p[1]))
+    baseline_by_ref: dict[str, list[tuple[int, int, str]]] = _dd(list)
+    for rid, pos, strand in baseline_positions:
+        if rid in ref_seqs:
+            baseline_by_ref[rid].append((pos, 0, strand))
 
     n_baseline_samples = 0
     t0 = _time.time()
-    for i, (rid, pos, strand) in enumerate(baseline_positions, start=1):
-        if rid not in ref_seqs:
-            continue
-        n_baseline_samples += _extract_position(
-            bam, bam_fmt, rid, pos, strand, 0,
-            ref_seqs[rid], cfg, rng, builder, ref_name_to_idx[rid], labels,
-        )
-        if i % PROGRESS_EVERY == 0:
-            elapsed = _time.time() - t0
-            rate = i / max(elapsed, 1e-3)
-            eta = (len(baseline_positions) - i) / max(rate, 1e-3)
-            log.info(
-                "[%s] baseline progress %d/%d (%.0f pos/s, ETA %.0f min, samples=%d)",
-                sample_id, i, len(baseline_positions), rate, eta / 60, n_baseline_samples,
+    n_chunks_done = 0
+    total_bl = sum(len(v) for v in baseline_by_ref.values())
+    bl_done = 0
+    for rid, items in baseline_by_ref.items():
+        i = 0
+        while i < len(items):
+            chunk_start_pos = items[i][0]
+            j = i + 1
+            while (j < len(items)
+                   and items[j][0] - chunk_start_pos < CHUNK_SPAN_BP
+                   and (j - i) < CHUNK_MAX_POSITIONS):
+                j += 1
+            chunk = items[i:j]
+            n_baseline_samples += _extract_chunk_batched(
+                bam, bam_fmt, rid, chunk, ref_seqs[rid], cfg, rng, builder,
+                ref_name_to_idx[rid], labels,
             )
-    log.info("[%s] Baseline phase done: %d samples in %.0f min",
-             sample_id, n_baseline_samples, (_time.time() - t0) / 60)
+            bl_done += len(chunk)
+            i = j
+            n_chunks_done += 1
+            if n_chunks_done % PROGRESS_EVERY_CHUNKS == 0:
+                elapsed = _time.time() - t0
+                rate = bl_done / max(elapsed, 1e-3)
+                eta = (total_bl - bl_done) / max(rate, 1e-3)
+                log.info(
+                    "[%s] baseline chunks=%d positions=%d/%d (%.0f pos/s, ETA %.0f min, samples=%d)",
+                    sample_id, n_chunks_done, bl_done, total_bl,
+                    rate, eta / 60, n_baseline_samples,
+                )
+    log.info("[%s] Baseline phase done: %d chunks, %d samples in %.1f min",
+             sample_id, n_chunks_done, n_baseline_samples, (_time.time() - t0) / 60)
 
     bam.close()
 
