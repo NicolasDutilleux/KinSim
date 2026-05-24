@@ -348,28 +348,61 @@ def extract_strain(
     unique_meth_positions: dict[tuple[str, int], tuple[int, str]] = {}
     for (rid, pos, strand), mid in labels.items():
         key = (rid, pos)
-        # First encounter wins (deterministic order via dict iteration in Py 3.7+);
-        # when both strands label the same position, the chosen strand is used only
-        # for the stored metadata (the overlay sees both strands regardless).
         if key not in unique_meth_positions:
             unique_meth_positions[key] = (mid, strand)
-    for (rid, pos), (mid, strand) in unique_meth_positions.items():
+
+    # Optional random subsample of meth positions per strain. Strepto strains can
+    # have 400k+ labelled positions which makes BAM I/O dominate wall time.
+    meth_items = list(unique_meth_positions.items())
+    cap = int(getattr(cfg.extract, "meth_per_strain_cap", 0) or 0)
+    if cap and len(meth_items) > cap:
+        rng.shuffle(meth_items)
+        meth_items = meth_items[:cap]
+        log.info("[%s] Subsampled %d meth positions to %d (cap)",
+                 sample_id, len(unique_meth_positions), cap)
+    log.info("[%s] Processing %d unique meth positions ...", sample_id, len(meth_items))
+
+    PROGRESS_EVERY = 10_000
+    import time as _time
+    t0 = _time.time()
+    for i, ((rid, pos), (mid, strand)) in enumerate(meth_items, start=1):
         if rid not in ref_seqs:
             continue
         n_meth_samples += _extract_position(
             bam, bam_fmt, rid, pos, strand, mid,
             ref_seqs[rid], cfg, rng, builder, ref_name_to_idx[rid], labels,
         )
+        if i % PROGRESS_EVERY == 0:
+            elapsed = _time.time() - t0
+            rate = i / max(elapsed, 1e-3)
+            eta = (len(meth_items) - i) / max(rate, 1e-3)
+            log.info(
+                "[%s] meth progress %d/%d (%.0f pos/s, ETA %.0f min, samples=%d)",
+                sample_id, i, len(meth_items), rate, eta / 60, n_meth_samples,
+            )
+    log.info("[%s] Meth phase done: %d samples in %.0f min",
+             sample_id, n_meth_samples, (_time.time() - t0) / 60)
 
     # Baseline positions (meth_id=0)
     n_baseline_samples = 0
-    for (rid, pos, strand) in baseline_positions:
+    t0 = _time.time()
+    for i, (rid, pos, strand) in enumerate(baseline_positions, start=1):
         if rid not in ref_seqs:
             continue
         n_baseline_samples += _extract_position(
             bam, bam_fmt, rid, pos, strand, 0,
             ref_seqs[rid], cfg, rng, builder, ref_name_to_idx[rid], labels,
         )
+        if i % PROGRESS_EVERY == 0:
+            elapsed = _time.time() - t0
+            rate = i / max(elapsed, 1e-3)
+            eta = (len(baseline_positions) - i) / max(rate, 1e-3)
+            log.info(
+                "[%s] baseline progress %d/%d (%.0f pos/s, ETA %.0f min, samples=%d)",
+                sample_id, i, len(baseline_positions), rate, eta / 60, n_baseline_samples,
+            )
+    log.info("[%s] Baseline phase done: %d samples in %.0f min",
+             sample_id, n_baseline_samples, (_time.time() - t0) / 60)
 
     bam.close()
 

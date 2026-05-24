@@ -44,6 +44,7 @@ class ExtractParams:
     reads_cap_per_position: int = 20
     min_mapq: int = 20            # was min_read_qv — it's MAPQ, not base QV
     bystrandify_pairing: bool = True
+    meth_per_strain_cap: int = 0  # 0 = no cap; else random subsample meth positions
 
 
 @dataclass(frozen=True)
