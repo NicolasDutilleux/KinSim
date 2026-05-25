@@ -181,9 +181,29 @@ def _generate_signal_batched(
 ) -> np.ndarray:
     """Return the center (IPD_fwd, PW_fwd, IPD_rev, PW_rev) predictions for
     a batch of windows. Shape: (B, 4) float32 in log1p(frames) space."""
+    out_np = _generate_signal_batched_full(
+        g, base_fwd_stack, meth_fwd_stack, meth_rev_stack, n_meth_types, device,
+    )
+    K = base_fwd_stack.shape[1]
+    return out_np[:, K // 2].astype(np.float32)           # (B, 4)
+
+
+def _generate_signal_batched_full(
+    g: TransformerGenerator,
+    base_fwd_stack: np.ndarray,     # (B, K) uint8
+    meth_fwd_stack: np.ndarray,     # (B, K) uint8
+    meth_rev_stack: np.ndarray,     # (B, K) uint8
+    n_meth_types: int,
+    device: torch.device,
+) -> np.ndarray:
+    """Return the FULL K-position window prediction for a batch.
+    Shape: (B, K, 4) float32 in log1p(frames) space.
+
+    Used by the precompute-cache path: each inference's K outputs fill K
+    consecutive reference positions instead of being discarded (the old
+    per-position code threw away K-1 of K outputs)."""
     B, K = base_fwd_stack.shape
     base_rev = _RC_TABLE[base_fwd_stack]
-    # one-hot via fancy-indexing
     base_fwd_oh = np.zeros((B, K, 4), dtype=np.float32)
     base_rev_oh = np.zeros((B, K, 4), dtype=np.float32)
     np.put_along_axis(base_fwd_oh, base_fwd_stack.astype(np.int64)[..., None], 1.0, axis=-1)
@@ -201,8 +221,7 @@ def _generate_signal_batched(
         torch.from_numpy(meth_fwd_oh).to(device),
         torch.from_numpy(meth_rev_oh).to(device),
     )
-    out_np = out.cpu().numpy()                            # (B, K, 4)
-    return out_np[:, K // 2].astype(np.float32)           # (B, 4)
+    return out.cpu().numpy().astype(np.float32)          # (B, K, 4)
 
 
 def _draw_read_effective_meth(
@@ -257,6 +276,164 @@ def _build_meth_window(
         meth_fwd[valid] = eff_fwd[valid_pos]
         meth_rev[valid] = eff_rev[valid_pos]
     return meth_fwd, meth_rev
+
+
+def _precompute_kinetics_map_for_contig(
+    ref_seq: str,
+    eff_fwd: np.ndarray,                # (L,) uint8 — GLOBAL effective meth + strand
+    eff_rev: np.ndarray,                # (L,) uint8 — GLOBAL effective meth − strand
+    g: TransformerGenerator,
+    n_meth_types: int,
+    K: int,
+    half_width: int,
+    n_z_samples: int,
+    device: torch.device,
+    batch_size: int = 256,
+) -> np.ndarray:
+    """Generate predicted kinetics for the WHOLE contig, once per z sample.
+
+    Walks the genome at stride K so each inference's K outputs fill K
+    consecutive reference positions (the old per-position code threw away
+    K-1 of K outputs and re-fetched the same window for each base of each
+    read).
+
+    Per-read kinetic variance is preserved at lookup time by sampling a
+    different ``z_idx`` per read (each shows kinetics from one of the N
+    pre-drawn z latents). N=8 gives ~12 distinct per-position kinetic
+    samples per read which is plenty to break determinism without bloating
+    memory.
+
+    Returns array ``(L, 4, n_z_samples)`` uint8 in PacBio codec
+    (FRAMES_TABLE → byte). Positions outside ``[half_width, L-half_width)``
+    stay at 0 (read filler fills them with ``default_value``).
+    """
+    L = len(ref_seq)
+    kin_map = np.zeros((L, 4, n_z_samples), dtype=np.uint8)
+    if L < 2 * half_width + 1:
+        return kin_map  # contig too short for any window
+
+    centers = list(range(half_width, L - half_width, K))
+    log.info("  precompute contig L=%d → %d windows × %d z = %d inferences",
+             L, len(centers), n_z_samples, len(centers) * n_z_samples)
+
+    for z_idx in range(n_z_samples):
+        for start in range(0, len(centers), batch_size):
+            chunk = centers[start : start + batch_size]
+            B = len(chunk)
+            bf = np.zeros((B, K), dtype=np.uint8)
+            mf = np.zeros((B, K), dtype=np.uint8)
+            mr = np.zeros((B, K), dtype=np.uint8)
+            for i, c in enumerate(chunk):
+                bf[i] = _encode_seq(ref_seq[c - half_width : c + half_width + 1])
+                mf[i] = eff_fwd[c - half_width : c + half_width + 1]
+                mr[i] = eff_rev[c - half_width : c + half_width + 1]
+            full = _generate_signal_batched_full(g, bf, mf, mr, n_meth_types, device)
+            # full: (B, K, 4) log1p(frames) → uint8 PacBio codec
+            u8 = log1p_frames_to_uint8(full)             # (B, K, 4)
+            for i, c in enumerate(chunk):
+                kin_map[c - half_width : c + half_width + 1, :, z_idx] = u8[i]
+        if (z_idx + 1) % max(1, n_z_samples // 4) == 0:
+            log.info("    z_sample %d/%d done", z_idx + 1, n_z_samples)
+
+    return kin_map
+
+
+def _draw_global_effective_meth(
+    fwd_map: np.ndarray,                # (L,) uint8
+    rev_map: np.ndarray,                # (L,) uint8
+    fwd_frac: np.ndarray,               # (L,) float32
+    rev_frac: np.ndarray,               # (L,) float32
+    rng: random.Random,
+    use_bernoulli: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """GLOBAL Bernoulli (one decision per genomic site, shared by all reads).
+
+    Biologically this matches PacBio's ``fraction`` semantic: across a
+    population, X% of all genomic sites of a motif are methylated. In any
+    one cell a given site is either methylated or not (fully). The previous
+    per-read draw over-modeled stochasticity by treating each (read, site)
+    pair as an independent Bernoulli — different reads then disagreed on
+    whether the SAME site was methylated, which doesn't match the biology.
+
+    Per-read kinetic variance is now preserved by sampling a different
+    ``z_idx`` into the kinetics map per read (see
+    :func:`_precompute_kinetics_map_for_contig`).
+    """
+    eff_fwd = fwd_map.copy()
+    eff_rev = rev_map.copy()
+    if not use_bernoulli:
+        return eff_fwd, eff_rev
+    fwd_idx = np.flatnonzero(eff_fwd)
+    rev_idx = np.flatnonzero(eff_rev)
+    for i in fwd_idx:
+        if rng.random() > float(fwd_frac[i]):
+            eff_fwd[i] = 0
+    for i in rev_idx:
+        if rng.random() > float(rev_frac[i]):
+            eff_rev[i] = 0
+    return eff_fwd, eff_rev
+
+
+def _process_mapped_read_lookup(
+    read: pysam.AlignedSegment,
+    kin_map: np.ndarray,                # (L, 4, n_z_samples) uint8
+    rng: random.Random,
+    n_z_samples: int,
+    qlen: int,
+    default_value: int,
+    n_context_skip: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Fill fi/fp/ri/rp by looking up the precomputed kinetics map.
+
+    Per-read variance: pick ONE ``z_idx`` for the entire read so all
+    positions in the same read share the same noise realisation (biology:
+    one polymerase ZMW = one noise pattern across all bases). Different
+    reads at the same genomic position see different z_idx → distinct
+    realisations → ensemble variance preserved.
+
+    Strand routing matches :func:`_process_mapped_read` exactly:
+      is_reverse=False → fi←ipd_rev(ch2), fp←pw_rev(ch3), ri←ipd_fwd(ch0), rp←pw_fwd(ch1)
+      is_reverse=True  → fi←ipd_fwd(ch0), fp←pw_fwd(ch1), ri←ipd_rev(ch2), rp←pw_rev(ch3)
+    """
+    fi = np.full(qlen, default_value, dtype=np.uint8)
+    fp = np.full(qlen, default_value, dtype=np.uint8)
+    ri = np.full(qlen, default_value, dtype=np.uint8)
+    rp = np.full(qlen, default_value, dtype=np.uint8)
+    pairs = read.get_aligned_pairs(matches_only=True)
+    if not pairs:
+        return fi, fp, ri, rp
+
+    is_rev = bool(read.is_reverse)
+    z_idx = rng.randrange(n_z_samples)
+    L = kin_map.shape[0]
+    # Vectorise the per-base lookup. pairs is list of (q, ref).
+    pair_arr = np.asarray(pairs, dtype=np.int64)
+    q_arr = pair_arr[:, 0]
+    r_arr = pair_arr[:, 1]
+    # Filter: skip context-edge positions AND off-contig refs (defensive)
+    valid = (
+        (q_arr >= n_context_skip)
+        & (q_arr < qlen - n_context_skip)
+        & (r_arr >= 0)
+        & (r_arr < L)
+    )
+    if not valid.any():
+        return fi, fp, ri, rp
+    q_valid = q_arr[valid]
+    r_valid = r_arr[valid]
+    # kin_map[r, :, z_idx] is (4,) — gather all valid positions at once
+    block = kin_map[r_valid, :, z_idx]                    # (n_valid, 4)
+    if is_rev:
+        fi[q_valid] = block[:, 0]
+        fp[q_valid] = block[:, 1]
+        ri[q_valid] = block[:, 2]
+        rp[q_valid] = block[:, 3]
+    else:
+        fi[q_valid] = block[:, 2]
+        fp[q_valid] = block[:, 3]
+        ri[q_valid] = block[:, 0]
+        rp[q_valid] = block[:, 1]
+    return fi, fp, ri, rp
 
 
 def _process_mapped_read(
@@ -427,6 +604,8 @@ def generate(
     cfg_yaml: Path | None,
     seed: int = 42,
     use_bernoulli: bool = True,
+    precompute_cache: bool = True,
+    n_z_samples: int = 8,
 ) -> None:
     setup_logging()
     cfg = load_config(cfg_yaml)
@@ -470,6 +649,42 @@ def generate(
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+    # ----------------------------------------------------------------------
+    # FAST PATH: precompute a per-contig kinetics map (one inference per K
+    # ref positions × n_z_samples), then each MAPPED read just looks up.
+    # ~100-200× faster than the per-position fallback, and uses GLOBAL
+    # Bernoulli (one decision per genomic site, matching PacBio fraction
+    # semantics). Unmapped reads still go through the per-position path.
+    # ----------------------------------------------------------------------
+    kin_maps: dict[str, np.ndarray] = {}
+    if precompute_cache:
+        log.info("Precompute path: drawing GLOBAL Bernoulli + generating per-contig kinetics maps")
+        eff_fwds: dict[str, np.ndarray] = {}
+        eff_revs: dict[str, np.ndarray] = {}
+        for rid in ref_seqs:
+            ef, er = _draw_global_effective_meth(
+                fwd_maps[rid], rev_maps[rid],
+                fwd_fracs[rid], rev_fracs[rid],
+                rng, use_bernoulli,
+            )
+            eff_fwds[rid] = ef
+            eff_revs[rid] = er
+        total_after_bernoulli = sum(
+            int(np.count_nonzero(eff_fwds[r])) + int(np.count_nonzero(eff_revs[r]))
+            for r in ref_seqs
+        )
+        log.info("  GLOBAL Bernoulli kept %d/%d meth sites", total_after_bernoulli, total_sites)
+
+        for rid, seq in ref_seqs.items():
+            log.info("Precomputing kinetics map: %s (len=%d)", rid, len(seq))
+            kin_maps[rid] = _precompute_kinetics_map_for_contig(
+                seq, eff_fwds[rid], eff_revs[rid],
+                g, n_meth_types, K, half_width, n_z_samples, device,
+            )
+            mb = kin_maps[rid].nbytes / 1e6
+            log.info("  %s kin_map: %.1f MB (L=%d × 4 ch × %d z)", rid, mb, len(seq), n_z_samples)
+        log.info("Precompute done. Kinetics cached for %d contigs.", len(kin_maps))
+
     in_bam = pysam.AlignmentFile(str(input_bam), "rb", check_sq=False)
     header = in_bam.header.to_dict()
     pg = header.setdefault("PG", [])
@@ -512,22 +727,33 @@ def generate(
             if ref_id not in ref_seqs:
                 log.warning("Skipping read on unknown ref: %s", ref_id)
                 continue
-            fi, fp, ri, rp = _process_mapped_read(
-                read=read,
-                ref_seq=ref_seqs[ref_id],
-                fwd_map=fwd_maps[ref_id],
-                rev_map=rev_maps[ref_id],
-                fwd_frac=fwd_fracs[ref_id],
-                rev_frac=rev_fracs[ref_id],
-                g=g,
-                n_meth_types=n_meth_types,
-                half_width=half_width,
-                n_context_skip=n_context_skip,
-                default_value=cfg.generate.default_fi_for_unknown,
-                use_bernoulli=use_bernoulli,
-                rng=rng,
-                device=device,
-            )
+            if precompute_cache:
+                fi, fp, ri, rp = _process_mapped_read_lookup(
+                    read=read,
+                    kin_map=kin_maps[ref_id],
+                    rng=rng,
+                    n_z_samples=n_z_samples,
+                    qlen=read.query_length,
+                    default_value=cfg.generate.default_fi_for_unknown,
+                    n_context_skip=n_context_skip,
+                )
+            else:
+                fi, fp, ri, rp = _process_mapped_read(
+                    read=read,
+                    ref_seq=ref_seqs[ref_id],
+                    fwd_map=fwd_maps[ref_id],
+                    rev_map=rev_maps[ref_id],
+                    fwd_frac=fwd_fracs[ref_id],
+                    rev_frac=rev_fracs[ref_id],
+                    g=g,
+                    n_meth_types=n_meth_types,
+                    half_width=half_width,
+                    n_context_skip=n_context_skip,
+                    default_value=cfg.generate.default_fi_for_unknown,
+                    use_bernoulli=use_bernoulli,
+                    rng=rng,
+                    device=device,
+                )
         # Strip any existing kinetics tags before writing fresh ones.
         # ``set_tag(name, None)`` removal landed in pysam 0.17; older versions
         # raise TypeError. Use the version-stable ``has_tag`` + nothing-to-do
@@ -557,6 +783,16 @@ def main(argv=None):
     ap.add_argument("output_bam")
     ap.add_argument("--config", default=None, help="kinsim_nn_config.yaml")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--no-precompute", action="store_true",
+                    help="Disable the precompute-cache fast path. With this set, "
+                         "each (read, position) gets its own model inference "
+                         "(~100-200× slower, but per-read per-site Bernoulli).")
+    ap.add_argument("--n-z-samples", type=int, default=8,
+                    help="Number of z noise realisations to pre-draw per genomic "
+                         "position when --precompute is on. Per read picks one "
+                         "of these N samples → preserves per-read variance. "
+                         "Higher = more variance, more memory (L × 4 × N bytes). "
+                         "Default: %(default)d.")
     ap.add_argument("--no-bernoulli", action="store_true",
                     help="Override YAML and disable Bernoulli sampling on motif fraction "
                          "(always set meth at every motif site).")
@@ -584,6 +820,8 @@ def main(argv=None):
         cfg_yaml=Path(args.config) if args.config else None,
         seed=args.seed,
         use_bernoulli=use_bernoulli,
+        precompute_cache=not args.no_precompute,
+        n_z_samples=args.n_z_samples,
     )
 
 
