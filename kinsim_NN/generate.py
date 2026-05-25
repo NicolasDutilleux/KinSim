@@ -214,14 +214,15 @@ def _generate_signal_batched_full(
     np.put_along_axis(meth_rev_oh, meth_rev_stack.astype(np.int64)[..., None], 1.0, axis=-1)
 
     z = g.sample_z(B, device=device)
-    out = g(
-        z,
-        torch.from_numpy(base_fwd_oh).to(device),
-        torch.from_numpy(base_rev_oh).to(device),
-        torch.from_numpy(meth_fwd_oh).to(device),
-        torch.from_numpy(meth_rev_oh).to(device),
-    )
-    return out.cpu().numpy().astype(np.float32)          # (B, K, 4)
+    with torch.no_grad():
+        out = g(
+            z,
+            torch.from_numpy(base_fwd_oh).to(device),
+            torch.from_numpy(base_rev_oh).to(device),
+            torch.from_numpy(meth_fwd_oh).to(device),
+            torch.from_numpy(meth_rev_oh).to(device),
+        )
+    return out.detach().cpu().numpy().astype(np.float32)  # (B, K, 4)
 
 
 def _draw_read_effective_meth(
