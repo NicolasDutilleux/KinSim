@@ -375,6 +375,132 @@ def _draw_global_effective_meth(
     return eff_fwd, eff_rev
 
 
+def _cigar_to_match_pairs(
+    cigartuples: list[tuple[int, int]],
+    ref_start: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Walk CIGAR ops → arrays of matched (q_pos, ref_pos) pairs.
+
+    Faster than ``pysam.AlignedSegment.get_aligned_pairs(matches_only=True)``
+    for our needs because it stays in pure-numpy land (no Python tuple list).
+    BAM op codes: 0=M, 1=I, 2=D, 3=N, 4=S, 5=H, 6=P, 7==, 8=X.
+    M/=/X advance both query and ref. I/S advance query only. D/N advance
+    ref only. H/P advance neither.
+    """
+    q_parts: list[np.ndarray] = []
+    r_parts: list[np.ndarray] = []
+    q_pos = 0
+    r_pos = ref_start
+    for op, length in cigartuples:
+        if op == 0 or op == 7 or op == 8:    # M, =, X
+            q_parts.append(np.arange(q_pos, q_pos + length, dtype=np.int64))
+            r_parts.append(np.arange(r_pos, r_pos + length, dtype=np.int64))
+            q_pos += length
+            r_pos += length
+        elif op == 1 or op == 4:              # I, S
+            q_pos += length
+        elif op == 2 or op == 3:              # D, N
+            r_pos += length
+        # H (5), P (6) advance neither
+    if not q_parts:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    return np.concatenate(q_parts), np.concatenate(r_parts)
+
+
+def _process_read_from_cigar(
+    qlen: int,
+    ref_start: int,
+    cigartuples: list[tuple[int, int]],
+    is_rev: bool,
+    kin_map: np.ndarray,                # (L, 4, n_z_samples) uint8
+    z_idx: int,
+    default_value: int,
+    n_context_skip: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Worker-safe variant of :func:`_process_mapped_read_lookup` that takes
+    only picklable args (no ``pysam.AlignedSegment``). Used by the
+    multiprocess generation path.
+
+    Strand routing matches :func:`_process_mapped_read` exactly:
+      is_rev=False → fi←ipd_rev(ch2), fp←pw_rev(ch3), ri←ipd_fwd(ch0), rp←pw_fwd(ch1)
+      is_rev=True  → fi←ipd_fwd(ch0), fp←pw_fwd(ch1), ri←ipd_rev(ch2), rp←pw_rev(ch3)
+    """
+    fi = np.full(qlen, default_value, dtype=np.uint8)
+    fp = np.full(qlen, default_value, dtype=np.uint8)
+    ri = np.full(qlen, default_value, dtype=np.uint8)
+    rp = np.full(qlen, default_value, dtype=np.uint8)
+    q_arr, r_arr = _cigar_to_match_pairs(cigartuples, ref_start)
+    if q_arr.size == 0:
+        return fi, fp, ri, rp
+    L = kin_map.shape[0]
+    valid = (
+        (q_arr >= n_context_skip)
+        & (q_arr < qlen - n_context_skip)
+        & (r_arr >= 0)
+        & (r_arr < L)
+    )
+    if not valid.any():
+        return fi, fp, ri, rp
+    q_valid = q_arr[valid]
+    r_valid = r_arr[valid]
+    block = kin_map[r_valid, :, z_idx]
+    if is_rev:
+        fi[q_valid] = block[:, 0]
+        fp[q_valid] = block[:, 1]
+        ri[q_valid] = block[:, 2]
+        rp[q_valid] = block[:, 3]
+    else:
+        fi[q_valid] = block[:, 2]
+        fp[q_valid] = block[:, 3]
+        ri[q_valid] = block[:, 0]
+        rp[q_valid] = block[:, 1]
+    return fi, fp, ri, rp
+
+
+# Module-global so forked workers inherit the kin_maps via copy-on-write
+# (zero-copy on Linux; matters because the maps are ~256 MB per contig).
+_WORKER_KIN_MAPS: dict[str, np.ndarray] = {}
+_WORKER_CONFIG: dict = {}
+
+
+def _worker_init(kin_maps: dict[str, np.ndarray], cfg_dict: dict) -> None:
+    """Called once per worker at pool startup. Stores the kin_maps as a
+    module-global so subsequent task calls can reach them without re-pickling
+    (kin_maps are 256 MB each — never pickle them per task)."""
+    global _WORKER_KIN_MAPS, _WORKER_CONFIG
+    _WORKER_KIN_MAPS = kin_maps
+    _WORKER_CONFIG = cfg_dict
+
+
+def _worker_process_batch(
+    batch: list[dict],
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Run by each worker process. Takes a list of picklable read-descriptors,
+    returns list of (fi, fp, ri, rp) tuples in the same order."""
+    n_z = _WORKER_CONFIG["n_z_samples"]
+    default_value = _WORKER_CONFIG["default_value"]
+    n_context_skip = _WORKER_CONFIG["n_context_skip"]
+    out = []
+    for item in batch:
+        kin_map = _WORKER_KIN_MAPS.get(item["ref_name"])
+        if kin_map is None:
+            # Unknown ref — should be filtered out by master, but be defensive
+            empty = np.full(item["qlen"], default_value, dtype=np.uint8)
+            out.append((empty, empty.copy(), empty.copy(), empty.copy()))
+            continue
+        out.append(_process_read_from_cigar(
+            qlen=item["qlen"],
+            ref_start=item["ref_start"],
+            cigartuples=item["cigar"],
+            is_rev=item["is_rev"],
+            kin_map=kin_map,
+            z_idx=item["z_idx"],
+            default_value=default_value,
+            n_context_skip=n_context_skip,
+        ))
+    return out
+
+
 def _process_mapped_read_lookup(
     read: pysam.AlignedSegment,
     kin_map: np.ndarray,                # (L, 4, n_z_samples) uint8
@@ -596,6 +722,117 @@ def _process_unmapped_read(
 # ---------------------------------------------------------------------------
 
 
+def _run_mapped_reads_multiprocess(
+    in_bam: pysam.AlignmentFile,
+    out_bam: pysam.AlignmentFile,
+    kin_maps: dict[str, np.ndarray],
+    n_z_samples: int,
+    default_value: int,
+    n_context_skip: int,
+    rng: random.Random,
+    n_workers: int,
+    batch_size: int = 500,
+    max_pending_batches: int | None = None,
+    unmapped_passthrough: bool = True,
+) -> tuple[int, int]:
+    """Master loop: parallelise the per-read CIGAR + lookup + tag-build over
+    a worker pool. Master keeps the sequential responsibilities (BAM read,
+    BAM write, set_tag) and ships off the CPU-bound per-read math.
+
+    Returns ``(n_processed, n_unmapped_or_skipped_for_main_path)``.
+
+    Workers fork from master *after* kin_maps are precomputed → they inherit
+    the maps via copy-on-write. Per-task IPC carries only the picklable
+    read descriptor (qlen, ref_start, cigar, is_rev, ref_name, z_idx) and
+    returns 4 uint8 arrays — minimal bandwidth.
+
+    Read order is preserved by submitting batches into a FIFO deque of
+    (reads_in_batch, future) and consuming results in submission order.
+    """
+    from collections import deque
+    from concurrent.futures import ProcessPoolExecutor
+
+    if max_pending_batches is None:
+        max_pending_batches = max(4, n_workers * 2)
+
+    cfg_dict = {
+        "n_z_samples": n_z_samples,
+        "default_value": default_value,
+        "n_context_skip": n_context_skip,
+    }
+
+    n_processed = 0
+    n_skipped_unmapped = 0
+
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        initializer=_worker_init,
+        initargs=(kin_maps, cfg_dict),
+    ) as executor:
+        pending: deque = deque()
+        read_iter = in_bam.fetch(until_eof=True)
+        eof = False
+
+        while True:
+            # Fill the work queue
+            while len(pending) < max_pending_batches and not eof:
+                reads_batch: list[pysam.AlignedSegment] = []
+                items: list[dict] = []
+                while len(items) < batch_size:
+                    try:
+                        read = next(read_iter)
+                    except StopIteration:
+                        eof = True
+                        break
+                    if read.is_secondary or read.is_supplementary:
+                        out_bam.write(read)
+                        continue
+                    if read.is_unmapped:
+                        if unmapped_passthrough:
+                            out_bam.write(read)
+                            n_skipped_unmapped += 1
+                            continue
+                        # else: caller handles unmapped separately
+                        out_bam.write(read)
+                        n_skipped_unmapped += 1
+                        continue
+                    ref_name = read.reference_name
+                    if ref_name not in kin_maps:
+                        log.warning("Skipping read on unknown ref: %s", ref_name)
+                        continue
+                    items.append({
+                        "qlen": read.query_length,
+                        "ref_start": read.reference_start,
+                        "cigar": list(read.cigartuples) if read.cigartuples else [],
+                        "is_rev": bool(read.is_reverse),
+                        "ref_name": ref_name,
+                        "z_idx": rng.randrange(n_z_samples),
+                    })
+                    reads_batch.append(read)
+                if items:
+                    future = executor.submit(_worker_process_batch, items)
+                    pending.append((reads_batch, future))
+
+            # Drain one completed batch (in submission order)
+            if pending:
+                reads_batch, future = pending.popleft()
+                results = future.result()
+                for read, (fi, fp, ri, rp) in zip(reads_batch, results):
+                    read.set_tag("fi", array.array("B", fi.tobytes()))
+                    read.set_tag("fp", array.array("B", fp.tobytes()))
+                    read.set_tag("ri", array.array("B", ri.tobytes()))
+                    read.set_tag("rp", array.array("B", rp.tobytes()))
+                    out_bam.write(read)
+                    n_processed += 1
+                    if n_processed % 1000 == 0:
+                        log.info("Processed %d mapped reads", n_processed)
+            else:
+                if eof:
+                    break
+
+    return n_processed, n_skipped_unmapped
+
+
 def generate(
     input_bam: Path,
     ref_fasta: Path,
@@ -607,6 +844,7 @@ def generate(
     use_bernoulli: bool = True,
     precompute_cache: bool = True,
     n_z_samples: int = 8,
+    n_workers: int = 1,
 ) -> None:
     setup_logging()
     cfg = load_config(cfg_yaml)
@@ -699,6 +937,35 @@ def generate(
 
     n_reads = 0
     n_unmapped = 0
+
+    # FAST MULTIPROCESS PATH — only applies when precompute_cache is on,
+    # n_workers > 1, AND the input BAM has mapped reads. For unmapped reads
+    # (PBSIM3 sim output), per-read GPU work is still needed → fallback to
+    # the sequential path. We detect by peeking: if input is mapped-mostly,
+    # use multiprocess; otherwise fall through.
+    if precompute_cache and n_workers > 1:
+        log.info("Multiprocess path enabled: %d workers, batch=500", n_workers)
+        n_proc, n_skip = _run_mapped_reads_multiprocess(
+            in_bam=in_bam,
+            out_bam=out_bam,
+            kin_maps=kin_maps,
+            n_z_samples=n_z_samples,
+            default_value=cfg.generate.default_fi_for_unknown,
+            n_context_skip=n_context_skip,
+            rng=rng,
+            n_workers=n_workers,
+            unmapped_passthrough=True,
+        )
+        log.info("Multiprocess done. mapped=%d  unmapped_passthrough=%d",
+                 n_proc, n_skip)
+        n_reads = n_proc
+        n_unmapped = n_skip
+        in_bam.close()
+        out_bam.close()
+        log.info("Done. Wrote %d reads (%d unmapped passthrough) -> %s",
+                 n_reads, n_unmapped, output_bam)
+        return
+
     for read in in_bam.fetch(until_eof=True):
         if read.is_secondary or read.is_supplementary:
             out_bam.write(read)
@@ -792,6 +1059,14 @@ def main(argv=None):
                          "of these N samples → preserves per-read variance. "
                          "Higher = more variance, more memory (L × 4 × N bytes). "
                          "Default: %(default)d.")
+    ap.add_argument("--n-workers", type=int, default=1,
+                    help="Number of worker processes for parallel read "
+                         "processing (only used with precompute path). Workers "
+                         "fork from master after kin_maps are built, inheriting "
+                         "them via copy-on-write (no per-task pickling). Set to "
+                         "1 to disable multiprocess (sequential mapped-read "
+                         "processing). Typically set to --cpus-per-task value. "
+                         "Default: %(default)d (sequential).")
     ap.add_argument("--no-bernoulli", action="store_true",
                     help="Override YAML and disable Bernoulli sampling on motif fraction "
                          "(always set meth at every motif site).")
@@ -821,6 +1096,7 @@ def main(argv=None):
         use_bernoulli=use_bernoulli,
         precompute_cache=not args.no_precompute,
         n_z_samples=args.n_z_samples,
+        n_workers=args.n_workers,
     )
 
 
