@@ -413,13 +413,21 @@ def _process_read_from_cigar(
     cigartuples: list[tuple[int, int]],
     is_rev: bool,
     kin_map: np.ndarray,                # (L, 4, n_z_samples) uint8
-    z_idx: int,
+    z_seed: int,
     default_value: int,
     n_context_skip: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Worker-safe variant of :func:`_process_mapped_read_lookup` that takes
-    only picklable args (no ``pysam.AlignedSegment``). Used by the
-    multiprocess generation path.
+    """Worker-safe variant of :func:`_process_mapped_read_lookup`.
+
+    Per-position-random z: each base picks a RANDOM z_idx independently
+    (vectorised numpy.random.randint). This dramatically expands the
+    apparent variance at every genomic position — 8 precomputed kinetic
+    values × N reads × M positions per read = many distinct kinetic
+    realisations per position, instead of just 8 (which was the case
+    with the earlier per-read z choice).
+
+    ``z_seed`` is per-read so different reads see different random streams
+    (reproducible given seed).
 
     Strand routing matches :func:`_process_mapped_read` exactly:
       is_rev=False → fi←ipd_rev(ch2), fp←pw_rev(ch3), ri←ipd_fwd(ch0), rp←pw_fwd(ch1)
@@ -433,6 +441,7 @@ def _process_read_from_cigar(
     if q_arr.size == 0:
         return fi, fp, ri, rp
     L = kin_map.shape[0]
+    n_z = kin_map.shape[2]
     valid = (
         (q_arr >= n_context_skip)
         & (q_arr < qlen - n_context_skip)
@@ -443,7 +452,11 @@ def _process_read_from_cigar(
         return fi, fp, ri, rp
     q_valid = q_arr[valid]
     r_valid = r_arr[valid]
-    block = kin_map[r_valid, :, z_idx]
+    # Per-position random z_idx (seeded by z_seed for reproducibility)
+    z_rng = np.random.default_rng(z_seed)
+    z_indices = z_rng.integers(0, n_z, size=r_valid.size)
+    # Advanced indexing: gather (r_valid[i], :, z_indices[i]) → (n_valid, 4)
+    block = kin_map[r_valid[:, None], np.arange(4)[None, :], z_indices[:, None]]
     if is_rev:
         fi[q_valid] = block[:, 0]
         fp[q_valid] = block[:, 1]
@@ -494,7 +507,7 @@ def _worker_process_batch(
             cigartuples=item["cigar"],
             is_rev=item["is_rev"],
             kin_map=kin_map,
-            z_idx=item["z_idx"],
+            z_seed=item["z_seed"],
             default_value=default_value,
             n_context_skip=n_context_skip,
         ))
@@ -531,8 +544,8 @@ def _process_mapped_read_lookup(
         return fi, fp, ri, rp
 
     is_rev = bool(read.is_reverse)
-    z_idx = rng.randrange(n_z_samples)
     L = kin_map.shape[0]
+    n_z = kin_map.shape[2]
     # Vectorise the per-base lookup. pairs is list of (q, ref).
     pair_arr = np.asarray(pairs, dtype=np.int64)
     q_arr = pair_arr[:, 0]
@@ -548,8 +561,9 @@ def _process_mapped_read_lookup(
         return fi, fp, ri, rp
     q_valid = q_arr[valid]
     r_valid = r_arr[valid]
-    # kin_map[r, :, z_idx] is (4,) — gather all valid positions at once
-    block = kin_map[r_valid, :, z_idx]                    # (n_valid, 4)
+    # Per-position random z_idx → much more variance than fixed-z-per-read
+    z_indices = np.asarray([rng.randrange(n_z) for _ in range(r_valid.size)], dtype=np.int64)
+    block = kin_map[r_valid[:, None], np.arange(4)[None, :], z_indices[:, None]]
     if is_rev:
         fi[q_valid] = block[:, 0]
         fp[q_valid] = block[:, 1]
@@ -806,7 +820,9 @@ def _run_mapped_reads_multiprocess(
                         "cigar": list(read.cigartuples) if read.cigartuples else [],
                         "is_rev": bool(read.is_reverse),
                         "ref_name": ref_name,
-                        "z_idx": rng.randrange(n_z_samples),
+                        # Per-read seed → reproducible per-position random z
+                        # inside the worker (NumPy default_rng with this seed).
+                        "z_seed": rng.randrange(2**31),
                     })
                     reads_batch.append(read)
                 if items:
@@ -843,7 +859,7 @@ def generate(
     seed: int = 42,
     use_bernoulli: bool = True,
     precompute_cache: bool = True,
-    n_z_samples: int = 8,
+    n_z_samples: int = 32,
     n_workers: int = 1,
 ) -> None:
     setup_logging()
@@ -1053,12 +1069,13 @@ def main(argv=None):
                     help="Disable the precompute-cache fast path. With this set, "
                          "each (read, position) gets its own model inference "
                          "(~100-200× slower, but per-read per-site Bernoulli).")
-    ap.add_argument("--n-z-samples", type=int, default=8,
+    ap.add_argument("--n-z-samples", type=int, default=32,
                     help="Number of z noise realisations to pre-draw per genomic "
-                         "position when --precompute is on. Per read picks one "
-                         "of these N samples → preserves per-read variance. "
+                         "position when --precompute is on. Each (read, base) "
+                         "picks one of these N samples INDEPENDENTLY → much "
+                         "more apparent variance than fixed-z-per-read. "
                          "Higher = more variance, more memory (L × 4 × N bytes). "
-                         "Default: %(default)d.")
+                         "Default: %(default)d (= 1 GB per 8 Mbp contig).")
     ap.add_argument("--n-workers", type=int, default=1,
                     help="Number of worker processes for parallel read "
                          "processing (only used with precompute path). Workers "
