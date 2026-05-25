@@ -755,15 +755,13 @@ def generate(
                     rng=rng,
                     device=device,
                 )
-        # Strip any existing kinetics tags before writing fresh ones.
-        # ``set_tag(name, None)`` removal landed in pysam 0.17; older versions
-        # raise TypeError. Use the version-stable ``has_tag`` + nothing-to-do
-        # pattern: simply overwriting via set_tag is safe for tag replacement.
-        # Explicit array.array("B", ...) so the subtype is unambiguously uint8.
-        read.set_tag("fi", array.array("B", fi.tolist()))
-        read.set_tag("fp", array.array("B", fp.tolist()))
-        read.set_tag("ri", array.array("B", ri.tolist()))
-        read.set_tag("rp", array.array("B", rp.tolist()))
+        # Strip + write kinetics tags. ``array.array('B', bytes)`` is ~10x
+        # faster than ``array.array('B', ndarray.tolist())`` (no Python-list
+        # roundtrip) — matters when we're doing this per read on 124k reads.
+        read.set_tag("fi", array.array("B", fi.tobytes()))
+        read.set_tag("fp", array.array("B", fp.tobytes()))
+        read.set_tag("ri", array.array("B", ri.tobytes()))
+        read.set_tag("rp", array.array("B", rp.tobytes()))
         out_bam.write(read)
         n_reads += 1
         if n_reads % 100 == 0:
