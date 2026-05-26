@@ -7,7 +7,60 @@ v12_run3 manual run.
 
 ---
 
-## Bug 4 — `template_length=0` triggered bystrandify discard (THE *actual* root cause)
+## Bug 5 — zero values in fi/fp/ri/rp trigger bystrandify discard (THE *actual* root cause)
+
+**Symptom:** After fixing Bugs 1-4, bystrandify STILL discarded ~all reads
+with the misleading "has '0' PulseWidths, discarding" warning.
+
+**Diagnosis methodology:** When all observable record-level fields (flag,
+TLEN, SO, RG, SEQ, QUAL, tag names, tag types, tag order, tag lengths,
+PG chain) were proven byte-identical between OLD (working) and NEW
+(rejected) bams, the only remaining difference was the VALUES inside
+fi/fp/ri/rp. A targeted test — overwriting NEW's records with constant=50
+across all fi/fp/ri/rp — passed cleanly (2.1 MB output, zero warnings).
+Then a second test — replacing only the zeros (`v[v==0] = 1`) — also
+passed cleanly. **Confirmed: bystrandify rejects records that contain
+ANY zero in fi/fp/ri/rp.**
+
+**Root cause:** The PacBio frame-count codec uses uint8 values 1-255;
+**0 means "invalid/missing"**. ccs-kinetics-bystrandify validates the
+input record and discards it on encountering any 0 in the per-base
+kinetic arrays — emitting the misleading "has '0' PulseWidths" warning
+that reads (in retrospect) as "has '0' [value] in PulseWidths" rather
+than "has 0 [count of] PulseWidths".
+
+kinsim_NN's predicted kinetics occasionally hit 0 (~0.1-0.3% of
+positions per read) when the model's log-space output rounds down to
+zero frame counts. Legacy kinsim must have either clamped or had a
+distribution that avoided 0s.
+
+**Fix:** Clamp fi/fp/ri/rp to ≥ 1 right before `set_tag`, in BOTH the
+sequential (`_process_read_*`) and multiprocess paths of
+`kinsim_NN/generate.py`:
+
+```python
+np.maximum(fi, 1, out=fi)
+np.maximum(fp, 1, out=fp)
+np.maximum(ri, 1, out=ri)
+np.maximum(rp, 1, out=rp)
+```
+
+**Lesson:** Five separate bystrandify-discard bugs in sequence, all
+surfacing the SAME misleading "0 PulseWidths" warning. The decisive
+diagnostic was not more byte-level diffing of OLD vs NEW (which
+converged to "structurally identical"), but a controlled-substitution
+experiment: replace NEW's records' kinetic VALUES with known-good
+constants and see if bystrandify accepts. That isolated the bug to
+the value distribution. Without the constant-fill test we would have
+kept hunting structural differences forever.
+
+The "0 in PacBio uint8 codec means invalid" rule belongs in the
+canonical unalign / BAM-emission recipe documented in
+`kinsim_NN/utils/bam_io.py`.
+
+---
+
+## Bug 4 — `template_length=0` triggered bystrandify discard (formerly thought to be the root cause)
 
 **Symptom:** After fixing Bug 1 (flag=4), Bug 2 (SO:unknown), AND Bug 3
 (strip ip/pw), bystrandify STILL discarded 99.8 % of reads. Output BAM

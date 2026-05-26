@@ -931,6 +931,14 @@ def _run_mapped_reads_multiprocess(
                 reads_batch, future = pending.popleft()
                 results = future.result()
                 for read, (fi, fp, ri, rp) in zip(reads_batch, results):
+                    # Clamp zeros → 1. PacBio frame-count codec is 1-255;
+                    # 0 means "invalid/missing" and ccs-kinetics-bystrandify
+                    # discards the entire record (misleading "0 PulseWidths"
+                    # warning) if it finds any 0 in fi/fp/ri/rp.
+                    np.maximum(fi, 1, out=fi)
+                    np.maximum(fp, 1, out=fp)
+                    np.maximum(ri, 1, out=ri)
+                    np.maximum(rp, 1, out=rp)
                     read.set_tag("fi", array.array("B", fi.tobytes()))
                     read.set_tag("fp", array.array("B", fp.tobytes()))
                     read.set_tag("ri", array.array("B", ri.tobytes()))
@@ -1148,6 +1156,13 @@ def generate(
                 )
         # ``array.array('B', bytes)`` is ~10× faster than ``.tolist()`` —
         # matters at 124k reads.
+        # Clamp zeros → 1. PacBio frame-count codec is 1-255; 0 means
+        # "invalid/missing" and ccs-kinetics-bystrandify discards the
+        # entire record (misleading "0 PulseWidths" warning) on any 0.
+        np.maximum(fi, 1, out=fi)
+        np.maximum(fp, 1, out=fp)
+        np.maximum(ri, 1, out=ri)
+        np.maximum(rp, 1, out=rp)
         read.set_tag("fi", array.array("B", fi.tobytes()))
         read.set_tag("fp", array.array("B", fp.tobytes()))
         read.set_tag("ri", array.array("B", ri.tobytes()))
