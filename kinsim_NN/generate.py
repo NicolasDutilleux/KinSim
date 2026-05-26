@@ -488,25 +488,19 @@ def _process_read_from_cigar(
 def _unalign_read(read: pysam.AlignedSegment) -> None:
     """Convert an aligned read in-place into an unaligned record.
 
-    ccs-kinetics-bystrandify (used downstream) refuses aligned inputs:
-    'Read X is aligned, only unaligned CCS reads can be converted'. The
-    validate chain therefore wants generate's output to be unaligned HiFi
-    (matches kinsim's BAM contract: flag=4, ref_id=-1, no cigar). Doing it
-    here saves the extra unalign pass.
+    Target flag = 4 EXACTLY (unmapped, not paired). PacBio raw HiFi BAMs
+    have flag=4 on all CCS reads — anything else (e.g. flag=12 with
+    mate_is_unmapped, or flag=20 with is_reverse) makes downstream tools
+    like ``ccs-kinetics-bystrandify`` reject the read with misleading
+    'has 0 PulseWidths' warnings. So we set the FLAG byte directly and
+    leave the paired-end flags untouched (CCS reads aren't paired —
+    is_paired is already False).
 
-    Clears: alignment flags (sets unmapped=True, reverse=False, secondary=
-    False, supplementary=False, mate_unmapped=True), reference_id,
-    reference_start, mapping_quality, cigarstring, next_reference_id,
-    next_reference_start, template_length. Preserves: query_name,
-    query_sequence, query_qualities, all tags (including fi/fp/ri/rp we
-    just wrote).
+    Clears: ref_id, ref_start, mapq, cigar, mate ref_id/start, tlen.
+    Preserves: query_name, query_sequence, query_qualities, all tags
+    (including fi/fp/ri/rp we just wrote).
     """
-    read.is_unmapped = True
-    read.is_reverse = False
-    read.is_secondary = False
-    read.is_supplementary = False
-    read.mate_is_unmapped = True
-    read.is_proper_pair = False
+    read.flag = 4
     read.reference_id = -1
     read.reference_start = -1
     read.mapping_quality = 0
