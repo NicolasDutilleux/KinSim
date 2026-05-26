@@ -416,17 +416,28 @@ def _process_read_from_cigar(
     z_seed: int,
     default_value: int,
     n_context_skip: int,
+    per_read_z: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Worker-safe variant of :func:`_process_mapped_read_lookup`.
 
-    Per-position-random z: each base picks a RANDOM z_idx independently
-    (vectorised numpy.random.randint). This dramatically expands the
-    apparent variance at every genomic position — 8 precomputed kinetic
-    values × N reads × M positions per read = many distinct kinetic
-    realisations per position, instead of just 8 (which was the case
-    with the earlier per-read z choice).
+    Two z-sampling modes (controlled by ``per_read_z``):
 
-    ``z_seed`` is per-read so different reads see different random streams
+    * **per_read_z=True (default, v2 fix)**: pick ONE z_idx for the whole
+      read. All bases of this read share the same noise realisation.
+      Models the biological reality that a single ZMW has one polymerase
+      with correlated noise across its bases. This is what ipdSummary
+      expects to find — CONSISTENT slowdown across many reads at a
+      methylated site. Different reads at the same position pick different
+      z_idx's so ensemble variance at the position level is preserved.
+      Critical for downstream motif detection.
+
+    * **per_read_z=False (legacy)**: per-(read, base) random z_idx.
+      Maximum apparent variance but BREAKS per-read coherence and
+      desensitises ipdSummary's per-position statistical tests. Earlier
+      v1 default; kept for ablation but ipdSummary motif detection on
+      v1 output found only weak generic motifs (not the real GATC/etc).
+
+    ``z_seed`` is per-read so different reads pick different z's
     (reproducible given seed).
 
     Strand routing matches :func:`_process_mapped_read` exactly:
@@ -452,11 +463,15 @@ def _process_read_from_cigar(
         return fi, fp, ri, rp
     q_valid = q_arr[valid]
     r_valid = r_arr[valid]
-    # Per-position random z_idx (seeded by z_seed for reproducibility)
     z_rng = np.random.default_rng(z_seed)
-    z_indices = z_rng.integers(0, n_z, size=r_valid.size)
-    # Advanced indexing: gather (r_valid[i], :, z_indices[i]) → (n_valid, 4)
-    block = kin_map[r_valid[:, None], np.arange(4)[None, :], z_indices[:, None]]
+    if per_read_z:
+        # Pick ONE z_idx for the whole read → coherent across bases
+        z_idx = int(z_rng.integers(0, n_z))
+        block = kin_map[r_valid, :, z_idx]    # (n_valid, 4) — all bases same z
+    else:
+        # Legacy: per-base random z_idx (high variance, breaks coherence)
+        z_indices = z_rng.integers(0, n_z, size=r_valid.size)
+        block = kin_map[r_valid[:, None], np.arange(4)[None, :], z_indices[:, None]]
     if is_rev:
         fi[q_valid] = block[:, 0]
         fp[q_valid] = block[:, 1]
@@ -468,6 +483,46 @@ def _process_read_from_cigar(
         ri[q_valid] = block[:, 0]
         rp[q_valid] = block[:, 1]
     return fi, fp, ri, rp
+
+
+def _unalign_read(read: pysam.AlignedSegment) -> None:
+    """Convert an aligned read in-place into an unaligned record.
+
+    ccs-kinetics-bystrandify (used downstream) refuses aligned inputs:
+    'Read X is aligned, only unaligned CCS reads can be converted'. The
+    validate chain therefore wants generate's output to be unaligned HiFi
+    (matches kinsim's BAM contract: flag=4, ref_id=-1, no cigar). Doing it
+    here saves the extra unalign pass.
+
+    Clears: alignment flags (sets unmapped=True, reverse=False, secondary=
+    False, supplementary=False, mate_unmapped=True), reference_id,
+    reference_start, mapping_quality, cigarstring, next_reference_id,
+    next_reference_start, template_length. Preserves: query_name,
+    query_sequence, query_qualities, all tags (including fi/fp/ri/rp we
+    just wrote).
+    """
+    read.is_unmapped = True
+    read.is_reverse = False
+    read.is_secondary = False
+    read.is_supplementary = False
+    read.mate_is_unmapped = True
+    read.is_proper_pair = False
+    read.reference_id = -1
+    read.reference_start = -1
+    read.mapping_quality = 0
+    read.cigarstring = None
+    read.next_reference_id = -1
+    read.next_reference_start = -1
+    read.template_length = 0
+
+
+def _sanitize_header_for_unaligned(header_dict: dict) -> dict:
+    """Strip @SQ lines from a BAM header — an unaligned BAM must not
+    reference contigs (pbmm2/samtools tolerate it but ccs-kinetics-
+    bystrandify and downstream PacBio tools are stricter)."""
+    out = dict(header_dict)
+    out["SQ"] = []
+    return out
 
 
 # Module-global so forked workers inherit the kin_maps via copy-on-write
@@ -490,9 +545,9 @@ def _worker_process_batch(
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """Run by each worker process. Takes a list of picklable read-descriptors,
     returns list of (fi, fp, ri, rp) tuples in the same order."""
-    n_z = _WORKER_CONFIG["n_z_samples"]
     default_value = _WORKER_CONFIG["default_value"]
     n_context_skip = _WORKER_CONFIG["n_context_skip"]
+    per_read_z = _WORKER_CONFIG.get("per_read_z", True)
     out = []
     for item in batch:
         kin_map = _WORKER_KIN_MAPS.get(item["ref_name"])
@@ -510,6 +565,7 @@ def _worker_process_batch(
             z_seed=item["z_seed"],
             default_value=default_value,
             n_context_skip=n_context_skip,
+            per_read_z=per_read_z,
         ))
     return out
 
@@ -522,14 +578,12 @@ def _process_mapped_read_lookup(
     qlen: int,
     default_value: int,
     n_context_skip: int,
+    per_read_z: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Fill fi/fp/ri/rp by looking up the precomputed kinetics map.
 
-    Per-read variance: pick ONE ``z_idx`` for the entire read so all
-    positions in the same read share the same noise realisation (biology:
-    one polymerase ZMW = one noise pattern across all bases). Different
-    reads at the same genomic position see different z_idx → distinct
-    realisations → ensemble variance preserved.
+    ``per_read_z`` controls per-read coherence (see
+    :func:`_process_read_from_cigar` for the trade-off discussion).
 
     Strand routing matches :func:`_process_mapped_read` exactly:
       is_reverse=False → fi←ipd_rev(ch2), fp←pw_rev(ch3), ri←ipd_fwd(ch0), rp←pw_fwd(ch1)
@@ -561,9 +615,12 @@ def _process_mapped_read_lookup(
         return fi, fp, ri, rp
     q_valid = q_arr[valid]
     r_valid = r_arr[valid]
-    # Per-position random z_idx → much more variance than fixed-z-per-read
-    z_indices = np.asarray([rng.randrange(n_z) for _ in range(r_valid.size)], dtype=np.int64)
-    block = kin_map[r_valid[:, None], np.arange(4)[None, :], z_indices[:, None]]
+    if per_read_z:
+        z_idx = rng.randrange(n_z)
+        block = kin_map[r_valid, :, z_idx]
+    else:
+        z_indices = np.asarray([rng.randrange(n_z) for _ in range(r_valid.size)], dtype=np.int64)
+        block = kin_map[r_valid[:, None], np.arange(4)[None, :], z_indices[:, None]]
     if is_rev:
         fi[q_valid] = block[:, 0]
         fp[q_valid] = block[:, 1]
@@ -748,6 +805,8 @@ def _run_mapped_reads_multiprocess(
     batch_size: int = 500,
     max_pending_batches: int | None = None,
     unmapped_passthrough: bool = True,
+    per_read_z: bool = True,
+    emit_unaligned: bool = True,
 ) -> tuple[int, int]:
     """Master loop: parallelise the per-read CIGAR + lookup + tag-build over
     a worker pool. Master keeps the sequential responsibilities (BAM read,
@@ -773,6 +832,7 @@ def _run_mapped_reads_multiprocess(
         "n_z_samples": n_z_samples,
         "default_value": default_value,
         "n_context_skip": n_context_skip,
+        "per_read_z": per_read_z,
     }
 
     n_processed = 0
@@ -799,7 +859,10 @@ def _run_mapped_reads_multiprocess(
                         eof = True
                         break
                     if read.is_secondary or read.is_supplementary:
-                        out_bam.write(read)
+                        # Aligned-only artifacts; skip in unaligned mode (header
+                        # has no @SQ to reference). Pass-through otherwise.
+                        if not emit_unaligned:
+                            out_bam.write(read)
                         continue
                     if read.is_unmapped:
                         if unmapped_passthrough:
@@ -838,6 +901,8 @@ def _run_mapped_reads_multiprocess(
                     read.set_tag("fp", array.array("B", fp.tobytes()))
                     read.set_tag("ri", array.array("B", ri.tobytes()))
                     read.set_tag("rp", array.array("B", rp.tobytes()))
+                    if emit_unaligned:
+                        _unalign_read(read)
                     out_bam.write(read)
                     n_processed += 1
                     if n_processed % 1000 == 0:
@@ -861,6 +926,8 @@ def generate(
     precompute_cache: bool = True,
     n_z_samples: int = 32,
     n_workers: int = 1,
+    per_read_z: bool = True,
+    emit_unaligned: bool = True,
 ) -> None:
     setup_logging()
     cfg = load_config(cfg_yaml)
@@ -949,6 +1016,9 @@ def generate(
         "VN": __version__,
         "CL": f"kinsim_nn generate (ckpt={ckpt_dir.name})",
     })
+    if emit_unaligned:
+        header = _sanitize_header_for_unaligned(header)
+        log.info("emit_unaligned=True: stripped @SQ lines; reads will be written unmapped")
     out_bam = pysam.AlignmentFile(str(output_bam), "wb", header=header)
 
     n_reads = 0
@@ -971,6 +1041,8 @@ def generate(
             rng=rng,
             n_workers=n_workers,
             unmapped_passthrough=True,
+            per_read_z=per_read_z,
+            emit_unaligned=emit_unaligned,
         )
         log.info("Multiprocess done. mapped=%d  unmapped_passthrough=%d",
                  n_proc, n_skip)
@@ -984,7 +1056,8 @@ def generate(
 
     for read in in_bam.fetch(until_eof=True):
         if read.is_secondary or read.is_supplementary:
-            out_bam.write(read)
+            if not emit_unaligned:
+                out_bam.write(read)
             continue
         if read.is_unmapped:
             # PBSIM3 sim output or any unaligned read: scan motifs against
@@ -1020,6 +1093,7 @@ def generate(
                     qlen=read.query_length,
                     default_value=cfg.generate.default_fi_for_unknown,
                     n_context_skip=n_context_skip,
+                    per_read_z=per_read_z,
                 )
             else:
                 fi, fp, ri, rp = _process_mapped_read(
@@ -1038,13 +1112,14 @@ def generate(
                     rng=rng,
                     device=device,
                 )
-        # Strip + write kinetics tags. ``array.array('B', bytes)`` is ~10x
-        # faster than ``array.array('B', ndarray.tolist())`` (no Python-list
-        # roundtrip) — matters when we're doing this per read on 124k reads.
+        # ``array.array('B', bytes)`` is ~10× faster than ``.tolist()`` —
+        # matters at 124k reads.
         read.set_tag("fi", array.array("B", fi.tobytes()))
         read.set_tag("fp", array.array("B", fp.tobytes()))
         read.set_tag("ri", array.array("B", ri.tobytes()))
         read.set_tag("rp", array.array("B", rp.tobytes()))
+        if emit_unaligned:
+            _unalign_read(read)
         out_bam.write(read)
         n_reads += 1
         if n_reads % 100 == 0:
@@ -1089,6 +1164,15 @@ def main(argv=None):
                          "(always set meth at every motif site).")
     ap.add_argument("--force-bernoulli", action="store_true",
                     help="Override YAML and force Bernoulli sampling on motif fraction.")
+    ap.add_argument("--no-per-read-z", action="store_true",
+                    help="Use per-(read, base) random z_idx instead of one z per read. "
+                         "Max apparent variance but breaks read-level coherence — "
+                         "desensitises ipdSummary's per-position tests. Kept for "
+                         "ablation; v2 default is per-read-z=True.")
+    ap.add_argument("--no-emit-unaligned", action="store_true",
+                    help="Keep alignment fields on output reads. Default (emit-"
+                         "unaligned) writes flag=4 / ref_id=-1 / cigar=None so the "
+                         "BAM is directly consumable by ccs-kinetics-bystrandify.")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     if args.verbose:
@@ -1114,6 +1198,8 @@ def main(argv=None):
         precompute_cache=not args.no_precompute,
         n_z_samples=args.n_z_samples,
         n_workers=args.n_workers,
+        per_read_z=not args.no_per_read_z,
+        emit_unaligned=not args.no_emit_unaligned,
     )
 
 
