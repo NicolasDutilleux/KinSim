@@ -7,6 +7,62 @@ v12_run3 manual run.
 
 ---
 
+## Bug 3 — pbmm2's `ip` / `pw` tags survived from aligned input (THE root cause)
+
+**Symptom:** After fixing Bug 1 (flag=4) AND Bug 2 (SO:unknown),
+bystrandify STILL discarded 99.8 % of reads with the same misleading
+"has 0 PulseWidths" warning. Bystrandified BAM = 6.3 MB (vs 4 GB for the
+legacy `kinsim generate` chain).
+
+**Root cause:** The @RG DS field on every PacBio HiFi BAM (preserved
+from the original sequencer output via prep + align) declares:
+
+```
+DS:READTYPE=CCS;Ipd:CodecV1=ip;PulseWidth:CodecV1=pw;...
+```
+
+This tells downstream PacBio tools "kinetics live in ``ip`` and ``pw``
+tags", **not** in ``fi`` / ``fp`` / ``ri`` / ``rp``. ``fi`` / ``fp`` /
+``ri`` / ``rp`` are the legacy per-read tag names used on raw HiFi BAMs.
+pbmm2 align can convert those into per-strand ``ip`` / ``pw`` on the
+aligned output. When our input is the aligned BAM, the read may already
+carry stale ``ip`` / ``pw`` from pbmm2.
+
+kinsim_NN generate wrote fresh ``fi`` / ``fp`` / ``ri`` / ``rp`` over
+the existing read but **did not strip the stale ``ip`` / ``pw``**.
+ccs-kinetics-bystrandify obeys the @RG and reads ``pw`` for
+PulseWidths — finds it empty or invalid → discards the read with the
+"has 0 PulseWidths" warning.
+
+**Confirmation:** Legacy ``kinsim/generate.py`` explicitly strips ``ip``
+/ ``pw`` before writing (see comment at line ~1475: *"pbmm2 may have
+converted fi/fp/ri/rp → ip/pw on the aligned input. Strip ip/pw so
+downstream tools read our fresh fi/fp/ri/rp."*). Legacy chain produced
+4 GB bystrandified output. kinsim_NN didn't strip → 6 MB.
+
+**Fix:** `_unalign_read` now also strips ``ip`` / ``pw`` tags. Three
+clean lines:
+
+```python
+for stale in ("ip", "pw"):
+    if read.has_tag(stale):
+        read.set_tag(stale, None)
+```
+
+**Lesson:** When converting an aligned PacBio BAM into "raw HiFi
+shape" for downstream PacBio tooling, you cannot simply clear alignment
+fields — you must also strip alignment-induced tag rewrites. The @RG
+DS field decides which tag bystrandify obeys, not the tag-presence in
+the read.
+
+The misleading "0 PulseWidths" warning surfaced THREE separate bugs in
+sequence, each masked by the others. The actionable diagnostic is to
+diff the BAM record (header + flag + full tag set) against a
+known-working legacy ``kinsim generate`` output, NOT to trust the
+warning text.
+
+---
+
 ## Bug 2 — emit_unaligned kept `@HD SO:coordinate` on unaligned output (CRITICAL)
 
 **Symptom:** After fixing Bug 1 (flag=4), bystrandify STILL discarded

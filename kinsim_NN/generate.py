@@ -486,19 +486,29 @@ def _process_read_from_cigar(
 
 
 def _unalign_read(read: pysam.AlignedSegment) -> None:
-    """Convert an aligned read in-place into an unaligned record.
+    """Convert an aligned read in-place into a raw-HiFi-shaped unaligned record.
 
     Target flag = 4 EXACTLY (unmapped, not paired). PacBio raw HiFi BAMs
     have flag=4 on all CCS reads — anything else (e.g. flag=12 with
     mate_is_unmapped, or flag=20 with is_reverse) makes downstream tools
-    like ``ccs-kinetics-bystrandify`` reject the read with misleading
-    'has 0 PulseWidths' warnings. So we set the FLAG byte directly and
-    leave the paired-end flags untouched (CCS reads aren't paired —
-    is_paired is already False).
+    like ``ccs-kinetics-bystrandify`` reject the read with the misleading
+    'has 0 PulseWidths' warning.
 
-    Clears: ref_id, ref_start, mapq, cigar, mate ref_id/start, tlen.
-    Preserves: query_name, query_sequence, query_qualities, all tags
-    (including fi/fp/ri/rp we just wrote).
+    CRITICAL: strip any pre-existing ``ip`` / ``pw`` tags. The @RG DS field
+    on PacBio HiFi BAMs declares ``Ipd:CodecV1=ip; PulseWidth:CodecV1=pw``
+    — i.e. it tells downstream tools to read kinetics from ``ip`` /
+    ``pw``, not ``fi`` / ``fp`` / ``ri`` / ``rp``. pbmm2 align may convert
+    the raw HiFi ``fi`` / ``fp`` / ``ri`` / ``rp`` tags into per-strand
+    ``ip`` / ``pw`` on aligned reads. If those stale ``ip`` / ``pw`` tags
+    survive into our output, bystrandify reads them (obeying the @RG),
+    finds junk/empty, and discards the read. Stripping them forces
+    bystrandify back to the ``fi`` / ``fp`` / ``ri`` / ``rp`` tags we
+    actually wrote. (Matches the legacy ``kinsim/generate.py`` recipe.)
+
+    Clears: flag → 4, ref_id, ref_start, mapq, cigar, mate ref_id/start,
+    tlen, plus any ``ip`` / ``pw`` tag. Preserves: query_name,
+    query_sequence, query_qualities, all PacBio aux tags (cx, qs, qe, ec,
+    np, rq, sn, zm, ML, MM, etc.).
     """
     read.flag = 4
     read.reference_id = -1
@@ -508,6 +518,9 @@ def _unalign_read(read: pysam.AlignedSegment) -> None:
     read.next_reference_id = -1
     read.next_reference_start = -1
     read.template_length = 0
+    for stale in ("ip", "pw"):
+        if read.has_tag(stale):
+            read.set_tag(stale, None)
 
 
 def _sanitize_header_for_unaligned(header_dict: dict) -> dict:
