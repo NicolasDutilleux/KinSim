@@ -7,7 +7,54 @@ v12_run3 manual run.
 
 ---
 
-## Bug 3 — pbmm2's `ip` / `pw` tags survived from aligned input (THE root cause)
+## Bug 4 — `template_length=0` triggered bystrandify discard (THE *actual* root cause)
+
+**Symptom:** After fixing Bug 1 (flag=4), Bug 2 (SO:unknown), AND Bug 3
+(strip ip/pw), bystrandify STILL discarded 99.8 % of reads. Output BAM
+still 6.3 MB.
+
+**Diagnosis:** Side-by-side `samtools view` of one specific read
+(261166274/ccs) between the OLD working v12_run3 SIM.bam (passed
+bystrandify) and the NEW broken validate_bc2034_perreadz SIM.bam
+(rejected) — the only differing field across all 11 SAM columns + all
+tags was **TLEN (col 9)**:
+
+* OLD:  ``flag=4 ... TLEN=3960`` (= read length, left over from aligned input)
+* NEW:  ``flag=4 ... TLEN=0``    (my _unalign_read cleared it)
+
+Per BAM spec, TLEN is undefined for unmapped single-end reads — 0 is
+the "spec-correct" value. But ccs-kinetics-bystrandify apparently uses
+``TLEN > 0`` as a heuristic to detect "valid HiFi record" and silently
+discards records with TLEN=0 — with the same misleading "has 0
+PulseWidths" warning.
+
+**Fix:** stop clearing template_length in ``_unalign_read``. Match
+legacy ``kinsim/generate.py`` which never touches the field — TLEN
+stays at whatever the aligned input had (typically = seq length).
+
+```python
+# DON'T do this:
+#   read.template_length = 0   # ← triggers bystrandify rejection
+```
+
+Also: switched ``cigarstring=None`` to ``cigartuples=None`` to match
+legacy exactly. Both should work, but the legacy form is the proven one.
+
+**Lesson:** Four separate things contributed to bystrandify rejection,
+all surfacing the same misleading "0 PulseWidths" warning. Only a
+column-by-column ``samtools view`` diff between a known-working record
+and a broken one localised the actual root cause. The other three
+fixes were also necessary (without them, the output would have failed
+other validators downstream), but only the TLEN fix unblocked
+bystrandify.
+
+The methodology: when a downstream tool gives misleading errors,
+**diff a single record at the SAM/BAM level against a known-working
+sample**. Don't trust the warning text.
+
+---
+
+## Bug 3 — pbmm2's `ip` / `pw` tags survived from aligned input
 
 **Symptom:** After fixing Bug 1 (flag=4) AND Bug 2 (SO:unknown),
 bystrandify STILL discarded 99.8 % of reads with the same misleading

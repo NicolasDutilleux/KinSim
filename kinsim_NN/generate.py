@@ -514,10 +514,16 @@ def _unalign_read(read: pysam.AlignedSegment) -> None:
     read.reference_id = -1
     read.reference_start = -1
     read.mapping_quality = 0
-    read.cigarstring = None
+    read.cigartuples = None
     read.next_reference_id = -1
     read.next_reference_start = -1
-    read.template_length = 0
+    # Do NOT touch template_length: legacy kinsim/generate.py leaves it as
+    # the aligned input had it (typically = read length). ccs-kinetics-
+    # bystrandify treats TLEN=0 records as invalid and discards them
+    # silently with the misleading "has 0 PulseWidths" warning. Diffing
+    # OLD-working vs NEW-broken records, TLEN was the only differing SAM
+    # field — every fix before this one (flag, SO, ip/pw strip) was
+    # necessary but not sufficient because TLEN=0 still triggered discard.
     for stale in ("ip", "pw"):
         if read.has_tag(stale):
             read.set_tag(stale, None)
