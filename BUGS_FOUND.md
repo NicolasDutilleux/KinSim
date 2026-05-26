@@ -7,6 +7,36 @@ v12_run3 manual run.
 
 ---
 
+## Bug 2 — emit_unaligned kept `@HD SO:coordinate` on unaligned output (CRITICAL)
+
+**Symptom:** After fixing Bug 1 (flag=4), bystrandify STILL discarded
+99.8 % of reads with the same "has 0 PulseWidths" warning. Output BAM
+shrunk from 3.2 GB → 6.3 MB just like before.
+
+**Root cause:** The input was a coordinate-sorted aligned BAM
+(`@HD SO:coordinate`). `_sanitize_header_for_unaligned` stripped @SQ
+but left SO:coordinate intact. After unaligning every record, every
+read has ref_id=-1 / no CIGAR — there is no coordinate to sort by.
+bystrandify reads SO:coordinate, dispatches to its aligned-processing
+path, then rejects every record (which now lacks alignment fields)
+with the misleading "0 PulseWidths" warning.
+
+**Confirmation:** OLD validate run (v12_run3) used the legacy
+`kinsim generate` which natively writes unaligned output with
+`@HD SO:unknown`. Its bystrandified BAM = 4.0 GB (kept everything).
+NEW kinsim_NN bystrandified BAM (with SO:coordinate left over) =
+6.3 MB. Identical reads, identical tags, only SO differs.
+
+**Fix:** `_sanitize_header_for_unaligned` now also forces `SO:unknown`
+on the @HD entry, matching the canonical raw HiFi BAM shape.
+
+**Lesson:** Both Bug 1 ("0 PulseWidths" → wrong flag bit) and Bug 2
+("0 PulseWidths" → wrong SO header) hide behind the same misleading
+warning text. bystrandify's discard message is generic — debug by
+comparing the whole header + flag against a known-working BAM.
+
+---
+
 ## Bug 1 — `_unalign_read` wrote flag=12 instead of flag=4 (CRITICAL)
 
 **Symptom:** ccs-kinetics-bystrandify discarded 99.8 % of reads with the

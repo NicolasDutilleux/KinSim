@@ -511,11 +511,25 @@ def _unalign_read(read: pysam.AlignedSegment) -> None:
 
 
 def _sanitize_header_for_unaligned(header_dict: dict) -> dict:
-    """Strip @SQ lines from a BAM header — an unaligned BAM must not
-    reference contigs (pbmm2/samtools tolerate it but ccs-kinetics-
-    bystrandify and downstream PacBio tools are stricter)."""
+    """Sanitize a BAM header for unaligned output.
+
+    Two transforms:
+
+    1. Strip ``@SQ`` lines — an unaligned BAM must not reference contigs
+       (pbmm2/samtools tolerate it but PacBio tools like
+       ``ccs-kinetics-bystrandify`` reject SQ-referencing records).
+    2. Force ``@HD SO:unknown``. The input was a coordinate-sorted aligned
+       BAM (``SO:coordinate``); after unaligning every record there is no
+       coordinate to sort by, so claiming SO:coordinate is a lie that
+       bystrandify uses to pick its aligned-processing path, then
+       silently rejects every record with the misleading "has 0
+       PulseWidths" warning.
+    """
     out = dict(header_dict)
     out["SQ"] = []
+    if "HD" in out:
+        out["HD"] = dict(out["HD"])
+        out["HD"]["SO"] = "unknown"
     return out
 
 
