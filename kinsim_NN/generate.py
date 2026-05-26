@@ -526,6 +526,16 @@ def _unalign_read(read: pysam.AlignedSegment) -> None:
     for stale in ("ip", "pw"):
         if read.has_tag(stale):
             read.set_tag(stale, None)
+    # Move RG to the END of the tag list. The legacy `kinsim generate`
+    # output (which bystrandify accepts) ends with the RG tag; kinsim_NN
+    # has RG sitting wherever pbmm2 left it (typically before mg/NM, with
+    # our fresh fi/fp/ri/rp appended *after* it). Bystrandify's libpbbam
+    # is apparently order-sensitive: identical-byte records that only
+    # differ in RG position get rejected. Pop+re-set RG to canonicalise.
+    if read.has_tag("RG"):
+        rg = read.get_tag("RG")
+        read.set_tag("RG", None)
+        read.set_tag("RG", rg)
 
 
 def _sanitize_header_for_unaligned(header_dict: dict) -> dict:
