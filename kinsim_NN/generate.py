@@ -453,23 +453,22 @@ def _process_read_from_cigar(
         return fi, fp, ri, rp
     L = kin_map.shape[0]
     n_z = kin_map.shape[2]
-    valid = (
-        (q_arr >= n_context_skip)
-        & (q_arr < qlen - n_context_skip)
-        & (r_arr >= 0)
-        & (r_arr < L)
-    )
+    # n_context_skip used to filter read-edge positions in the older per-
+    # position inference path (where the K-window was sliced from the READ
+    # sequence and went negative for q < half_width). In the precompute
+    # path the window comes from the REFERENCE around ref_pos, so as long
+    # as ref_pos is inside the contig we have a valid model prediction.
+    # Keep only the contig-bound check on r; predict every q.
+    valid = (r_arr >= 0) & (r_arr < L)
     if not valid.any():
         return fi, fp, ri, rp
     q_valid = q_arr[valid]
     r_valid = r_arr[valid]
     z_rng = np.random.default_rng(z_seed)
     if per_read_z:
-        # Pick ONE z_idx for the whole read → coherent across bases
         z_idx = int(z_rng.integers(0, n_z))
         block = kin_map[r_valid, :, z_idx]    # (n_valid, 4) — all bases same z
     else:
-        # Legacy: per-base random z_idx (high variance, breaks coherence)
         z_indices = z_rng.integers(0, n_z, size=r_valid.size)
         block = kin_map[r_valid[:, None], np.arange(4)[None, :], z_indices[:, None]]
     if is_rev:
@@ -631,13 +630,11 @@ def _process_mapped_read_lookup(
     pair_arr = np.asarray(pairs, dtype=np.int64)
     q_arr = pair_arr[:, 0]
     r_arr = pair_arr[:, 1]
-    # Filter: skip context-edge positions AND off-contig refs (defensive)
-    valid = (
-        (q_arr >= n_context_skip)
-        & (q_arr < qlen - n_context_skip)
-        & (r_arr >= 0)
-        & (r_arr < L)
-    )
+    # Predict every q whose ref maps inside the contig — kin_map already has
+    # values at every interior ref_pos via the precompute. Read-edge q's
+    # (q < half_width or q > qlen - half_width) are valid here because the
+    # ±half_width window is read on the REFERENCE, not on the read.
+    valid = (r_arr >= 0) & (r_arr < L)
     if not valid.any():
         return fi, fp, ri, rp
     q_valid = q_arr[valid]
