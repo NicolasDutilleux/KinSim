@@ -82,18 +82,20 @@ class MultiHeadSelfAttention(nn.Module):
         self.scale = self.d_head ** -0.5
         self.qkv = maybe_spectral_norm(nn.Linear(d_model, d_model * 3, bias=True), spectral_norm)
         self.out = maybe_spectral_norm(nn.Linear(d_model, d_model, bias=True), spectral_norm)
-        self._dropout_p = float(drop_rate)
+        self.drop = nn.Dropout(drop_rate)
+        # NOTE: cannot use F.scaled_dot_product_attention here — the efficient/
+        # flash kernels do NOT implement double-backward, which WGAN-GP's
+        # gradient penalty requires (create_graph=True). Manual attention only.
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, K, D = x.shape
         qkv = self.qkv(x).reshape(B, K, 3, self.n_heads, self.d_head)
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, K, d_head)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        # FlashAttention-2 via fused SDPA. ~30% faster vs manual qkv on Ampere+.
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            dropout_p=self._dropout_p if self.training else 0.0,
-        )
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B, H, K, K)
+        attn = attn.softmax(dim=-1)
+        attn = self.drop(attn)
+        out = attn @ v                                   # (B, H, K, d_head)
         out = out.transpose(1, 2).reshape(B, K, D)
         return self.out(out)
 
