@@ -132,7 +132,7 @@ train:
   eval_every: 5000
   log_every: 100
   seed: 42
-  num_workers: 4                # DataLoader workers (per-process)
+  num_workers: 8                # DataLoader workers (per-process); match SLURM --cpus-per-task
   pin_memory: true
 
 # -- Generation ---------------------------------------------------------

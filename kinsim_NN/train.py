@@ -28,6 +28,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.amp import autocast
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -211,13 +212,15 @@ def _evaluate_on_shards(
             for k in batch_items[0]
         }
         z = g.sample_z(batch["signal"].size(0), device=device)
-        gen = g(
-            z,
-            batch["base_fwd_onehot"].to(device),
-            batch["base_rev_onehot"].to(device),
-            batch["meth_fwd_onehot"].to(device),
-            batch["meth_rev_onehot"].to(device),
-        )
+        with autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+            gen = g(
+                z,
+                batch["base_fwd_onehot"].to(device),
+                batch["base_rev_onehot"].to(device),
+                batch["meth_fwd_onehot"].to(device),
+                batch["meth_rev_onehot"].to(device),
+            )
+        gen = gen.float()
         half = shard.k // 2
         gen_center = gen[:, half].cpu().numpy()                     # (B, 4)
         gen_u8 = log1p_frames_to_uint8(gen_center)
@@ -314,14 +317,26 @@ def train(
         num_workers=cfg.train.num_workers,
         pin_memory=cfg.train.pin_memory,
         collate_fn=_collate,
+        persistent_workers=cfg.train.num_workers > 0,
+        prefetch_factor=4 if cfg.train.num_workers > 0 else None,
     )
 
     # Models
     g, d = _build_models(cfg, device)
+    # Fused Adam (~10% optimizer-step speedup on CUDA; falls back gracefully on CPU).
+    _fused = (device.type == "cuda")
     opt_g = torch.optim.Adam(g.parameters(), lr=cfg.train.lr_g,
-                             betas=(cfg.train.beta1, cfg.train.beta2))
+                             betas=(cfg.train.beta1, cfg.train.beta2),
+                             fused=_fused)
     opt_d = torch.optim.Adam(d.parameters(), lr=cfg.train.lr_d,
-                             betas=(cfg.train.beta1, cfg.train.beta2))
+                             betas=(cfg.train.beta1, cfg.train.beta2),
+                             fused=_fused)
+    # bf16 autocast: 2-3× speedup on Ampere+ GPUs without the gradient
+    # scaler that fp16 needs. Forward passes run in bf16; gradient penalty
+    # stays in fp32 (double-backward via create_graph=True is fragile under
+    # autocast on some PyTorch versions).
+    _amp_enabled = (device.type == "cuda")
+    _amp_dtype = torch.bfloat16
 
     start_step = 0
     start_epoch = 0
@@ -411,16 +426,19 @@ def train(
                 batch = _to_device(batch, device)
                 bsz = batch["signal"].size(0)
                 z = g.sample_z(bsz, device=device)
-                with torch.no_grad():
+                with torch.no_grad(), autocast("cuda", dtype=_amp_dtype, enabled=_amp_enabled):
                     fake = _g_forward(g, batch, z)
-                d_real = _d_forward(d, batch["signal"], batch)
-                d_fake = _d_forward(d, fake, batch)
+                fake = fake.float()  # cast back to fp32 for D + GP
+                with autocast("cuda", dtype=_amp_dtype, enabled=_amp_enabled):
+                    d_real = _d_forward(d, batch["signal"], batch)
+                    d_fake = _d_forward(d, fake, batch)
+                # GP stays in fp32 — create_graph=True is brittle under autocast.
                 gp = gradient_penalty(
                     d, batch["signal"], fake,
                     cond_kwargs=_cond_kwargs(batch),
                     device=device,
                 )
-                d_loss = wgan_gp_d_loss(d_real, d_fake, gp,
+                d_loss = wgan_gp_d_loss(d_real.float(), d_fake.float(), gp,
                                         gp_lambda=cfg.train.gradient_penalty_lambda)
                 opt_d.zero_grad(set_to_none=True)
                 d_loss.backward()
@@ -447,9 +465,10 @@ def train(
             # memory or accumulate. Re-enable right after.
             for p in d.parameters():
                 p.requires_grad_(False)
-            fake = _g_forward(g, batch, z)
-            d_fake = _d_forward(d, fake, batch)
-            g_loss = wgan_g_loss(d_fake)
+            with autocast("cuda", dtype=_amp_dtype, enabled=_amp_enabled):
+                fake = _g_forward(g, batch, z)
+                d_fake = _d_forward(d, fake, batch)
+            g_loss = wgan_g_loss(d_fake.float())
             opt_g.zero_grad(set_to_none=True)
             g_loss.backward()
             opt_g.step()
