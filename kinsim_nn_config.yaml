@@ -102,20 +102,28 @@ split:
   # split_seed: 42
 
 # -- Model architecture --------------------------------------------------
+# Sizing rationale (cGAN/WGAN-GP on K=21 tokens):
+#   - Generator gets ~12 M params: enough capacity per (context, meth) bucket
+#     when training corpus has ~100 k unique contexts × 50+ samples each.
+#   - Discriminator slightly smaller (~3 M) — keeps WGAN-GP balance (D too
+#     strong vs G blocks G from learning).
+#   - d_model divisible by n_heads (256/8, 192/6).
+#   - z_dim 128 gives the generator room to encode per-sample stochasticity
+#     in the 21×4 output space.
 model:
   generator:
+    d_model: 256
+    n_layers: 8
+    n_heads: 8
+    z_dim: 128
+    drop_rate: 0.0
+    pos_embed_dim: 32
+  discriminator:
     d_model: 192
     n_layers: 6
     n_heads: 6
-    z_dim: 64
-    drop_rate: 0.0
-    pos_embed_dim: 16
-  discriminator:
-    d_model: 128
-    n_layers: 4
-    n_heads: 4
     spectral_norm: true
-    pos_embed_dim: 16
+    pos_embed_dim: 32
 
 # -- Training -----------------------------------------------------------
 train:
@@ -127,7 +135,7 @@ train:
   lr_d: 0.0004                  # TTUR: D is 4x faster
   beta1: 0.0                    # WGAN-GP standard
   beta2: 0.9
-  n_steps: 200000
+  n_steps: 500000               # default upped for the bigger model (12M params)
   checkpoint_every: 5000
   eval_every: 5000
   log_every: 100
