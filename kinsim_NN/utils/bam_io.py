@@ -112,8 +112,24 @@ def extract_window_from_read(
     ipd_tag: str,
     pw_tag: str,
     ref_positions: np.ndarray,
+    stored_seq_is_revcomp_ccs: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Pull IPD + PW values from one read at the requested reference positions.
+
+    ``stored_seq_is_revcomp_ccs`` controls per-base kinetic tag reversal,
+    needed because pbmm2 + ccs-kinetics-bystrandify on this cluster do
+    NOT reverse the per-base kinetic tag arrays when reversing the SEQ.
+
+    Storage convention (empirically confirmed):
+      - Raw HiFi record:                  SEQ = CCS,           tag = CCS order
+      - Bystrandified /fwd record:        SEQ = CCS,           tag = CCS order
+      - Bystrandified /rev record:        SEQ = revcomp(CCS),  tag = CCS order
+
+    Pass ``stored_seq_is_revcomp_ccs=True`` for bystrandified /rev records,
+    ``False`` for all other inputs. The function then reverses the tag array
+    iff the BAM SEQ ends up in revcomp(CCS) orientation, so that the
+    BAM-coordinate ``aligned_pairs`` query position correctly indexes into
+    the (now-aligned) tag array.
 
     Returns:
         ipd: (K,) uint8, 0 where read doesn't cover.
@@ -133,6 +149,10 @@ def extract_window_from_read(
 
     ip_arr = np.asarray(read.get_tag(ipd_tag), dtype=np.uint8)
     pw_arr = np.asarray(read.get_tag(pw_tag), dtype=np.uint8)
+    # BAM SEQ in revcomp(CCS) order iff stored-SEQ-orientation XOR pbmm2-revcomp
+    if stored_seq_is_revcomp_ccs != read.is_reverse:
+        ip_arr = ip_arr[::-1]
+        pw_arr = pw_arr[::-1]
 
     ref_pairs = pairs[:, 1]
     qry_pairs = pairs[:, 0]
@@ -243,11 +263,16 @@ def iter_window_samples(
             rev_rec = pair["rev"]
             # Extract ip/pw from both records at the requested ref positions.
             # These are RAW per-record values (fi-like from /fwd, ri-like from /rev).
+            # bystrandify stores /fwd.SEQ = CCS and /rev.SEQ = revcomp(CCS) but
+            # leaves the kinetic tags in CCS order. See extract_window_from_read
+            # docstring for the tag-reversal rationale.
             ip_fi, pw_fi, mask_fi = extract_window_from_read(
                 fwd_rec, fmt.ipd_fwd_tag, fmt.pw_fwd_tag, ref_positions,
+                stored_seq_is_revcomp_ccs=False,   # /fwd.stored.SEQ = CCS
             )
             ip_ri, pw_ri, mask_ri = extract_window_from_read(
                 rev_rec, fmt.ipd_rev_tag, fmt.pw_rev_tag, ref_positions,
+                stored_seq_is_revcomp_ccs=True,    # /rev.stored.SEQ = revcomp(CCS)
             )
             # Bystrandified pairs are reverse-complementary by construction:
             # /fwd carries the original CCS SEQ, /rev carries its
@@ -291,11 +316,15 @@ def iter_window_samples(
             # bound check avoids the expensive get_aligned_pairs downstream.
             if r.reference_start > center_pos or r.reference_end <= center_pos:
                 continue
+            # Raw HiFi: SEQ = CCS, all four tags in CCS order. Tag-reversal
+            # only needed when pbmm2 set is_reverse=True (handled inside).
             ip_fi, pw_fi, mask_fi = extract_window_from_read(
                 r, fmt.ipd_fwd_tag, fmt.pw_fwd_tag, ref_positions,  # 'fi', 'fp'
+                stored_seq_is_revcomp_ccs=False,
             )
             ip_ri, pw_ri, mask_ri = extract_window_from_read(
                 r, fmt.ipd_rev_tag, fmt.pw_rev_tag, ref_positions,  # 'ri', 'rp'
+                stored_seq_is_revcomp_ccs=False,
             )
             if r.is_reverse:
                 ipd_fwd_w, pw_fwd_w = ip_fi, pw_fi
@@ -432,6 +461,17 @@ def iter_chunk_samples(
             pw_fi_arr = np.asarray(fwd_rec.get_tag(fmt.pw_fwd_tag), dtype=np.uint8)
             ip_ri_arr = np.asarray(rev_rec.get_tag(fmt.ipd_rev_tag), dtype=np.uint8)
             pw_ri_arr = np.asarray(rev_rec.get_tag(fmt.pw_rev_tag), dtype=np.uint8)
+            # Tag-reversal: bystrandify leaves kinetic tags in CCS order even
+            # though it revcomp's /rev.SEQ. pbmm2 doesn't reverse tags either.
+            # Reverse the tag iff BAM SEQ is in revcomp(CCS) orientation:
+            #   /fwd:  stored_revcomp=False → reverse iff fwd.is_reverse=True
+            #   /rev:  stored_revcomp=True  → reverse iff rev.is_reverse=False
+            if fwd_rec.is_reverse:               # /fwd: stored_revcomp=False
+                ip_fi_arr = ip_fi_arr[::-1]
+                pw_fi_arr = pw_fi_arr[::-1]
+            if not rev_rec.is_reverse:           # /rev: stored_revcomp=True
+                ip_ri_arr = ip_ri_arr[::-1]
+                pw_ri_arr = pw_ri_arr[::-1]
             fwd_rs, fwd_re = fwd_rec.reference_start, fwd_rec.reference_end
             rev_rs, rev_re = rev_rec.reference_start, rev_rec.reference_end
 
@@ -501,6 +541,13 @@ def iter_chunk_samples(
             pw_fi_arr = np.asarray(r.get_tag(fmt.pw_fwd_tag), dtype=np.uint8)
             ip_ri_arr = np.asarray(r.get_tag(fmt.ipd_rev_tag), dtype=np.uint8)
             pw_ri_arr = np.asarray(r.get_tag(fmt.pw_rev_tag), dtype=np.uint8)
+            # Raw HiFi: stored SEQ = CCS, tags in CCS order. Reverse all four
+            # tag arrays iff pbmm2 reverse-complemented the SEQ at alignment.
+            if r.is_reverse:
+                ip_fi_arr = ip_fi_arr[::-1]
+                pw_fi_arr = pw_fi_arr[::-1]
+                ip_ri_arr = ip_ri_arr[::-1]
+                pw_ri_arr = pw_ri_arr[::-1]
             ref_rs, ref_re = r.reference_start, r.reference_end
             is_rev = r.is_reverse
             zmw_id = r.query_name or ""
