@@ -370,14 +370,16 @@ def train(
     else:
         log.info("Resume: keeping existing %s (skipping rewrite)", cfg_json)
 
-    # Held-out test shards for periodic eval
+    # Held-out test shards for periodic eval. Shards may be prefixed by
+    # lineage (``strepto_bc2034_shard.pkl``, ``vega_bc2034_shard.pkl``);
+    # glob matches either form.
     test_shard_paths: list[Path] = []
     for sid in test_strains:
-        p = Path(shards_dir) / f"{sid}_shard.pkl"
-        if p.is_file():
-            test_shard_paths.append(p)
+        matches = list(Path(shards_dir).glob(f"*{sid}_shard.pkl"))
+        test_shard_paths.extend(matches)
     if test_shard_paths:
-        log.info("Eval shards: %d", len(test_shard_paths))
+        log.info("Eval shards: %d (%s)", len(test_shard_paths),
+                 [p.name for p in test_shard_paths])
     else:
         log.warning("No eval shards found for test_strains=%s", test_strains)
 
