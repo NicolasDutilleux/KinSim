@@ -317,8 +317,8 @@ def train(
         num_workers=cfg.train.num_workers,
         pin_memory=cfg.train.pin_memory,
         collate_fn=_collate,
-        persistent_workers=cfg.train.num_workers > 0,
-        prefetch_factor=4 if cfg.train.num_workers > 0 else None,
+        persistent_workers=False,                   # don't pin shards in worker mem
+        prefetch_factor=2 if cfg.train.num_workers > 0 else None,
     )
 
     # Models

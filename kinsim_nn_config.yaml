@@ -132,7 +132,8 @@ train:
   eval_every: 5000
   log_every: 100
   seed: 42
-  num_workers: 8                # DataLoader workers (per-process); match SLURM --cpus-per-task
+  num_workers: 2                # DataLoader workers (per-process). Kept low because each
+                                # worker keeps shard data in memory; 8 workers OOM'd at 200G.
   pin_memory: true
 
 # -- Generation ---------------------------------------------------------
