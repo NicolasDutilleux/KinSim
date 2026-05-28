@@ -37,7 +37,7 @@ def _base_to_meth() -> dict[str, str]:
     their motifs.csv. Cache size 1 means a YAML reload (e.g. tests)
     needs ``_base_to_meth.cache_clear()``.
     """
-    from kinsim.utils.config import get_modified_base_map
+    from ..config import get_modified_base_map
 
     by_base: dict[str, list[str]] = {}
     for mod_type, base in get_modified_base_map().items():

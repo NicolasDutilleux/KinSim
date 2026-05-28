@@ -13,7 +13,7 @@
 # prep/assembly_hifiasm — draft de novo assembly from HiFi reads
 #
 # Usage:
-#   sbatch -J prep_asm_<sample> slurm_kinsim/prep/assembly_hifiasm.slurm \
+#   sbatch -J prep_asm_<sample> slurm/prep/assembly_hifiasm.slurm \
 #          <raw_bam> <out_fasta>
 #
 # Produces: <out_fasta>  (cleaned primary-contig FASTA from hifiasm GFA)

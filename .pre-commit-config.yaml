@@ -31,5 +31,5 @@ repos:
           (?x)^(
             baseline/.*|
             kinsim/utils/motifs\.py|
-            slurm_kinsim/.*\.csv
+            slurm/.*\.csv
           )$

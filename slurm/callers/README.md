@@ -1,9 +1,9 @@
-# slurm_kinsim/callers/ — methylation caller scripts
+# `slurm/callers/` — methylation caller scripts
 
-Scripts génériques qui consomment un BAM aligné + ref et produisent un
-`motifs.csv` (format combined-parser : `mod_type,motif,offset,frac_mod,n_sites,source`).
-
-Appelables depuis n'importe quel dataset via arguments positionnels.
+Scripts that consume an aligned BAM and a reference and produce a
+`motifs.csv` (combined-parser format:
+`mod_type,motif,offset,frac_mod,n_sites,source`). Callable via
+positional arguments from any orchestration.
 
 | Script | Mod types | Input | Output |
 |---|---|---|---|

@@ -386,7 +386,7 @@ def parse_rebase_isoschizomers(filepath):
 
 
 # ---------------------------------------------------------------------------
-# REBASE web fetch (kinsim-prep rebase fetch <org_num>)
+# REBASE web fetch (python -m kinsim_NN.utils.parsers.rebase rebase fetch <org_num>)
 # ---------------------------------------------------------------------------
 #
 # URL: https://rebase.neb.com/cgi-bin/pacbioget?<org_num>
@@ -593,7 +593,7 @@ def _find_table_end(html: str, table_start: int) -> int:
 
 def _is_palindromic(motif: str) -> bool:
     """True if the IUPAC motif is its own reverse complement."""
-    from kinsim.utils.motifs import reverse_complement
+    from ..motifs import reverse_complement
 
     return reverse_complement(motif.upper()) == motif.upper()
 
@@ -616,7 +616,7 @@ def _parse_active_mtases_table(html: str, color_to_meth: dict[str, str]) -> list
 
     For palindromic motifs (% Detected shows one value), generates one entry.
     """
-    from kinsim.utils.motifs import reverse_complement
+    from ..motifs import reverse_complement
 
     from .motif_merge import _make_entry
 
@@ -849,7 +849,7 @@ def fetch_rebase_org(org_num: int, output_path: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# CLI: kinsim-prep rebase
+# CLI: python -m kinsim_NN.utils.parsers.rebase rebase
 # ---------------------------------------------------------------------------
 
 
@@ -857,7 +857,7 @@ def main(argv=None):
     import argparse
 
     parser = argparse.ArgumentParser(
-        prog="kinsim-prep rebase",
+        prog="python -m kinsim_NN.utils.parsers.rebase rebase",
         description=(
             "Parse REBASE files and generate fuzznuc pattern files.\n\n"
             "Accepted REBASE formats:\n"
@@ -879,7 +879,7 @@ def main(argv=None):
             "With --output-csv: write a standard PacBio motifs.csv instead.\n"
             "This file is named 'rebase_motifs.csv' by default and can be\n"
             "merged with calling-derived motifs via:\n\n"
-            "    kinsim-prep merge-motifs species_motifs.csv rebase_motifs.csv \\\n"
+            "    python -m kinsim_NN.utils.parsers.rebase merge-motifs species_motifs.csv rebase_motifs.csv \\\n"
             "        --output final_motifs.csv\n"
         ),
     )
@@ -908,8 +908,8 @@ def main(argv=None):
             "The organism number (Org#) is shown on REBASE organism pages.\n"
             "Parses only 'MTases active in the genome' (genuine motifs).\n\n"
             "Example:\n"
-            "  kinsim-prep rebase fetch 1260 --output Ecoli_rebase.csv\n"
-            "  kinsim-prep rebase fetch 1260   # writes rebase_motifs.csv\n"
+            "  python -m kinsim_NN.utils.parsers.rebase rebase fetch 1260 --output Ecoli_rebase.csv\n"
+            "  python -m kinsim_NN.utils.parsers.rebase rebase fetch 1260   # writes rebase_motifs.csv\n"
         ),
     )
     p_fetch.add_argument(
@@ -953,7 +953,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.command == "fetch":
-        from kinsim.utils.config import setup_logging
+        from ..config import setup_logging
 
         setup_logging(verbose=getattr(args, "verbose", False))
         try:
@@ -1001,7 +1001,7 @@ def main(argv=None):
             print(result)
 
     elif args.command == "patterns":
-        from kinsim.utils.motifs import load_motif_string
+        from ..motifs import load_motif_string
 
         motif_string = load_motif_string(
             args.motifs, min_fraction=args.min_fraction, min_detected=args.min_detected

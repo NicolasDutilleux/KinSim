@@ -13,7 +13,7 @@
 # callers/merge_motifs — union de motifs.csv filtrés par threshold
 #
 # Usage:
-#   sbatch -J call_merge_<sample> slurm_kinsim/callers/merge_motifs.slurm \
+#   sbatch -J call_merge_<sample> slurm/callers/merge_motifs.slurm \
 #          <out_merged_csv> <threshold> <input_csv1> [<input_csv2> ...]
 #
 # Policy: no precedence rules. Concat all inputs, filter frac >= threshold,

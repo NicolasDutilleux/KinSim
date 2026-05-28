@@ -13,7 +13,7 @@
 # callers/jasmine_modkit — 5mC CpG motif discovery via jasmine + modkit
 #
 # Usage:
-#   sbatch -J call_jm_<sample> slurm_kinsim/callers/jasmine_modkit.slurm \
+#   sbatch -J call_jm_<sample> slurm/callers/jasmine_modkit.slurm \
 #          <raw_bam> <reference_fasta> <out_motifs_csv> [work_dir]
 #
 # Strategy:

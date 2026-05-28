@@ -8,11 +8,11 @@ Supported parsers (auto-detected by ``load_motif_string``):
   - modkit:    Oxford Nanopore modkit pileup --bedMethyl TSV
   - combined:  Combined CSV (mod_type, motif, offset, frac_mod, n_sites, source)
   - rebase:    REBASE simplified or Format #19 (withrefm) — via
-               ``kinsim.utils.parsers.rebase`` (kept separate because
+               ``kinsim_NN.utils.parsers.rebase`` (kept separate because
                rebase parsing has its own CLI and helpers)
 
 Usage:
-    from kinsim.utils.parsers import create_parser, list_parsers, auto_detect_parser
+    from kinsim_NN.utils.parsers import create_parser, list_parsers, auto_detect_parser
 
     parser = create_parser("pacbio")
     motif_string = parser.parse("/data/motifs.csv")

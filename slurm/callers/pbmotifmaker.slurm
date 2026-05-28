@@ -13,7 +13,7 @@
 # callers/pbmotifmaker — motif discovery from ipdSummary GFF
 #
 # Usage:
-#   sbatch -J call_mm_<sample> slurm_kinsim/callers/pbmotifmaker.slurm \
+#   sbatch -J call_mm_<sample> slurm/callers/pbmotifmaker.slurm \
 #          <ref_fasta> <ipdsummary_gff> <out_motifs_csv>
 #
 # Output is the PacBio motifs.csv format (motifString, centerPos,

@@ -18,8 +18,8 @@ pre-commit install
 ```
 
 This installs:
-- `kinsim` and `kinsim-prep` in editable mode
-- the `[ml]` and `[plot]` extras for the full pipeline
+- `kinsim_nn` in editable mode
+- the `[plot]` extras for the analysis dashboards
 - `ruff`, `pre-commit`, `pytest`, `pytest-cov` for development
 
 ## Running the checks
@@ -33,7 +33,7 @@ ruff format .
 pytest
 
 # coverage
-pytest --cov=kinsim --cov=prep --cov-report=term-missing
+pytest --cov=kinsim_NN --cov-report=term-missing
 ```
 
 `pre-commit` runs the same lints automatically on every `git commit`.
@@ -41,23 +41,23 @@ CI runs the matrix on Python 3.10 / 3.11 / 3.12.
 
 ## Project layout
 
-- `kinsim/`            ML pipeline (the `kinsim` CLI)
-- `prep/`              Data preparation (the `kinsim-prep` CLI)
-- `slurm_kinsim/`      HPC SLURM scripts
-- `scripts/`           auxiliary one-off tools (run with `python`, not via the CLI)
-- `kinsim_config.yaml` biology / refine knobs (signature offsets, etc.)
-- `tests/`             pytest suite
-- `baseline/`          baseline models for ablations
+- `kinsim_NN/`            core package (extract / train / generate / evaluate / analyze)
+- `kinsim_nn_config.yaml` single source of truth for all stages
+- `slurm/`                HPC SLURM scripts (prep + callers)
+- `scripts/`              auxiliary one-off tools (run with `python`, not via the CLI)
+- `tests/`                pytest suite
 
-See [CLAUDE.md](CLAUDE.md) for the in-depth developer reference (data
-flow, file formats, import rules, conventions).
+See [`CLAUDE.md`](CLAUDE.md) for the in-depth developer reference (data
+flow, file formats, import rules, conventions) and
+[`DECISIONS.md`](DECISIONS.md) for the architectural rationale.
 
 ## Coding conventions
 
-- Python 3.10+; type hints on public APIs, `from __future__ import annotations`.
+- Python 3.10 or above; type hints on public APIs,
+  `from __future__ import annotations`.
 - `Path` for I/O, never `os.path.join`.
-- Every module: `log = logging.getLogger(__name__)`; never bare `print()`
-  for operational output.
+- Every module: `log = logging.getLogger(__name__)`; never bare
+  `print()` for operational output.
 - Catch specific exceptions, never bare `except Exception`.
 - Don't add features, refactors, or abstractions beyond what the task
   needs. A bug fix doesn't need surrounding cleanup.

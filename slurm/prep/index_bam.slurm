@@ -13,7 +13,7 @@
 # prep/index_bam — samtools index (.bai) + pbindex (.pbi)
 #
 # Usage:
-#   sbatch -J prep_idx_<sample> slurm_kinsim/prep/index_bam.slurm <bam>
+#   sbatch -J prep_idx_<sample> slurm/prep/index_bam.slurm <bam>
 # ============================================================
 
 set +u

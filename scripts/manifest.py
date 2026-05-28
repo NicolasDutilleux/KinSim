@@ -2,160 +2,112 @@
 
 Provides three subcommands that operate on a manifest CSV:
 
-    python scripts/manifest.py count    manifest.csv  -- print the number of data rows
-    python scripts/manifest.py validate manifest.csv  -- check for errors (files, duplicates)
-    python scripts/manifest.py list     manifest.csv  -- tabular display of all entries
+    python scripts/manifest.py count    manifest.csv
+    python scripts/manifest.py validate manifest.csv
+    python scripts/manifest.py list     manifest.csv
 
-The ``count`` subcommand is designed to be used directly in shell scripts, for
-example when setting the SLURM array size::
+The ``count`` subcommand is designed for shell scripts that set a SLURM
+array size:
 
     N=$(python scripts/manifest.py count manifest.csv)
-    sbatch --array=1-$N kinsim_extract.slurm manifest.csv shards/ master.pkl
+    sbatch --array=0-$((N-1)) kinsim_extract.slurm manifest.csv shards/
 
-Using ``python scripts/manifest.py count`` instead of ``grep -c .`` or ``wc -l`` is
-safer because it reuses the same Python logic as ``load_manifest()`` -- it
-correctly skips comment rows (``#``), blank rows, and the header, matching
-exactly the row indices that ``kinsim extract --task N`` will use.
+The manifest CSV columns are ``sample_id, bam_path, motifs`` with optional
+``ref_path``. Comment rows starting with ``#`` and blank rows are skipped.
 """
+from __future__ import annotations
 
+import argparse
+import csv
 import sys
+from pathlib import Path
 
 
-def main(argv=None) -> None:
-    import argparse
+def _load_rows(manifest: Path) -> list[dict]:
+    out: list[dict] = []
+    with manifest.open() as f:
+        reader = csv.DictReader(_strip_comments(f))
+        for row in reader:
+            sid = (row.get("sample_id") or "").strip()
+            if not sid:
+                continue
+            out.append({k: (v or "").strip() for k, v in row.items()})
+    return out
 
-    from kinsim.utils.config import load_manifest, setup_logging, validate_manifest
 
-    parser = argparse.ArgumentParser(
+def _strip_comments(lines):
+    for line in lines:
+        s = line.lstrip()
+        if not s or s.startswith("#"):
+            continue
+        yield line
+
+
+def _cmd_count(args: argparse.Namespace) -> int:
+    rows = _load_rows(Path(args.manifest))
+    print(len(rows))
+    return 0
+
+
+def _cmd_list(args: argparse.Namespace) -> int:
+    rows = _load_rows(Path(args.manifest))
+    if not rows:
+        print("(empty manifest)")
+        return 0
+    cols = ["sample_id", "bam_path", "motifs", "ref_path"]
+    print("\t".join(cols))
+    for r in rows:
+        print("\t".join(r.get(c, "") for c in cols))
+    return 0
+
+
+def _cmd_validate(args: argparse.Namespace) -> int:
+    rows = _load_rows(Path(args.manifest))
+    errors: list[str] = []
+    seen_ids: set[str] = set()
+    for i, r in enumerate(rows, start=1):
+        sid = r.get("sample_id", "")
+        if sid in seen_ids:
+            errors.append(f"row {i}: duplicate sample_id {sid!r}")
+        seen_ids.add(sid)
+        bam = r.get("bam_path", "")
+        if not bam:
+            errors.append(f"row {i} ({sid}): missing bam_path")
+        elif not Path(bam).is_file():
+            errors.append(f"row {i} ({sid}): bam_path does not exist: {bam}")
+        ref = r.get("ref_path", "")
+        if ref and not Path(ref).is_file():
+            errors.append(f"row {i} ({sid}): ref_path does not exist: {ref}")
+    if errors:
+        for e in errors:
+            print(e, file=sys.stderr)
+        return 1
+    print(f"OK: {len(rows)} entries, no errors")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> None:
+    p = argparse.ArgumentParser(
         prog="python scripts/manifest.py",
-        description=(
-            "Inspect and validate a KinSim manifest CSV.\n\n"
-            "Manifest format:\n"
-            "  sample_id,bam_path,motifs\n"
-            '  strain1,/data/bams/s1.bam,"m6A,GATC,1"\n'
-            "  strain2,/data/bams/s2.bam,/data/motifs/s2.csv\n\n"
-            "Comment rows (# ...) and blank rows are skipped, matching the\n"
-            "exact row indices used by 'kinsim extract --task N'."
-        ),
+        description="Inspect or validate a KinSim manifest CSV.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG-level logging")
-    sub = parser.add_subparsers(dest="subcommand", required=True)
+    sub = p.add_subparsers(dest="subcommand", required=True)
 
-    # -- count --
-    p_count = sub.add_parser(
-        "count",
-        help="Print the number of active data rows (safe for SLURM --array=1-N)",
-        description=(
-            "Count data rows in the manifest, skipping comment (#) and blank rows.\n\n"
-            "Usage in SLURM scripts:\n"
-            "  N=$(python scripts/manifest.py count manifest.csv)\n"
-            "  sbatch --array=1-$N kinsim_extract.slurm manifest.csv shards/ master.pkl"
-        ),
-    )
-    p_count.add_argument("manifest", help="Path to the manifest CSV file")
+    p_count = sub.add_parser("count", help="Print number of active data rows")
+    p_count.add_argument("manifest")
+    p_count.set_defaults(func=_cmd_count)
 
-    # -- validate --
-    p_validate = sub.add_parser(
-        "validate",
-        help="Validate the manifest for errors (duplicate IDs, missing files)",
-        description=(
-            "Check the manifest for:\n"
-            "  - Duplicate sample_id values\n"
-            "  - BAM files that do not exist on disk\n"
-            "  - Motif files that do not exist (when the motifs field is a path)\n\n"
-            "Exits 0 if valid, 1 if errors are found."
-        ),
-    )
-    p_validate.add_argument("manifest", help="Path to the manifest CSV file")
-    p_validate.add_argument(
-        "--no-check-files",
-        action="store_true",
-        help="Skip file-existence checks (validate structure only; "
-        "useful when BAMs are on a remote cluster)",
-    )
+    p_validate = sub.add_parser("validate", help="Check files and duplicates")
+    p_validate.add_argument("manifest")
+    p_validate.set_defaults(func=_cmd_validate)
 
-    # -- list --
-    p_list = sub.add_parser(
-        "list",
-        help="Print a tabular summary of all manifest entries",
-    )
-    p_list.add_argument("manifest", help="Path to the manifest CSV file")
-    p_list.add_argument(
-        "--no-truncate",
-        action="store_true",
-        help="Print full paths (default: truncate long paths to 50 characters)",
-    )
+    p_list = sub.add_parser("list", help="Tab-separated dump of every entry")
+    p_list.add_argument("manifest")
+    p_list.set_defaults(func=_cmd_list)
 
-    args = parser.parse_args(argv)
-    setup_logging(verbose=args.verbose)
-
-    # -- count --
-    if args.subcommand == "count":
-        try:
-            entries = load_manifest(args.manifest)
-        except (FileNotFoundError, ValueError) as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
-            sys.exit(1)
-        print(len(entries))
-
-    # -- validate --
-    elif args.subcommand == "validate":
-        try:
-            entries = load_manifest(args.manifest)
-        except (FileNotFoundError, ValueError) as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
-            sys.exit(1)
-
-        errors = validate_manifest(entries, check_files=not args.no_check_files)
-
-        if not errors:
-            n = len(entries)
-            check_label = " (structure only)" if args.no_check_files else ""
-            print(f"OK: {n} entr{'y' if n == 1 else 'ies'} valid{check_label}")
-        else:
-            print(f"ERRORS ({len(errors)} found in {args.manifest}):", file=sys.stderr)
-            for err in errors:
-                print(f"  - {err}", file=sys.stderr)
-            sys.exit(1)
-
-    # -- list --
-    elif args.subcommand == "list":
-        try:
-            entries = load_manifest(args.manifest)
-        except (FileNotFoundError, ValueError) as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
-            sys.exit(1)
-
-        max_path = 50
-
-        def _fmt(s: str, width: int) -> str:
-            if not args.no_truncate and len(s) > width:
-                return "..." + s[-(width - 3) :]
-            return s
-
-        # Header
-        id_w = max(len(e.sample_id) for e in entries)
-        bam_w = min(max_path, max(len(e.bam_path) for e in entries))
-        mot_w = min(max_path, max(len(e.motifs) for e in entries))
-        id_w = max(id_w, 9)  # at least "sample_id"
-        bam_w = max(bam_w, 8)  # at least "bam_path"
-        mot_w = max(mot_w, 6)  # at least "motifs"
-
-        header = f"{'#':>4}  {'sample_id':<{id_w}}  {'bam_path':<{bam_w}}  {'motifs':<{mot_w}}"
-        print(header)
-        print("-" * len(header))
-
-        for idx, entry in enumerate(entries, start=1):
-            row = (
-                f"{idx:>4}  "
-                f"{entry.sample_id:<{id_w}}  "
-                f"{_fmt(entry.bam_path, bam_w):<{bam_w}}  "
-                f"{_fmt(entry.motifs, mot_w):<{mot_w}}"
-            )
-            print(row)
-
-        print(f"\n{len(entries)} entr{'y' if len(entries) == 1 else 'ies'} total.")
+    args = p.parse_args(argv)
+    sys.exit(args.func(args))
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@
 # prep/align_pbmm2 — pbmm2 CCS alignment via SMRT-Tools SIF
 #
 # Usage:
-#   sbatch -J prep_aln_<sample> slurm_kinsim/prep/align_pbmm2.slurm \
+#   sbatch -J prep_aln_<sample> slurm/prep/align_pbmm2.slurm \
 #          <input_bam> <reference_fasta> <output_bam>
 #
 # Preserves kinetics tags (fi/fp/ri/rp or ip/pw) and MM/ML tags when present.

@@ -13,7 +13,7 @@
 # prep/bystrandify — ccs-kinetics-bystrandify (fi/fp/ri/rp → ip/pw per strand)
 #
 # Usage:
-#   sbatch -J prep_by_<sample> slurm_kinsim/prep/bystrandify.slurm \
+#   sbatch -J prep_by_<sample> slurm/prep/bystrandify.slurm \
 #          <raw_bam> <out_bam>
 #
 # Runs the SMRT-Tools SIF. Produces a pbindex sidecar (.pbi) alongside

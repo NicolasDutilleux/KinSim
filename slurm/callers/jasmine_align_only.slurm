@@ -13,7 +13,7 @@
 # callers/jasmine_align_only — jasmine 5mC + pbmm2 align (NO modkit, NO motif_merge)
 #
 # Usage:
-#   sbatch -J call_jas_<sample> slurm_kinsim/callers/jasmine_align_only.slurm \
+#   sbatch -J call_jas_<sample> slurm/callers/jasmine_align_only.slurm \
 #          <raw_bam> <reference_fasta> <out_aligned_bam> [work_dir]
 #
 # Outputs the aligned bystrandified-equivalent jasmine BAM with C+m MM/ML

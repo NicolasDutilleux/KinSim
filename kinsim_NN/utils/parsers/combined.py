@@ -34,10 +34,10 @@ log = logging.getLogger(__name__)
 
 # Combined CSVs use various conventions for mod names ('5mC' vs 'm5C',
 # '6mA' vs 'm6A'). The alias-to-canonical mapping is derived from
-# kinsim_config.yaml's ``aliases`` field per meth type, so adding a new
+# kinsim_nn_config.yaml's ``aliases`` field per meth type, so adding a new
 # methylation (or a new alias for an existing one) is a YAML edit only.
 def _combined_mod_map() -> dict[str, str]:
-    from kinsim.utils.config import get_meth_alias_map
+    from ..config import get_meth_alias_map
 
     return get_meth_alias_map()
 
@@ -116,7 +116,7 @@ class CombinedParser(BaseOutputParser):
                 if mod_type not in get_meth_ids():
                     log.warning(
                         "Combined CSV line %d: mod_type '%s' not declared in "
-                        "kinsim_config.yaml kinetic_signatures -- skipped",
+                        "kinsim_nn_config.yaml kinetic_signatures -- skipped",
                         lineno,
                         mod_type,
                     )

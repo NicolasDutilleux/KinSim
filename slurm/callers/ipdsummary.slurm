@@ -13,7 +13,7 @@
 # callers/ipdsummary — ipdSummary SP3-C3 (m6A + m4C with methylFraction)
 #
 # Usage:
-#   sbatch -J call_ipd_<sample> slurm_kinsim/callers/ipdsummary.slurm \
+#   sbatch -J call_ipd_<sample> slurm/callers/ipdsummary.slurm \
 #          <aligned_bam> <reference_fasta> <out_gff> <out_csv>
 #
 # Uses L. Falquet's SMRT-Link 25.1 install (kineticsTools/ipdSummary 3.0)

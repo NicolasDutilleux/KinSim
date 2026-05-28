@@ -4,11 +4,11 @@ Two-step workflow
 -----------------
 1. Fetch REBASE motifs -> rebase_motifs.csv (standard PacBio format)::
 
-       kinsim-prep rebase fetch <org_num> --output rebase_motifs.csv
+       python -m kinsim_NN.utils.parsers.motif_merge rebase fetch <org_num> --output rebase_motifs.csv
 
 2. Merge calling-derived CSV + rebase_motifs.csv -> final_motifs.csv::
 
-       kinsim-prep merge-motifs species_motifs.csv rebase_motifs.csv \\
+       python -m kinsim_NN.utils.parsers.motif_merge merge-motifs species_motifs.csv rebase_motifs.csv \\
            --output final_motifs.csv --min-frac 0.8 --min-sites 300
 
 Input formats accepted (auto-detected per file):
@@ -16,7 +16,7 @@ Input formats accepted (auto-detected per file):
     Combined CSV  -- mod_type,motif,offset,frac_mod,n_sites,source
                     (output from modkit + fibertools pipeline)
     PacBio CSV    -- motifString,centerPos,modificationType,fraction,...
-                    (output from SMRT Link, or from kinsim-prep rebase)
+                    (output from SMRT Link, or from python -m kinsim_NN.utils.parsers.motif_merge rebase)
 
 Filtering (applied before deduplication):
     --min-frac    Minimum frac_mod / fraction  (default: 0.80)
@@ -47,7 +47,7 @@ Standard PacBio motifs.csv (comma-separated, 12 columns):
     meanScore, meanIpdRatio, meanCoverage, objectiveScore
 
 Columns without available data are written as empty strings.
-This file is directly parseable by ``kinsim-prep parse`` (PacBioParser),
+This file is directly parseable by ``python -m kinsim_NN.utils.parsers.motif_merge parse`` (PacBioParser),
 which converts it to a KinSim motif string for use in the pipeline.
 """
 
@@ -631,7 +631,7 @@ def write_pacbio_motifs_csv(entries: list[dict], filepath: str) -> None:
     All 12 standard columns are written; unavailable fields are empty strings.
     The output is directly parseable by PacBioParser::
 
-        kinsim-prep parse final_motifs.csv   -> KinSim motif string
+        python -m kinsim_NN.utils.parsers.motif_merge parse final_motifs.csv   -> KinSim motif string
 
     Args:
         entries:  List of motif entry dicts from :func:`_make_entry`.
@@ -774,10 +774,10 @@ def merge_motifs(
 def main(argv=None) -> None:
     import argparse
 
-    from kinsim.utils.config import setup_logging
+    from ..config import setup_logging
 
     parser = argparse.ArgumentParser(
-        prog="kinsim-prep merge-motifs",
+        prog="python -m kinsim_NN.utils.parsers.motif_merge merge-motifs",
         description=(
             "Merge, filter, and deduplicate motifs from multiple sources\n"
             "into a single standard PacBio motifs.csv.\n\n"
@@ -785,12 +785,12 @@ def main(argv=None) -> None:
             "  Combined CSV  : mod_type,motif,offset,frac_mod,n_sites,source\n"
             "                  (output from modkit + fibertools pipeline)\n"
             "  PacBio CSV    : motifString,centerPos,modificationType,...\n"
-            "                  (output from 'kinsim-prep rebase fetch')\n\n"
+            "                  (output from 'python -m kinsim_NN.utils.parsers.motif_merge rebase fetch')\n\n"
             "Deduplication removes motifs that are IUPAC-supersets of shorter cores:\n"
             "  6mA GATC (offset=1) is the core; CGATC, GATCA, TGATC, GGATC\n"
             "  are all extensions and will be removed.\n\n"
             "Output is a standard PacBio motifs.csv, readable by:\n"
-            "  kinsim-prep parse final_motifs.csv  -> KinSim motif string\n"
+            "  python -m kinsim_NN.utils.parsers.motif_merge parse final_motifs.csv  -> KinSim motif string\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

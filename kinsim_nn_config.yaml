@@ -1,6 +1,7 @@
 # kinsim_NN — default config
 #
-# All defaults documented here. CLI flags override. See kinsim_NN/DESIGN.md.
+# All defaults documented here. CLI flags override. See CLAUDE.md for the
+# package layout and DECISIONS.md for the architectural rationale.
 
 # -- Window geometry -----------------------------------------------------
 window:

@@ -262,6 +262,19 @@ def get_modified_base_map() -> dict[str, str]:
     }
 
 
+def get_meth_alias_map() -> dict[str, str]:
+    """Return ``{alias: canonical_meth_name}``.
+
+    The kinsim_NN YAML schema does not currently declare aliases; this
+    function therefore returns the identity map over the declared
+    canonical names (so callers using the canonical form still work).
+    Extend the YAML schema with an ``aliases`` field per methylation
+    type if alternate naming is needed.
+    """
+    cfg = load_config()
+    return {t.name: t.name for t in cfg.methylation_types if t.name != "none"}
+
+
 # ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
@@ -289,5 +302,6 @@ __all__ = [
     "load_config",
     "get_modified_base",
     "get_modified_base_map",
+    "get_meth_alias_map",
     "setup_logging",
 ]

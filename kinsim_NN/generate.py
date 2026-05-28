@@ -83,7 +83,7 @@ def _build_strand_meth_maps(
       in **forward-ref coordinates** (so it can be indexed alongside fwd_map).
     * ``fwd_frac``, ``rev_frac`` = the per-motif fraction at the same positions.
 
-    Uses :func:`kinsim.utils.motifs.parse_motifs_per_strand` for the canonical
+    Uses :func:`kinsim_NN.utils.motifs.parse_motifs_per_strand` for the canonical
     per-strand handling (palindromic motifs, IUPAC, centerPos→0-based).
     """
     fwd_motifs, rev_motifs = parse_motifs_per_strand(motif_string)
@@ -687,7 +687,7 @@ def _process_mapped_read(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Generate fi/fp/ri/rp for all query positions of an aligned read.
 
-    Strand routing matches ``kinsim2.generate._route_strands``: the model
+    Strand routing: the model
     emits (ipd_fwd, pw_fwd, ipd_rev, pw_rev) where ipd_fwd is + strand
     methylation kinetics. PacBio BAM convention:
 

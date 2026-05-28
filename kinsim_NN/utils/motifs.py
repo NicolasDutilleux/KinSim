@@ -62,7 +62,7 @@ IUPAC_TO_REGEX = {
 # Concrete bases that an IUPAC code can match.  Used by `_validate_mod_pos`
 # to check whether a declared mod_pos lands on the right base for a given
 # methylation type. The mapping (mod_type → expected base) is itself read
-# from kinsim_config.yaml so adding a new modification type is a YAML edit
+# from kinsim_nn_config.yaml so adding a new modification type is a YAML edit
 # only — no code change.
 _IUPAC_EXPANSIONS = {
     "A": "A",
@@ -103,7 +103,7 @@ COMPLEMENT = {
 
 # PacBio CSV "modified_base" resolver: when modificationType is blank or
 # generic, infer the meth type from the base at centerPos. Built lazily
-# from kinsim_config.yaml's ``modified_base`` fields so the mapping is
+# from kinsim_nn_config.yaml's ``modified_base`` fields so the mapping is
 # generalisable — adding a new modification (e.g. m4mC at C) is a YAML
 # edit only.
 def _build_base_to_meth() -> dict[str, str]:
@@ -159,7 +159,7 @@ def _validate_mod_pos(seq: str, mod_pos: int, meth_type: str) -> None:
     ``pos`` is the 1-based position of the modified base in ``pattern``,
     and the modified base is determined by ``mod_type`` via the
     ``modified_base`` field of ``kinetic_signatures.<mod_type>`` in
-    kinsim_config.yaml. If the trio is internally inconsistent the
+    kinsim_nn_config.yaml. If the trio is internally inconsistent the
     motif spec is wrong — silently auto-correcting would hide bugs in
     the upstream caller / motif file and corrupt training data with no
     visible failure.
@@ -175,7 +175,7 @@ def _validate_mod_pos(seq: str, mod_pos: int, meth_type: str) -> None:
     ambiguous code, accepting that some forward-strand matches will
     not actually carry the modification.
 
-    Methylation types that aren't declared in kinsim_config.yaml will
+    Methylation types that aren't declared in kinsim_nn_config.yaml will
     fail upstream (parse_motifs raises before reaching here), so this
     function never sees an unknown type in practice. As a final guard,
     a missing-from-YAML lookup raises with the same helpful message as
@@ -526,7 +526,7 @@ def parse_motifs_csv(csv_path, min_fraction=0.40, min_detected=20):
 
     The historical body of this function duplicated PacBioParser.parse() and
     drifted from it over time. Retired in favour of the registered parser
-    (kinsim.utils.parsers.pacbio.PacBioParser).
+    (kinsim_NN.utils.parsers.pacbio.PacBioParser).
     """
     from .parsers import create_parser
     return create_parser("pacbio").parse(
@@ -649,9 +649,9 @@ def build_reference_meth_map_per_strand(ref_seqs, motif_string):
     (forward-strand coordinates), else 0. The union of these two equals
     what :func:`build_reference_meth_map` returns with ``revcomp=True``.
 
-    Needed by :mod:`kinsim.generate` to populate the ``rev_meth`` block of
+    Needed by :mod:`kinsim_NN.generate` to populate the ``rev_meth`` block of
     ``meth_full`` (complementary-strand methylation at the active-site
-    neighbours) the same way :mod:`kinsim.extract` does at training time.
+    neighbours) the same way :mod:`kinsim_NN.extract` does at training time.
     Without this, palindromic motifs (e.g. m6A on both strands of GATC)
     lose their partner-strand signal at inference.
     """

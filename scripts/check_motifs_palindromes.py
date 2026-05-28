@@ -2,8 +2,8 @@
 
 Background
 ----------
-``kinsim.utils.motifs.parse_motifs_per_strand`` (called by ``kinsim_NN
-generate`` and by older kinsim/kinsim2 pipelines) auto-generates the
+``kinsim_NN.utils.motifs.parse_motifs_per_strand`` (called by ``kinsim_nn
+generate``) auto-generates the
 reverse-strand entry for each motif row IF the reverse-complement's
 ``mod_pos`` lands on the right base for that meth type. For a
 **palindromic** motif like GATC + m6A at pos 2 (1-based), the auto-rc
@@ -34,7 +34,7 @@ from pathlib import Path
 
 
 # IUPAC complement for palindrome detection (handles ambiguity codes — same
-# table as kinsim.utils.motifs.COMPLEMENT, copy-pasted to avoid the heavy
+# table as kinsim_NN.utils.motifs.COMPLEMENT, copy-pasted to avoid the heavy
 # import chain).
 _COMPLEMENT = {
     "A": "T", "C": "G", "G": "C", "T": "A",

@@ -1,8 +1,9 @@
-# slurm_kinsim/prep/ — shared preprocessing helpers
+# `slurm/prep/` — shared preprocessing helpers
 
-Scripts génériques qui transforment un raw HiFi BAM en un BAM aligné+indexé
-prêt à être callé par `callers/`. Appelables depuis n'importe quel dataset
-(vega, sequel, strepto) via arguments positionnels — pas de hardcoding de chemins.
+Scripts that transform a raw HiFi BAM into an aligned, indexed BAM
+ready to be consumed by the callers in `../callers/`. Callable from
+any dataset orchestration via positional arguments — no hard-coded
+paths.
 
 | Script | Input | Output |
 |---|---|---|

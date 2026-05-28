@@ -13,7 +13,7 @@
 # callers/pbmotifmaker_reprocess — annotate ipdSummary GFF with motif= attribute
 #
 # Usage:
-#   sbatch -J call_mm_rp_<sample> slurm_kinsim/callers/pbmotifmaker_reprocess.slurm \
+#   sbatch -J call_mm_rp_<sample> slurm/callers/pbmotifmaker_reprocess.slurm \
 #          <ref_fasta> <ipdsummary_gff> <motifs_csv> <out_annotated_gff>
 #
 # Takes the raw ipdSummary GFF + the motifs.csv produced by `pbmotifmaker find`
