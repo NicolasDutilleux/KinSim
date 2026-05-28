@@ -9,7 +9,7 @@ description     = "PacBio HiFi kinetic-signal generator (conditional WGAN-GP) fo
 readme          = "README.md"
 license         = "MIT"
 license-files   = ["LICENSE"]
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 authors         = [{ name = "Nicolas Dutilleux", email = "nicolas.dutilleux@unifr.ch" }]
 keywords        = ["pacbio", "kinetics", "methylation", "metagenomics", "simulator", "bioinformatics"]
 classifiers     = [
@@ -18,6 +18,7 @@ classifiers     = [
     "Operating System :: POSIX :: Linux",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -71,7 +72,7 @@ kinsim_NN = ["py.typed"]
 
 [tool.ruff]
 line-length    = 100
-target-version = "py310"
+target-version = "py39"
 extend-exclude = ["kinsim.egg-info"]
 
 [tool.ruff.lint]
@@ -92,7 +93,7 @@ ignore = [
     "N806",    # local var should be lowercase — same reason
     "N812",    # lowercase imported as non-lowercase — `import numpy as np`
     "B008",    # function call in default arg — argparse / config patterns
-    "B905",    # zip(strict=...) — assumed available; target is Python 3.10+
+    "B905",    # zip(strict=...) — Python 3.10+ only; cluster env is 3.9
     "RUF001",  # ambiguous unicode in string — μ, σ, →, — used intentionally
     "RUF002",  # ambiguous unicode in docstring
     "RUF003",  # ambiguous unicode in comment

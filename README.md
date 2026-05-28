@@ -16,7 +16,7 @@ rationale and [`CLAUDE.md`](CLAUDE.md) for the developer reference.
 
 ## Installation
 
-Requires Python 3.10 or above. The package is a standard
+Requires Python 3.9 or above. The package is a standard
 `pip install -e .` away once dependencies are in place. CUDA-enabled
 PyTorch is required for training; CPU PyTorch suffices for inference
 on the held-out scale tested.
@@ -46,7 +46,7 @@ production cluster.
 
 | Component | Version | Source |
 |---|---|---|
-| Python | 3.12 | conda env `kinsim_env` |
+| Python | 3.9.25 | conda env `kinsim_env` on the production cluster |
 | PyTorch | 2.x with CUDA 12.1 wheels | `pyproject.toml` |
 | numpy | 1.26 or above | `pyproject.toml` |
 | pysam | 0.22 or above | `pyproject.toml` |

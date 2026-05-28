@@ -37,7 +37,8 @@ pytest --cov=kinsim_NN --cov-report=term-missing
 ```
 
 `pre-commit` runs the same lints automatically on every `git commit`.
-CI runs the matrix on Python 3.10 / 3.11 / 3.12.
+CI runs the matrix on Python 3.9 / 3.10 / 3.11 / 3.12. The production
+cluster's `kinsim_env` conda environment is Python 3.9.25.
 
 ## Project layout
 
@@ -53,8 +54,9 @@ flow, file formats, import rules, conventions) and
 
 ## Coding conventions
 
-- Python 3.10 or above; type hints on public APIs,
-  `from __future__ import annotations`.
+- Python 3.9 or above; type hints on public APIs,
+  `from __future__ import annotations` mandatory on every module so
+  PEP 604 union and PEP 585 generic syntax stay 3.9-compatible.
 - `Path` for I/O, never `os.path.join`.
 - Every module: `log = logging.getLogger(__name__)`; never bare
   `print()` for operational output.

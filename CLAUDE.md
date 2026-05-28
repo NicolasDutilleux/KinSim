@@ -124,8 +124,12 @@ real-data ipdSummary as the position reference.
 
 ## Coding conventions
 
-- Python 3.10 or above. Type hints on public function signatures in
-  `kinsim_NN/models/` and `kinsim_NN/data/`.
+- Python 3.9 or above (the production cluster runs 3.9.25 inside the
+  `kinsim_env` conda environment). Type hints on public function
+  signatures in `kinsim_NN/models/` and `kinsim_NN/data/`. Every module
+  starts with ``from __future__ import annotations`` so that PEP 604
+  union syntax (``int | None``) and PEP 585 generics (``dict[str, int]``)
+  are stringified at runtime and remain valid on 3.9.
 - `Path` objects for file I/O.
 - `sys.exit(1)` with a stderr message on fatal errors.
 - Never catch `Exception` broadly; catch specific exceptions.

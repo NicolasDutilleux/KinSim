@@ -42,7 +42,7 @@ body:
     attributes:
       label: Python version
       description: Output of `python --version`.
-      placeholder: "Python 3.12.4"
+      placeholder: "Python 3.9.25"
     validations:
       required: true
 
