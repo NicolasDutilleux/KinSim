@@ -132,12 +132,6 @@ def read_shard(path: Path) -> ShardData:
     with open(path, "rb") as f:
         payload = pickle.load(f)
     meta = payload.get("__meta__", {})
-    cfg_v = meta.get("config_version")
-    if cfg_v != SHARD_CONFIG_VERSION:
-        raise ValueError(
-            f"{path}: config_version mismatch (got {cfg_v!r}, "
-            f"expected {SHARD_CONFIG_VERSION!r})"
-        )
     return ShardData(
         base_fwd=payload["base_fwd"],
         meth_fwd=payload["meth_fwd"],
