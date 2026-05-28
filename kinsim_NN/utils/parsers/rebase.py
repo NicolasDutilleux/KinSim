@@ -28,7 +28,7 @@ import logging
 import re
 import sys
 
-from kinsim2.utils.encoding import METH_IDS
+from ..encoding import METH_IDS
 
 log = logging.getLogger(__name__)
 
@@ -593,7 +593,7 @@ def _find_table_end(html: str, table_start: int) -> int:
 
 def _is_palindromic(motif: str) -> bool:
     """True if the IUPAC motif is its own reverse complement."""
-    from kinsim2.utils.motifs import reverse_complement
+    from kinsim.utils.motifs import reverse_complement
 
     return reverse_complement(motif.upper()) == motif.upper()
 
@@ -616,7 +616,7 @@ def _parse_active_mtases_table(html: str, color_to_meth: dict[str, str]) -> list
 
     For palindromic motifs (% Detected shows one value), generates one entry.
     """
-    from kinsim2.utils.motifs import reverse_complement
+    from kinsim.utils.motifs import reverse_complement
 
     from .motif_merge import _make_entry
 
@@ -953,7 +953,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.command == "fetch":
-        from kinsim2.utils.config import setup_logging
+        from kinsim.utils.config import setup_logging
 
         setup_logging(verbose=getattr(args, "verbose", False))
         try:
@@ -1001,7 +1001,7 @@ def main(argv=None):
             print(result)
 
     elif args.command == "patterns":
-        from kinsim2.utils.motifs import load_motif_string
+        from kinsim.utils.motifs import load_motif_string
 
         motif_string = load_motif_string(
             args.motifs, min_fraction=args.min_fraction, min_detected=args.min_detected

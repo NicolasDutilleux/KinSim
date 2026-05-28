@@ -1,14 +1,50 @@
 """Shared encoding helpers for kinsim_NN.
 
-A thin compatibility layer that re-exports the canonical base map from
-``kinsim.utils.encoding`` (single source of truth) and provides
-``encode_seq`` used by both extract and generate.
+Self-contained: defines the base map and methylation-id map used across the
+package, with no dependency on legacy kinsim modules.
 """
 from __future__ import annotations
 
 import numpy as np
 
-from kinsim.utils.encoding import BASE_MAP
+
+# Single source of truth for base → integer code.
+BASE_MAP: dict[str, int] = {"A": 0, "C": 1, "G": 2, "T": 3}
+
+# Default methylation type → integer mapping. Stable across runs because IDs
+# are persisted in shard storage. Extended at runtime by ``get_meth_ids()``
+# which reads any additional types declared in ``kinsim_nn_config.yaml``.
+METH_IDS: dict[str, int] = {"none": 0, "m6A": 1, "m4C": 2, "m5C": 3}
+
+
+def get_meth_ids() -> dict[str, int]:
+    """Return ``{mod_type: int_id}`` from the kinsim_NN YAML.
+
+    Pinned IDs (METH_IDS) win to keep older shards decodable; any extra
+    type declared in YAML is assigned the next free integer in declaration
+    order. Falls back to bare METH_IDS if the YAML cannot be loaded.
+    """
+    try:
+        from .config import load_config  # lazy to avoid circular import
+        cfg = load_config()
+    except (ImportError, OSError, ValueError):
+        return dict(METH_IDS)
+
+    user_types = [t.name for t in cfg.methylation_types]
+    out: dict[str, int] = {"none": 0}
+    next_id = 1
+    for pinned, pinned_id in METH_IDS.items():
+        if pinned == "none":
+            continue
+        if pinned in user_types:
+            out[pinned] = pinned_id
+            next_id = max(next_id, pinned_id + 1)
+    for name in user_types:
+        if name in out:
+            continue
+        out[name] = next_id
+        next_id += 1
+    return out
 
 
 # 256-entry lookup table: byte (uppercase ACGT or lowercase variant) → code 0..3.
@@ -53,4 +89,11 @@ def encode_seq(seq: str, track_n: bool = True) -> np.ndarray:
     return _BYTE_TO_CODE[bytes_]
 
 
-__all__ = ["BASE_MAP", "BASE_RC", "encode_seq", "N_BASE_COUNT"]
+__all__ = [
+    "BASE_MAP",
+    "BASE_RC",
+    "METH_IDS",
+    "N_BASE_COUNT",
+    "encode_seq",
+    "get_meth_ids",
+]

@@ -16,8 +16,8 @@ import csv
 import functools
 import logging
 
-from kinsim.utils.encoding import get_meth_ids
-from kinsim.utils.motifs import reverse_complement
+from ..encoding import get_meth_ids
+from ..motifs import reverse_complement
 
 from .base import BaseOutputParser
 from .registry import register

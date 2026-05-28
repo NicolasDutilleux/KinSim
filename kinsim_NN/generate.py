@@ -39,7 +39,7 @@ import numpy as np
 import pysam
 import torch
 
-from kinsim.utils.motifs import (
+from .utils.motifs import (
     load_motif_string,
     parse_motifs_per_strand,
     reverse_complement,

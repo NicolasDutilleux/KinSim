@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "kinsim"
-version         = "0.4.0"
-description     = "PacBio HiFi kinetic signal simulator for methylation-aware metagenomic binning"
+version         = "1.0.0"
+description     = "PacBio HiFi kinetic-signal generator (conditional WGAN-GP) for methylation-aware metagenomics"
 readme          = "README.md"
 license         = "MIT"
 license-files   = ["LICENSE"]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors         = [{ name = "Nicolas Dutilleux", email = "nicolas.dutilleux@unifr.ch" }]
 keywords        = ["pacbio", "kinetics", "methylation", "metagenomics", "simulator", "bioinformatics"]
 classifiers     = [
@@ -27,33 +27,26 @@ dependencies = [
     "numpy>=1.26",
     "pyyaml>=6.0",
     "pysam>=0.22",
-    "scikit-learn>=1.4",
+    "torch>=2.0",
+    "tensorboard>=2.10",
 ]
 
 [project.optional-dependencies]
-ml = [
-    "torch>=2.0",
-    "pytorch-lightning>=2.0",
-    "tensorboard>=2.10",   # hard-imported in kinsim_NN/train.py
-]
 plot = [
-    "plotly>=5.20",
     "matplotlib>=3.8",
     "pandas>=2.2",
-    "kaleido",         # static image export from plotly
+    "plotly>=5.20",
+    "kaleido",
 ]
-hpo = ["optuna"]
 dev = [
     "ruff>=0.6",
     "pre-commit>=3.6",
     "pytest>=8.0",
     "pytest-cov>=5.0",
-    "kinsim[ml,plot]",
+    "kinsim[plot]",
 ]
 
 [project.scripts]
-kinsim = "kinsim.__main__:main"
-kinsim2 = "kinsim2.__main__:main"
 kinsim_nn = "kinsim_NN.__main__:main"
 
 [project.urls]
@@ -67,59 +60,55 @@ Documentation = "https://github.com/NicolasDutilleux/KinSim#readme"
 # ----------------------------------------------------------------------------
 
 [tool.setuptools.packages.find]
-include = ["kinsim*", "kinsim2*", "kinsim_NN*"]
+include = ["kinsim_NN*"]
 
 [tool.setuptools.package-data]
-kinsim = ["py.typed"]
-kinsim2 = ["py.typed"]
 kinsim_NN = ["py.typed"]
 
 # ----------------------------------------------------------------------------
-# Lint / format — ruff (replaces flake8 + isort + pyupgrade + pydocstyle)
+# Lint / format
 # ----------------------------------------------------------------------------
 
 [tool.ruff]
 line-length    = 100
-target-version = "py39"
-extend-exclude = [
-    "kinsim.egg-info",
-]
+target-version = "py310"
+extend-exclude = ["kinsim.egg-info"]
 
 [tool.ruff.lint]
 select = [
     "E",   # pycodestyle errors
-    "F",   # pyflakes (unused imports, names, etc.)
+    "F",   # pyflakes
     "W",   # pycodestyle warnings
-    "I",   # isort (import order)
+    "I",   # isort
     "N",   # pep8-naming
-    "UP",  # pyupgrade (modern syntax)
-    "B",   # flake8-bugbear (likely-bug patterns)
-    "SIM", # flake8-simplify (simplifiable patterns)
-    "RUF", # ruff-specific rules
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
 ]
 ignore = [
-    "E501",    # line-too-long — long log strings + dataframe-style code
+    "E501",    # long lines (log strings, dataframe-style code)
     "N803",    # arg name should be lowercase — K, IPD, PW are scientific names
-    "N806",    # variable in function should be lowercase — same reason
-    "N812",    # lowercase imported as non-lowercase — `import numpy as np` etc.
+    "N806",    # local var should be lowercase — same reason
+    "N812",    # lowercase imported as non-lowercase — `import numpy as np`
     "B008",    # function call in default arg — argparse / config patterns
-    "B905",    # zip(strict=...) — Python 3.10+ only; cluster envs may be older
+    "B905",    # zip(strict=...) — assumed available; target is Python 3.10+
     "RUF001",  # ambiguous unicode in string — μ, σ, →, — used intentionally
-    "RUF002",  # ambiguous unicode in docstring — same reason
-    "RUF003",  # ambiguous unicode in comment — same reason
+    "RUF002",  # ambiguous unicode in docstring
+    "RUF003",  # ambiguous unicode in comment
     "RUF012",  # mutable class default — false positive on dataclass fields
     "SIM105",  # `try/except: pass` is clearer than `with contextlib.suppress`
     "SIM108",  # `if/else` is often more readable than a packed ternary
     "SIM118",  # `key in dict.keys()` — explicit is fine
-    "E701",    # multi-statement-on-one-line — common pattern in scientific code
+    "E701",    # multi-statement-on-one-line — common in scientific code
     "E702",    # same, with semicolons (test fixture builders)
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["B011", "SIM117"]  # asserts and nested with-statements are fine in tests
+"tests/**" = ["B011", "SIM117"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["kinsim", "kinsim2"]
+known-first-party = ["kinsim_NN"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -141,10 +130,8 @@ python_files = ["test_*.py"]
 
 [tool.coverage.run]
 branch = true
-source = ["kinsim", "kinsim2"]
-omit   = [
-    "*/__main__.py",   # CLI dispatch — covered by integration runs
-]
+source = ["kinsim_NN"]
+omit   = ["*/__main__.py"]
 
 [tool.coverage.report]
 exclude_lines = [

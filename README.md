@@ -1,150 +1,129 @@
 # KinSim
 
-<p align="center">
-  <img src="./images/unifr_logo.svg" alt="University of Fribourg" width="300">
-</p>
+Generative tool that injects biologically realistic PacBio HiFi kinetic
+signals (Inter-Pulse Duration and Pulse Width) into a target BAM,
+conditioned on the local sequence context and per-position methylation
+state. The output BAM carries the canonical PacBio raw-HiFi tag layout
+(`fi`, `fp`, `ri`, `rp`) and is drop-in compatible with the standard
+downstream chain (`ccs-kinetics-bystrandify` → `pbmm2 align` →
+`ipdSummary` → `pbmotifmaker`, and the jasmine / modkit path for 5mC).
 
-<p align="center">
-  <strong>PacBio HiFi kinetic signal simulator for methylation-aware metagenomic binning.</strong>
-</p>
-
-<p align="center">
-  <img alt="Python" src="https://img.shields.io/badge/python-3.10%2B-blue">
-  <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-%E2%89%A52.0-orange">
-  <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
-  <img alt="Platform" src="https://img.shields.io/badge/platform-Linux%20%7C%20SLURM-lightgrey">
-</p>
+The model is a conditional WGAN-GP with a transformer generator and a
+transformer critic; see [`DECISIONS.md`](DECISIONS.md) for the design
+rationale and [`CLAUDE.md`](CLAUDE.md) for the developer reference.
 
 ---
 
-## What is KinSim?
+## Installation
 
-KinSim learns per-context **IPD/PW kinetic distributions** from real PacBio HiFi reads and injects realistic kinetic signals into PBSIM3-simulated reads. The output is a synthetic BAM that mimics real PacBio kinetics — including methylation-driven shifts — usable as input for any downstream tool that consumes kinetic information (modkit, ipdSummary, jasmine, motif callers).
-
-**Why?** Standard simulators (PBSIM3, badread) generate sequence + quality but ignore kinetics. Methylation detection in metagenomics relies on kinetic signals; without them, simulated reads are useless for benchmarking methylation-aware binners. KinSim fills this gap.
-
-```
-Real PacBio BAMs              Synthetic reads (PBSIM3)
-        │                              │
-        ▼                              ▼
-[motif discovery]              [PBSIM3 sequences]
-        │                              │
-        └─► kinetic library ──► [trained NN] ──► simulated BAM with fi/fp tags
-```
-
----
-
-## Tools used
-
-### Upstream callers (methylation motif discovery)
-
-| Tool | Tested version | Role |
-|---|---|---|
-| **PacBio SMRT-Link** | 25.1 (containerised: `pacbio-smrt-tools-25.3.sif` on IBU) | Bundle providing all PacBio CLIs below |
-| `ccs-kinetics-bystrandify` | SMRT-Link 25.1 | Split each HiFi read into two per-strand reads carrying ip/pw |
-| `pbindex` | SMRT-Link 25.1 | Build `.pbi` index required by ipdSummary |
-| `pbmm2` | SMRT-Link 25.1 | Reference alignment (when GFF mode was used; now optional) |
-| `ipdSummary` (kineticsTools) | SMRT-Link 25.1, SP3-C3 chemistry model | m6A / m4C statistical caller |
-| `pbmotifmaker` | SMRT-Link 25.1 | Consensus motif discovery from ipdSummary GFF |
-| `jasmine` | SMRT-Link 25.1 (Revio P2-C2 model) | 5mC ML caller producing MM/ML tags |
-| `modkit` | 0.4.x | Convert MM/ML tags into per-position bedMethyl / motif fractions |
-| `hifiasm` | 0.19.x | Draft assembly (Vega prep pipeline only) |
-| `samtools` | 1.18+ | BAM indexing |
-
-### Read simulation
-
-| Tool | Tested version | Role |
-|---|---|---|
-| `PBSIM3` | 3.0.4 | HiFi read simulator (sequence-only, no kinetics) — input to `kinsim generate` |
-
-### KinSim model + pipeline
-
-| Component | Tested version | Role |
-|---|---|---|
-| **Python** | 3.10+ | runtime |
-| **PyTorch** | ≥ 2.0 | neural network framework |
-| **pysam** | 0.22+ | BAM I/O |
-| **numpy** | 1.26+ | numerical core |
-| **scikit-learn** | 1.4+ | utilities used by baselines |
-| **pandas** | 2.2+ | report tables |
-| **plotly** | 5.20+ | interactive HTML reports |
-| **pyyaml** | 6.0+ | `kinsim_config.yaml` loader |
-| **EMBOSS fuzznuc** *(optional)* | 6.6.0 | fast genome-wide motif scanning (Python regex used as fallback) |
-| **Apptainer / Singularity** *(HPC)* | 1.x | container runtime for SMRT-Link image |
-
-The IBU cluster ships `/containers/apptainer/pacbio-smrt-tools-25.3.sif` —
-note the image label says 25.3 but the embedded SMRT-Link release is 25.1
-for `ipdSummary`/`pbmotifmaker`. Pinning to 25.1 was a deliberate choice:
-SMRT-Link 12.x (the system module) detected only ~73% of TCGCGA m4C sites,
-versus ~95% with 25.1 (matching L. Falquet's reference output).
-
----
-
-## How to reproduce
-
-### 1. Install
+Requires Python 3.10 or above. The package is a standard
+`pip install -e .` away once dependencies are in place. CUDA-enabled
+PyTorch is required for training; CPU PyTorch suffices for inference
+on the held-out scale tested.
 
 ```bash
 git clone https://github.com/NicolasDutilleux/KinSim.git
 cd KinSim
+python -m venv .venv && source .venv/bin/activate
 pip install -e .
+pip install -e ".[plot]"   # matplotlib / plotly extras for the analysis dashboards
+pip install -e ".[dev]"    # ruff, pytest, pre-commit
 ```
 
-The main CLI entry point is **`kinsim`** — the full ML pipeline (extract /
-refine / train / generate / evaluate / verify-generate / analyze /
-predict-kmers). Data-preparation utilities (motif parsing, manifest CSV
-checks, REBASE fetch, motif merging) live in `scripts/` and
-`kinsim/utils/parsers/`, run via `python scripts/<name>.py` or
-`python -m kinsim.utils.parsers.<module>`.
-
-A separate `kinsim_baseline` module
-(`python -m kinsim_baseline <verb>`) provides a context-free naive
-Gaussian benchmark for the ML model.
-
-### 2. Discover methylation motifs (upstream callers)
-
-For each sample, run the prep pipeline that combines jasmine, ipdSummary and pbmotifmaker into one `motifs_merged.csv` (kept at ≥ 70% confidence):
+For a fully pinned environment, regenerate `requirements.lock.txt` from
+the cluster `kinsim_env` conda environment:
 
 ```bash
-sbatch slurm_kinsim/strepto/run.sh all       # 52 Streptomyces samples
-sbatch slurm_kinsim/vega/run.sh    all       # 15 Vega samples
+ssh <cluster>
+conda activate kinsim_env
+pip freeze > requirements.lock.txt
 ```
 
-See [`slurm_kinsim/README.md`](slurm_kinsim/README.md) for details.
+### Component versions
 
-### 3. Run the ML pipeline
+The pipeline relies on the following exact versions, validated on the
+production cluster.
+
+| Component | Version | Source |
+|---|---|---|
+| Python | 3.12 | conda env `kinsim_env` |
+| PyTorch | 2.x with CUDA 12.1 wheels | `pyproject.toml` |
+| numpy | 1.26 or above | `pyproject.toml` |
+| pysam | 0.22 or above | `pyproject.toml` |
+| PyYAML | 6.0 or above | `pyproject.toml` |
+| TensorBoard | 2.10 or above | `pyproject.toml` |
+| matplotlib | 3.8 or above | `pyproject.toml [plot]` |
+| EMBOSS fuzznuc | 6.6.0 | system binary on the cluster |
+| SMRT-Link | 25.1 | `slurm/callers/ipdsummary.slurm` (Apptainer / SIF) |
+| `ipdSummary` (kineticsTools) | 3.0 (SP3-C3 model) | shipped with SMRT-Link 25.1 |
+| `pbmotifmaker` | shipped with SMRT-Link 25.1 | shipped with SMRT-Link 25.1 |
+| `pbmm2` | shipped with SMRT-Link 25.1 | shipped with SMRT-Link 25.1 |
+| `ccs-kinetics-bystrandify` | shipped with SMRT-Link 25.1 | shipped with SMRT-Link 25.1 |
+| `jasmine` | to be pinned from the cluster | `slurm/callers/jasmine_modkit.slurm` |
+| `modkit` | to be pinned from the cluster | `slurm/callers/jasmine_modkit.slurm` |
+
+The PacBio binaries (`ipdSummary`, `pbmotifmaker`, `pbmm2`,
+`ccs-kinetics-bystrandify`) are not pip-installable; they are routed
+through the SMRT-Link 25.1 Apptainer image from the SLURM scripts.
+
+---
+
+## Pipeline at a glance
+
+```
+Aligned bystrandified BAM (ip/pw, 2 records per ZMW)
+  + reference FASTA
+  + GFF / jasmine MM-ML labels
+                                       │
+                          kinsim_nn extract
+                                       │
+                       shards/<strain>_shard.pkl
+                                       │
+                            kinsim_nn train
+                                       │
+                  ckpts/{G.pt, D.pt, best_G.pt,
+                         model_config.json, metrics.csv, tb/}
+                                       │
+              ┌────────────────────────┴────────────────────────┐
+              │                                                 │
+       kinsim_nn evaluate                              kinsim_nn generate
+       W1 on held-out shards                  BAM(stripped) → BAM(fi/fp/ri/rp)
+```
+
+The same SLURM building blocks in `slurm/prep/` and `slurm/callers/`
+are used to validate a generated BAM end-to-end against the standard
+PacBio methylation-calling chain.
+
+---
+
+## Command-line interface
+
+```text
+kinsim_nn extract <manifest.csv> <out_dir> [--task <i>] [--config <yaml>]
+kinsim_nn train    <shards_dir> <ckpt_dir> [--resume] [--config <yaml>]
+kinsim_nn generate <input.bam> <ref.fa> <ckpt_dir> <motifs.csv> <out.bam>
+kinsim_nn evaluate <ckpt_dir> <shards_dir> --output-prefix <prefix>
+kinsim_nn analyze  <shards_dir_or_file> [--output-dir <dir>] [--no-html]
+```
+
+### Typical usage
 
 ```bash
-N=$(python scripts/manifest.py count manifest.csv)
-SHARDS=/path/to/shards
-REFINED=/path/to/refined
+# 1. Extract shards from the production manifest, one SLURM array task per strain.
+sbatch --array=0-N slurm/prep/... kinsim_nn extract manifest.csv shards/ --task ${SLURM_ARRAY_TASK_ID}
 
-EX=$(sbatch --parsable --array=1-${N}%8 slurm_kinsim/ml/00_extract.slurm \
-    manifest.csv $SHARDS)
-RF=$(sbatch --parsable --dependency=afterany:$EX slurm_kinsim/ml/02_refine.slurm \
-    $SHARDS $REFINED)
-sbatch --dependency=afterok:$RF slurm_kinsim/ml/03_train.slurm \
-    $REFINED checkpoints/
+# 2. Train.
+kinsim_nn train shards/ ckpts/ --config kinsim_nn_config.yaml
+
+# 3. Generate kinetics into a stripped HiFi BAM.
+kinsim_nn generate input_stripped.bam reference.fa ckpts/ motifs.csv output.bam
+
+# 4. Validate the generated BAM end-to-end against the upstream methylation-calling chain.
+sbatch slurm/prep/bystrandify.slurm     output.bam              output_bys.bam
+sbatch slurm/prep/align_pbmm2.slurm     output_bys.bam reference.fa   output_aln.bam
+sbatch slurm/callers/ipdsummary.slurm   output_aln.bam reference.fa   output.gff output.csv
+sbatch slurm/callers/pbmotifmaker.slurm reference.fa   output.gff     output_motifs.csv
 ```
-
-See [`kinsim/README.md`](kinsim/README.md) for the full ML pipeline reference.
-
-### 4. Generate synthetic BAMs
-
-`kinsim generate` has three modes (auto-detected from argument count):
-
-```bash
-# Directory mode (PBSIM3 outputs)
-kinsim generate <pbsim3_dir> checkpoints/best.pt motifs.csv output_dir/
-
-# BAM mode (existing aligned BAM, e.g. real raw HiFi)
-kinsim generate <input.bam> <ref.fna> checkpoints/best.pt motifs.csv output.bam
-
-# Per-genome mode (PBSIM3 fq.gz + maf.gz pair)
-kinsim generate <fq.gz> <maf.gz> <ref.fna> checkpoints/best.pt motifs.csv output.bam
-```
-
-Output: unmapped HiFi BAMs (`flag=4`) with `fi:B:C` (IPD) and `fp:B:C` (PW) tags, ready for `ccs-kinetics-bystrandify` then any kinetics-aware downstream tool.
 
 ---
 
@@ -152,189 +131,62 @@ Output: unmapped HiFi BAMs (`flag=4`) with `fi:B:C` (IPD) and `fp:B:C` (PW) tags
 
 ```
 KinSim/
-├── README.md                ← this file (overview)
-├── CLAUDE.md                ← in-depth developer reference
-├── kinsim_config.yaml       ← biology / refine parameters (signature offsets, etc.)
-├── pyproject.toml           ← entry point: kinsim
-│
-├── kinsim/                  ← ML pipeline package      [docs: kinsim/README.md]
-├── kinsim_baseline/         ← naive Gaussian benchmark CLI
-├── slurm_kinsim/            ← HPC SLURM scripts        [docs: slurm_kinsim/README.md]
-├── scripts/                 ← offline tools (manifest, merge_shards, strip-kinetics, …)
-└── images/                  ← logos / figures
+├── kinsim_NN/                       core package (extract / train / generate / evaluate / analyze)
+├── kinsim_nn_config.yaml            single source of truth for all stages
+├── slurm/
+│   ├── prep/                        bystrandify, pbmm2 alignment, indexing, hifiasm
+│   └── callers/                     ipdSummary, pbmotifmaker, jasmine + modkit, motif merge
+├── scripts/
+│   ├── strip_kinetics.py            remove fi/fp/ri/rp from a BAM in place
+│   ├── plot_perread_ipd_at_gff_sites.py  per-read IPD histograms at top-N GFF positions
+│   ├── plot_motif_ipdratios_corpus.py    cross-corpus motif IPDratio aggregator
+│   ├── inspect_null_model.py        ipdSummary null-model inspector
+│   ├── check_motifs_palindromes.py  motif-catalogue QC
+│   └── manifest.py                  manifest CSV utilities
+├── tests/                           pytest smoke tests
+├── images/                          figures for the thesis
+├── reports/                         outputs of the analysis dashboards
+├── BUGS_FOUND.md                    BAM-emission boundary bugs and their corrections
+├── CHANGELOG.md                     release notes
+├── CLAUDE.md                        developer reference
+├── CONTRIBUTING.md                  contribution guidelines
+├── DECISIONS.md                     architectural decisions log
+├── LICENSE                          MIT
+├── CITATION.cff                     citation metadata
+└── pyproject.toml
 ```
 
-Each subpackage has its own README with the tool-specific details:
-
-- **[kinsim/README.md](kinsim/README.md)** — ML pipeline, models, refine algorithm, signature profiles
-- **[slurm_kinsim/README.md](slurm_kinsim/README.md)** — per-dataset prep pipelines, ML SLURM chain, resource defaults
-
-For implementation details (data flow, file format, conventions), see [`CLAUDE.md`](CLAUDE.md).
-
 ---
 
-## Input requirements
+## Validation chain in one paragraph
 
-`kinsim extract` consumes **aligned bystrandified BAMs only**. Other BAM formats either fail fast (a sniff check rejects raw HiFi BAMs that still carry `ri` tags) or fall back to half-data with a warning.
+The validation chain is the same that a real PacBio dataset goes
+through. After the generator emits `<sample>_simulated.bam` (unaligned
+HiFi with `fi/fp/ri/rp`), the chain is:
 
-Required preprocessing chain (versions in the [Tools used](#tools-used) table above):
+1. `ccs-kinetics-bystrandify` to split each ZMW into one
+   `/ccs/fwd` and one `/ccs/rev` record carrying per-strand `ip` / `pw`.
+2. `pbmm2 align` to the strain's reference assembly.
+3. `ipdSummary` with the SP3-C3 model to call modifications, then
+   `pbmotifmaker` to extract motif catalogues.
+4. In parallel, `jasmine` (5mC) followed by `modkit pileup` and
+   `modkit find-motifs` for 5mC motifs.
+5. The two catalogues are merged via `slurm/callers/merge_motifs.slurm`
+   with a default fraction threshold of `0.7`.
 
-```
-raw HiFi BAM
-  → ccs-kinetics-bystrandify   (split each CCS into 2 reads, one per polymerase pass)
-  → pbmm2 align                (produces aligned bystrandified BAM)
-  → samtools index + pbindex
-  → kinsim extract             (this repo)
-```
-
-Implemented end-to-end by the prep pipelines under [`slurm_kinsim/<dataset>/`](slurm_kinsim/).
-
----
-
-## Reproducibility / Benchmarking
-
-The pipeline is built to be re-runnable from the same starting state. Each stage is deterministic given a seed (refine, train accept `--seed`); the generative samples in `generate` are explicitly stochastic but seedable too.
-
-### Reference dataset
-
-Streptomyces collection (52 strains, ~250k–500k primary aligned reads each) — internal IBU paths:
-
-| Resource | Path |
-|---|---|
-| Bystrandified aligned BAMs | `/data/projects/p774_MARSD/NDutilleux/training/Strepto/pipeline/<sample>/<sample>_aligned.bam` |
-| Reference assemblies | `/data/projects/p774_MARSD/NDutilleux/training/Strepto/<sample>/final_assembly.fasta` |
-| Merged motifs (per-sample CSV) | adjacent to each BAM |
-| Manifest CSV (52 samples) | `/data/projects/p774_MARSD/NDutilleux/runs/v?_strepto/manifest_aligned.csv` |
-| SMRT-Tools container | `/containers/apptainer/pacbio-smrt-tools-25.3.sif` |
-
-### Expected runtimes (single bc2034 strain on `pshort_el8`)
-
-Validated 2026-05-06 with the v7 / 20-col / vectorised extract:
-
-| Stage | Wall time | Memory | Notes |
-|---|---|---|---|
-| `00_extract` | ~50 min | 32 GB | 248k primary reads, vectorised inner loop |
-| `02_refine` | ~10 min | 16 GB | per-(meth, offset) GMM, BIC over K∈{2,3} |
-| `03_train` | ~2-4 h | 32 GB + 1 GPU | ConvPredictor, 50 epochs, ReduceLROnPlateau |
-| `05_evaluate` | ~10 min | 32 GB | calibration plots + per-kmer report |
-
-For the **full Strepto corpus** (52 strains via SLURM array), wall time is bounded by the slowest single strain — typically ~60-90 min for extract.
-
-### One-shot reproduction
-
-After cloning + `pip install -e .` and verifying the cluster paths above:
-
-```bash
-# bc2034 single-strain verification (extract → refine, ~1h total)
-PREFIX=/path/to/run_dir
-MANIFEST=/path/to/manifest_bc2034_only.csv
-N=$(python scripts/manifest.py count $MANIFEST)
-J0=$(sbatch --parsable --array=1-${N} \
-    --partition=pshort_el8 --mem=32G --time=02:00:00 \
-    slurm_kinsim/ml/00_extract.slurm $MANIFEST $PREFIX/shards)
-sbatch --parsable --dependency=afterok:$J0 \
-    --partition=pshort_el8 --mem=16G --time=01:00:00 \
-    slurm_kinsim/ml/02_refine.slurm $PREFIX/shards $PREFIX/refined
-
-# full corpus: replace manifest, drop --time bound, use pibu_el8 if needed
-```
-
-### Versioning / change history
-
-- Architectural decisions with rationale: [`DECISIONS.md`](DECISIONS.md).
-- User-facing change log: [`CHANGELOG.md`](CHANGELOG.md).
-- For the exact code state used to produce a result, capture the commit SHA next to your results: `git rev-parse HEAD`.
+The merged catalogue is then compared site-by-site to the
+real-data catalogue using the per-read IPD distribution at the GFF
+positions called from the real run
+(`scripts/plot_perread_ipd_at_gff_sites.py`).
 
 ---
-
-## Configuration
-
-A single `kinsim_config.yaml` at the repo root holds the biology- and refine-related parameters that the user must keep up-to-date. **Every** pipeline stage (extract, refine, train, generate, predict-kmers, evaluate, analyze) reads this YAML — edits propagate without code changes but also between stages:
-
-```yaml
-kinetic_signatures:
-  m6A: { modified_base: A, signal_offsets: [0, 5] }   # at modified A AND +5 downstream
-  m4C: { modified_base: C, signal_offsets: [0] }      # at modified C only
-  m5C: { modified_base: C, signal_offsets: [2, 6] }   # +2 and +6 downstream — NOT at the C itself
-
-extraction:
-  kmer_size: 11      # K-mer length
-  upstream:  7       # bases of context BEFORE the prediction position
-  downstream: 3      # bases of context AFTER (upstream + 1 + downstream == kmer_size)
-  rev_meth_offsets: [-1, 0, 1]
-```
-
-Strain-specific signatures (e.g. m6A at +8 instead of +5 for some methyltransferases) are handled by editing the YAML — no code change. The shard `__meta__["extraction_params"]` freezes these for traceability so refine / train cross-check.
-
-**generate** also reads from the YAML at run time: `kinetic_signatures.<T>.signal_offsets` drives the Bernoulli firing decision per site, and `generation.use_motif_fraction` is a generate-only toggle (default `false` because the trained model's `p_fire` already absorbs occupancy).
-
----
-
-## Output BAM format
-
-| Field | Value |
-|---|---|
-| `flag` | `4` (unmapped, raw HiFi convention) |
-| `fi:B:C` | per-base IPD forward, uint8, length = read length |
-| `fp:B:C` | per-base PW forward |
-| `ri:B:C` | per-base IPD reverse |
-| `rp:B:C` | per-base PW reverse |
-| Header `@PG` | KinSim entry with version, training corpus (Revio HiFi), K, architecture |
-| Header `@RG` | Inherited from input (bystrandify-hex suffix stripped) — full PacBio metadata preserved |
-
-The output is single-read-per-molecule (raw HiFi format). The validate
-chain pipes it through `ccs-kinetics-bystrandify` then `pbmm2 align` to
-match the real-data preprocessing path before ipdSummary.
-
----
-
-## Acknowledgements — Tooling
-
-The author (Nicolas Dutilleux) developed this project during a stage de
-master at the University of Fribourg (February – May 2026). The code,
-the scientific approach, the architectural decisions, the validation
-methodology, and the interpretation of results are the author's
-contribution and responsibility.
-
-**Tooling used during development:**
-**Claude (Anthropic)**, accessed via the **Claude Code** CLI, was used
-as a coding assistant — similar in role to an IDE, an autocomplete, or
-a documentation lookup. The AI accelerated tasks like vectorising
-numpy loops, scaffolding CLI options and SLURM submission scripts,
-drafting helper utilities, surfacing potential failure modes in code
-review, and producing first-draft docstrings.
-
-**Review and validation:**
-Every block of AI-suggested code was read, validated, and integrated
-by the author before being committed. AI suggestions that did not match
-the intended design were rejected or rewritten. Issues identified
-during review and debug iterations on the cluster were diagnosed and
-fixed by the author.
-
-**Residual bugs:**
-Like any software project of this scope developed under stage-de-master
-time constraints, residual bugs may remain. Reviewers and re-users
-of this code are encouraged to read critically, run their own
-validations, and open issues on the tracker for anything that looks
-suspicious.
-
-This disclosure follows current best practice (2026) for AI-assisted
-research software and aligns with the spirit of academic honesty for
-master-level work. The author can explain and defend every design
-decision and every line of code in this repository.
-
----
-
-## License
-
-MIT — see `LICENSE`.
 
 ## Citation
 
-If you use KinSim in your work, please cite:
+If KinSim contributes to your work, please cite this repository
+(see [`CITATION.cff`](CITATION.cff) for machine-readable metadata) and
+the foundational references listed in [`DECISIONS.md`](DECISIONS.md).
 
-```
-Dutilleux, N. (2026). KinSim: PacBio HiFi kinetic signal simulator for
-methylation-aware metagenomic binning. University of Fribourg.
-https://github.com/NicolasDutilleux/KinSim
-```
+## License
+
+MIT — see [`LICENSE`](LICENSE).

@@ -228,6 +228,41 @@ def load_config(path: str | Path | None = None) -> KinsimNNConfig:
 
 
 # ---------------------------------------------------------------------------
+# YAML-derived lookups (used by the vendored motif parser code)
+# ---------------------------------------------------------------------------
+
+
+def get_modified_base(meth_name: str) -> str:
+    """Return the concrete base (A/C/G/T) that ``meth_name`` modifies.
+
+    Raises ValueError on missing entry or invalid base.
+    """
+    cfg = load_config()
+    for t in cfg.methylation_types:
+        if t.name == meth_name:
+            base = (t.modified_base or "").upper()
+            if base not in ("A", "C", "G", "T"):
+                raise ValueError(
+                    f"kinsim_nn_config.yaml: methylation_types.{meth_name}.modified_base "
+                    f"must be one of A/C/G/T, got {t.modified_base!r}."
+                )
+            return base
+    raise ValueError(
+        f"kinsim_nn_config.yaml: no methylation type named {meth_name!r}."
+    )
+
+
+def get_modified_base_map() -> dict[str, str]:
+    """Return ``{meth_name: modified_base}`` for every declared meth type."""
+    cfg = load_config()
+    return {
+        t.name: get_modified_base(t.name)
+        for t in cfg.methylation_types
+        if t.name != "none"
+    }
+
+
+# ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
 
@@ -252,5 +287,7 @@ __all__ = [
     "GenerateParams",
     "KinsimNNConfig",
     "load_config",
+    "get_modified_base",
+    "get_modified_base_map",
     "setup_logging",
 ]

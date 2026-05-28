@@ -1,68 +1,60 @@
 # Changelog
 
-All notable changes to KinSim are recorded here. Format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
+and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] — 2026-05
 
 ### Added
-- `kinsim2/` — bilateral architecture (v2). Single forward pass jointly
-  predicts (ipd_fwd, pw_fwd, ipd_rev, pw_rev) from a raw HiFi aligned
-  BAM, no bystrandify dependency. 33-column shard layout
-  (`11 + 2*K`), cross-meth FiLM, per-strand
-  `category / parent_meth / parent_offset`, 4-channel Beta-NLL.
-  Installed as a separate CLI `kinsim2` alongside `kinsim`.
-- `model_config.json` now records `git_sha`, `kinsim_version` and
-  `timestamp_utc` for reproducibility — both packages.
-- Global determinism: `L.seed_everything(workers=True)` in `kinsim
-  train` / `kinsim2 train`; `torch.manual_seed` + `np.random.seed` +
-  `random.seed` in `kinsim generate` / `kinsim2 generate` (seed via
-  `--seed` CLI flag or `KINSIM_SEED` env var).
-
-### Fixed
-- `kinsim generate`: per-read propagation of PacBio auxiliary tags
-  (`np`, `rq`, `sn`, `zm`, `MM`, `ML`, …) from the input record, so
-  ccs-kinetics-bystrandify finds the metadata it needs. The previous
-  YAML-driven preset stamped a single `np=3` on every read, which
-  bystrandify silently rejected.
-- `kinsim2/analyze.py`: scans every row instead of skipping bad ones
-  silently; raises with a precise diagnostic if any shard row diverges
-  from the bilateral v2 layout.
-- `kinsim2/utils/config.py`: NameError on import (forward-reference to
-  `_FALLBACK_*` constants).
-
-### Changed
-- `kinsim/refine.py` / `kinsim2/refine.py`: baseline-anchored 1D-IPD
-  GMM (per `(meth_type, parent_offset)`) is now the only refine method.
-  K∈{1,2,3} picked by BIC with a strict biological veto rejecting
-  sub-baseline components for K>2.
-- `kinsim/train.py` / `kinsim2/train.py`: default loss is Beta-NLL
-  (β=0.5, Seitzer 2022) to prevent the model from inflating σ in place
-  of fitting μ.
-- Sharded mode is the default training path; `ShardedSignalDataset`
-  bounds peak RAM at one shard regardless of corpus size.
-- Train / test split: `--test-strains a,b,c` (by sample_id) or
-  `--test-fraction 0.10 --split-seed N` (random per-shard).
+- `kinsim_NN/` — conditional WGAN-GP with a transformer generator
+  (~12 M parameters, 8 layers, 8 heads, `d_model = 256`, `z_dim = 128`)
+  and a transformer critic (~3 M parameters, 6 layers, 6 heads,
+  `d_model = 192`) on a 21 bp window with 4 kinetic channels per
+  position (`IPD_fwd`, `PW_fwd`, `IPD_rev`, `PW_rev`).
+- AdaLN-Zero conditioning ([Peebles & Xie, 2023](https://doi.org/10.48550/arXiv.2212.09748))
+  on every generator block, with `(shift, scale, gate)` derived from
+  `cond_emb = MLP(z) + Linear(tokens.mean)`.
+- Three-category extraction (`BASELINE` / `SLOWED` / `NEAR_METH`) on
+  labeled methylation positions, with per-strand methylation context on
+  all 21 window positions.
+- Modular labelers: `GFFLabeler` (motifs.gff via pbmotifmaker, with
+  optional `require_motif` filter) and `JasmineMMMLLabeler` (5mC via
+  MM/ML tags on a jasmine BAM).
+- Held-out per-test-strain Wasserstein-1 evaluation during training,
+  with `best_G.pt` selection on the global metric.
+- `kinsim_nn evaluate` and `kinsim_nn analyze` CLIs for post-training
+  diagnostics on shards.
+- Smoke tests under `tests/test_kinsim_nn_smoke.py`.
 
 ### Removed
-- v3/v4 dispatch concepts; the codebase is one bilateral path
-  (`kinsim2`) plus the legacy single-strand path (`kinsim`).
-- `MLPPredictor` references in docs (only `ConvPredictor` survives).
-- `requirements.txt` (dependencies live in `pyproject.toml`).
+- The legacy `kinsim/` package (ConvPredictor with FiLM, single-strand
+  per-position Gaussian-NLL prediction).
+- The exploratory `kinsim2/` (duplicate of `kinsim/`).
+- `kinsim_baseline/` (naive Gaussian baseline).
+- The SLURM orchestrators for the legacy training pipeline
+  (`slurm/ml/`, per-lineage `slurm/strepto/`, `slurm/vega/`,
+  `slurm/sequel/`, the legacy `validate/` chain).
+- Legacy `kinsim_config.yaml`. Single configuration source is now
+  `kinsim_nn_config.yaml`.
 
-## [0.4.0] - 2026-04 → 2026-05
+### Fixed
+- Five format-boundary bugs in the BAM emission path
+  (`flag = 4`, `@HD SO:unknown`, stale `ip` / `pw` stripping,
+  `template_length` preservation, kinetic-array clamping to `≥ 1`).
+  See [`BUGS_FOUND.md`](BUGS_FOUND.md). Aggregate effect: end-to-end
+  yield on bc2034 went from ~250 retained per-position kinetic calls
+  to 16.7 million.
+- Strand-aware kinetic-tag reversal in
+  `kinsim_NN/utils/bam_io.py` for bystrandified inputs. Verified by
+  byte-level cross-check against the raw BAM at high-confidence m6A
+  positions.
 
-- 20-column single-strand shard layout
-  (`IPD, PW, fraction, mc_ctx[K], rev_meth[3], category, parent_meth,
-  parent_offset`).
-- ConvPredictor (per-base embed + positional + FiLM(meth) + 3 conv
-  layers + dual readout) as the default architecture.
-- Modular methylation types via `kinsim_config.yaml`
-  (`kinetic_signatures.<T>.{modified_base, signal_offsets, aliases}`).
-- Per-package READMEs (`kinsim/`, `slurm_kinsim/`, `kinsim_baseline/`).
-- Validate chain end-to-end: SIM.bam → bystrandify → align →
-  ipdSummary + jasmine → merge_motifs → compare to real motifs.
+## [0.4.0] — 2026-04 / 2026-05 (legacy)
 
-[Unreleased]: https://github.com/NicolasDutilleux/KinSim/compare/v0.4.0...HEAD
+Single-strand ConvPredictor architecture (~140 K parameters,
+FiLM conditioning on methylation context) with per-position Gaussian
+output trained under Beta-NLL. Removed in the current release in
+favour of `kinsim_NN/`.
+
+[Unreleased]: https://github.com/NicolasDutilleux/KinSim/tree/main
 [0.4.0]: https://github.com/NicolasDutilleux/KinSim/releases/tag/v0.4.0

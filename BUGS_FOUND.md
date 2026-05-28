@@ -1,41 +1,102 @@
-# Bugs found during bc2034 validate run (2026-05-26)
+# Bugs found during validation
 
-Context: re-running `kinsim_NN generate` on bc2034 with v2 changes
-(per_read_z + emit_unaligned by default) then chaining bystrandify →
-align → ipdSummary → motifmaker. Found via comparison with the prior
-v12_run3 manual run.
+Each entry: symptom, root cause, fix, lesson. All five share a single
+misleading downstream warning (`ccs-kinetics-bystrandify`: `has '0'
+PulseWidths, discarding`), surfaced sequentially during the bc2034 chain
+validation in 2026-05.
+
+The methodology that ultimately localised each bug: byte-level
+`samtools view` diff between a known-working legacy record and a
+rejected new one, then targeted controlled substitutions.
 
 ---
 
-## Bug 5 — zero values in fi/fp/ri/rp trigger bystrandify discard (THE *actual* root cause)
+## Bug 1 — `flag = 4` violation on the unaligned output
 
-**Symptom:** After fixing Bugs 1-4, bystrandify STILL discarded ~all reads
-with the misleading "has '0' PulseWidths, discarding" warning.
+**Symptom.** Bystrandify discarded 99.8 % of records. Output ~6 MB
+where the legacy chain produced ~4 GB.
 
-**Diagnosis methodology:** When all observable record-level fields (flag,
-TLEN, SO, RG, SEQ, QUAL, tag names, tag types, tag order, tag lengths,
-PG chain) were proven byte-identical between OLD (working) and NEW
-(rejected) bams, the only remaining difference was the VALUES inside
-fi/fp/ri/rp. A targeted test — overwriting NEW's records with constant=50
-across all fi/fp/ri/rp — passed cleanly (2.1 MB output, zero warnings).
-Then a second test — replacing only the zeros (`v[v==0] = 1`) — also
-passed cleanly. **Confirmed: bystrandify rejects records that contain
-ANY zero in fi/fp/ri/rp.**
+**Root cause.** The emission code set `mate_is_unmapped = True` on the
+unaligned record, which silently added bit 8, raising the SAM flag from
+4 to 12. PacBio HiFi convention requires exactly `flag = 4` (unmapped,
+single-end) on raw HiFi BAMs.
 
-**Root cause:** The PacBio frame-count codec uses uint8 values 1-255;
-**0 means "invalid/missing"**. ccs-kinetics-bystrandify validates the
-input record and discards it on encountering any 0 in the per-base
-kinetic arrays — emitting the misleading "has '0' PulseWidths" warning
-that reads (in retrospect) as "has '0' [value] in PulseWidths" rather
-than "has 0 [count of] PulseWidths".
+**Fix.** Set `read.flag = 4` directly in `_unalign_read`.
 
-kinsim_NN's predicted kinetics occasionally hit 0 (~0.1-0.3% of
-positions per read) when the model's log-space output rounds down to
-zero frame counts. Legacy kinsim must have either clamped or had a
-distribution that avoided 0s.
+**Lesson.** Strictly equal-to checks on flag values in downstream
+PacBio tools — bit semantics are not always honoured.
 
-**Fix:** Clamp fi/fp/ri/rp to ≥ 1 right before `set_tag`, in BOTH the
-sequential (`_process_read_*`) and multiprocess paths of
+---
+
+## Bug 2 — `@HD SO:coordinate` left on unaligned output
+
+**Symptom.** With `flag = 4` correct, bystrandify still discarded
+99.8 % of records.
+
+**Root cause.** `_sanitize_header_for_unaligned` stripped `@SQ` lines
+but inherited `@HD SO:coordinate` from the aligned input. That value
+routed bystrandify into its aligned-input code path, which then
+rejected every record now lacking alignment fields.
+
+**Fix.** Force `SO:unknown` on the `@HD` line when emitting an
+unaligned output.
+
+**Lesson.** Header-level convention can override per-record content in
+downstream tools' control flow.
+
+---
+
+## Bug 3 — stale `ip` / `pw` tags inherited from `pbmm2 align`
+
+**Symptom.** With Bugs 1 and 2 fixed, the chain still rejected 99.8 %.
+
+**Root cause.** The `@RG DS` field declares
+`Ipd:CodecV1=ip;PulseWidth:CodecV1=pw`, telling downstream tools to
+read kinetics from `ip` / `pw`. When the aligned input carried
+per-strand `ip` / `pw` tags from a prior `pbmm2 align`, those survived
+into the generated BAM and were preferred by bystrandify over the
+freshly written `fi` / `fp` / `ri` / `rp`.
+
+**Fix.** Strip `ip` and `pw` in `_unalign_read` before writing.
+
+**Lesson.** When converting an aligned PacBio BAM into raw-HiFi shape,
+alignment-induced tag rewrites must be stripped, not only the
+alignment fields themselves.
+
+---
+
+## Bug 4 — `template_length = 0` triggers bystrandify discard
+
+**Symptom.** With Bugs 1–3 fixed, bystrandify still rejected 99.8 %.
+
+**Root cause.** Bystrandify uses `TLEN > 0` as a heuristic to detect a
+"valid HiFi record". The `_unalign_read` code had set
+`template_length = 0` on the unaligned output, which is spec-correct
+for an unmapped single-end record but triggered the discard.
+
+**Fix.** Leave `template_length` untouched in `_unalign_read`. The
+inherited value (typically the read length) satisfies bystrandify's
+heuristic.
+
+**Lesson.** Diff one specific record column-by-column against a
+known-working sample; do not trust the warning text.
+
+---
+
+## Bug 5 — zero values in `fi` / `fp` / `ri` / `rp` are codec-invalid
+
+**Symptom.** With Bugs 1–4 fixed, bystrandify still discarded a small
+but non-zero fraction of records under the same "0 PulseWidths"
+warning.
+
+**Root cause.** The PacBio uint8 frame-count codec uses values in
+`[1, 255]`; byte value `0` denotes "missing / invalid".
+`ccs-kinetics-bystrandify` discards any record containing a `0` in its
+kinetic arrays. The generator's log-space output occasionally rounds
+down to `0` (~0.1 – 0.3 % of positions per read).
+
+**Fix.** Clamp the four kinetic arrays to `≥ 1` immediately before
+`set_tag`, in both the sequential and the multiprocess paths of
 `kinsim_NN/generate.py`:
 
 ```python
@@ -45,243 +106,13 @@ np.maximum(ri, 1, out=ri)
 np.maximum(rp, 1, out=rp)
 ```
 
-**Lesson:** Five separate bystrandify-discard bugs in sequence, all
-surfacing the SAME misleading "0 PulseWidths" warning. The decisive
-diagnostic was not more byte-level diffing of OLD vs NEW (which
-converged to "structurally identical"), but a controlled-substitution
-experiment: replace NEW's records' kinetic VALUES with known-good
-constants and see if bystrandify accepts. That isolated the bug to
-the value distribution. Without the constant-fill test we would have
-kept hunting structural differences forever.
-
-The "0 in PacBio uint8 codec means invalid" rule belongs in the
-canonical unalign / BAM-emission recipe documented in
-`kinsim_NN/utils/bam_io.py`.
+**Lesson.** The decisive diagnostic was a controlled substitution
+(replace generated kinetics with a constant) rather than further
+structural diffing.
 
 ---
 
-## Bug 4 — `template_length=0` triggered bystrandify discard (formerly thought to be the root cause)
+## Aggregate effect
 
-**Symptom:** After fixing Bug 1 (flag=4), Bug 2 (SO:unknown), AND Bug 3
-(strip ip/pw), bystrandify STILL discarded 99.8 % of reads. Output BAM
-still 6.3 MB.
-
-**Diagnosis:** Side-by-side `samtools view` of one specific read
-(261166274/ccs) between the OLD working v12_run3 SIM.bam (passed
-bystrandify) and the NEW broken validate_bc2034_perreadz SIM.bam
-(rejected) — the only differing field across all 11 SAM columns + all
-tags was **TLEN (col 9)**:
-
-* OLD:  ``flag=4 ... TLEN=3960`` (= read length, left over from aligned input)
-* NEW:  ``flag=4 ... TLEN=0``    (my _unalign_read cleared it)
-
-Per BAM spec, TLEN is undefined for unmapped single-end reads — 0 is
-the "spec-correct" value. But ccs-kinetics-bystrandify apparently uses
-``TLEN > 0`` as a heuristic to detect "valid HiFi record" and silently
-discards records with TLEN=0 — with the same misleading "has 0
-PulseWidths" warning.
-
-**Fix:** stop clearing template_length in ``_unalign_read``. Match
-legacy ``kinsim/generate.py`` which never touches the field — TLEN
-stays at whatever the aligned input had (typically = seq length).
-
-```python
-# DON'T do this:
-#   read.template_length = 0   # ← triggers bystrandify rejection
-```
-
-Also: switched ``cigarstring=None`` to ``cigartuples=None`` to match
-legacy exactly. Both should work, but the legacy form is the proven one.
-
-**Lesson:** Four separate things contributed to bystrandify rejection,
-all surfacing the same misleading "0 PulseWidths" warning. Only a
-column-by-column ``samtools view`` diff between a known-working record
-and a broken one localised the actual root cause. The other three
-fixes were also necessary (without them, the output would have failed
-other validators downstream), but only the TLEN fix unblocked
-bystrandify.
-
-The methodology: when a downstream tool gives misleading errors,
-**diff a single record at the SAM/BAM level against a known-working
-sample**. Don't trust the warning text.
-
----
-
-## Bug 3 — pbmm2's `ip` / `pw` tags survived from aligned input
-
-**Symptom:** After fixing Bug 1 (flag=4) AND Bug 2 (SO:unknown),
-bystrandify STILL discarded 99.8 % of reads with the same misleading
-"has 0 PulseWidths" warning. Bystrandified BAM = 6.3 MB (vs 4 GB for the
-legacy `kinsim generate` chain).
-
-**Root cause:** The @RG DS field on every PacBio HiFi BAM (preserved
-from the original sequencer output via prep + align) declares:
-
-```
-DS:READTYPE=CCS;Ipd:CodecV1=ip;PulseWidth:CodecV1=pw;...
-```
-
-This tells downstream PacBio tools "kinetics live in ``ip`` and ``pw``
-tags", **not** in ``fi`` / ``fp`` / ``ri`` / ``rp``. ``fi`` / ``fp`` /
-``ri`` / ``rp`` are the legacy per-read tag names used on raw HiFi BAMs.
-pbmm2 align can convert those into per-strand ``ip`` / ``pw`` on the
-aligned output. When our input is the aligned BAM, the read may already
-carry stale ``ip`` / ``pw`` from pbmm2.
-
-kinsim_NN generate wrote fresh ``fi`` / ``fp`` / ``ri`` / ``rp`` over
-the existing read but **did not strip the stale ``ip`` / ``pw``**.
-ccs-kinetics-bystrandify obeys the @RG and reads ``pw`` for
-PulseWidths — finds it empty or invalid → discards the read with the
-"has 0 PulseWidths" warning.
-
-**Confirmation:** Legacy ``kinsim/generate.py`` explicitly strips ``ip``
-/ ``pw`` before writing (see comment at line ~1475: *"pbmm2 may have
-converted fi/fp/ri/rp → ip/pw on the aligned input. Strip ip/pw so
-downstream tools read our fresh fi/fp/ri/rp."*). Legacy chain produced
-4 GB bystrandified output. kinsim_NN didn't strip → 6 MB.
-
-**Fix:** `_unalign_read` now also strips ``ip`` / ``pw`` tags. Three
-clean lines:
-
-```python
-for stale in ("ip", "pw"):
-    if read.has_tag(stale):
-        read.set_tag(stale, None)
-```
-
-**Lesson:** When converting an aligned PacBio BAM into "raw HiFi
-shape" for downstream PacBio tooling, you cannot simply clear alignment
-fields — you must also strip alignment-induced tag rewrites. The @RG
-DS field decides which tag bystrandify obeys, not the tag-presence in
-the read.
-
-The misleading "0 PulseWidths" warning surfaced THREE separate bugs in
-sequence, each masked by the others. The actionable diagnostic is to
-diff the BAM record (header + flag + full tag set) against a
-known-working legacy ``kinsim generate`` output, NOT to trust the
-warning text.
-
----
-
-## Bug 2 — emit_unaligned kept `@HD SO:coordinate` on unaligned output (CRITICAL)
-
-**Symptom:** After fixing Bug 1 (flag=4), bystrandify STILL discarded
-99.8 % of reads with the same "has 0 PulseWidths" warning. Output BAM
-shrunk from 3.2 GB → 6.3 MB just like before.
-
-**Root cause:** The input was a coordinate-sorted aligned BAM
-(`@HD SO:coordinate`). `_sanitize_header_for_unaligned` stripped @SQ
-but left SO:coordinate intact. After unaligning every record, every
-read has ref_id=-1 / no CIGAR — there is no coordinate to sort by.
-bystrandify reads SO:coordinate, dispatches to its aligned-processing
-path, then rejects every record (which now lacks alignment fields)
-with the misleading "0 PulseWidths" warning.
-
-**Confirmation:** OLD validate run (v12_run3) used the legacy
-`kinsim generate` which natively writes unaligned output with
-`@HD SO:unknown`. Its bystrandified BAM = 4.0 GB (kept everything).
-NEW kinsim_NN bystrandified BAM (with SO:coordinate left over) =
-6.3 MB. Identical reads, identical tags, only SO differs.
-
-**Fix:** `_sanitize_header_for_unaligned` now also forces `SO:unknown`
-on the @HD entry, matching the canonical raw HiFi BAM shape.
-
-**Lesson:** Both Bug 1 ("0 PulseWidths" → wrong flag bit) and Bug 2
-("0 PulseWidths" → wrong SO header) hide behind the same misleading
-warning text. bystrandify's discard message is generic — debug by
-comparing the whole header + flag against a known-working BAM.
-
----
-
-## Bug 1 — `_unalign_read` wrote flag=12 instead of flag=4 (CRITICAL)
-
-**Symptom:** ccs-kinetics-bystrandify discarded 99.8 % of reads with the
-misleading log warning:
-
-```
-WARN | New read 'm84151_.../ccs/fwd' has '0' PulseWidths, discarding
-```
-
-Out of 124,446 SIM.bam reads, only ~250 made it into the bystrandified
-output (6.3 MB vs 3.2 GB input). The downstream chain (pbmm2 align →
-ipdSummary → pbmotifmaker) then ran on essentially nothing and produced
-0 motifs.
-
-**Root cause:** `kinsim_NN/generate.py::_unalign_read` set:
-
-```python
-read.is_unmapped = True
-read.is_reverse = False
-read.is_secondary = False
-read.is_supplementary = False
-read.mate_is_unmapped = True   # ← BUG
-read.is_proper_pair = False
-```
-
-`mate_is_unmapped = True` sets bit 8, giving flag = 4 + 8 = **12**.
-PacBio CCS reads are not paired — raw HiFi BAMs from the sequencer have
-flag = **4** exactly. ccs-kinetics-bystrandify uses the flag byte to
-validate the input is a real raw HiFi record; flag=12 fails the check
-and the read is discarded with the (misleading) PulseWidths warning.
-
-**Confirmed by diagnostic:** a discarded read (`261166274/ccs`) had
-qlen=3960, all four kinetic tags size=3960, ~all bytes non-zero, mean ~24,
-diverse value distribution. Data was perfect; only the flag was wrong.
-
-**Fix (commit pending):** set `read.flag = 4` directly. Clears all flag
-bits in one shot, including the mate_unmapped and is_reverse bits.
-Leaves the paired-end bits untouched because CCS reads aren't paired
-anyway.
-
-```python
-def _unalign_read(read):
-    read.flag = 4
-    read.reference_id = -1
-    read.reference_start = -1
-    read.mapping_quality = 0
-    read.cigarstring = None
-    read.next_reference_id = -1
-    read.next_reference_start = -1
-    read.template_length = 0
-```
-
-**Lesson:** "0 PulseWidths" was a red herring. Always confirm the flag
-byte matches the canonical raw HiFi shape (`samtools view -c -f 4`) when
-emitting unaligned BAMs for downstream PacBio tooling.
-
----
-
-## Observation — bystrandify message is misleading
-
-The warning text suggests a tag-content problem ("0 PulseWidths") when
-the real cause is flag validation. Worth keeping in mind when debugging
-future cases: don't trust the warning text, inspect the actual tags AND
-the flag.
-
----
-
-## Non-bugs verified during the same run
-
-* **Model output is good.** First sampled read fp values: min=0,
-  max=112, mean=23.74, 105 unique bytes — real model signal, not
-  default placeholder.
-* **Precompute path works.** 12.5 M model inferences across 32 z samples
-  filled the 1050 MB kin_map for ctg.s1; multiprocess workers correctly
-  looked up the cached values.
-* **REF path discrepancy** between `validate.sh` and reality —
-  validate.sh expects `pipeline/<sample>/<sample>_assembly.fasta`,
-  but for bc2034 the actual file is at `<sample>/final_assembly.fasta`.
-  Already handled by the `[ -f "$REF" ] || REF=...` fallback in
-  validate.sh; just noting it.
-
----
-
-## After-the-fact follow-ups (post-Friday)
-
-* The misleading bystrandify warning argues for a per-read flag
-  pre-flight check in the validate chain: assert all reads in SIM.bam
-  have flag=4 before submitting bystrandify, fail loudly otherwise.
-* The `mate_is_unmapped=True` mistake came from copy-pasting a standard
-  "make read unmapped" snippet that assumes paired-end. KinSim/kinsim_NN
-  generate is single-end CCS only — worth documenting the canonical
-  unalign recipe somewhere central (e.g. in `utils/bam_io.py`).
+End-to-end yield on the bc2034 test strain, after all five corrections,
+went from ~250 retained per-position kinetic calls to **16.7 million**.
