@@ -502,7 +502,7 @@ def _unalign_read(read: pysam.AlignedSegment) -> None:
     survive into our output, bystrandify reads them (obeying the @RG),
     finds junk/empty, and discards the read. Stripping them forces
     bystrandify back to the ``fi`` / ``fp`` / ``ri`` / ``rp`` tags we
-    actually wrote. (Matches the legacy ``kinsim/generate.py`` recipe.)
+    actually wrote.
 
     Clears: flag → 4, ref_id, ref_start, mapq, cigar, mate ref_id/start,
     tlen, plus any ``ip`` / ``pw`` tag. Preserves: query_name,
@@ -516,9 +516,9 @@ def _unalign_read(read: pysam.AlignedSegment) -> None:
     read.cigartuples = None
     read.next_reference_id = -1
     read.next_reference_start = -1
-    # Do NOT touch template_length: legacy kinsim/generate.py leaves it as
-    # the aligned input had it (typically = read length). ccs-kinetics-
-    # bystrandify treats TLEN=0 records as invalid and discards them
+    # Do NOT touch template_length: it is left as the aligned input had it
+    # (typically = read length). ccs-kinetics-bystrandify treats TLEN=0
+    # records as invalid and discards them
     # silently with the misleading "has 0 PulseWidths" warning. Diffing
     # OLD-working vs NEW-broken records, TLEN was the only differing SAM
     # field — every fix before this one (flag, SO, ip/pw strip) was
@@ -976,6 +976,15 @@ def generate(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("Device: %s", device)
 
+    # Seed every RNG before any consumer (the precompute path below draws
+    # latent noise via ``g.sample_z``, and the multiprocess workers each
+    # re-seed from this base — so the seeding has to precede every code
+    # path that consumes randomness, _load_generator included).
+    rng = random.Random(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
     g, model_cfg = _load_generator(ckpt_dir, device)
     n_meth_types = int(model_cfg["n_meth_types"])
     K = int(model_cfg["k"])
@@ -1008,10 +1017,6 @@ def generate(
         for r in ref_seqs
     )
     log.info("Total methylation sites across reference: %d", total_sites)
-
-    rng = random.Random(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
 
     # ----------------------------------------------------------------------
     # FAST PATH: precompute a per-contig kinetics map (one inference per K

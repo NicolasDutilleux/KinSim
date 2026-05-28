@@ -54,17 +54,17 @@ production cluster.
 | TensorBoard | 2.10 or above | `pyproject.toml` |
 | matplotlib | 3.8 or above | `pyproject.toml [plot]` |
 | EMBOSS fuzznuc | 6.6.0 | system binary on the cluster |
-| SMRT-Link | 25.1 | `slurm/callers/ipdsummary.slurm` (Apptainer / SIF) |
-| `ipdSummary` (kineticsTools) | 3.0 (SP3-C3 model) | shipped with SMRT-Link 25.1 |
-| `pbmotifmaker` | shipped with SMRT-Link 25.1 | shipped with SMRT-Link 25.1 |
-| `pbmm2` | shipped with SMRT-Link 25.1 | shipped with SMRT-Link 25.1 |
-| `ccs-kinetics-bystrandify` | shipped with SMRT-Link 25.1 | shipped with SMRT-Link 25.1 |
+| SMRT-Link Apptainer image | 25.3 | `pacbio-smrt-tools-25.3.sif` (cluster) |
+| `pbmm2`, `ccs-kinetics-bystrandify`, `samtools`, `pbindex` | shipped with SMRT-Link 25.3 SIF | `slurm/prep/*.slurm`, jasmine wrapper |
+| `ipdSummary` (kineticsTools) | 3.0, SP3-C3 model, **from SMRT-Link 25.1** | L. Falquet install — `slurm/callers/ipdsummary.slurm` (matches his reference detection rates on the production corpus) |
+| `pbmotifmaker` | shipped with SMRT-Link 25.1 | same Falquet install |
 | `jasmine` | to be pinned from the cluster | `slurm/callers/jasmine_modkit.slurm` |
 | `modkit` | to be pinned from the cluster | `slurm/callers/jasmine_modkit.slurm` |
 
-The PacBio binaries (`ipdSummary`, `pbmotifmaker`, `pbmm2`,
-`ccs-kinetics-bystrandify`) are not pip-installable; they are routed
-through the SMRT-Link 25.1 Apptainer image from the SLURM scripts.
+The PacBio binaries are not pip-installable. Most are routed through
+the SMRT-Link 25.3 Apptainer SIF on the cluster; `ipdSummary` and
+`pbmotifmaker` are pinned to SMRT-Link 25.1 to match the reference
+detection rates of the production pipeline.
 
 ---
 
@@ -99,7 +99,7 @@ PacBio methylation-calling chain.
 ## Command-line interface
 
 ```text
-kinsim_nn extract <manifest.csv> <out_dir> [--task <i>] [--config <yaml>]
+kinsim_nn extract  --manifest <csv> --output-dir <dir> [--task <i>] [--config <yaml>]
 kinsim_nn train    <shards_dir> <ckpt_dir> [--resume] [--config <yaml>]
 kinsim_nn generate <input.bam> <ref.fa> <ckpt_dir> <motifs.csv> <out.bam>
 kinsim_nn evaluate <ckpt_dir> <shards_dir> --output-prefix <prefix>
@@ -110,7 +110,7 @@ kinsim_nn analyze  <shards_dir_or_file> [--output-dir <dir>] [--no-html]
 
 ```bash
 # 1. Extract shards from the production manifest, one SLURM array task per strain.
-sbatch --array=0-N slurm/prep/... kinsim_nn extract manifest.csv shards/ --task ${SLURM_ARRAY_TASK_ID}
+kinsim_nn extract --manifest manifest.csv --output-dir shards/ --task ${SLURM_ARRAY_TASK_ID}
 
 # 2. Train.
 kinsim_nn train shards/ ckpts/ --config kinsim_nn_config.yaml

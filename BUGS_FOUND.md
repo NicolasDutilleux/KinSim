@@ -116,3 +116,88 @@ structural diffing.
 
 End-to-end yield on the bc2034 test strain, after all five corrections,
 went from ~250 retained per-position kinetic calls to **16.7 million**.
+
+---
+
+# Bugs found during code review (post-pipeline-validation)
+
+A subsequent code-review pass surfaced four correctness defects in the
+extraction, evaluation, and generation paths that were independent of
+the BAM-emission boundary bugs above. All four are now corrected.
+
+## Bug 6 — Jasmine MM/ML labeler mis-indexed C positions on reverse-mapped reads
+
+**Symptom.** Approximately half of the 5mC calls produced by
+`JasmineMMMLLabeler` were placed at incorrect reference positions on
+reverse-mapped reads.
+
+**Root cause.** Per the SAM specification, the `MM` tag enumerates
+modified-base positions in the **original (forward) read orientation**,
+regardless of the alignment direction. The labeler enumerated C
+positions in `query_sequence`, which `pysam` reverse-complements when
+`read.is_reverse` is set. For those reads, the C indices used to decode
+MM deltas no longer corresponded to the bases MM was describing.
+
+**Fix.** When `read.is_reverse`, enumerate C positions in
+`read.get_forward_sequence()` (the original CCS orientation) and convert
+each forward-frame index to its BAM-SEQ index (`n − 1 − i`) for the
+alignment lookup. Forward-mapped reads are unchanged.
+
+**Lesson.** Tags that the SAM specification defines in the
+original-read frame must not be indexed via `query_sequence` for
+reverse-mapped records.
+
+## Bug 7 — Baseline samples double-counted in the held-out W1 evaluation
+
+**Symptom.** The `w1_baseline` and `w1_overall` metrics were
+systematically inflated relative to the per-meth W1 buckets, making
+cross-bucket comparison meaningless.
+
+**Root cause.** Both the in-training evaluator
+(`kinsim_NN.train._evaluate_on_shards`) and the standalone
+`kinsim_NN.evaluate` appended *two* values (channels 0 and 2) to the
+baseline pool while methylation buckets received only one. Baselines
+were therefore weighted twice in the pool.
+
+**Fix.** Append exactly one value per sample to every bucket. The
+baseline branch now uses channel 0 only, picked deterministically so
+the bucketing is reproducible across runs.
+
+## Bug 8 — Palindromic methylation sites dropped from the held-out W1 evaluation
+
+**Symptom.** Roughly half of the methylated-position signal on
+palindromic motifs (e.g. m6A on both strands of `GATC`) was silently
+omitted from the eval pool.
+
+**Root cause.** The same evaluator used an `if mf > 0 / elif mr > 0`
+chain that picked only one strand when both were methylated. On
+palindromic motifs this discarded the contribution of the other
+strand. In Strepto, where palindromic sites dominate, the loss was
+substantial.
+
+**Fix.** Replace the `elif` with an independent `if`: when both
+strands carry a methylation, append to both per-meth buckets. The
+per-category bucket still receives only one contribution per sample.
+
+## Bug 9 — Generator RNG seeded after the precompute path consumed randomness
+
+**Symptom.** `kinsim_nn generate --seed N` did not produce
+byte-reproducible BAM output across runs that used the precompute fast
+path.
+
+**Root cause.** `torch.manual_seed`, `np.random.seed`, and
+`random.Random(seed)` were called after `_load_generator` and after
+ancillary helpers that may consume PRNG state. Although in the current
+code path no consumer actually drew before the seed call, the ordering
+was load-bearing and brittle.
+
+**Fix.** Move the seeding to the top of `kinsim_NN.generate.generate`,
+immediately after `setup_logging` and before any other call. Also
+seed `torch.cuda.manual_seed_all` to cover CUDA streams.
+
+## Aggregate effect (bugs 6–9)
+
+The held-out W1 estimates produced after bugs 7 and 8 are corrected
+are directly comparable across buckets, the 5mC subset of labelled
+positions now reflects the jasmine catalogue without orientation bias,
+and `kinsim_nn generate --seed N` is reproducible end-to-end.

@@ -1,29 +1,35 @@
-# requirements.lock.txt — exact versions used to train and validate
-# the production KinSim model (v0.4.0+).
+# requirements.lock.txt — exact pinned versions for reproducing the
+# production KinSim environment.
 #
-# This file is meant to be regenerated from the cluster `kinsim_env`
-# conda environment at the commit that produced the checkpoint. To
-# refresh:
+# This file is intentionally empty in the repository. The authoritative
+# pin set lives on the production cluster (conda env `kinsim_env`) and
+# must be regenerated from there to capture the exact PyTorch wheel,
+# pysam, and TensorBoard versions used to train the current checkpoint:
 #
-#     ssh ndutilleux@login8.ibu.unibe.ch
+#     ssh <cluster>
 #     conda activate kinsim_env
 #     pip freeze > requirements.lock.txt
 #
-# A reviewer can reproduce the env with:
+# Reproducing the environment locally from the regenerated file:
 #
 #     python -m venv .venv && . .venv/bin/activate
 #     pip install -r requirements.lock.txt
 #     pip install -e .
 #
 # Notes:
-#   - PyTorch wheel index depends on the local CUDA stack — the cluster
-#     uses CUDA 12.1 wheels. For CPU-only reproduction strip the
-#     `+cu121` suffix or pin from `https://download.pytorch.org/whl/cpu`.
-#   - EMBOSS fuzznuc (used by `kinsim.utils.motifs`) is a system binary,
-#     not a Python package. Cluster build: EMBOSS 6.6.0.
-#   - SMRT-Tools (`ccs-kinetics-bystrandify`, `ipdSummary`, `pbmm2`,
-#     `jasmine`) are routed through the SMRTlink 25.1 apptainer; not
-#     installable via pip.
-#
-# Until refreshed from the cluster, the only authoritative version
-# constraints are in pyproject.toml.
+#   - The PyTorch wheel index depends on the local CUDA stack. The
+#     cluster uses CUDA 12.1 wheels; for CPU-only reproduction, drop
+#     any `+cu121` suffix and pin from
+#     https://download.pytorch.org/whl/cpu.
+#   - EMBOSS fuzznuc (used by `kinsim_NN.utils.motifs`) is a system
+#     binary and is not pip-installable. Cluster install: EMBOSS 6.6.0.
+#   - The PacBio binaries (`ccs-kinetics-bystrandify`, `pbmm2`,
+#     `ipdSummary`, `pbmotifmaker`) ship with SMRT-Link. The cluster
+#     uses two SMRT-Link installs: the Apptainer image
+#     `pacbio-smrt-tools-25.3.sif` (default for prep, alignment, jasmine
+#     bystrandify wrapper) and L. Falquet's SMRT-Link 25.1 install for
+#     `ipdSummary` and `pbmotifmaker` to match his reference detection
+#     rates on the production corpus.
+#   - `jasmine` and `modkit` are invoked from the conda environment;
+#     their exact versions should be captured by `pip freeze` and
+#     `jasmine --version` / `modkit --version`.

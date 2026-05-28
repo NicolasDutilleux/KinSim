@@ -200,7 +200,7 @@ def iter_window_samples(
 ) -> Iterator[WindowSample]:
     """Iterate per-ZMW bilateral samples covering the requested window.
 
-    **Canonical strand convention** (matches ``kinsim2/extract.py``):
+    **Canonical strand convention** used throughout kinsim_NN:
 
         ``ipd_fwd[ref_pos]`` = IPD measured during synthesis when the
         polymerase used the **+ reference strand** as template, i.e.

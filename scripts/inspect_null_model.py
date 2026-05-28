@@ -6,9 +6,9 @@ methylation. Understanding this model is key to understanding the signal
 KinSim needs to reproduce.
 
 CLI usage:
-    kinsim inspect-model /path/to/SP3-C3.npz.gz
-    kinsim inspect-model /path/to/SP3-C3.npz.gz --output report.txt
-    kinsim inspect-model /path/to/SP3-C3.npz.gz --dump-csv null_model.csv
+    python scripts/inspect_null_model.py /path/to/SP3-C3.npz.gz
+    python scripts/inspect_null_model.py /path/to/SP3-C3.npz.gz --output report.txt
+    python scripts/inspect_null_model.py /path/to/SP3-C3.npz.gz --dump-csv null_model.csv
 
 What the null model contains (typically):
     - Per-context (kmer) expected mean IPD in native space
@@ -169,7 +169,7 @@ def inspect_model(path: str, dump_csv: str | None = None) -> str:
 
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
-        prog="kinsim inspect-model",
+        prog="python scripts/inspect_null_model.py",
         description="Inspect a PacBio ipdSummary null model file.",
     )
     parser.add_argument("model_path", help="Path to .npz.gz or .npz null model file")

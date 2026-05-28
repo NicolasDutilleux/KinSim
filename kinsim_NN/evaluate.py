@@ -125,24 +125,29 @@ def evaluate(
             real_centers = shard.signal[start:stop, half]      # (B, 4) = (IPD_fwd, PW_fwd, IPD_rev, PW_rev)
             mf_center = shard.meth_fwd[start:stop, half]
             mr_center = shard.meth_rev[start:stop, half]
-            # Pool from the IPD channel matching the strand of the methylation:
-            # meth_fwd > 0 → IPD_fwd (ch 0); meth_rev > 0 → IPD_rev (ch 2).
-            # Baseline (both zero) → BOTH channels (pool fwd AND rev so under-fit
-            # of either is visible in W1).
+            # Strand pooling per sample (same rules as the in-training eval
+            # in train.py): every sample contributes exactly one value per
+            # bucket so per-meth_id W1 estimates are comparable across
+            # buckets. Palindromic sites (both meth_fwd > 0 AND meth_rev > 0)
+            # contribute to BOTH the fwd-meth and the rev-meth buckets so
+            # neither strand is silently dropped.
             for i in range(real_centers.shape[0]):
+                added = False
                 if mf_center[i] > 0:
                     m_id = int(mf_center[i])
                     pooled_real[m_id].append(int(real_centers[i, 0]))
                     pooled_gen[m_id].append(int(gen_centers[i, 0]))
-                elif mr_center[i] > 0:
+                    added = True
+                if mr_center[i] > 0:
                     m_id = int(mr_center[i])
                     pooled_real[m_id].append(int(real_centers[i, 2]))
                     pooled_gen[m_id].append(int(gen_centers[i, 2]))
-                else:
+                    added = True
+                if not added:
+                    # Baseline: deterministic strand pick (channel 0) keeps
+                    # the baseline count equal to the per-meth count.
                     pooled_real[0].append(int(real_centers[i, 0]))
                     pooled_gen[0].append(int(gen_centers[i, 0]))
-                    pooled_real[0].append(int(real_centers[i, 2]))
-                    pooled_gen[0].append(int(gen_centers[i, 2]))
 
     # Write summary TSV
     out = Path(str(output_prefix) + "_stats.tsv")

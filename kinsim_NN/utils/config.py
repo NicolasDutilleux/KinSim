@@ -75,21 +75,25 @@ class SplitParams:
 
 @dataclass(frozen=True)
 class GeneratorParams:
-    d_model: int = 192
-    n_layers: int = 6
-    n_heads: int = 6
-    z_dim: int = 64
+    # Defaults aligned with kinsim_nn_config.yaml. Editing these here does
+    # not change a run that reads the YAML (the YAML wins), but a fresh
+    # KinsimNNConfig built without a YAML now produces the canonical
+    # ~12 M-parameter generator instead of the older small variant.
+    d_model: int = 256
+    n_layers: int = 8
+    n_heads: int = 8
+    z_dim: int = 128
     drop_rate: float = 0.0
-    pos_embed_dim: int = 16
+    pos_embed_dim: int = 32
 
 
 @dataclass(frozen=True)
 class DiscriminatorParams:
-    d_model: int = 128
-    n_layers: int = 4
-    n_heads: int = 4
+    d_model: int = 192
+    n_layers: int = 6
+    n_heads: int = 6
     spectral_norm: bool = True
-    pos_embed_dim: int = 16
+    pos_embed_dim: int = 32
     drop_rate: float = 0.0
 
 
@@ -109,12 +113,15 @@ class TrainParams:
     lr_d: float = 4e-4
     beta1: float = 0.0
     beta2: float = 0.9
-    n_steps: int = 200_000
+    # Aligned with kinsim_nn_config.yaml. ``num_workers = 2`` reflects the
+    # measured RAM ceiling on the production cluster (8 workers OOM'd at
+    # 200 GB per node).
+    n_steps: int = 500_000
     checkpoint_every: int = 5000
     eval_every: int = 5000
     log_every: int = 100
     seed: int = 42
-    num_workers: int = 4
+    num_workers: int = 2
     pin_memory: bool = True
 
 

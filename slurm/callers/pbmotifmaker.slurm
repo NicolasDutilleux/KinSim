@@ -55,11 +55,10 @@ T=$(date +%s)
 # --min-score threshold. Falquet's legacy motifs.csv has meanScores 46.9-65.0
 # (pb_microbial_analysis cromwell workflow uses an internal low threshold).
 # Standalone pbmotifmaker default is 100 — too strict, gets 1 motif.
-# * --min-score 40 would catch all 9 legacy motifs but takes > 2h per sample
-#   (combinatorial blowup of candidates to evaluate at low threshold).
-# * --min-score 50 catches 8/9 (misses only VVRCNKNNNND at meanScore 47.4,
-#   fraction 2.7% = noise anyway), runs in ~75 min per sample.
-# 50 is the best time-vs-sensitivity tradeoff. Override via env var.
+# Default 40 maximises sensitivity (recovers all 9 legacy motifs on the
+# reference strain) at the cost of runtime (>2h per sample). Override
+# with MOTIFMAKER_MIN_SCORE=50 if the queue does not allow that wall time;
+# 50 still recovers 8/9 legacy motifs in ~75 min per sample.
 MOTIFMAKER_MIN_SCORE=${MOTIFMAKER_MIN_SCORE:-40}
 "$FALQUET_PBMM" find --min-score "$MOTIFMAKER_MIN_SCORE" \
     "$REF" "$GFF" "$OUT_CSV"

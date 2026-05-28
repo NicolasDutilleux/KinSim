@@ -37,12 +37,17 @@ jobs:
         with:
           enable-cache: false
           python-version: ${{ matrix.python }}
-      # Install with the [ml] extra disabled to avoid pulling torch in CI:
-      # tests under tests/ exercise pure-numpy code paths only.
+      # The smoke tests exercise both pure-numpy paths and tiny torch forward
+      # passes (the generator/critic instantiation tests), so torch is required.
+      # The CPU-only PyTorch wheel index is forced to avoid pulling the CUDA
+      # build on a GitHub runner that has no GPU.
       - name: Install package
-        run: uv pip install --system -e ".[plot]" pytest pytest-cov
+        run: |
+          uv pip install --system --index-strategy unsafe-best-match \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            -e ".[plot]" pytest pytest-cov
       - name: Run tests
-        run: pytest --cov=kinsim --cov=prep --cov-report=xml -v
+        run: pytest --cov=kinsim_NN --cov-report=xml -v
       - name: Upload coverage
         if: matrix.python == '3.12'
         uses: actions/upload-artifact@v4

@@ -12,8 +12,12 @@ array size:
     N=$(python scripts/manifest.py count manifest.csv)
     sbatch --array=0-$((N-1)) kinsim_extract.slurm manifest.csv shards/
 
-The manifest CSV columns are ``sample_id, bam_path, motifs`` with optional
-``ref_path``. Comment rows starting with ``#`` and blank rows are skipped.
+The manifest CSV columns are ``sample_id`` (required), ``bam_path``
+(required), and ``ref_path`` (required for `kinsim_nn extract`).
+Methylation labels are located by the labeler ``file_pattern`` field in
+the YAML (typically ``{strain_dir}/motifs.gff``); there is no ``motifs``
+column on this manifest. Comment rows starting with ``#`` and blank
+rows are skipped.
 """
 from __future__ import annotations
 
@@ -54,7 +58,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if not rows:
         print("(empty manifest)")
         return 0
-    cols = ["sample_id", "bam_path", "motifs", "ref_path"]
+    cols = ["sample_id", "bam_path", "ref_path"]
     print("\t".join(cols))
     for r in rows:
         print("\t".join(r.get(c, "") for c in cols))

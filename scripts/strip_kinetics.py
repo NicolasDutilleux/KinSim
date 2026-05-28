@@ -4,7 +4,7 @@ Copies the input BAM to a new file then removes the four PacBio kinetic tags
 from every read in the copy.  The original BAM is never modified.
 
 CLI:
-    kinsim strip-kinetics <input.bam> <output.bam>
+    python scripts/strip_kinetics.py <input.bam> <output.bam>
 """
 
 import argparse
@@ -23,7 +23,7 @@ def strip_kinetics(input_bam: str, output_bam: str) -> None:
 
     All other tags (RG, np, rq, zm, ...) and alignment records are preserved
     unchanged.  Only the four PacBio kinetic tags are stripped so that
-    ``kinsim generate`` can inject fresh synthetic kinetics.
+    ``kinsim_nn generate`` can inject fresh synthetic kinetics.
 
     Args:
         input_bam:  Source BAM (never modified).
@@ -55,11 +55,11 @@ def main(argv=None):
         argv = sys.argv[1:]
 
     parser = argparse.ArgumentParser(
-        prog="kinsim strip-kinetics",
+        prog="python scripts/strip_kinetics.py",
         description=(
             "Copy a PacBio BAM and remove fi/fp/ri/rp kinetic tags from the copy.\n"
             "The original BAM is never touched.\n\n"
-            "Use this before 'kinsim generate' when you want to replace real kinetics\n"
+            "Use this before 'kinsim_nn generate' when you want to replace real kinetics\n"
             "with synthetic ones while keeping the read sequences and alignments."
         ),
     )

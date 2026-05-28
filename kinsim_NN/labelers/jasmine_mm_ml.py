@@ -134,14 +134,30 @@ class JasmineMMMLLabeler(BaseLabeler):
                 qseq = read.query_sequence
                 if qseq is None:
                     continue
-                # Find C positions in the (synthesized strand) query sequence
-                c_positions = [i for i, b in enumerate(qseq) if b in "Cc"]
+                # The MM tag is in ORIGINAL (forward) read orientation per
+                # the SAM specification, regardless of how the aligner stored
+                # SEQ. For forward-mapped reads, BAM SEQ equals the original
+                # sequence and MM C-positions correspond to C positions in
+                # qseq directly. For reverse-mapped reads, BAM SEQ is the
+                # reverse complement of the original; we enumerate Cs in the
+                # forward sequence (the frame MM uses) and convert each
+                # position to its BAM-SEQ index for the alignment lookup.
+                if read.is_reverse:
+                    fwd_seq = read.get_forward_sequence()
+                    if fwd_seq is None:
+                        continue
+                    n = len(qseq)
+                    c_positions = [
+                        n - 1 - i for i, b in enumerate(fwd_seq) if b in "Cc"
+                    ]
+                else:
+                    c_positions = [i for i, b in enumerate(qseq) if b in "Cc"]
                 if not c_positions:
                     continue
                 calls = self._decode_mm_ml(read, c_positions)
                 if not calls:
                     continue
-                # Map query → ref via aligned pairs
+                # Map query → ref via aligned pairs (BAM-SEQ-indexed).
                 pairs = read.get_aligned_pairs(matches_only=True)
                 q_to_r = {q: r for q, r in pairs}
                 strand = "-" if read.is_reverse else "+"

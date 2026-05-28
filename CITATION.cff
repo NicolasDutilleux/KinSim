@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-title: "KinSim: PacBio HiFi kinetic signal simulator for methylation-aware metagenomic binning"
+title: "KinSim: PacBio HiFi kinetic signal generator for methylation-aware metagenomic binning"
 message: "If you use KinSim in your work, please cite this software."
 type: software
 authors:
@@ -10,26 +10,21 @@ authors:
 repository-code: "https://github.com/NicolasDutilleux/KinSim"
 url: "https://github.com/NicolasDutilleux/KinSim"
 license: MIT
-version: 0.4.0
-date-released: 2026-05-04
+version: 1.0.0
+date-released: 2026-05-28
 keywords:
   - PacBio
   - kinetics
   - methylation
   - metagenomics
-  - simulator
+  - generative model
   - bioinformatics
 abstract: >
-  KinSim learns per-context IPD/PW kinetic distributions from real PacBio HiFi
-  reads and injects realistic kinetic signals into PBSIM3-simulated reads.
-  Output BAMs carry standard PacBio fi/fp tags, usable by any downstream
-  tool that consumes kinetic information (modkit, ipdSummary, jasmine,
-  motif callers).
-references:
-  - type: software
-    title: "Claude (Anthropic) — AI coding assistant via Claude Code CLI"
-    notes: >
-      Used throughout development for code vectorisation, CLI scaffolding,
-      and architecture review. Scientific decisions and final integration
-      by the author. See README "Acknowledgements" section for details.
-    url: "https://www.anthropic.com/claude"
+  KinSim is a generative tool that injects biologically realistic PacBio HiFi
+  kinetic signals (Inter-Pulse Duration and Pulse Width) into a target BAM,
+  conditioned on the local sequence context and per-position methylation
+  state. It is a conditional WGAN-GP with a transformer generator and a
+  transformer critic, trained on real bystrandified BAMs from production
+  Streptomyces and Vega corpora and validated end-to-end through the
+  PacBio analytical chain (ccs-kinetics-bystrandify, pbmm2, ipdSummary,
+  pbmotifmaker, jasmine, modkit).

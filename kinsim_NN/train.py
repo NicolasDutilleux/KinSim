@@ -34,7 +34,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from . import __version__
 from .data.dataset import MultiShardDataset, ShardedDataset, list_shards
-from .data.shard import read_shard
+from .data.shard import SHARD_CONFIG_VERSION, read_shard
 from .models.discriminator import TransformerDiscriminator
 from .models.generator import TransformerGenerator
 from .utils.config import KinsimNNConfig, load_config, setup_logging
@@ -67,7 +67,7 @@ def _save_model_config(ckpt_dir: Path, cfg: KinsimNNConfig) -> None:
         "kinsim_nn_version": __version__,
         "git_sha": _git_sha(),
         "timestamp_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-        "config_version": "kinsim_NN-1",
+        "config_version": SHARD_CONFIG_VERSION,
         "k": cfg.window.k,
         "half_width": cfg.window.half_width,
         "n_channels": cfg.window.n_channels,
@@ -229,33 +229,42 @@ def _evaluate_on_shards(
         mr = shard.meth_rev[idxs, half]
         cats = shard.category[idxs]
         for i in range(real_u8.shape[0]):
-            # Bilateral pooling: meth on a strand → that strand's IPD only.
-            # Baseline (both zero) → BOTH channels so under-fit of either is
-            # visible in W1.
+            # Strand pooling: every sample contributes EXACTLY ONE value per
+            # bucket so per-bucket W1 estimates are comparable across buckets
+            # (an earlier version double-counted baselines on both channels,
+            # which biased w1_baseline against per-meth W1s).
+            #
+            # For palindromic sites where both meth_fwd > 0 and meth_rev > 0
+            # (e.g. m6A on both strands of GATC), we add the sample to BOTH
+            # the fwd-meth and the rev-meth buckets so neither strand's
+            # contribution is silently discarded.
+            cat = int(cats[i])
+            contributed = False
             if mf[i] > 0:
                 m_id = int(mf[i])
                 real_by_m.setdefault(m_id, []).append(int(real_u8[i, 0]))
                 gen_by_m.setdefault(m_id, []).append(int(gen_u8[i, 0]))
-                strand_real = int(real_u8[i, 0])
-                strand_gen = int(gen_u8[i, 0])
-            elif mr[i] > 0:
+                if not contributed and cat in real_by_cat:
+                    real_by_cat[cat].append(int(real_u8[i, 0]))
+                    gen_by_cat[cat].append(int(gen_u8[i, 0]))
+                    contributed = True
+            if mr[i] > 0:
                 m_id = int(mr[i])
                 real_by_m.setdefault(m_id, []).append(int(real_u8[i, 2]))
                 gen_by_m.setdefault(m_id, []).append(int(gen_u8[i, 2]))
-                strand_real = int(real_u8[i, 2])
-                strand_gen = int(gen_u8[i, 2])
-            else:
+                if not contributed and cat in real_by_cat:
+                    real_by_cat[cat].append(int(real_u8[i, 2]))
+                    gen_by_cat[cat].append(int(gen_u8[i, 2]))
+                    contributed = True
+            if mf[i] == 0 and mr[i] == 0:
+                # Baseline: deterministic strand pick keeps the per-bucket
+                # count equal to the per-meth count. Channel 0 (fwd IPD) is
+                # always used so the bucketing is reproducible across runs.
                 real_by_m.setdefault(0, []).append(int(real_u8[i, 0]))
                 gen_by_m.setdefault(0, []).append(int(gen_u8[i, 0]))
-                real_by_m.setdefault(0, []).append(int(real_u8[i, 2]))
-                gen_by_m.setdefault(0, []).append(int(gen_u8[i, 2]))
-                strand_real = int(real_u8[i, 0])  # arbitrary; baseline either-strand
-                strand_gen = int(gen_u8[i, 0])
-            # Per-category bucketing (uses the SAME strand pick as per-meth-id)
-            cat = int(cats[i])
-            if cat in real_by_cat:
-                real_by_cat[cat].append(strand_real)
-                gen_by_cat[cat].append(strand_gen)
+                if cat in real_by_cat:
+                    real_by_cat[cat].append(int(real_u8[i, 0]))
+                    gen_by_cat[cat].append(int(gen_u8[i, 0]))
     g.train()
     out: dict[str, float] = {}
     all_real, all_gen = [], []

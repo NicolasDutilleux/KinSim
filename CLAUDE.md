@@ -88,12 +88,15 @@ Per row of length `K = 21`:
 ## CLI
 
 ```
-kinsim_nn extract <manifest.csv> <out_dir> [--task <i>] [--config <yaml>]
-kinsim_nn train <shards_dir> <ckpt_dir> [--resume] [--config <yaml>]
+kinsim_nn extract  --manifest <csv> --output-dir <dir> [--task <i>] [--config <yaml>]
+kinsim_nn train    <shards_dir> <ckpt_dir> [--resume] [--config <yaml>]
 kinsim_nn generate <input.bam> <ref.fa> <ckpt_dir> <motifs.csv> <out.bam>
 kinsim_nn evaluate <ckpt_dir> <shards_dir> --output-prefix <prefix>
-kinsim_nn analyze <shards_dir_or_file> [--output-dir <dir>] [--no-html]
+kinsim_nn analyze  <shards_dir_or_file> [--output-dir <dir>] [--no-html]
 ```
+
+Note: `extract` takes named flags (`--manifest`, `--output-dir`); every
+other subcommand is positional.
 
 ## SLURM building blocks (kept for the validation chain)
 
