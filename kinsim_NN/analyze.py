@@ -122,12 +122,16 @@ def accumulate_shard(shard: ShardData, sample_cap_per_offset_bucket: int = 5000)
     ipd_u8 = _active_strand_ipd(shard)
     ipd_frames = FRAMES_TABLE[ipd_u8].astype(np.float32)
 
-    # Offset range comes from the shard metadata, not a hard-coded 0..10.
-    # If a future config bumps ``extract.near_meth_max_dist`` past 10, the
-    # full range is preserved here. Falls back to 10 for older shards that
-    # did not persist the field.
+    # Offset range comes from the shard metadata. The current extraction
+    # uses the bilateral window [-near_meth_max_dist, +near_meth_max_dist];
+    # older shards that only emitted downstream offsets are detected by
+    # inspecting the minimum parent_offset seen in the data and rendering
+    # the unilateral range accordingly.
     near_max = int(shard.meta.get("near_meth_max_dist", 10))
-    offset_range = list(range(0, near_max + 1))
+    if poff.size and int(poff.min()) < 0:
+        offset_range = list(range(-near_max, near_max + 1))
+    else:
+        offset_range = list(range(0, near_max + 1))
 
     for cat in (0, 1, 2):
         mask = cats == cat
@@ -196,13 +200,16 @@ def build_html_report(
     meth_name_by_id: dict[int, str],
     out_path: Path,
     near_meth_max_dist: int = 10,
+    bilateral_offsets: bool = True,
 ) -> None:
     """Generate an HTML dashboard from accumulated stats.
 
-    ``near_meth_max_dist`` controls the offset range plotted on the
-    per-meth-trajectory and counts-heatmap figures. Defaults to 10 so
-    older shards that did not persist the field still render the
-    historical 0..10 range.
+    ``near_meth_max_dist`` controls the half-width of the offset range
+    plotted on the per-meth-trajectory and counts-heatmap figures.
+    ``bilateral_offsets`` selects between the bilateral range
+    ``[-near_meth_max_dist, +near_meth_max_dist]`` (current extraction)
+    and the historical unilateral ``[0, +near_meth_max_dist]`` range
+    used on older shards.
     """
     try:
         import plotly.graph_objects as go
@@ -212,7 +219,10 @@ def build_html_report(
         sys.exit(2)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    offsets_range = list(range(0, near_meth_max_dist + 1))
+    if bilateral_offsets:
+        offsets_range = list(range(-near_meth_max_dist, near_meth_max_dist + 1))
+    else:
+        offsets_range = list(range(0, near_meth_max_dist + 1))
     n_offsets = len(offsets_range)
 
     # ---- Aggregate across strains ----
@@ -370,12 +380,14 @@ def build_html_report(
     figs_html.append(fig4.to_html(full_html=False, include_plotlyjs=False))
 
     # ---- Fig 5: counts heatmap per (parent_meth, parent_offset) ----
+    # Column index = position of the offset in offsets_range (not the offset
+    # value itself), so the matrix indexing works with negative offsets too.
     fig5_data_slowed = np.zeros((len(meth_ids_in_data), n_offsets), dtype=np.int64)
     fig5_data_nm = np.zeros((len(meth_ids_in_data), n_offsets), dtype=np.int64)
     for i, m in enumerate(meth_ids_in_data):
-        for off in offsets_range:
-            fig5_data_slowed[i, off] = total_counts_by_offset.get((CATEGORY_SLOWED, m, off), 0)
-            fig5_data_nm[i, off] = total_counts_by_offset.get((CATEGORY_NEAR_METH, m, off), 0)
+        for j, off in enumerate(offsets_range):
+            fig5_data_slowed[i, j] = total_counts_by_offset.get((CATEGORY_SLOWED, m, off), 0)
+            fig5_data_nm[i, j] = total_counts_by_offset.get((CATEGORY_NEAR_METH, m, off), 0)
     fig5 = make_subplots(rows=1, cols=2, subplot_titles=("SLOWED counts", "NEAR_METH counts"))
     meth_labels = [meth_name_by_id.get(m, f"meth_{m}") for m in meth_ids_in_data]
     fig5.add_trace(
@@ -483,6 +495,7 @@ def main(argv=None):
 
     per_strain: list[StrainStats] = []
     near_meth_max_dist: int = 10
+    bilateral_offsets: bool = True
     for i, p in enumerate(shards, 1):
         log.info("[%d/%d] Reading %s", i, len(shards), p.name)
         try:
@@ -494,9 +507,12 @@ def main(argv=None):
             log.warning("Empty shard: %s", p.name)
             continue
         # All shards in a corpus share the same extraction geometry; take
-        # the first non-empty shard's value to drive the plot range.
+        # the first non-empty shard's value to drive the plot range. The
+        # sign of the minimum parent_offset disambiguates between the new
+        # bilateral extraction range and the historical downstream-only one.
         if not per_strain:
             near_meth_max_dist = int(shard.meta.get("near_meth_max_dist", 10))
+            bilateral_offsets = bool(shard.parent_offset.size and int(shard.parent_offset.min()) < 0)
         stats = accumulate_shard(shard)
         log.info("  %s: B=%d  S=%d  N=%d",
                  stats.strain_id,
@@ -514,6 +530,7 @@ def main(argv=None):
     build_html_report(
         per_strain, meth_name_by_id, out_dir / "report.html",
         near_meth_max_dist=near_meth_max_dist,
+        bilateral_offsets=bilateral_offsets,
     )
 
     log.info("Done. Open %s in a browser.", out_dir / "report.html")

@@ -15,8 +15,12 @@ The pickle contains a dict with these arrays (all length N):
                                          (the "none" methylation id collides numerically
                                          but is unreachable as a parent — parent_meth
                                          is only meaningful when category > 0)
-    parent_offset int8   (N,)           offset from parent meth; 0 for BASELINE samples
-                                         (same sentinel-overlap remark as parent_meth)
+    parent_offset int8   (N,)           offset from parent meth in the bilateral
+                                         range [-near_meth_max_dist, +near_meth_max_dist];
+                                         0 for BASELINE samples (same sentinel-overlap
+                                         remark as parent_meth). Older shards extracted
+                                         under the legacy downstream-only convention
+                                         only carry non-negative offsets.
     ref_id        uint16 (N,)           indexed into __meta__["ref_names"]
     ref_pos       int32  (N,)           0-based position of window center
     strand        int8   (N,)           +1 (fwd) or -1 (rev); for BASELINE the value

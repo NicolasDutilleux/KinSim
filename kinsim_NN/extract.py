@@ -510,25 +510,39 @@ def extract_strain(
                  sample_id, len(unique_meth_positions), cap)
 
     # ----------------------------------------------------------------------
-    # v3-style emission expansion: each meth position p of type T spawns
-    # emission candidates at p+k for k in [0, near_meth_max_dist]. Category
-    # is SLOWED if k in T.signal_offsets, else NEAR_METH. Conflicts resolved
-    # with SLOWED-beats-NEAR_METH precedence; within same category last
-    # writer wins (deterministic by iteration order).
+    # Emission expansion: each meth position p of type T spawns emission
+    # candidates at p+k for k in [-near_meth_max_dist, +near_meth_max_dist].
+    # The full bilateral window is used because PacBio polymerase kinetic
+    # perturbations are not strictly downstream of the modified base —
+    # upstream perturbations (positions -10 to -2 for m5C, per Tse et al.
+    # PNAS 2021, and the Jasmine 21-bp context) carry detectable signal too.
+    #
+    # Category is SLOWED if k in T.signal_offsets, else NEAR_METH. Conflicts
+    # are resolved with SLOWED-beats-NEAR_METH precedence; within the same
+    # category the last writer wins (deterministic by iteration order).
+    #
+    # Bounds check: emit_pos must leave room for the K-window on both sides
+    # of the reference contig, so we drop candidates that would underflow
+    # or overflow the contig boundary.
     # ----------------------------------------------------------------------
     signal_offsets_by_id: dict[int, frozenset[int]] = {
         t.id: frozenset(t.signal_offsets) for t in cfg.methylation_types
     }
     near_meth_max_dist = int(getattr(cfg.extract, "near_meth_max_dist", 10))
+    half = int(cfg.window.half_width)
 
     # key=(rid, emit_pos, strand) → (category, parent_meth, parent_offset)
     emissions: dict[tuple[str, int, str], tuple[int, int, int]] = {}
     for (rid, p), (mid, strand) in meth_items:
         if rid not in ref_seqs:
             continue
+        ref_len = len(ref_seqs[rid])
         sig_offs = signal_offsets_by_id.get(mid, frozenset())
-        for k in range(0, near_meth_max_dist + 1):
+        for k in range(-near_meth_max_dist, near_meth_max_dist + 1):
             emit_pos = p + k
+            # Drop windows that would extend past either contig boundary.
+            if emit_pos < half or emit_pos >= ref_len - half:
+                continue
             key = (rid, emit_pos, strand)
             if k in sig_offs:
                 emissions[key] = (CATEGORY_SLOWED, mid, k)

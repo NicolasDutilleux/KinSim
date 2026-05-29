@@ -72,14 +72,21 @@ extract:
   # motif-confirmed positions which would take 80+ hours to extract).
   # 0 = no cap.
   meth_per_strain_cap: 15000
-  # 3-category labeling (v3-style). For each meth position p of type T,
-  # expand into emission candidates at offsets [0, near_meth_max_dist]:
+  # 3-category labelling. For each meth position p of type T, expand into
+  # emission candidates at offsets [-near_meth_max_dist, +near_meth_max_dist]:
   #   k ∈ signal_offsets[T] → CATEGORY_SLOWED
   #   k ∉ signal_offsets[T] → CATEGORY_NEAR_METH
-  # Defaults: NO cap on SLOWED/NEAR_METH (keep everything — they're precious
-  # signal and ~complete-genome-coverage control respectively). meth_per_strain_cap
-  # is left at 0 so the parent expansion sees every labelled position. If you
-  # need to bound BAM I/O on a 12 GB Strepto BAM, set meth_per_strain_cap > 0.
+  # The full bilateral window is used because the PacBio polymerase kinetic
+  # signature extends both upstream and downstream of the modified base
+  # (m5C carries detectable perturbations at positions -10 to -2 per the
+  # 21-bp Jasmine/HK-model window). This roughly doubles the NEAR_METH pool
+  # size relative to a downstream-only range and substantially boosts the
+  # methylation-class representation in the training set vs the BASELINE
+  # pool, which is the intended effect.
+  #
+  # Defaults: NO cap on SLOWED/NEAR_METH (keep everything — they are the
+  # signal we want the generator to learn). meth_per_strain_cap is set to
+  # 15000 to bound BAM I/O on the largest Vega strains.
   near_meth_max_dist: 10
   slowed_per_strain_cap: 0             # 0 = no cap (keep all SLOWED)
   near_meth_per_strain_cap: 0          # 0 = no cap
