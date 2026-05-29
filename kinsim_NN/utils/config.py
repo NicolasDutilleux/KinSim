@@ -106,16 +106,17 @@ class ModelParams:
 class TrainParams:
     loss: str = "wgan_gp"
     batch_size: int = 256
-    # Defaults aligned with kinsim_nn_config.yaml. The WGAN-GP-stabilisation
-    # configuration (n_critic = 2, λ = 50, one-sided GP, neutralised TTUR)
-    # replaces the original Gulrajani-2017 defaults after the first
-    # production run showed the critic's Lipschitz constraint collapsing
-    # around step 25 000.
-    n_critic: int = 2
+    # Defaults aligned with kinsim_nn_config.yaml. The Gulrajani 2017
+    # dynamics (n_critic = 5, TTUR with lr_d = 4 × lr_g, two-sided GP)
+    # are kept; the one stabilisation lever is the higher
+    # gradient_penalty_lambda, intended to bound the late-training
+    # mode collapse observed at step 25 000 in the first production
+    # run without disturbing the early-phase dynamics.
+    n_critic: int = 5
     gradient_penalty_lambda: float = 50.0
     gradient_penalty_form: str = "two_sided"   # "two_sided" (WGAN-GP) or "one_sided" (WGAN-LP)
     lr_g: float = 1e-4
-    lr_d: float = 1e-4
+    lr_d: float = 4e-4
     beta1: float = 0.0
     beta2: float = 0.9
     n_steps: int = 500_000
