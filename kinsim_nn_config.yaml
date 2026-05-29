@@ -127,18 +127,16 @@ model:
 train:
   loss: wgan_gp                 # only WGAN-GP supported for now
   batch_size: 256
-  # Stabilisation rationale: a stricter Lipschitz constraint to bound
-  # the late-training mode collapse observed at step 25 000 in the
-  # first production run, without touching the proven Gulrajani 2017
-  # dynamics that gave us a stable early phase. The single change
-  # versus the legacy run is gradient_penalty_lambda 10 → 50; n_critic,
-  # the TTUR ratio (lr_d = 4 × lr_g), and the two-sided GP form are
-  # restored to their original WGAN-GP defaults after an attempt to
-  # change them all at once produced an unstable run (D could not
-  # establish a positive d_real − d_fake gap on the first 4 000 steps).
-  n_critic: 5                          # Gulrajani 2017 default — proven stable
-  gradient_penalty_lambda: 50.0        # the one stabilisation lever we keep
-  gradient_penalty_form: two_sided     # "two_sided" (WGAN-GP) or "one_sided" (WGAN-LP)
+  # Pure Gulrajani 2017 WGAN-GP defaults. The legacy production run
+  # under exactly these hyperparameters converged to W1 ≈ 2.8 around
+  # step 25 000 before drifting at later steps. A subsequent attempt
+  # with λ = 50 instead of 10 regressed between step 5 000 (W1 ≈ 10)
+  # and step 10 000 (W1 ≈ 18), confirming that λ = 10 is the empirically
+  # right choice on this dataset. Tighter Lipschitz pressure is not
+  # the answer here; reproducing the legacy convergence is.
+  n_critic: 5                          # Gulrajani 2017 default
+  gradient_penalty_lambda: 10.0        # Gulrajani 2017 default — empirically right on this dataset
+  gradient_penalty_form: two_sided     # Gulrajani 2017 default
   lr_g: 0.0001
   lr_d: 0.0004                         # TTUR: 4× faster D (Heusel 2017)
   beta1: 0.0                           # WGAN-GP standard

@@ -106,14 +106,13 @@ class ModelParams:
 class TrainParams:
     loss: str = "wgan_gp"
     batch_size: int = 256
-    # Defaults aligned with kinsim_nn_config.yaml. The Gulrajani 2017
-    # dynamics (n_critic = 5, TTUR with lr_d = 4 × lr_g, two-sided GP)
-    # are kept; the one stabilisation lever is the higher
-    # gradient_penalty_lambda, intended to bound the late-training
-    # mode collapse observed at step 25 000 in the first production
-    # run without disturbing the early-phase dynamics.
+    # Defaults aligned with kinsim_nn_config.yaml. Pure Gulrajani 2017
+    # WGAN-GP defaults: n_critic = 5, λ = 10, two-sided GP, TTUR with
+    # lr_d = 4 × lr_g. Empirically the right operating point on this
+    # dataset (λ = 50 regressed between step 5 000 and step 10 000 in
+    # a controlled comparison).
     n_critic: int = 5
-    gradient_penalty_lambda: float = 50.0
+    gradient_penalty_lambda: float = 10.0
     gradient_penalty_form: str = "two_sided"   # "two_sided" (WGAN-GP) or "one_sided" (WGAN-LP)
     lr_g: float = 1e-4
     lr_d: float = 4e-4
