@@ -1213,11 +1213,13 @@ def main(argv=None):
                          "1 to disable multiprocess (sequential mapped-read "
                          "processing). Typically set to --cpus-per-task value. "
                          "Default: %(default)d (sequential).")
-    ap.add_argument("--no-bernoulli", action="store_true",
-                    help="Override YAML and disable Bernoulli sampling on motif fraction "
-                         "(always set meth at every motif site).")
-    ap.add_argument("--force-bernoulli", action="store_true",
-                    help="Override YAML and force Bernoulli sampling on motif fraction.")
+    bern_group = ap.add_mutually_exclusive_group()
+    bern_group.add_argument("--no-bernoulli", action="store_true",
+                            help="Override YAML and disable Bernoulli sampling on motif "
+                                 "fraction (always set meth at every motif site).")
+    bern_group.add_argument("--force-bernoulli", action="store_true",
+                            help="Override YAML and force Bernoulli sampling on motif "
+                                 "fraction.")
     ap.add_argument("--no-per-read-z", action="store_true",
                     help="Use per-(read, base) random z_idx instead of one z per read. "
                          "Max apparent variance but breaks read-level coherence — "

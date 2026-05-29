@@ -72,9 +72,6 @@ extract:
   # motif-confirmed positions which would take 80+ hours to extract).
   # 0 = no cap.
   meth_per_strain_cap: 15000
-  # Bystrandified pair combination: required if input BAM is bystrandified
-  # (2 records/ZMW). Disabled if raw HiFi aligned (1 record/ZMW with fi/fp/ri/rp).
-  bystrandify_pairing: true
   # 3-category labeling (v3-style). For each meth position p of type T,
   # expand into emission candidates at offsets [0, near_meth_max_dist]:
   #   k ∈ signal_offsets[T] → CATEGORY_SLOWED
@@ -130,14 +127,27 @@ model:
 train:
   loss: wgan_gp                 # only WGAN-GP supported for now
   batch_size: 256
-  n_critic: 5                   # D updates per G update
-  gradient_penalty_lambda: 10.0
+  # Stabilisation rationale (first production run collapsed the critic's
+  # 1-Lipschitz constraint around step 25 000 — see BUGS_FOUND.md):
+  #   - n_critic 5 → 2: keeps D from over-saturating between G updates;
+  #   - gradient_penalty_lambda 10 → 50: forces the critic to respect
+  #     ||∇D|| ≈ 1 even on this dataset, where λ=10 turned out to be
+  #     soft enough that the empirical gp value drifted to ~0.017;
+  #   - gradient_penalty_form one_sided: penalise only ||∇D|| > 1 (the
+  #     WGAN-LP variant of Petzka et al., ICLR 2018), removing the
+  #     "critic-goes-flat" degenerate optimum that the two-sided form
+  #     fell into;
+  #   - TTUR neutralised (lr_d = lr_g): with n_critic = 2 the critic no
+  #     longer needs a 4× learning-rate edge.
+  n_critic: 2
+  gradient_penalty_lambda: 50.0
+  gradient_penalty_form: one_sided   # "two_sided" (original WGAN-GP) or "one_sided" (WGAN-LP)
   lr_g: 0.0001
-  lr_d: 0.0004                  # TTUR: D is 4x faster
+  lr_d: 0.0001
   beta1: 0.0                    # WGAN-GP standard
   beta2: 0.9
   n_steps: 500000               # default upped for the bigger model (12M params)
-  checkpoint_every: 5000
+  checkpoint_every: 2500        # tighter spacing for recovery if a new instability appears
   eval_every: 5000
   log_every: 100
   seed: 42

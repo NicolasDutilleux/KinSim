@@ -448,6 +448,7 @@ def train(
                     d, batch["signal"], fake,
                     cond_kwargs=_cond_kwargs(batch),
                     device=device,
+                    form=getattr(cfg.train, "gradient_penalty_form", "one_sided"),
                 )
                 d_loss = wgan_gp_d_loss(d_real.float(), d_fake.float(), gp,
                                         gp_lambda=cfg.train.gradient_penalty_lambda)

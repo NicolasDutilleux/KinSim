@@ -48,7 +48,6 @@ class ExtractParams:
                                   # mapq=0 to all unique alignments (config-dependent).
                                   # Bump to 20+ only if you've verified the BAM has
                                   # actual MAPQ values > 0.
-    bystrandify_pairing: bool = True
     meth_per_strain_cap: int = 0  # 0 = no cap; else random subsample meth positions
     # 3-category expansion: each meth position p of type T spawns emission
     # candidates at p+k for k in [0, near_meth_max_dist]. Category depends on
@@ -107,21 +106,24 @@ class ModelParams:
 class TrainParams:
     loss: str = "wgan_gp"
     batch_size: int = 256
-    n_critic: int = 5
-    gradient_penalty_lambda: float = 10.0
+    # Defaults aligned with kinsim_nn_config.yaml. The WGAN-GP-stabilisation
+    # configuration (n_critic = 2, λ = 50, one-sided GP, neutralised TTUR)
+    # replaces the original Gulrajani-2017 defaults after the first
+    # production run showed the critic's Lipschitz constraint collapsing
+    # around step 25 000.
+    n_critic: int = 2
+    gradient_penalty_lambda: float = 50.0
+    gradient_penalty_form: str = "one_sided"   # "one_sided" (WGAN-LP) or "two_sided" (WGAN-GP)
     lr_g: float = 1e-4
-    lr_d: float = 4e-4
+    lr_d: float = 1e-4
     beta1: float = 0.0
     beta2: float = 0.9
-    # Aligned with kinsim_nn_config.yaml. ``num_workers = 2`` reflects the
-    # measured RAM ceiling on the production cluster (8 workers OOM'd at
-    # 200 GB per node).
     n_steps: int = 500_000
-    checkpoint_every: int = 5000
+    checkpoint_every: int = 2500
     eval_every: int = 5000
     log_every: int = 100
     seed: int = 42
-    num_workers: int = 2
+    num_workers: int = 2          # measured cluster RAM ceiling (8 workers OOM'd at 200 GB)
     pin_memory: bool = True
 
 

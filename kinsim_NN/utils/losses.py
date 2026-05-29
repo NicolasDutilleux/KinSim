@@ -42,17 +42,32 @@ def gradient_penalty(
     fake: torch.Tensor,
     cond_kwargs: dict,
     device: torch.device | str = "cpu",
+    form: str = "one_sided",
 ) -> torch.Tensor:
-    """Standard two-sided gradient penalty for WGAN-GP (Gulrajani 2017).
+    """Gradient penalty for WGAN-GP / WGAN-LP.
 
     Interpolates between real and fake samples conditioned on ``cond_kwargs``
-    and penalises the squared deviation of ``‖∇_x D(x_interp, cond)‖₂`` from
-    1.0 — i.e. ``mean((‖∇‖₂ − 1)²)``. ``cond_kwargs`` is forwarded
-    unchanged to the discriminator (e.g. ``base_fwd_onehot``, ``base_rev_onehot``,
-    ``meth_fwd_onehot``, ``meth_rev_onehot``).
+    and penalises the squared deviation of ``‖∇_x D(x_interp, cond)‖₂`` from 1.
+
+    Two penalty forms are supported:
+      * ``"two_sided"`` — original WGAN-GP, ``mean((‖∇‖₂ − 1)²)``
+        (Gulrajani et al., NeurIPS 2017).
+      * ``"one_sided"`` — WGAN-LP, ``mean(max(0, ‖∇‖₂ − 1)²)``
+        (Petzka et al., ICLR 2018). Only penalises when the gradient
+        norm exceeds 1, so a degenerate "flat critic" optimum
+        (``‖∇‖₂ → 0``) is no longer attractive — empirically observed
+        as the failure mode of the two-sided form on this dataset.
+
+    ``cond_kwargs`` is forwarded unchanged to the discriminator
+    (``base_fwd_onehot``, ``base_rev_onehot``, ``meth_fwd_onehot``,
+    ``meth_rev_onehot``).
     """
     if real.shape != fake.shape:
         raise ValueError(f"shape mismatch real {real.shape} vs fake {fake.shape}")
+    if form not in ("one_sided", "two_sided"):
+        raise ValueError(
+            f"gradient_penalty form must be 'one_sided' or 'two_sided', got {form!r}"
+        )
 
     bsz = real.size(0)
     # Per-sample alpha in [0, 1], broadcast over signal dims
@@ -71,7 +86,10 @@ def gradient_penalty(
     )[0]
     gradients = gradients.reshape(bsz, -1)
     grad_norm = gradients.norm(2, dim=1)
-    return ((grad_norm - 1.0) ** 2).mean()
+    if form == "two_sided":
+        return ((grad_norm - 1.0) ** 2).mean()
+    # one_sided (WGAN-LP)
+    return torch.clamp(grad_norm - 1.0, min=0.0).pow(2).mean()
 
 
 __all__ = ["wgan_gp_d_loss", "wgan_g_loss", "gradient_penalty"]

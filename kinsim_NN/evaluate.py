@@ -205,38 +205,43 @@ def evaluate(
                     pooled_real[0].append(int(real_centers[i, 0]))
                     pooled_gen[0].append(int(gen_centers[i, 0]))
 
-    # Write summary TSV
+    # Compute per-bucket stats once, then both write the TSV and log them.
+    per_bucket: list[dict] = []
+    for m_id in sorted(set(pooled_real.keys()) | set(pooled_gen.keys())):
+        r = np.asarray(pooled_real.get(m_id, []), dtype=np.float32)
+        g_arr = np.asarray(pooled_gen.get(m_id, []), dtype=np.float32)
+        per_bucket.append({
+            "meth_id": m_id,
+            "meth_name": meth_name_by_id.get(m_id, "?"),
+            "n": int(r.size),
+            "real_median": float(np.median(r)) if r.size else float("nan"),
+            "real_mean": float(np.mean(r)) if r.size else float("nan"),
+            "real_sigma": float(np.std(r)) if r.size else float("nan"),
+            "gen_median": float(np.median(g_arr)) if g_arr.size else float("nan"),
+            "gen_mean": float(np.mean(g_arr)) if g_arr.size else float("nan"),
+            "gen_sigma": float(np.std(g_arr)) if g_arr.size else float("nan"),
+            "wasserstein_1d": _wasserstein_1d(r, g_arr),
+        })
+
     out = Path(str(output_prefix) + "_stats.tsv")
     with open(out, "w") as f:
         f.write("meth_id\tmeth_name\tn\treal_median\treal_mean\treal_sigma\t"
                 "gen_median\tgen_mean\tgen_sigma\twasserstein_1d\n")
-        for m_id in sorted(set(pooled_real.keys()) | set(pooled_gen.keys())):
-            r = np.asarray(pooled_real.get(m_id, []))
-            g_arr = np.asarray(pooled_gen.get(m_id, []))
-            w1 = _wasserstein_1d(r.astype(np.float32), g_arr.astype(np.float32))
+        for row in per_bucket:
             f.write(
-                f"{m_id}\t{meth_name_by_id.get(m_id, '?')}\t{r.size}\t"
-                f"{np.median(r) if r.size else float('nan'):.2f}\t"
-                f"{r.mean() if r.size else float('nan'):.2f}\t"
-                f"{r.std() if r.size else float('nan'):.2f}\t"
-                f"{np.median(g_arr) if g_arr.size else float('nan'):.2f}\t"
-                f"{g_arr.mean() if g_arr.size else float('nan'):.2f}\t"
-                f"{g_arr.std() if g_arr.size else float('nan'):.2f}\t"
-                f"{w1:.3f}\n"
+                f"{row['meth_id']}\t{row['meth_name']}\t{row['n']}\t"
+                f"{row['real_median']:.2f}\t{row['real_mean']:.2f}\t{row['real_sigma']:.2f}\t"
+                f"{row['gen_median']:.2f}\t{row['gen_mean']:.2f}\t{row['gen_sigma']:.2f}\t"
+                f"{row['wasserstein_1d']:.3f}\n"
             )
     log.info("Wrote %s", out)
-    for m_id in sorted(set(pooled_real.keys()) | set(pooled_gen.keys())):
-        r = np.asarray(pooled_real.get(m_id, []))
-        g_arr = np.asarray(pooled_gen.get(m_id, []))
-        w1 = _wasserstein_1d(r.astype(np.float32), g_arr.astype(np.float32))
+    for row in per_bucket:
         log.info(
             "  meth=%s n=%d  real(med=%.1f σ=%.1f) gen(med=%.1f σ=%.1f) W1=%.2f",
-            meth_name_by_id.get(m_id, "?"), r.size,
-            np.median(r) if r.size else float("nan"),
-            r.std() if r.size else float("nan"),
-            np.median(g_arr) if g_arr.size else float("nan"),
-            g_arr.std() if g_arr.size else float("nan"),
-            w1,
+            row["meth_name"], row["n"],
+            row["real_median"], row["real_sigma"],
+            row["gen_median"], row["gen_sigma"],
+            row["wasserstein_1d"],
         )
 
 

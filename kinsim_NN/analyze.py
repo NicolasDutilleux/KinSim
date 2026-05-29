@@ -91,13 +91,23 @@ def _active_strand_ipd(shard: ShardData) -> np.ndarray:
     """Pick the centre-position IPD on the strand matching the parent meth.
 
     For samples on the ``+`` parent strand we use ``IPD_fwd`` (channel 0);
-    for ``-`` parent strand we use ``IPD_rev`` (channel 2). Returns
-    ``(N,)`` uint8 bytes (PacBio codec); use ``FRAMES_TABLE`` for frames.
+    for ``-`` parent strand we use ``IPD_rev`` (channel 2). For BASELINE
+    samples we pick ``IPD_fwd`` deterministically, regardless of the
+    random ``strand`` value extract may have stored, because the strand
+    has no biological meaning when no methylation is present on either
+    channel; using channel 0 keeps the per-strain baseline histograms
+    reproducible across re-extractions.
+
+    Returns ``(N,)`` uint8 bytes (PacBio codec); use :data:`FRAMES_TABLE`
+    for frames.
     """
     half = shard.k // 2
-    sig_center = shard.signal[:, half]   # (N, 4)
-    strand = shard.strand                # (N,) int8
+    sig_center = shard.signal[:, half]      # (N, 4)
+    is_baseline = shard.category == CATEGORY_BASELINE
+    strand = shard.strand                   # (N,) int8
     out = np.where(strand >= 0, sig_center[:, 0], sig_center[:, 2])
+    # Baselines always read channel 0, deterministically.
+    out = np.where(is_baseline, sig_center[:, 0], out)
     return out.astype(np.uint8)
 
 
@@ -111,6 +121,13 @@ def accumulate_shard(shard: ShardData, sample_cap_per_offset_bucket: int = 5000)
     poff = shard.parent_offset
     ipd_u8 = _active_strand_ipd(shard)
     ipd_frames = FRAMES_TABLE[ipd_u8].astype(np.float32)
+
+    # Offset range comes from the shard metadata, not a hard-coded 0..10.
+    # If a future config bumps ``extract.near_meth_max_dist`` past 10, the
+    # full range is preserved here. Falls back to 10 for older shards that
+    # did not persist the field.
+    near_max = int(shard.meta.get("near_meth_max_dist", 10))
+    offset_range = list(range(0, near_max + 1))
 
     for cat in (0, 1, 2):
         mask = cats == cat
@@ -136,7 +153,7 @@ def accumulate_shard(shard: ShardData, sample_cap_per_offset_bucket: int = 5000)
     rng = np.random.default_rng(42)
     for cat in (CATEGORY_SLOWED, CATEGORY_NEAR_METH):
         for m in unique_meths:
-            for off in range(0, 11):
+            for off in offset_range:
                 mask = (cats == cat) & (pmeth == m) & (poff == off)
                 n = int(mask.sum())
                 if n == 0:
@@ -178,8 +195,15 @@ def build_html_report(
     per_strain: list[StrainStats],
     meth_name_by_id: dict[int, str],
     out_path: Path,
+    near_meth_max_dist: int = 10,
 ) -> None:
-    """Generate an HTML dashboard from accumulated stats."""
+    """Generate an HTML dashboard from accumulated stats.
+
+    ``near_meth_max_dist`` controls the offset range plotted on the
+    per-meth-trajectory and counts-heatmap figures. Defaults to 10 so
+    older shards that did not persist the field still render the
+    historical 0..10 range.
+    """
     try:
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
@@ -188,6 +212,8 @@ def build_html_report(
         sys.exit(2)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    offsets_range = list(range(0, near_meth_max_dist + 1))
+    n_offsets = len(offsets_range)
 
     # ---- Aggregate across strains ----
     total_counts = dict.fromkeys([0, 1, 2], 0)
@@ -296,7 +322,7 @@ def build_html_report(
         shared_yaxes=True,
     )
     for col, m in enumerate(meth_ids_in_data, start=1):
-        offsets = list(range(0, 11))
+        offsets = offsets_range
         slowed_medians, near_meth_medians = [], []
         slowed_ns, near_meth_ns = [], []
         for off in offsets:
@@ -344,10 +370,10 @@ def build_html_report(
     figs_html.append(fig4.to_html(full_html=False, include_plotlyjs=False))
 
     # ---- Fig 5: counts heatmap per (parent_meth, parent_offset) ----
-    fig5_data_slowed = np.zeros((len(meth_ids_in_data), 11), dtype=np.int64)
-    fig5_data_nm = np.zeros((len(meth_ids_in_data), 11), dtype=np.int64)
+    fig5_data_slowed = np.zeros((len(meth_ids_in_data), n_offsets), dtype=np.int64)
+    fig5_data_nm = np.zeros((len(meth_ids_in_data), n_offsets), dtype=np.int64)
     for i, m in enumerate(meth_ids_in_data):
-        for off in range(0, 11):
+        for off in offsets_range:
             fig5_data_slowed[i, off] = total_counts_by_offset.get((CATEGORY_SLOWED, m, off), 0)
             fig5_data_nm[i, off] = total_counts_by_offset.get((CATEGORY_NEAR_METH, m, off), 0)
     fig5 = make_subplots(rows=1, cols=2, subplot_titles=("SLOWED counts", "NEAR_METH counts"))
@@ -355,7 +381,7 @@ def build_html_report(
     fig5.add_trace(
         go.Heatmap(
             z=fig5_data_slowed,
-            x=list(range(0, 11)),
+            x=offsets_range,
             y=meth_labels,
             colorscale="Oranges",
             text=fig5_data_slowed,
@@ -367,7 +393,7 @@ def build_html_report(
     fig5.add_trace(
         go.Heatmap(
             z=fig5_data_nm,
-            x=list(range(0, 11)),
+            x=offsets_range,
             y=meth_labels,
             colorscale="Blues",
             text=fig5_data_nm,
@@ -456,6 +482,7 @@ def main(argv=None):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     per_strain: list[StrainStats] = []
+    near_meth_max_dist: int = 10
     for i, p in enumerate(shards, 1):
         log.info("[%d/%d] Reading %s", i, len(shards), p.name)
         try:
@@ -466,6 +493,10 @@ def main(argv=None):
         if shard.n == 0:
             log.warning("Empty shard: %s", p.name)
             continue
+        # All shards in a corpus share the same extraction geometry; take
+        # the first non-empty shard's value to drive the plot range.
+        if not per_strain:
+            near_meth_max_dist = int(shard.meta.get("near_meth_max_dist", 10))
         stats = accumulate_shard(shard)
         log.info("  %s: B=%d  S=%d  N=%d",
                  stats.strain_id,
@@ -480,7 +511,10 @@ def main(argv=None):
         sys.exit("No usable shards.")
 
     write_summary_csv(per_strain, out_dir / "per_strain_counts.csv")
-    build_html_report(per_strain, meth_name_by_id, out_dir / "report.html")
+    build_html_report(
+        per_strain, meth_name_by_id, out_dir / "report.html",
+        near_meth_max_dist=near_meth_max_dist,
+    )
 
     log.info("Done. Open %s in a browser.", out_dir / "report.html")
 

@@ -11,11 +11,19 @@ The pickle contains a dict with these arrays (all length N):
     meth_rev      uint8  (N, K)         meth_id 0..M-1 on reverse strand
     signal        uint8  (N, K, 4)      IPD_fwd, PW_fwd, IPD_rev, PW_rev (uint8 codec)
     category      uint8  (N,)           0 = BASELINE, 1 = SLOWED, 2 = NEAR_METH
-    parent_meth   uint8  (N,)           parent methylation id (0 if baseline)
-    parent_offset int8   (N,)           offset from parent meth (0 if baseline)
+    parent_meth   uint8  (N,)           parent methylation id; sentinel 0 for BASELINE
+                                         (the "none" methylation id collides numerically
+                                         but is unreachable as a parent — parent_meth
+                                         is only meaningful when category > 0)
+    parent_offset int8   (N,)           offset from parent meth; 0 for BASELINE samples
+                                         (same sentinel-overlap remark as parent_meth)
     ref_id        uint16 (N,)           indexed into __meta__["ref_names"]
     ref_pos       int32  (N,)           0-based position of window center
-    strand        int8   (N,)           +1 / -1
+    strand        int8   (N,)           +1 (fwd) or -1 (rev); for BASELINE the value
+                                         carries no biological meaning (the channel
+                                         picked at analysis time is forced to
+                                         IPD_fwd to keep the per-strain histograms
+                                         reproducible — see analyze._active_strand_ipd)
     zmw           int64  (N,)           ZMW number (16-byte read name hash if non-numeric)
 
 plus a metadata dict::
