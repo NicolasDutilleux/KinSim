@@ -86,6 +86,9 @@ def evaluate(
     shards_dir: Path,
     output_prefix: Path,
     batch_size: int = 256,
+    test_strains_only: bool = True,
+    max_samples_per_shard: int | None = 20_000,
+    config_path: Path | None = None,
 ) -> None:
     setup_logging()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -99,6 +102,29 @@ def evaluate(
     if not shards:
         raise FileNotFoundError(f"No shards in {shards_dir}")
 
+    if test_strains_only:
+        # Match the in-training eval semantics: restrict to held-out
+        # test_strains declared in the YAML. Shards may be prefixed by
+        # lineage (e.g. ``vega_bc2034_shard.pkl``); glob over the suffix.
+        from .utils.config import load_config
+        cfg = load_config(config_path)
+        test_strains = cfg.split.test_strains or ()
+        if test_strains:
+            keep: list[Path] = []
+            for sid in test_strains:
+                keep.extend(p for p in shards if p.name.endswith(f"{sid}_shard.pkl"))
+            shards = sorted(set(keep))
+            log.info(
+                "test_strains_only: restricted to %d held-out shard(s) "
+                "(test_strains=%s)",
+                len(shards), list(test_strains),
+            )
+        else:
+            log.warning(
+                "test_strains_only=True but YAML declares no test_strains; "
+                "falling back to all shards.",
+            )
+
     # Pooled per-meth_type stats
     pooled_real: dict[int, list[int]] = defaultdict(list)
     pooled_gen: dict[int, list[int]] = defaultdict(list)
@@ -109,11 +135,40 @@ def evaluate(
         if shard.n == 0:
             continue
         ds = ShardedDataset(shard, n_meth_types)
-        # Iterate batches
         n = len(ds)
-        for start in range(0, n, batch_size):
-            stop = min(start + batch_size, n)
-            batch_items = [ds[i] for i in range(start, stop)]
+        # Optional deterministic subsample for fast comparisons across
+        # checkpoints. The seed is fixed (0) so the two evaluations on
+        # the same shard pick exactly the same rows, isolating model
+        # differences from sampling noise.
+        if max_samples_per_shard is not None and n > max_samples_per_shard:
+            import numpy as _np
+            idxs_subset = _np.random.default_rng(0).permutation(n)[:max_samples_per_shard]
+            idxs_subset.sort()
+            iter_pairs = [(int(i), int(i) + 1) for i in idxs_subset]
+            n = len(iter_pairs)
+            log.info(
+                "  subsampled %d of %d rows (deterministic seed=0)",
+                n, len(ds),
+            )
+        else:
+            iter_pairs = None
+        # Iterate batches
+        if iter_pairs is not None:
+            # When subsampling, batch contiguous chunks of the sorted index list.
+            batches_idxs = [
+                [j for j, _ in iter_pairs[k:k + batch_size]]
+                for k in range(0, len(iter_pairs), batch_size)
+            ]
+            iter_batches: list[tuple[int, int] | list[int]] = batches_idxs  # type: ignore[assignment]
+        else:
+            iter_batches = [(start, min(start + batch_size, n)) for start in range(0, n, batch_size)]
+        for spec in iter_batches:
+            if isinstance(spec, list):
+                indices = spec
+            else:
+                start, stop = spec
+                indices = list(range(start, stop))
+            batch_items = [ds[i] for i in indices]
             batch = {
                 key: torch.stack([item[key] for item in batch_items])
                 if key != "category"
@@ -122,9 +177,10 @@ def evaluate(
             }
             gen_centers = _generate_batch(g, batch, device, n_meth_types)
             half = shard.k // 2
-            real_centers = shard.signal[start:stop, half]      # (B, 4) = (IPD_fwd, PW_fwd, IPD_rev, PW_rev)
-            mf_center = shard.meth_fwd[start:stop, half]
-            mr_center = shard.meth_rev[start:stop, half]
+            idx_arr = np.asarray(indices, dtype=np.int64)
+            real_centers = shard.signal[idx_arr, half]
+            mf_center = shard.meth_fwd[idx_arr, half]
+            mr_center = shard.meth_rev[idx_arr, half]
             # Strand pooling per sample (same rules as the in-training eval
             # in train.py): every sample contributes exactly one value per
             # bucket so per-meth_id W1 estimates are comparable across
@@ -190,6 +246,19 @@ def main(argv=None):
     ap.add_argument("shards_dir")
     ap.add_argument("--output-prefix", required=True)
     ap.add_argument("--batch-size", type=int, default=256)
+    ap.add_argument(
+        "--all-shards", action="store_true",
+        help="Evaluate every shard in shards_dir. Default behaviour is to "
+             "restrict to the held-out test_strains declared in the YAML, "
+             "which matches the in-training eval semantics.",
+    )
+    ap.add_argument(
+        "--max-samples-per-shard", type=int, default=20_000,
+        help="Deterministic subsample size per shard (seed=0). 0 disables "
+             "subsampling and walks every row. Default 20000 keeps a full "
+             "two-checkpoint eval under ~10 min on the production corpus.",
+    )
+    ap.add_argument("--config", default=None, help="kinsim_nn_config.yaml path")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     if args.verbose:
@@ -199,6 +268,9 @@ def main(argv=None):
         shards_dir=Path(args.shards_dir),
         output_prefix=Path(args.output_prefix),
         batch_size=args.batch_size,
+        test_strains_only=not args.all_shards,
+        max_samples_per_shard=(args.max_samples_per_shard or None),
+        config_path=(Path(args.config) if args.config else None),
     )
 
 

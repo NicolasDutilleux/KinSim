@@ -51,12 +51,15 @@ OUT_BEST=$RUN_DIR/eval_best_G
 mkdir -p "$OUT_BEST"
 
 J_BEST=$(sbatch --parsable \
-    --partition=pgpu --gres=gpu:1 --mem=48G --time=01:00:00 \
+    --partition=pgpu --gres=gpu:1 --mem=24G --time=00:30:00 \
     --account=p774 \
     --output=$LOG_DIR/%x_%J.log \
     --job-name=eval_best_G \
     --wrap="set +u; source ~/.bashrc; conda activate kinsim_env; set -euo pipefail; \
-            kinsim_nn evaluate '$CKPT_DIR' '$SHARDS' --output-prefix '$OUT_BEST/best_G' -v")
+            kinsim_nn evaluate '$CKPT_DIR' '$SHARDS' \
+                --output-prefix '$OUT_BEST/best_G' \
+                --max-samples-per-shard 20000 \
+                -v")
 
 # --- eval current G.pt -------------------------------------------------
 # Expose only G.pt + model_config.json in a sub-dir so `_find_checkpoint`
@@ -68,12 +71,15 @@ ln -sf "$CKPT_DIR/G.pt"              "$WORK/G.pt"
 ln -sf "$CKPT_DIR/model_config.json" "$WORK/model_config.json"
 
 J_CUR=$(sbatch --parsable \
-    --partition=pgpu --gres=gpu:1 --mem=48G --time=01:00:00 \
+    --partition=pgpu --gres=gpu:1 --mem=24G --time=00:30:00 \
     --account=p774 \
     --output=$LOG_DIR/%x_%J.log \
     --job-name=eval_current_G \
     --wrap="set +u; source ~/.bashrc; conda activate kinsim_env; set -euo pipefail; \
-            kinsim_nn evaluate '$WORK' '$SHARDS' --output-prefix '$OUT_CUR/current_G' -v")
+            kinsim_nn evaluate '$WORK' '$SHARDS' \
+                --output-prefix '$OUT_CUR/current_G' \
+                --max-samples-per-shard 20000 \
+                -v")
 
 # --- summary -----------------------------------------------------------
 echo "Submitted:"
