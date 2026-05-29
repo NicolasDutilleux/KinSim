@@ -113,7 +113,7 @@ class TrainParams:
     # around step 25 000.
     n_critic: int = 2
     gradient_penalty_lambda: float = 50.0
-    gradient_penalty_form: str = "one_sided"   # "one_sided" (WGAN-LP) or "two_sided" (WGAN-GP)
+    gradient_penalty_form: str = "two_sided"   # "two_sided" (WGAN-GP) or "one_sided" (WGAN-LP)
     lr_g: float = 1e-4
     lr_d: float = 1e-4
     beta1: float = 0.0

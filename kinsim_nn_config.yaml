@@ -127,26 +127,32 @@ model:
 train:
   loss: wgan_gp                 # only WGAN-GP supported for now
   batch_size: 256
-  # Stabilisation rationale (first production run collapsed the critic's
-  # 1-Lipschitz constraint around step 25 000 — see BUGS_FOUND.md):
-  #   - n_critic 5 → 2: keeps D from over-saturating between G updates;
-  #   - gradient_penalty_lambda 10 → 50: forces the critic to respect
-  #     ||∇D|| ≈ 1 even on this dataset, where λ=10 turned out to be
-  #     soft enough that the empirical gp value drifted to ~0.017;
-  #   - gradient_penalty_form one_sided: penalise only ||∇D|| > 1 (the
-  #     WGAN-LP variant of Petzka et al., ICLR 2018), removing the
-  #     "critic-goes-flat" degenerate optimum that the two-sided form
-  #     fell into;
-  #   - TTUR neutralised (lr_d = lr_g): with n_critic = 2 the critic no
-  #     longer needs a 4× learning-rate edge.
+  # Stabilisation rationale (first production run mode-collapsed around
+  # step 25 000, see BUGS_FOUND.md):
+  #   - n_critic 5 → 2: at n_critic=5 the critic converged to its local
+  #     optimum between each G step and stopped producing a usable
+  #     gradient for G, which is the proximate cause of the observed
+  #     mode collapse;
+  #   - TTUR neutralised (lr_d = lr_g): with n_critic=2 the critic no
+  #     longer needs a 4× learning-rate edge to keep up;
+  #   - gradient_penalty_lambda 10 → 50: marginal tightening of the
+  #     Lipschitz constraint. The critic was already approximately
+  #     1-Lipschitz at λ=10 (final gp ≈ 0.002 ⇒ ||∇D||₂ ≈ 0.96 on
+  #     average), so this is a safety margin rather than a corrective
+  #     measure;
+  #   - gradient_penalty_form stays "two_sided" (the original Gulrajani
+  #     2017 formulation). The one-sided WGAN-LP variant of Petzka
+  #     et al. (ICLR 2018) is exposed as a knob but is not the default,
+  #     because the observed failure mode here was not a critic
+  #     Lipschitz-violation that one_sided would fix.
   n_critic: 2
   gradient_penalty_lambda: 50.0
-  gradient_penalty_form: one_sided   # "two_sided" (original WGAN-GP) or "one_sided" (WGAN-LP)
+  gradient_penalty_form: two_sided   # "two_sided" (Gulrajani 2017) or "one_sided" (Petzka 2018)
   lr_g: 0.0001
   lr_d: 0.0001
   beta1: 0.0                    # WGAN-GP standard
   beta2: 0.9
-  n_steps: 500000               # default upped for the bigger model (12M params)
+  n_steps: 500000
   checkpoint_every: 2500        # tighter spacing for recovery if a new instability appears
   eval_every: 5000
   log_every: 100

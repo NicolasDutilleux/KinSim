@@ -42,21 +42,27 @@ def gradient_penalty(
     fake: torch.Tensor,
     cond_kwargs: dict,
     device: torch.device | str = "cpu",
-    form: str = "one_sided",
+    form: str = "two_sided",
 ) -> torch.Tensor:
     """Gradient penalty for WGAN-GP / WGAN-LP.
 
-    Interpolates between real and fake samples conditioned on ``cond_kwargs``
-    and penalises the squared deviation of ``‖∇_x D(x_interp, cond)‖₂`` from 1.
+    Interpolates between real and fake samples conditioned on
+    ``cond_kwargs`` and penalises the deviation of
+    ``‖∇_x D(x_interp, cond)‖₂`` from 1.
 
     Two penalty forms are supported:
-      * ``"two_sided"`` — original WGAN-GP, ``mean((‖∇‖₂ − 1)²)``
-        (Gulrajani et al., NeurIPS 2017).
-      * ``"one_sided"`` — WGAN-LP, ``mean(max(0, ‖∇‖₂ − 1)²)``
-        (Petzka et al., ICLR 2018). Only penalises when the gradient
-        norm exceeds 1, so a degenerate "flat critic" optimum
-        (``‖∇‖₂ → 0``) is no longer attractive — empirically observed
-        as the failure mode of the two-sided form on this dataset.
+      * ``"two_sided"`` — original WGAN-GP penalty (Gulrajani et al.,
+        NeurIPS 2017), ``mean((‖∇‖₂ − 1)²)``. Pulls the critic's
+        gradient norm towards exactly 1 on the interpolation path.
+        This is the default and corresponds to the K = 1 Lipschitz
+        constant baked into the Kantorovich-Rubinstein duality.
+      * ``"one_sided"`` — WGAN-LP penalty (Petzka et al., ICLR 2018),
+        ``mean(max(0, ‖∇‖₂ − 1)²)``. Only penalises when the gradient
+        norm exceeds 1, allowing ``‖∇‖₂ < 1`` without cost. Petzka
+        et al. argue that this is closer to the theoretical Lipschitz
+        constraint (``‖∇‖ ≤ 1``, not ``= 1``) and can be more stable
+        at the start of training; whether it helps on a given problem
+        is empirical.
 
     ``cond_kwargs`` is forwarded unchanged to the discriminator
     (``base_fwd_onehot``, ``base_rev_onehot``, ``meth_fwd_onehot``,
