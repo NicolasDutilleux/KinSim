@@ -10,6 +10,12 @@ can consume as if it were a fresh HiFi BAM with kinetics removed. We can then
 re-inject synthetic kinetics with the trained generator and compare the
 downstream ipdSummary chain against the real one.
 
+Implementation: the read is modified in place rather than re-built from
+scratch via ``set_tags``, because pysam's ``set_tags`` refuses to round-trip
+``B`` array tags (rejects ``value_type='B'`` with ``ValueError``). Using
+``set_tag(name, None)`` to delete the small set of unwanted tags is robust
+across pysam versions.
+
 CLI:
     python scripts/strip_bystrandified_to_hifi.py <input.bam> <output.bam>
 """
@@ -24,21 +30,24 @@ import pysam
 
 log = logging.getLogger(__name__)
 
-TAGS_TO_STRIP = frozenset({
-    "ip", "pw",                 # bystrandified kinetics
-    "fi", "fp", "ri", "rp",     # raw HiFi kinetics (shouldn't be here, defensive)
+TAGS_TO_STRIP = (
+    "ip", "pw",                 # bystrandified kinetics (per-base arrays)
+    "fi", "fp", "ri", "rp",     # raw HiFi kinetics (defensive)
     "MD", "NM", "AS", "XS",     # alignment-derived
     "SA", "cs", "ms",
-})
+)
 
 
 def strip(input_bam: str, output_bam: str) -> tuple[int, int]:
     """Return (kept_fwd, skipped_other)."""
     with pysam.AlignmentFile(input_bam, "rb", check_sq=False) as bam_in:
+        # Build an unaligned-style header: drop @SQ entries, mark SO=unknown.
         header = bam_in.header.to_dict()
         header.pop("SQ", None)
-        header_hd = header.setdefault("HD", {"VN": "1.6"})
-        header_hd["SO"] = "unknown"
+        if "HD" in header:
+            header["HD"]["SO"] = "unknown"
+        else:
+            header["HD"] = {"VN": "1.6", "SO": "unknown"}
         out_header = pysam.AlignmentHeader.from_dict(header)
 
         with pysam.AlignmentFile(output_bam, "wb", header=out_header) as bam_out:
@@ -48,25 +57,36 @@ def strip(input_bam: str, output_bam: str) -> tuple[int, int]:
                 if not read.query_name.endswith("/fwd"):
                     skipped += 1
                     continue
-                new = pysam.AlignedSegment(out_header)
-                new.query_name = read.query_name[:-4]
-                new.query_sequence = read.get_forward_sequence()
-                new.query_qualities = read.get_forward_qualities()
-                new.flag = 4
-                new.reference_id = -1
-                new.reference_start = -1
-                new.mapping_quality = 0
-                new.cigar = []
-                new.next_reference_id = -1
-                new.next_reference_start = -1
-                new.template_length = 0
-                tags = [
-                    (t, v, vt)
-                    for (t, v, vt) in read.get_tags(with_value_type=True)
-                    if t not in TAGS_TO_STRIP
-                ]
-                new.set_tags(tags)
-                bam_out.write(new)
+
+                # Snapshot the original HiFi-forward sequence/qualities BEFORE
+                # unmapping (get_forward_sequence reads the current flag's
+                # reverse bit to decide whether to reverse-complement).
+                orig_seq = read.get_forward_sequence()
+                orig_qual = read.get_forward_qualities()
+
+                # In-place: unmap + clear alignment fields.
+                read.flag = 4
+                read.reference_id = -1
+                read.reference_start = -1
+                read.mapping_quality = 0
+                read.cigartuples = None
+                read.next_reference_id = -1
+                read.next_reference_start = -1
+                read.template_length = 0
+
+                # Restore the original (forward) sequence and qualities.
+                read.query_sequence = orig_seq
+                read.query_qualities = orig_qual
+
+                # Strip the "/fwd" suffix from the read name.
+                read.query_name = read.query_name[:-4]
+
+                # Remove kinetics + alignment-derived tags one by one.
+                for t in TAGS_TO_STRIP:
+                    if read.has_tag(t):
+                        read.set_tag(t, None)
+
+                bam_out.write(read)
                 kept += 1
                 if kept % 50000 == 0:
                     log.info("  %d /fwd reads written", kept)
