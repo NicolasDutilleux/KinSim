@@ -48,6 +48,22 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `kinsim_NN/utils/bam_io.py` for bystrandified inputs. Verified by
   byte-level cross-check against the raw BAM at high-confidence m6A
   positions.
+- Bug 10 — `kinsim_NN/generate.py` now writes `fn:i:1` and `rn:i:1`
+  alongside `fi`/`fp`/`ri`/`rp`. Without these scalar per-strand
+  subread-count tags, `ccs-kinetics-bystrandify` silently dropped
+  every record (missing `fn` → no `/fwd`; missing `rn` → no `/rev`;
+  missing both → every ZMW gone). Diagnosed 2026-06-02 by tag
+  ablation on a known-good Sequel raw HiFi.
+
+### Added
+- `PACBIO_COMPATIBILITY.md` — forward-looking compatibility rules
+  between `pbmm2`, `ccs-kinetics-bystrandify`, `ipdSummary`,
+  `pbmotifmaker`, `jasmine`, `modkit`. Consolidates every silent-drop
+  rule (tag-presence, flag, SO, codec, header) and the SIF vs conda
+  version split.
+- `slurm/validate/` — v6 validation chain split into three SLURM
+  jobs (`v6_strip.slurm` on pibu_el8, `v6_generate.slurm` on pgpu,
+  `v6_downstream.slurm` on pibu_el8) chained via `--dependency=afterok`.
 
 ## [0.4.0] — 2026-04 / 2026-05 (legacy)
 

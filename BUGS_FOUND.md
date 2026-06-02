@@ -201,3 +201,49 @@ The held-out W1 estimates produced after bugs 7 and 8 are corrected
 are directly comparable across buckets, the 5mC subset of labelled
 positions now reflects the jasmine catalogue without orientation bias,
 and `kinsim_nn generate --seed N` is reproducible end-to-end.
+
+---
+
+## Bug 10 — Missing `fn` / `rn` per-strand subread-count tags drop every record
+
+**Symptom.** When feeding the v6 validation chain a kinsim BAM (124 k
+unaligned records with valid `fi`/`fp`/`ri`/`rp`, all per-record
+checks green — flag = 4, SO = unknown, TLEN ≠ 0, no zero in kinetic
+arrays, no stale `ip`/`pw`), `ccs-kinetics-bystrandify` produced an
+output BAM with the header only and zero records. Silent on stderr.
+Downstream `ipdSummary` then errored with `OSError: No mapped reads
+found`.
+
+**Diagnostic methodology.** Comparing the tag profile of the broken
+kinsim BAM against a Sequel raw HiFi BAM that bystrandifies cleanly
+(`samtools view tag.bam | head -1 | tr '\t' '\n' | grep ':'`)
+revealed two scalar tags present on the working input and absent on
+the kinsim BAM: `fn:i:N` (forward subread count) and `rn:i:N` (reverse
+subread count).
+
+A controlled ablation on the working raw HiFi BAM (target output 392
+records on a 196-read tiny subset) confirmed the role of each tag:
+
+| ablation | output records |
+|---|---|
+| baseline | 392 |
+| minus `ec` | 392 (not required) |
+| minus `fn` | 196 (only `/rev` emitted) |
+| minus `rn` | 196 (only `/fwd` emitted) |
+| minus both `fn` AND `rn` | **0** |
+
+**Root cause.** Bystrandify uses the presence of `fn` to emit the
+`/fwd` record and the presence of `rn` to emit the `/rev` record.
+Neither has anything to do with the actual subread counts — only
+presence is checked. `kinsim_NN.generate` did not write either tag,
+so every record was double-rejected.
+
+**Fix.** Write `fn:i:1` and `rn:i:1` alongside the kinetic-array
+`set_tag` calls, in both the multiprocess and single-threaded branches
+of `kinsim_NN/generate.py`. Value `1` is arbitrary; bystrandify checks
+presence only.
+
+**Lesson.** When a PacBio tool is silent on rejection, the tag-profile
+diff against a known-working input — not the documented field
+semantics — is the only reliable diagnostic. Cf. the SAME methodology
+that resolved bugs 1–5.

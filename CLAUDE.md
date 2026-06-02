@@ -149,5 +149,12 @@ real-data ipdSummary as the position reference.
   `kinsim_NN/utils/bam_io.py` when handling bystrandified BAMs.
 - Do not emit a BAM with a SAM flag other than `4` on the unaligned
   output, do not leave `SO:coordinate` on the `@HD` line, do not leave
-  stale `ip` and `pw` tags on the output, and do not allow `0` in the
-  `fi`, `fp`, `ri`, `rp` arrays. See [`BUGS_FOUND.md`](BUGS_FOUND.md).
+  stale `ip` and `pw` tags on the output, do not allow `0` in the
+  `fi`, `fp`, `ri`, `rp` arrays, and do not omit `fn:i:1` / `rn:i:1`
+  (without these, `ccs-kinetics-bystrandify` silently drops every
+  record). See [`BUGS_FOUND.md`](BUGS_FOUND.md) for the full case
+  history and [`PACBIO_COMPATIBILITY.md`](PACBIO_COMPATIBILITY.md) for
+  the forward-looking rules.
+- Do not mix PacBio tool sources inside one chain (SIF `pbmm2` 1.18 vs
+  conda `pbmm2` 26.x produce mutually unreadable BAMs). See
+  [`PACBIO_COMPATIBILITY.md`](PACBIO_COMPATIBILITY.md).
