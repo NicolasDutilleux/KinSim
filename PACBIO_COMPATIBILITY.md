@@ -17,9 +17,17 @@ reading the tool's output.
 
 ## 1. Tool source matrix
 
-Apptainer SIF first for everything PacBio. The cluster's conda
-`kinsim_env` has *newer* `pbmm2` (26.x) that **cannot read** BAMs
-produced by the SIF's `pbmm2` 1.18.0 — never mix sources inside a chain.
+Default to the Apptainer SIF (SMRT-Tools 25.3) for PacBio binaries
+that ship in it — and crucially **never mix sources inside one chain**.
+The cluster's conda `kinsim_env` has a newer `pbmm2` (26.x) that
+**cannot read** BAMs produced by the SIF's `pbmm2` 1.18.0; a chain that
+bystrandifies through the SIF and then aligns through conda breaks
+silently with *"Could not determine read input type(s)"*. Two
+exceptions to the SIF default: `ipdSummary` and `pbmotifmaker` are
+pinned to L. Falquet's host install of SMRT-Link 25.1 because the
+SIF's 25.3 versions of these are more stringent (`pbmotifmaker` 1.2.0)
+or absent (`ipdSummary` not shipped in the SIF) and produce lower
+detection rates against the reference catalogue.
 
 | Tool | Source | Version | Why this source |
 |---|---|---|---|
@@ -47,8 +55,17 @@ FALQUET=/data/users/lfalquet/SOFTS/SMRTlink/smrtlink251R
 "$FALQUET/smrtcmds/bin/pbmotifmaker" <args...>
 ```
 
-The SP3-C3 model lives at:
-`$FALQUET/install/.../kineticsTools/resources/SP3-C3.npz.gz`
+The SP3-C3 kinetics model (used by `ipdSummary --ipdModel`) lives at:
+
+```
+$FALQUET/install/smrtlink-release_25.1.0.257715/bundles/smrttools/install/smrttools-release_25.1.0.257715/private/pacbio/python3pkgs/kineticstools-py3/lib/python3.9/site-packages/kineticsTools/resources/SP3-C3.npz.gz
+```
+
+This is NOT the same SP3-C3 file as the one bundled with the cluster's
+`SMRT-Link/12.0.0.177059-cli-tools-only` module (which sits under
+`/mnt/ss/sib/ibu/rocky8/...`). Use Falquet's path with Falquet's
+`ipdSummary` for chain consistency; mixing the 25.1 binary with the
+12.0 model has not been validated.
 
 ---
 
@@ -93,13 +110,16 @@ A single record is dropped when **any** of the following hold:
    for lacking alignment fields. The unaligned output must carry
    `@HD SO:unknown` (or `unsorted`). See bug 2.
 
-3. **Stale `ip` or `pw` tags are present.** The `@RG DS` field
-   `Ipd:CodecV1=ip;PulseWidth:CodecV1=pw` declares the codec for the
-   bystrandified output, but on a raw HiFi BAM the kinetics live in
-   `fi`/`fp`/`ri`/`rp`. If a prior `pbmm2 align` left stale `ip`/`pw`
-   on the records, bystrandify reads those (per the @RG) and discards
-   the record on the empty/junk data. Strip `ip` and `pw` before
-   writing. See bug 3.
+3. **Stale `ip` or `pw` tags are present on the records.** The
+   `@RG DS` field declares `Ipd:CodecV1=ip;PulseWidth:CodecV1=pw` as a
+   PacBio convention regardless of whether actual `ip`/`pw` tags exist
+   on the reads. When `pbmm2 align` runs on a bystrandified input it
+   leaves per-strand `ip`/`pw` on the aligned records; if those
+   survive a downstream HiFi-shape conversion, bystrandify prefers
+   them over `fi`/`fp`/`ri`/`rp` and discards the record on the
+   empty / wrong-shape data. Strip `ip` and `pw` from every record
+   before writing — but leave the `@RG DS` declaration alone (see
+   section 4). See bug 3.
 
 4. **`TLEN = 0` (column 9).** Bystrandify uses non-zero TLEN as a
    heuristic to recognise a HiFi record. The spec-correct
@@ -135,7 +155,7 @@ bystrandify accepts records without it.
 
 ---
 
-## 4. The `@RG DS` field is information, not configuration
+## 4. The `@RG DS` field is a static convention, not a read-from pointer
 
 A typical PacBio HiFi `@RG` looks like:
 
@@ -144,35 +164,49 @@ A typical PacBio HiFi `@RG` looks like:
     DS:READTYPE=CCS;Ipd:CodecV1=ip;PulseWidth:CodecV1=pw;BINDINGKIT=...;...
 ```
 
-The `Ipd:CodecV1=ip` and `PulseWidth:CodecV1=pw` declarations are
-**normal** on raw HiFi BAMs even when the actual kinetics live in
-`fi`/`fp`/`ri`/`rp`. They tell *bystrandified* tooling where to put
-the post-bystrandify kinetics, not where to read them from on the raw
-input. Do **not** strip them — verified 2026-06-02 by comparing the
-@RG of a known-good Sequel raw HiFi (which has these declarations and
-bystrandifies fine) against a kinsim BAM (where stripping them changed
-nothing).
+`Ipd:CodecV1=ip` and `PulseWidth:CodecV1=pw` are codec-name
+declarations: "if a tag named `ip` is present, its codec is `V1`;
+same for `pw`". They are **always** present on PacBio BAMs (raw HiFi
+and bystrandified alike) by tool convention — verified 2026-06-02 by
+comparing the @RG of a known-good Sequel raw HiFi (which has these
+declarations and bystrandifies cleanly) against a kinsim BAM (where
+stripping them changes nothing).
 
-The DS field order is not load-bearing for any of the chain tools we
-have tested.
+Practical consequence: do **not** strip these declarations. The
+silent-drop trigger of bug 3 was the *presence of stale `ip`/`pw`
+tags on the records*, not the DS field — see section 3 item 3.
+
+The DS-field key order is not load-bearing for any chain tool we have
+tested (rebuilding the @RG via `pysam.AlignmentHeader.from_dict`
+reorders fields and bystrandify still accepts the result).
 
 ---
 
 ## 5. Bystrandified BAM conventions
 
-After `bystrandify`, each ZMW becomes two records:
+After `bystrandify`, each ZMW becomes two records distinguished by a
+suffix on the read name:
 
-- `<readname>/fwd` — `is_reverse = 0` after `pbmm2 align`, carries
-  `ip = fi` and `pw = fp` (forward-strand kinetics).
-- `<readname>/rev` — `is_reverse = 1` after `pbmm2 align`, carries
-  `ip = reverse-complement(ri)` and `pw = reverse-complement(rp)`.
+- `<readname>/fwd` — carries forward-strand kinetics:
+  `SEQ = original HiFi consensus`, `ip = fi`, `pw = fp`.
+- `<readname>/rev` — carries reverse-strand kinetics:
+  `SEQ = reverse-complement of HiFi consensus`,
+  `ip = reverse-complement(ri)`, `pw = reverse-complement(rp)`.
+
+The `/fwd` / `/rev` suffix refers to which strand's kinetics the
+record carries, **not** to its alignment direction. Both records of
+the same ZMW go through `pbmm2 align` independently and either may
+end up forward- or reverse-aligned in the BAM depending on which
+strand of the reference the original HiFi consensus came from.
 
 **Invariant.** After `pbmm2 align`, the `/fwd` and `/rev` records of
-the *same* ZMW always have **opposite** `is_reverse` flags. Same
-`is_reverse` on both is the pathological case that caused v3
-`extract samples=0` — fixed in `7ae9d66`. If you re-implement an
-extract pass, assert this invariant on at least one ZMW per shard
-during a sanity run.
+the *same* ZMW always have **opposite** `is_reverse` flags — because
+their SEQs are reverse-complements of each other, they cannot align
+in the same orientation. Same `is_reverse` on both is the pathological
+case that caused the v3 `extract samples=0` regression (root-cause fix
+in commit `7ae9d66`). If you re-implement an extract or downstream
+pass that pairs `/fwd` with `/rev`, assert this invariant on at least
+one ZMW per shard during a sanity run.
 
 ---
 
@@ -197,15 +231,24 @@ single-threaded branches.
 
 ## 7. `pbmm2` cannot read across versions
 
-The cluster has two `pbmm2` installations:
+Two `pbmm2` versions are reachable on the cluster:
 
-- **SIF 1.18.0** — required by `ccs-kinetics-bystrandify` 3.5.0 output.
-- **conda 26.x** — newer, but rejects SIF-produced BAMs with
-  *"Could not determine read input type(s)"*.
+- **SIF 1.18.0** — ships with SMRT-Tools 25.3, paired with the SIF's
+  `ccs-kinetics-bystrandify` 3.5.0. Used by every alignment in the
+  validation chain.
+- **conda 26.x** — newer, lives in `kinsim_env`. **Rejects** BAMs
+  produced by the SIF's `pbmm2` 1.18.0 with the message
+  *"Could not determine read input type(s)"*. Verified empirically on
+  the bc2071 production chain.
 
-Never mix sources inside one chain. The validation chain uses the
-SIF's `pbmm2` for both the bystrandified→aligned alignment after the
-generator and any prior alignments — keep the version line consistent.
+Rule: pin every `pbmm2` invocation in a chain to the same installation.
+Practically, this means the validation chain uses the SIF's `pbmm2`
+for the post-bystrandify alignment, and the training-data BAMs we
+strip from were also aligned with the SIF's `pbmm2` — the version line
+is internally consistent.
+
+If you ever need to feed a BAM produced by one `pbmm2` into the other,
+re-emit the alignment with the receiving version first.
 
 ---
 
@@ -223,26 +266,36 @@ proceed.
 
 ```
 kinsim_nn generate → output.bam
-    1 record per ZMW, unaligned (flag=4, SO=unknown, @SQ stripped)
-    tags: RG, np, rq, zm, fi, fp, ri, rp, fn=1, rn=1 (+ all preserved aux)
+    1 record per ZMW, unaligned
+    @HD SO:unknown, @SQ stripped, flag=4 on every record
+    kinetics: fi, fp, ri, rp (uint8 B:C arrays, clamped ≥1)
+    scalar gating tags: fn=1, rn=1
+    PacBio aux: RG, np, rq, zm, sn, qs, qe, cx, ec, ws, etc.
 
-ccs-kinetics-bystrandify → output_bys.bam
-    2 records per ZMW (/fwd, /rev), still unaligned
-    tags: RG, np, rq, zm, ip, pw
+ccs-kinetics-bystrandify (SIF 3.5.0) → output_bys.bam
+    2 records per ZMW with /fwd and /rev read-name suffixes,
+    still unaligned (flag=4)
+    kinetics consumed: fi, fp, ri, rp → per-strand ip, pw
+    (the fn/rn scalars are also consumed at this step)
 
-pbmm2 align (SIF 1.18) → output_aln.bam
-    sorted aligned BAM (SO:coordinate, @SQ from ref)
-    is_reverse on /fwd and /rev is OPPOSITE per ZMW (invariant)
+pbmm2 align --preset CCS --sort (SIF 1.18) → output_aln.bam
+    sorted aligned BAM (@HD SO:coordinate, @SQ from ref)
+    each ZMW's /fwd and /rev have OPPOSITE is_reverse (section 5)
+    samtools view -F 4 to drop the rare unmappable reads before
+    feeding ipdSummary — kineticsTools dies on unmapped records
+    with "No mapped reads found"
 
-ipdSummary (Falquet 25.1, SP3-C3) → basemods.gff + basemods.csv
-    per-position m6A and m4C calls
+ipdSummary (Falquet 25.1, --ipdModel SP3-C3.npz.gz) → basemods.gff + basemods.csv
+    per-position m6A and m4C calls with methylation fraction
 
-pbmotifmaker find (Falquet 25.1) → motifs.csv
-    motif-confirmed positions with fraction and meanScore
+pbmotifmaker find --min-score 40 (Falquet 25.1) → motifs.csv
+    motif-confirmed positions with motifString, centerPos, fraction,
+    nDetected, nGenome, meanScore
 ```
 
 Comparing this output to the real-data ipdSummary GFF at the same
-positions is the validation test — `scripts/plot_perread_ipd_at_gff_sites.py`.
+positions is the validation test
+([`scripts/plot_perread_ipd_at_gff_sites.py`](scripts/plot_perread_ipd_at_gff_sites.py)).
 
 ---
 
@@ -267,6 +320,30 @@ silently drop records.
 ## Sources / version evidence
 
 Versions in section 1 verified empirically 2026-04-22 by `--version`
-queries across SIF and conda. Re-verify with the probe block in
-[`.claude/skills/kinsim/SKILL.md`](.claude/skills/kinsim/SKILL.md) if
-you suspect drift.
+queries across SIF and conda. To re-verify on the cluster (one-shot
+srun, ~5 min):
+
+```bash
+srun --partition=pibu_el8 --account=p774 --time=00:05:00 --mem=2G --cpus-per-task=1 bash -c '
+SIF=/containers/apptainer/pacbio-smrt-tools-25.3.sif
+echo "=== SIF tools ==="
+for t in pbmm2 pbindex ccs-kinetics-bystrandify pbmotifmaker; do
+  echo -n "  $t: "
+  apptainer exec --bind /data "$SIF" "$t" --version 2>&1 | head -1
+done
+echo "=== Falquet 25.1 host install ==="
+F=/data/users/lfalquet/SOFTS/SMRTlink/smrtlink251R/smrtcmds/bin
+for t in ipdSummary pbmotifmaker; do
+  echo -n "  $t: "
+  "$F/$t" --version 2>&1 | head -1
+done
+echo "=== conda kinsim_env ==="
+source ~/.bashrc; conda activate kinsim_env
+for t in jasmine modkit samtools; do
+  echo -n "  $t: "; "$t" --version 2>&1 | head -1
+done
+'
+```
+
+If anything drifts, update the table in section 1 and the references
+in `slurm/callers/*.slurm` together.
