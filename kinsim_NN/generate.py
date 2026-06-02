@@ -943,6 +943,13 @@ def _run_mapped_reads_multiprocess(
                     read.set_tag("fp", array.array("B", fp.tobytes()))
                     read.set_tag("ri", array.array("B", ri.tobytes()))
                     read.set_tag("rp", array.array("B", rp.tobytes()))
+                    # ccs-kinetics-bystrandify uses fn/rn (per-strand subread
+                    # counts) to decide which strand records to emit. Missing
+                    # fn → no /fwd record; missing rn → no /rev record;
+                    # missing both → silently drop the ZMW entirely. Verified
+                    # 2026-06-02 via tag-ablation on a known-good raw HiFi BAM.
+                    read.set_tag("fn", 1)
+                    read.set_tag("rn", 1)
                     if emit_unaligned:
                         _unalign_read(read)
                     out_bam.write(read)
@@ -1172,6 +1179,10 @@ def generate(
         read.set_tag("fp", array.array("B", fp.tobytes()))
         read.set_tag("ri", array.array("B", ri.tobytes()))
         read.set_tag("rp", array.array("B", rp.tobytes()))
+        # See multiprocess branch comment: bystrandify requires fn/rn to
+        # emit /fwd and /rev records.
+        read.set_tag("fn", 1)
+        read.set_tag("rn", 1)
         if emit_unaligned:
             _unalign_read(read)
         out_bam.write(read)
