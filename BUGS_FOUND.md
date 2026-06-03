@@ -247,3 +247,53 @@ presence only.
 diff against a known-working input — not the documented field
 semantics — is the only reliable diagnostic. Cf. the SAME methodology
 that resolved bugs 1–5.
+
+---
+
+## Bug 11 — Stripping `@RG DS` codec declarations crashes `ipdSummary` with `KeyError: 'Ipd'`
+
+**Symptom.** With the bug 10 fix in place, the v6 validation chain
+sailed past bystrandify (248 382 records — exactly 2× the 124 191 ZMW
+input) and pbmm2 align (248 586 mapped reads), then `ipdSummary`
+crashed in ~5 minutes with `KeyError: 'Ipd'` raised inside every
+`KineticWorkerProcess`:
+
+```
+File ".../kineticsTools/KineticWorker.py", line 484, in _loadRawIpds
+    rawIpd = aln.IPD() * factor
+File ".../pbcore/io/align/BamAlignment.py", line 50, in f
+    return self.baseFeature(featureName, aligned, orientation)
+File ".../pbcore/io/align/BamAlignment.py", line 532, in baseFeature
+    concreteFeatureName = self.bam._baseFeatureNameMappings[self.qId][featureName]
+KeyError: 'Ipd'
+```
+
+**Root cause.** Earlier in the v6 debugging cycle (commit `0c2bd2f`),
+`scripts/strip_bystrandified_to_hifi.py` was modified to remove the
+`Ipd:CodecV1=ip;` and `PulseWidth:CodecV1=pw;` substrings from the
+`@RG DS` field on the suspicion that those declarations were causing
+bystrandify to silently drop records. They were not — bug 10 (missing
+`fn`/`rn`) was the actual cause, and the wrong-track DS cleanup
+remained in the script after that fix.
+
+`pbcore` (the BAM I/O library used internally by `kineticsTools`)
+builds a per-read-group lookup `_baseFeatureNameMappings[qId]` from
+exactly those `Ipd:CodecV1=...` and `PulseWidth:CodecV1=...`
+substrings. When `ipdSummary` calls `aln.IPD()`, the lookup queries
+this mapping with the feature name `"Ipd"`. With the codec
+declarations stripped from `@RG DS`, the mapping is empty and the
+query raises `KeyError: 'Ipd'`.
+
+**Fix.** Remove the `_clean_rg_ds` / `_clean_header` helpers from
+`scripts/strip_bystrandified_to_hifi.py` and pass `bam_in.header`
+through to the output verbatim. The codec declarations are a static
+PacBio convention present on every PacBio BAM (raw HiFi and
+bystrandified alike) and stripping them is never a correct move.
+
+**Lesson.** A "wrong-track" fix that does not break the immediate
+symptom can survive several diagnostic cycles. After the real cause
+(bug 10) was identified, the earlier band-aid still needed to be
+reverted — its consequences only surfaced once the chain ran further
+than the bystrandify step. Bisect-style attribution: if a partial fix
+made it through review without being reverted, audit it before
+claiming the chain is unblocked.

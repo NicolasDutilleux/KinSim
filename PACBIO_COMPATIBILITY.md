@@ -176,6 +176,17 @@ Practical consequence: do **not** strip these declarations. The
 silent-drop trigger of bug 3 was the *presence of stale `ip`/`pw`
 tags on the records*, not the DS field — see section 3 item 3.
 
+**Stripping the codec declarations breaks `ipdSummary` downstream.**
+`pbcore`'s `_baseFeatureNameMappings[qId]` is built from the
+`Ipd:CodecV1=...` and `PulseWidth:CodecV1=...` substrings in `@RG DS`.
+When `kineticsTools` calls `aln.IPD()`, it queries this mapping by the
+feature name `"Ipd"`. If the codec declaration is gone, the lookup
+raises `KeyError: 'Ipd'` and every worker process crashes. Diagnosed
+2026-06-03 on the bc2034 v6 validation chain — bystrandify succeeded
+(248 382 records, 2× input), pbmm2 aligned 248 586 reads, ipdSummary
+crashed in 5 minutes with `KeyError: 'Ipd'` after I had `strip` clean
+the DS field. Restoring the original `@RG DS` resolved it.
+
 The DS-field key order is not load-bearing for any chain tool we have
 tested (rebuilding the @RG via `pysam.AlignmentHeader.from_dict`
 reorders fields and bystrandify still accepts the result).
