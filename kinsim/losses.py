@@ -143,8 +143,59 @@ def spatial_per_position_w1(
     return torch.stack(losses).mean(), diag
 
 
+def tail_quantile_loss(
+    real: torch.Tensor,
+    fake: torch.Tensor,
+    bucket_id: torch.Tensor,
+    n_buckets: int,
+    quantiles: tuple[float, ...] = (0.95, 0.99),
+    min_samples: int = 8,
+) -> tuple[torch.Tensor, dict[int, float]]:
+    """Per-bucket per-position MSE between empirical tail quantiles.
+
+    Sorted-L1 (spatial_per_position_w1) measures average sample-to-sample
+    deviation between sorted real/fake values at each (position, channel),
+    but the top-quantile mass is only a small fraction of the sorted array
+    and its mismatch is averaged with the bulk. The audit showed the
+    generator under-producing extreme values: P(IPD > 80) ratio G/R ≈
+    0.54-0.58 on BASELINE and SLOWED. That tail under-production directly
+    suppresses ipdSummary's Z-scores (which are dominated by the extreme
+    end of the IPD distribution) and is the most likely cause of motif
+    recovery failure.
+
+    This loss penalises mismatch on the top quantiles SPECIFICALLY by
+    computing the per-cell empirical quantile of ``real`` and ``fake`` at
+    each requested level (default p95, p99) and MSE-comparing them.
+
+    Returns ``(loss, per_bucket_diag)`` analogous to the other bucketed
+    losses. Default ``min_samples=8`` higher than the others because a
+    p99 estimate from < 8 samples is essentially the maximum and has
+    high variance.
+    """
+    losses: list[torch.Tensor] = []
+    diag: dict[int, float] = {}
+    qs = torch.tensor(list(quantiles), device=real.device, dtype=real.dtype)
+    for b in range(n_buckets):
+        mask = (bucket_id == b)
+        if int(mask.sum().item()) < min_samples:
+            continue
+        r = real[mask]                                # (Nb, K, C)
+        f = fake[mask]
+        # torch.quantile reduces the chosen dim; with a 1-D ``qs`` of
+        # length Q the result has a leading Q dimension → (Q, K, C).
+        r_q = torch.quantile(r, qs, dim=0)
+        f_q = torch.quantile(f, qs, dim=0)
+        bucket_loss = ((r_q - f_q) ** 2).mean()
+        losses.append(bucket_loss)
+        diag[b] = float(bucket_loss.detach().item())
+    if not losses:
+        return real.new_zeros(()), diag
+    return torch.stack(losses).mean(), diag
+
+
 __all__ = [
     "energy_distance",
     "bucketed_energy_distance",
     "spatial_per_position_w1",
+    "tail_quantile_loss",
 ]

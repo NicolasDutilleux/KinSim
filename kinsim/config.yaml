@@ -1,12 +1,21 @@
-# kinsim — default training config.
+# kinsim — default training config (post-audit v2).
+#
+# Changes vs the previous run (commit 65144dc / step-130k audit):
+#   - 5-bucket stratification by (category, parent_meth) instead of
+#     3-bucket by category — splits SLOWED across m6A/m4C/m5C
+#   - Replaces L1-on-bucket-mean with spatial_per_position_w1 (sorted-L1
+#     per cell) and adds explicit tail_quantile_loss on p95 / p99
+#   - z_dim 64 → 96 (more stochastic capacity for tail diversity)
+#   - batch_size 256 → 384 (so even SLOWED_m4C bucket reaches min_samples)
+#   - n_steps 200k → 80k (audit shows drift after step ~130k; cosine
+#     decay drives lr down so the residual oscillation is small)
+#   - cosine LR decay (1.0 → 0.05 of base)
 
 window:
   k: 21
   n_channels: 4
 
 methylation:
-  # Must match n_meth_types stored in the shards' __meta__ section
-  # (4 by default in kinsim_NN: none / m6A / m4C / m5C).
   n_meth_types: 4
 
 model:
@@ -14,24 +23,18 @@ model:
   n_layers: 6
   n_heads: 6
   mlp_ratio: 4.0
-  z_dim: 64
+  z_dim: 96
   pos_embed_dim: 24
   drop_rate: 0.0
 
 train:
-  batch_size: 256
+  batch_size: 384
   lr: 0.0002
   beta1: 0.9
   beta2: 0.999
   weight_decay: 0.0
-  # Audit on the previous run (200k steps, no LR decay) showed late-
-  # training drift from W1=1.05 at step 130k to W1=3.72 at step 199999.
-  # Cosine LR decay from lr → lr*0.05 over n_steps tames this.
-  lr_schedule: cosine          # cosine | constant
-  lr_min_frac: 0.05            # cosine endpoint = lr * lr_min_frac
-  # n_steps reduced from 200000: best W1 hit at step 130k previously,
-  # and the spatial-w1 loss converges faster than ED+L1. 80k gives margin
-  # while best_G.pt selection covers the actual optimum.
+  lr_schedule: cosine
+  lr_min_frac: 0.05
   n_steps: 80000
   checkpoint_every: 5000
   log_every: 100
@@ -39,20 +42,27 @@ train:
   num_workers: 2
   pin_memory: true
   seed: 42
+
   # ─── post-audit loss weights ───────────────────────────────────────
-  # spatial_per_position_w1 captures per-position marginal mismatch
-  # (mean + spread + tail) per (category, parent_meth) bucket. ED²
-  # captures the joint structure on the flattened tile per bucket.
-  # Weights are normalised so both terms contribute comparable magnitudes
-  # after the first few thousand steps.
+  # Total L = λ_ed*ED² + λ_pos*spatial_per_position_w1 + λ_tail*tail_quantile_loss
+  #
+  # λ_ed     : joint-structure pressure on flattened (B, K*C) tile, bucketed
+  # λ_pos    : per-cell sorted-L1 between real & fake at each (bucket, K, C)
+  # λ_tail   : MSE on empirical p95/p99 per (bucket, K, C) — explicit tail
+  lambda_ed: 1.0
   lambda_pos: 1.0
-  # 5 buckets: BASELINE / NEAR_METH / SLOWED_m6A / SLOWED_m4C / SLOWED_m5C
-  # — split SLOWED by parent_meth so each bucket's mean profile shows the
-  # signature peaks at consistent offsets (previously averaged out).
+  lambda_tail: 0.3
+  tail_quantiles: [0.95, 0.99]
+  tail_min_samples: 8
+
+  # 5 buckets after the audit:
+  #   0 = BASELINE
+  #   1 = NEAR_METH
+  #   2 = SLOWED_m6A
+  #   3 = SLOWED_m4C
+  #   4 = SLOWED_m5C
   n_buckets: 5
   bucket_min_samples: 4
 
 split:
-  # Strain entries excluded from training (matched by full sample_id OR
-  # by trailing barcode component — same logic as kinsim_NN's list_shards).
   test_strains: [bc2034, bc2045, bc2048, bc2082]

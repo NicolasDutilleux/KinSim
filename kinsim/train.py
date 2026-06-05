@@ -36,7 +36,11 @@ from torch.utils.data import DataLoader
 
 from .data import build_train_dataset
 from .evaluate import find_test_shard_paths, held_out_w1
-from .losses import bucketed_energy_distance, spatial_per_position_w1
+from .losses import (
+    bucketed_energy_distance,
+    spatial_per_position_w1,
+    tail_quantile_loss,
+)
 from .model import GeneratorConfig, TransformerGenerator
 
 
@@ -224,7 +228,11 @@ def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
     # SLOWED_m6A / SLOWED_m4C / SLOWED_m5C.
     n_buckets = int(t_cfg.get("n_buckets", 5))
     bucket_min_samples = int(t_cfg.get("bucket_min_samples", 4))
+    lambda_ed = float(t_cfg.get("lambda_ed", 1.0))
     lambda_pos = float(t_cfg.get("lambda_pos", 1.0))
+    lambda_tail = float(t_cfg.get("lambda_tail", 0.3))
+    tail_quantiles = tuple(t_cfg.get("tail_quantiles", [0.95, 0.99]))
+    tail_min_samples = int(t_cfg.get("tail_min_samples", 8))
 
     log_every = int(t_cfg["log_every"])
     ckpt_every = int(t_cfg["checkpoint_every"])
@@ -260,7 +268,7 @@ def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
     best_w1 = float("inf")
 
     last_log = time.time()
-    running = {"ed": 0.0, "pos": 0.0, "loss": 0.0, "n": 0}
+    running = {"ed": 0.0, "pos": 0.0, "tail": 0.0, "loss": 0.0, "n": 0}
 
     for step in range(start_step, n_steps):
         # Apply cosine LR multiplier (does nothing if lr_schedule="constant")
@@ -291,7 +299,11 @@ def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
         pos_loss, _ = spatial_per_position_w1(
             real, fake, bucket, n_buckets, min_samples=bucket_min_samples
         )
-        loss = ed_loss + lambda_pos * pos_loss
+        tail_loss, _ = tail_quantile_loss(
+            real, fake, bucket, n_buckets,
+            quantiles=tail_quantiles, min_samples=tail_min_samples,
+        )
+        loss = lambda_ed * ed_loss + lambda_pos * pos_loss + lambda_tail * tail_loss
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -300,6 +312,7 @@ def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
 
         running["ed"] += float(ed_loss.detach().item())
         running["pos"] += float(pos_loss.detach().item())
+        running["tail"] += float(tail_loss.detach().item())
         running["loss"] += float(loss.detach().item())
         running["n"] += 1
 
@@ -307,14 +320,15 @@ def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
             now = time.time()
             steps_per_sec = running["n"] / max(now - last_log, 1e-6)
             log.info(
-                "step %6d  loss=%.4f  ed=%.4f  pos_w1=%.4f  lr=%.2e  steps/s=%.1f",
+                "step %6d  loss=%.4f  ed=%.4f  pos_w1=%.4f  tail=%.4f  lr=%.2e  steps/s=%.1f",
                 step, running["loss"] / running["n"],
                 running["ed"] / running["n"],
                 running["pos"] / running["n"],
+                running["tail"] / running["n"],
                 base_lr * _lr_mult(step),
                 steps_per_sec,
             )
-            running = {"ed": 0.0, "pos": 0.0, "loss": 0.0, "n": 0}
+            running = {"ed": 0.0, "pos": 0.0, "tail": 0.0, "loss": 0.0, "n": 0}
             last_log = now
 
         if step > 0 and step % ckpt_every == 0:
