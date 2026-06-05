@@ -1,31 +1,32 @@
 """Training losses for kinsim.
 
-Two components, combined as
+After the step-130k audit (see thesis §5.4 + audit_kinsim_step130k.json):
+the previous loss (bucketed ED² + L1 on per-bucket *mean*) reproduced
+the bucket mean well but flattened the per-position signature — exactly
+what the audit measured on SLOWED. Two changes:
 
-    L_total = L_ed + λ_mean * L_mean
+1. Bucket by (category, parent_meth) instead of category alone — done
+   in kinsim/train.py:_compute_bucket_id. Inside a 5-bucket
+   stratification (BASELINE / NEAR_METH / SLOWED_m6A / SLOWED_m4C /
+   SLOWED_m5C) each bucket's REAL per-position mean profile actually
+   shows the signature peaks rather than averaging them out across
+   meth types.
 
-L_ed (Energy Distance, Székely & Rizzo 2013) — captures the joint
-distribution match over the full (K × n_channels)-dimensional tile,
-within each category bucket. ED is a proper metric on distributions and
-has no kernel-bandwidth hyperparameter, unlike MMD with a Gaussian
-kernel:
+2. Replace the L1-on-bucket-mean anchor by a per-position 1D
+   Wasserstein loss (``spatial_per_position_w1``). Sorted L1 between
+   real and fake samples at each (bucket, position, channel) cell. This
+   penalises mismatches in the per-position marginal distribution
+   directly, not just in its first moment. It captures the missing
+   peaks AND the under-produced tail at once.
 
-    ED²(P, Q) = 2 E‖X − Y‖ − E‖X − X'‖ − E‖Y − Y'‖
+The total loss is:
 
-where X, X' ~ P and Y, Y' ~ Q are independent. ED captures the joint
-distribution including all moments and correlations between positions
-and channels, which is what the downstream methylation chain probes.
+    L = ED²(joint, bucketed)   +   λ_pos * W1_per_position(bucketed)
 
-L_mean (per-position L1 between conditional means) — a small auxiliary
-that anchors the predicted bucket mean to the real bucket mean. ED
-alone is theoretically sufficient but converges slowly because it has
-no signal about per-sample correspondence; the L1 anchor pulls the
-model into the right region of the joint quickly, then ED shapes the
-spread and the correlations around it. Default λ_mean = 0.1.
-
-The "bucket" is the emission category (BASELINE / SLOWED / NEAR_METH).
-Splitting by category ensures the slowed-position bucket is not
-swamped by the much larger baseline bucket when matching.
+ED² keeps the joint-structure pressure (correlations across positions
+inside the same window are still constrained). W1-per-position adds the
+explicit per-position marginal pressure the previous L1-on-mean term
+could not provide.
 """
 from __future__ import annotations
 
@@ -34,10 +35,9 @@ import torch
 
 def _pairwise_distances(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Euclidean pairwise distances between rows of x (N, D) and y (M, D)."""
-    # ||a - b||² = ||a||² + ||b||² - 2 a·b
-    xx = (x * x).sum(dim=-1, keepdim=True)             # (N, 1)
-    yy = (y * y).sum(dim=-1, keepdim=True).t()         # (1, M)
-    xy = x @ y.t()                                     # (N, M)
+    xx = (x * x).sum(dim=-1, keepdim=True)
+    yy = (y * y).sum(dim=-1, keepdim=True).t()
+    xy = x @ y.t()
     d2 = xx + yy - 2 * xy
     return d2.clamp_min(1e-12).sqrt()
 
@@ -46,11 +46,6 @@ def energy_distance(real: torch.Tensor, fake: torch.Tensor) -> torch.Tensor:
     """Energy distance² between empirical distributions of real and fake.
 
     real, fake: (N, D) and (M, D) tensors. Returns a non-negative scalar.
-
-    Implementation note: returns ED² (squared energy distance) for
-    smoothness; the gradient is identical up to sign and the scalar is
-    backprop-stable around 0. Both terms are required so that scaling
-    the input doesn't trivially decrease the loss.
     """
     if real.shape[0] < 2 or fake.shape[0] < 2:
         return real.new_zeros(())
@@ -70,10 +65,6 @@ def bucketed_energy_distance(
     """Energy distance averaged across category buckets.
 
     real, fake: (B, D) tensors. bucket_id: (B,) int tensor in [0, n_buckets).
-    Buckets with fewer than `min_samples` are skipped.
-
-    Returns the mean ED² across populated buckets, and a diagnostic dict
-    with per-bucket values (Python floats, detached).
     """
     losses: list[torch.Tensor] = []
     diag: dict[int, float] = {}
@@ -91,33 +82,69 @@ def bucketed_energy_distance(
     return torch.stack(losses).mean(), diag
 
 
-def conditional_mean_l1(
+def spatial_per_position_w1(
     real: torch.Tensor,
     fake: torch.Tensor,
     bucket_id: torch.Tensor,
     n_buckets: int,
     min_samples: int = 4,
-) -> torch.Tensor:
-    """L1 distance between per-bucket means of real and fake tiles.
+) -> tuple[torch.Tensor, dict[int, float]]:
+    """Per-bucket per-position 1-D Wasserstein loss on (B, K, C) tiles.
 
-    real, fake: (B, K, C) tensors. Returns mean L1 across populated
-    buckets and across all (K, C) positions.
+    For each populated bucket and each (position, channel) cell, computes
+    the empirical 1-D Wasserstein-1 distance via sorted L1 between the
+    real and fake samples drawn from that bucket. The empirical W₁ between
+    two equal-size samples in 1-D equals the L1 norm of the difference of
+    their sorted values — directly differentiable via autograd through
+    ``torch.sort``'s stable gradient.
+
+    The result for each bucket is the mean across all (position, channel)
+    cells; the final loss averages over populated buckets. Compared to
+    the previous L1-on-bucket-mean anchor, this:
+
+    * Looks at the FULL per-position marginal distribution, not just its
+      first moment. The narrow-std / under-produced-tail pathology that
+      the audit measured (std ratio 0.74, P[IPD>80] ratio 0.54 on SLOWED)
+      is directly visible in sorted-L1 because the sorted quantiles
+      differ when spread differs.
+    * Penalises the per-position SIGNATURE shape directly. If the real
+      SLOWED_m6A bucket has a peak at position 10, the sorted samples
+      at position 10 sit at higher values; the sorted-L1 of a flat
+      generator vs that bucket grows proportionally to the missing peak.
+
+    Returns ``(loss, per_bucket_diag)`` analogous to
+    :func:`bucketed_energy_distance`.
     """
     losses: list[torch.Tensor] = []
+    diag: dict[int, float] = {}
     for b in range(n_buckets):
         mask = (bucket_id == b)
         if int(mask.sum().item()) < min_samples:
             continue
-        r_mean = real[mask].mean(dim=0)               # (K, C)
-        f_mean = fake[mask].mean(dim=0)
-        losses.append((r_mean - f_mean).abs().mean())
+        r = real[mask]                           # (Nb, K, C)
+        f = fake[mask]                           # (Nb, K, C)
+        # Sort each (position, channel) column independently along the
+        # sample axis. ``r`` and ``f`` have the same Nb by construction
+        # (both come from the same mask), so sorted-L1 is the empirical
+        # W1 between the two 1D marginals.
+        r_sorted, _ = r.sort(dim=0)
+        f_sorted, _ = f.sort(dim=0)
+        # |r_sorted - f_sorted| has shape (Nb, K, C). The mean over Nb is
+        # the per-cell sample-mean of the absolute deviation between
+        # paired sorted values, equivalent to the empirical W1 in 1D up
+        # to a normalising constant. Then mean over (K, C) aggregates
+        # across all positions and channels.
+        per_cell = (r_sorted - f_sorted).abs().mean(dim=0)   # (K, C)
+        bucket_loss = per_cell.mean()
+        losses.append(bucket_loss)
+        diag[b] = float(bucket_loss.detach().item())
     if not losses:
-        return real.new_zeros(())
-    return torch.stack(losses).mean()
+        return real.new_zeros(()), diag
+    return torch.stack(losses).mean(), diag
 
 
 __all__ = [
     "energy_distance",
     "bucketed_energy_distance",
-    "conditional_mean_l1",
+    "spatial_per_position_w1",
 ]

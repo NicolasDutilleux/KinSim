@@ -86,6 +86,7 @@ class ShardedDataset(Dataset):
             "meth_rev_onehot": torch.from_numpy(_onehot(meth_rev, self.n_meth_types)),
             "signal": torch.from_numpy(signal),
             "category": int(s.category[idx]),
+            "parent_meth": int(s.parent_meth[idx]),
         }
 
 

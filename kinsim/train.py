@@ -36,7 +36,7 @@ from torch.utils.data import DataLoader
 
 from .data import build_train_dataset
 from .evaluate import find_test_shard_paths, held_out_w1
-from .losses import bucketed_energy_distance, conditional_mean_l1
+from .losses import bucketed_energy_distance, spatial_per_position_w1
 from .model import GeneratorConfig, TransformerGenerator
 
 
@@ -47,11 +47,44 @@ def _collate(batch: list[dict]) -> dict[str, torch.Tensor]:
     """
     out = {}
     for k in batch[0]:
-        if k == "category":
+        if k in ("category", "parent_meth"):
             out[k] = torch.tensor([b[k] for b in batch], dtype=torch.long)
         else:
             out[k] = torch.stack([b[k] for b in batch], dim=0)
     return out
+
+
+def _compute_bucket_id(category: torch.Tensor, parent_meth: torch.Tensor) -> torch.Tensor:
+    """Map (category, parent_meth) → integer bucket id in [0, 4].
+
+    5 buckets, each homogeneous so its per-position mean profile
+    actually shows the signature peaks the model must reproduce:
+
+        0 = BASELINE       (category == 0)
+        1 = NEAR_METH      (category == 2)
+        2 = SLOWED_m6A     (category == 1, parent_meth == 1)
+        3 = SLOWED_m4C     (category == 1, parent_meth == 2)
+        4 = SLOWED_m5C     (category == 1, parent_meth == 3)
+
+    Rationale: the previous 3-bucket scheme (BASELINE/SLOWED/NEAR_METH)
+    averaged the m6A signature (offsets 0, +5), m4C (offset 0), m5C
+    (offsets +2, +6) inside a single SLOWED bucket. The per-bucket mean
+    profile that the L1 anchor matched was therefore the average of three
+    different signatures — i.e. mostly flat. The audit on the previous
+    run (W1=1.05 best ckpt, step 130k) showed exactly this pathology:
+    the real SLOWED mean profile had small peaks at positions 4/9/16
+    while the generator produced a flat profile. Per-meth bucketing
+    gives each SLOWED_X bucket a CONSISTENT spatial signature that the
+    L1 anchor can pull the generator toward.
+    """
+    # Sentinel for SLOWED with unknown parent_meth (shouldn't happen
+    # in practice but be defensive: clamp to m6A bucket which is the
+    # most common).
+    slowed_id = torch.clamp(parent_meth, min=1, max=3) + 1  # 1→2, 2→3, 3→4
+    return torch.where(
+        category == 0, torch.zeros_like(category),
+        torch.where(category == 2, torch.ones_like(category), slowed_id),
+    ).long()
 
 
 log = logging.getLogger("kinsim.train")
@@ -186,14 +219,32 @@ def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
     )
     batches = _infinite_loader(loader, dataset, epoch_start=0)
 
-    n_buckets = int(t_cfg.get("n_buckets", 3))
+    # 5 buckets after the audit-driven per-meth refinement (see
+    # _compute_bucket_id docstring): BASELINE / NEAR_METH /
+    # SLOWED_m6A / SLOWED_m4C / SLOWED_m5C.
+    n_buckets = int(t_cfg.get("n_buckets", 5))
     bucket_min_samples = int(t_cfg.get("bucket_min_samples", 4))
-    lambda_mean = float(t_cfg.get("lambda_mean", 0.1))
+    lambda_pos = float(t_cfg.get("lambda_pos", 1.0))
 
     log_every = int(t_cfg["log_every"])
     ckpt_every = int(t_cfg["checkpoint_every"])
     eval_every = int(t_cfg.get("eval_every", ckpt_every))
     n_steps = int(t_cfg["n_steps"])
+
+    # Cosine LR decay so the late-training oscillation observed at the
+    # previous run (W1 1.05 → 3.72 between step 130k and step 199999)
+    # doesn't recur. Decays from base lr at step 0 to base lr × 0.05
+    # at step n_steps. If lr_schedule is "constant" the multiplier
+    # stays at 1.0.
+    lr_schedule = str(t_cfg.get("lr_schedule", "cosine")).lower()
+    lr_min_frac = float(t_cfg.get("lr_min_frac", 0.05))
+    import math
+    def _lr_mult(step_idx: int) -> float:
+        if lr_schedule == "cosine":
+            t = step_idx / max(1, n_steps - 1)
+            return lr_min_frac + 0.5 * (1.0 - lr_min_frac) * (1.0 + math.cos(math.pi * t))
+        return 1.0
+    base_lr = float(t_cfg["lr"])
 
     # Held-out test shards (looked up in the SAME shards dir as training —
     # list_shards excludes them from the training loader, so they live there
@@ -209,9 +260,13 @@ def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
     best_w1 = float("inf")
 
     last_log = time.time()
-    running = {"ed": 0.0, "mean": 0.0, "loss": 0.0, "n": 0}
+    running = {"ed": 0.0, "pos": 0.0, "loss": 0.0, "n": 0}
 
     for step in range(start_step, n_steps):
+        # Apply cosine LR multiplier (does nothing if lr_schedule="constant")
+        for pg in opt.param_groups:
+            pg["lr"] = base_lr * _lr_mult(step)
+
         batch = next(batches)
         base_fwd = batch["base_fwd_onehot"].to(dev, non_blocking=True)
         base_rev = batch["base_rev_onehot"].to(dev, non_blocking=True)
@@ -219,6 +274,9 @@ def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
         meth_rev = batch["meth_rev_onehot"].to(dev, non_blocking=True)
         real = batch["signal"].to(dev, non_blocking=True)               # (B, K, C)
         cat = batch["category"].to(dev, non_blocking=True).long()
+        parent_meth = batch["parent_meth"].to(dev, non_blocking=True).long()
+        # 5-bucket id from (category, parent_meth) — see _compute_bucket_id
+        bucket = _compute_bucket_id(cat, parent_meth)
 
         B = real.shape[0]
         z = torch.randn(B, g_cfg.z_dim, device=dev)
@@ -227,13 +285,13 @@ def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
         real_flat = real.reshape(B, -1)
         fake_flat = fake.reshape(B, -1)
 
-        ed_loss, _ed_per_bucket = bucketed_energy_distance(
-            real_flat, fake_flat, cat, n_buckets, min_samples=bucket_min_samples
+        ed_loss, _ = bucketed_energy_distance(
+            real_flat, fake_flat, bucket, n_buckets, min_samples=bucket_min_samples
         )
-        mean_loss = conditional_mean_l1(
-            real, fake, cat, n_buckets, min_samples=bucket_min_samples
+        pos_loss, _ = spatial_per_position_w1(
+            real, fake, bucket, n_buckets, min_samples=bucket_min_samples
         )
-        loss = ed_loss + lambda_mean * mean_loss
+        loss = ed_loss + lambda_pos * pos_loss
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -241,7 +299,7 @@ def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
         opt.step()
 
         running["ed"] += float(ed_loss.detach().item())
-        running["mean"] += float(mean_loss.detach().item())
+        running["pos"] += float(pos_loss.detach().item())
         running["loss"] += float(loss.detach().item())
         running["n"] += 1
 
@@ -249,13 +307,14 @@ def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
             now = time.time()
             steps_per_sec = running["n"] / max(now - last_log, 1e-6)
             log.info(
-                "step %6d  loss=%.4f  ed=%.4f  mean_l1=%.4f  steps/s=%.1f",
+                "step %6d  loss=%.4f  ed=%.4f  pos_w1=%.4f  lr=%.2e  steps/s=%.1f",
                 step, running["loss"] / running["n"],
                 running["ed"] / running["n"],
-                running["mean"] / running["n"],
+                running["pos"] / running["n"],
+                base_lr * _lr_mult(step),
                 steps_per_sec,
             )
-            running = {"ed": 0.0, "mean": 0.0, "loss": 0.0, "n": 0}
+            running = {"ed": 0.0, "pos": 0.0, "loss": 0.0, "n": 0}
             last_log = now
 
         if step > 0 and step % ckpt_every == 0:

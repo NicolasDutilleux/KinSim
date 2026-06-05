@@ -5,7 +5,7 @@ window:
   n_channels: 4
 
 methylation:
-  # Must match the n_meth_types stored in the shards' __meta__ section
+  # Must match n_meth_types stored in the shards' __meta__ section
   # (4 by default in kinsim_NN: none / m6A / m4C / m5C).
   n_meth_types: 4
 
@@ -24,17 +24,32 @@ train:
   beta1: 0.9
   beta2: 0.999
   weight_decay: 0.0
-  n_steps: 200000
+  # Audit on the previous run (200k steps, no LR decay) showed late-
+  # training drift from W1=1.05 at step 130k to W1=3.72 at step 199999.
+  # Cosine LR decay from lr → lr*0.05 over n_steps tames this.
+  lr_schedule: cosine          # cosine | constant
+  lr_min_frac: 0.05            # cosine endpoint = lr * lr_min_frac
+  # n_steps reduced from 200000: best W1 hit at step 130k previously,
+  # and the spatial-w1 loss converges faster than ED+L1. 80k gives margin
+  # while best_G.pt selection covers the actual optimum.
+  n_steps: 80000
   checkpoint_every: 5000
   log_every: 100
   eval_every: 5000
   num_workers: 2
   pin_memory: true
   seed: 42
-  # Loss weights
-  lambda_mean: 0.1            # weight on conditional-mean L1 anchor
-  # Bucket choice for energy distance / mean L1
-  n_buckets: 3                # category buckets: BASELINE / SLOWED / NEAR_METH
+  # ─── post-audit loss weights ───────────────────────────────────────
+  # spatial_per_position_w1 captures per-position marginal mismatch
+  # (mean + spread + tail) per (category, parent_meth) bucket. ED²
+  # captures the joint structure on the flattened tile per bucket.
+  # Weights are normalised so both terms contribute comparable magnitudes
+  # after the first few thousand steps.
+  lambda_pos: 1.0
+  # 5 buckets: BASELINE / NEAR_METH / SLOWED_m6A / SLOWED_m4C / SLOWED_m5C
+  # — split SLOWED by parent_meth so each bucket's mean profile shows the
+  # signature peaks at consistent offsets (previously averaged out).
+  n_buckets: 5
   bucket_min_samples: 4
 
 split:
