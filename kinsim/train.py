@@ -39,6 +39,20 @@ from .losses import bucketed_energy_distance, conditional_mean_l1
 from .model import GeneratorConfig, TransformerGenerator
 
 
+def _collate(batch: list[dict]) -> dict[str, torch.Tensor]:
+    """Explicit collate for the dict-of-tensors items produced by
+    ShardedDataset. Matches kinsim_NN's collate to avoid relying on
+    PyTorch's default collate quirks with IterableDataset + num_workers.
+    """
+    out = {}
+    for k in batch[0]:
+        if k == "category":
+            out[k] = torch.tensor([b[k] for b in batch], dtype=torch.long)
+        else:
+            out[k] = torch.stack([b[k] for b in batch], dim=0)
+    return out
+
+
 log = logging.getLogger("kinsim.train")
 
 
@@ -159,11 +173,15 @@ def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
         test_strains=test_strains,
         seed=seed,
     )
+    num_workers = int(t_cfg["num_workers"])
     loader = DataLoader(
         dataset,
         batch_size=int(t_cfg["batch_size"]),
-        num_workers=int(t_cfg["num_workers"]),
+        num_workers=num_workers,
         pin_memory=bool(t_cfg["pin_memory"]),
+        collate_fn=_collate,
+        persistent_workers=False,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
     batches = _infinite_loader(loader, dataset, epoch_start=0)
 
