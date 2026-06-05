@@ -35,6 +35,7 @@ import yaml
 from torch.utils.data import DataLoader
 
 from .data import build_train_dataset
+from .evaluate import find_test_shard_paths, held_out_w1
 from .losses import bucketed_energy_distance, conditional_mean_l1
 from .model import GeneratorConfig, TransformerGenerator
 
@@ -191,7 +192,21 @@ def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
 
     log_every = int(t_cfg["log_every"])
     ckpt_every = int(t_cfg["checkpoint_every"])
+    eval_every = int(t_cfg.get("eval_every", ckpt_every))
     n_steps = int(t_cfg["n_steps"])
+
+    # Held-out test shards (looked up in the SAME shards dir as training —
+    # list_shards excludes them from the training loader, so they live there
+    # but never enter a training batch).
+    test_shard_paths = find_test_shard_paths(Path(shards_dir), test_strains)
+    if test_shard_paths:
+        log.info("Held-out test shards: %d (%s)",
+                 len(test_shard_paths), [p.name for p in test_shard_paths])
+    else:
+        log.warning("No held-out test shards found for test_strains=%s — "
+                    "periodic W1 eval and best_G.pt selection disabled.",
+                    test_strains)
+    best_w1 = float("inf")
 
     last_log = time.time()
     running = {"ed": 0.0, "mean": 0.0, "loss": 0.0, "n": 0}
@@ -245,6 +260,33 @@ def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
 
         if step > 0 and step % ckpt_every == 0:
             _save_checkpoint(Path(ckpt_dir), step, model, opt, cfg)
+
+        # Held-out W1 eval (same bucketing as kinsim_NN — numbers directly
+        # comparable to v6 thesis W1=2.017). Saves best_G.pt on improvement.
+        if step > 0 and step % eval_every == 0 and test_shard_paths:
+            metrics = held_out_w1(
+                model, test_shard_paths,
+                g_cfg.n_meth_types, g_cfg.z_dim, dev,
+            )
+            w1 = metrics.get("w1_overall", float("nan"))
+            log.info(
+                "EVAL step %d  w1_overall=%.3f  %s",
+                step, w1,
+                "  ".join(f"{k}={v:.2f}" for k, v in metrics.items()
+                          if k != "w1_overall"),
+            )
+            if not (w1 != w1) and w1 < best_w1:        # not NaN and lower
+                best_w1 = w1
+                best_path = Path(ckpt_dir) / "best_G.pt"
+                torch.save({
+                    "step": step,
+                    "model_state": model.state_dict(),
+                    "opt_state": opt.state_dict(),
+                    "model_config": asdict(model.cfg),
+                    "train_config": cfg,
+                    "w1_overall": float(w1),
+                }, best_path)
+                log.info("New best G  (w1_overall=%.3f)  → %s", best_w1, best_path)
 
     # final checkpoint
     _save_checkpoint(Path(ckpt_dir), n_steps - 1, model, opt, cfg)
