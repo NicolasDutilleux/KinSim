@@ -87,7 +87,8 @@ def _evaluate(
         idxs = np.random.default_rng(0).permutation(shard.n)[:max_samples_per_shard]
         batch_items = [ds[int(i)] for i in idxs]
         batch = {
-            k: (torch.stack([b[k] for b in batch_items]) if k != "category"
+            k: (torch.stack([b[k] for b in batch_items])
+                if k not in ("category", "parent_meth")
                 else torch.tensor([b[k] for b in batch_items]))
             for k in batch_items[0]
         }
