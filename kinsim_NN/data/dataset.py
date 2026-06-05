@@ -158,7 +158,7 @@ class MultiShardDataset(IterableDataset):
         for p in paths:
             try:
                 shard = read_shard(p)
-            except (OSError, EOFError, ValueError) as e:
+            except (OSError, EOFError, ValueError, KeyError) as e:
                 log.warning("Skipping unreadable shard %s: %s", p, e)
                 continue
             if self._expected_k is None:
