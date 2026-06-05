@@ -229,15 +229,30 @@ def _evaluate_on_shards(
         mr = shard.meth_rev[idxs, half]
         cats = shard.category[idxs]
         for i in range(real_u8.shape[0]):
-            # Strand pooling: every sample contributes EXACTLY ONE value per
-            # bucket so per-bucket W1 estimates are comparable across buckets
-            # (an earlier version double-counted baselines on both channels,
-            # which biased w1_baseline against per-meth W1s).
+            # Strand pooling rules (Bug 7 + Bug 8 in BUGS_FOUND.md):
             #
-            # For palindromic sites where both meth_fwd > 0 and meth_rev > 0
-            # (e.g. m6A on both strands of GATC), we add the sample to BOTH
-            # the fwd-meth and the rev-meth buckets so neither strand's
-            # contribution is silently discarded.
+            # PER-METH buckets: each contribution = ONE kinetic measurement
+            #   on ONE strand. A non-palindromic methylation contributes once
+            #   (the methylated strand's IPD). A palindromic methylation
+            #   (mf[i]>0 AND mr[i]>0, e.g. m6A on both strands of GATC)
+            #   contributes TWICE because the two strands ARE two distinct
+            #   physical kinetic measurements of the modification — channel 0
+            #   for + strand IPD, channel 2 for − strand IPD. Both belong in
+            #   the m6A bucket. Counting only one would drop half the
+            #   palindromic signal, which is the bug 8 case.
+            #
+            # PER-CATEGORY buckets: each contribution = ONE per ROW, regardless
+            #   of strand multiplicity. The ``contributed`` flag enforces this:
+            #   on a palindromic site, channel 0 goes into the category bucket
+            #   but channel 2 does not. This keeps per-category sample counts
+            #   equal to the row count so categories remain comparable across
+            #   palindrome-heavy vs palindrome-light corpora.
+            #
+            # Consequence: in palindrome-dominated corpora (e.g. Streptomyces
+            # m6A on GATC), per-meth W1 has roughly 2× the sample count of
+            # per-category W1. The two metrics measure different things by
+            # construction — do not ratio them across buckets to estimate
+            # "how much harder is bucket X than bucket Y".
             cat = int(cats[i])
             contributed = False
             if mf[i] > 0:

@@ -84,6 +84,7 @@ class GFFLabeler(BaseLabeler):
         n_skipped_qv = 0
         n_skipped_type = 0
         n_skipped_no_motif = 0
+        n_skipped_strand = 0
         with open(path) as f:
             for line in f:
                 if line.startswith("#") or not line.strip():
@@ -108,7 +109,16 @@ class GFFLabeler(BaseLabeler):
                 if self.require_motif and "motif=" not in parts[8]:
                     n_skipped_no_motif += 1
                     continue
-                strand = parts[6]
+                strand = parts[6].strip()
+                # GFF3 declares strand as exactly "+" or "-" (or "." for
+                # unknown, "?" for relevance-unknown). Anything else is
+                # malformed and would be inserted into the labels dict with
+                # a key that never matches the downstream "+" / "-" lookup
+                # in extract.py, silently discarding the methylation. Reject
+                # explicitly so the n_skipped_strand counter surfaces it.
+                if strand not in ("+", "-"):
+                    n_skipped_strand += 1
+                    continue
 
                 meth_name: str | None
                 if gff_type in meth_id_by_name and gff_type != "none":
@@ -127,9 +137,11 @@ class GFFLabeler(BaseLabeler):
                 n_kept += 1
         log.info(
             "[GFFLabeler] %s parsed once  kept=%d  skipped(qv<%g)=%d  "
-            "skipped(type)=%d  skipped(no_motif)=%d  require_motif=%s",
+            "skipped(type)=%d  skipped(no_motif)=%d  skipped(strand)=%d  "
+            "require_motif=%s",
             path.name, n_kept, self.qv_threshold, n_skipped_qv,
-            n_skipped_type, n_skipped_no_motif, self.require_motif,
+            n_skipped_type, n_skipped_no_motif, n_skipped_strand,
+            self.require_motif,
         )
         self._cache[key] = dict(groups)
         return self._cache[key]

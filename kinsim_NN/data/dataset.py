@@ -187,7 +187,18 @@ class MultiShardDataset(IterableDataset):
 
 def list_shards(directory: Path, exclude_strains: set[str] | None = None) -> list[Path]:
     """Return all shard paths under ``directory``, optionally excluding
-    test-split strains by sample_id."""
+    test-split strains by sample_id.
+
+    Matching mirrors the eval-side ``glob(f"*{t}_shard.pkl")`` logic:
+    a test_strain entry like ``"bc2034"`` excludes both
+    ``strepto_bc2034`` and ``vega_bc2034`` shards (the bare barcode
+    appears as the trailing underscore-separated component of every
+    lineage-prefixed sample_id). A test_strain entry that matches the
+    full sample_id (e.g. ``"strepto_bc2034"``) is also honoured.
+    Without this trailing-component match a bare barcode in the YAML's
+    ``split.test_strains`` list would never match a prefixed shard and
+    the held-out evaluation would silently train on its own test set.
+    """
     directory = Path(directory)
     if not directory.is_dir():
         raise NotADirectoryError(f"shards dir not found: {directory}")
@@ -197,7 +208,10 @@ def list_shards(directory: Path, exclude_strains: set[str] | None = None) -> lis
     for p in paths:
         # Filename like "strepto_bc2033_shard.pkl" → sample_id "strepto_bc2033"
         sid = p.stem.removesuffix("_shard")
-        if sid in exclude_strains:
+        # Match the test_strain either against the full sample_id or against
+        # the trailing underscore-separated component (the barcode form).
+        sid_tail = sid.rsplit("_", 1)[-1]
+        if sid in exclude_strains or sid_tail in exclude_strains:
             continue
         out.append(p)
     return out

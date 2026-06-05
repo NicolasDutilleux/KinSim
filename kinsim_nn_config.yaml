@@ -33,7 +33,14 @@ methylation_types:
   m5C:
     id: 3
     modified_base: C
-    label_sources: [gff, jasmine_mm_ml]
+    # ``label_sources`` is informational only — it lists every labeler
+    # that *can* contribute to this meth type. The labelers actually
+    # invoked at extract time are the ``labelers:`` list below. With
+    # ``jasmine_mm_ml`` currently commented out, m5C labels come from
+    # GFF only. Add ``jasmine_mm_ml`` back to ``label_sources`` AND
+    # uncomment its entry in ``labelers:`` to re-enable single-molecule
+    # 5mC labelling.
+    label_sources: [gff]
     signal_offsets: [2, 6]
 
 # Treat GFF 'modified_base' (unclassified) as which type? Set to null to ignore.

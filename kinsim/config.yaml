@@ -1,0 +1,43 @@
+# kinsim — default training config.
+
+window:
+  k: 21
+  n_channels: 4
+
+methylation:
+  # Must match the n_meth_types stored in the shards' __meta__ section
+  # (4 by default in kinsim_NN: none / m6A / m4C / m5C).
+  n_meth_types: 4
+
+model:
+  d_model: 192
+  n_layers: 6
+  n_heads: 6
+  mlp_ratio: 4.0
+  z_dim: 64
+  pos_embed_dim: 24
+  drop_rate: 0.0
+
+train:
+  batch_size: 256
+  lr: 0.0002
+  beta1: 0.9
+  beta2: 0.999
+  weight_decay: 0.0
+  n_steps: 200000
+  checkpoint_every: 5000
+  log_every: 100
+  eval_every: 5000
+  num_workers: 2
+  pin_memory: true
+  seed: 42
+  # Loss weights
+  lambda_mean: 0.1            # weight on conditional-mean L1 anchor
+  # Bucket choice for energy distance / mean L1
+  n_buckets: 3                # category buckets: BASELINE / SLOWED / NEAR_METH
+  bucket_min_samples: 4
+
+split:
+  # Strain entries excluded from training (matched by full sample_id OR
+  # by trailing barcode component — same logic as kinsim_NN's list_shards).
+  test_strains: [bc2034, bc2045, bc2048, bc2082]

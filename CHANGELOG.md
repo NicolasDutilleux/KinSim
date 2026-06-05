@@ -54,6 +54,24 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every record (missing `fn` → no `/fwd`; missing `rn` → no `/rev`;
   missing both → every ZMW gone). Diagnosed 2026-06-02 by tag
   ablation on a known-good Sequel raw HiFi.
+- Bug 13 — `kinsim_NN/data/dataset.py` `list_shards()` now matches
+  the YAML `test_strains` entries against both the full sample_id
+  (`strepto_bc2034`) and the trailing barcode component (`bc2034`).
+  Prior behaviour: bare-barcode entries never matched lineage-prefixed
+  shards, so the held-out test strains silently leaked into the
+  training set. Every v6 W1 number prior to this fix is a
+  training-set fidelity metric, not a held-out generalisation result.
+  See [`BUGS_FOUND.md`](BUGS_FOUND.md) Bug 13.
+- `kinsim_NN/labelers/gff.py` now rejects GFF rows whose strand
+  column is anything other than `"+"` or `"-"`. Prior behaviour:
+  malformed strands (`"?"`, `"."`, leading whitespace) were inserted
+  into the labels dict with keys that never matched the downstream
+  `"+"` / `"-"` lookup in `extract.py`, silently discarding the
+  methylation. The `n_skipped_strand` count is now logged at parse
+  time so the discard is visible.
+- `kinsim_nn_config.yaml` — m5C `label_sources` no longer lists
+  `jasmine_mm_ml` while the labeler is commented out in the
+  `labelers:` list. The YAML now reflects what actually runs.
 
 ### Added
 - `PACBIO_COMPATIBILITY.md` — forward-looking compatibility rules

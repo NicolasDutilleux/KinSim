@@ -158,3 +158,13 @@ real-data ipdSummary as the position reference.
 - Do not mix PacBio tool sources inside one chain (SIF `pbmm2` 1.18 vs
   conda `pbmm2` 26.x produce mutually unreadable BAMs). See
   [`PACBIO_COMPATIBILITY.md`](PACBIO_COMPATIBILITY.md).
+- Do not assume two pieces of code that name "the same thing" agree on
+  the form of that thing. `cfg.split.test_strains` is normalised in
+  `kinsim_NN/data/dataset.py` `list_shards()` (suffix + exact match);
+  any new code path that filters shards by strain must use the same
+  helper, not re-implement set membership. See Bug 13 in
+  [`BUGS_FOUND.md`](BUGS_FOUND.md) for the historical leak.
+- Do not feed PBSIM3-simulated BAMs directly into the PacBio
+  downstream chain without rewriting read names to the
+  `m<MovieName>/<HoleNumber>/ccs` convention. See Bug 12 in
+  [`BUGS_FOUND.md`](BUGS_FOUND.md).

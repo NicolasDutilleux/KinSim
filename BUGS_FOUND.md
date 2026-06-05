@@ -297,3 +297,99 @@ reverted — its consequences only surfaced once the chain ran further
 than the bystrandify step. Bisect-style attribution: if a partial fix
 made it through review without being reverted, audit it before
 claiming the chain is unblocked.
+
+---
+
+## Bug 12 — PBSIM3 read names are not parseable by `ccs-kinetics-bystrandify` / `ipdSummary`
+
+**Symptom.** Feeding a PBSIM3-simulated HiFi BAM directly into the
+downstream PacBio chain (with `kinsim_nn generate` having injected
+synthetic `fi/fp/ri/rp`) caused tool-specific failures: `pbindex`
+either failed outright or produced an empty `.pbi`,
+`ccs-kinetics-bystrandify` silently dropped every record (the same
+silent-failure pattern as bugs 1–5, 10), and `ipdSummary` crashed
+inside `pbcore` while extracting the ZMW number.
+
+**Root cause.** PacBio HiFi BAM convention requires the read name to
+match `m<MovieName>/<HoleNumber>/ccs`, where `<HoleNumber>` is a
+non-negative decimal integer. `pbcore` parses the second
+slash-separated token as the ZMW hole number and indexes records by
+it. PBSIM3 emits simulator-native names (e.g. `S1_1`, `S1_2`, …,
+optionally prefixed by an organism tag) that do not contain the
+required `m...`/`<int>`/`ccs` structure. The PacBio readers either
+fail the integer parse or fall through to a code path that assumes a
+sentinel ZMW value and discards the record.
+
+**Fix (workflow level).** Before piping PBSIM3 output through KinSim's
+generation step, rewrite read names to a PacBio-conformant template
+with a synthetic movie tag and a monotonically increasing integer
+hole number. Reserved for a future preprocessing helper
+(`scripts/pbsim3_to_pacbio_names.py`); the strip-and-rename pattern
+mirrors the bystrandified-to-HiFi script we already maintain.
+
+**Lesson.** PacBio tools do not just consume a BAM — they consume a
+BAM under a structured read-name convention. Format conformance at
+the byte level (flags, tags, codec) is necessary but not sufficient;
+the read name itself is a load-bearing field. Validate the name
+pattern before submitting upstream of any PacBio binary.
+
+---
+
+## Bug 13 — Test-strain shards leak into the training set (`list_shards` exclusion logic)
+
+**Symptom.** The training log reported `Training shards: 65
+test_strains=('bc2034', 'bc2045', 'bc2048', 'bc2082')` for the v6
+bilateral run on a corpus of exactly 65 bilateral shards (58 training
++ 7 test shards). The "test_strains exclusion" produced *the entire
+corpus*. The held-out W1 evaluator separately re-found the test
+shards via `glob(f"*{sid}_shard.pkl")` (line 387) and dutifully
+reported W1 numbers — but those numbers were measured on data the
+model had already seen during training. The champion W1 = 2.017 at
+step 45 000 is therefore not a held-out generalisation metric on the
+v6 bilateral run; it is a training-set fidelity metric.
+
+**Root cause.** `kinsim_NN/data/dataset.py` `list_shards()` used
+`if sid in exclude_strains: continue`, where `sid` is the full
+sample_id like `"strepto_bc2034"` and `exclude_strains` is the set
+from `cfg.split.test_strains` like `{"bc2034", "bc2045", …}`. The
+`in` check is exact-membership — `"strepto_bc2034"` is not in
+`{"bc2034", …}`, so the exclusion never fires for lineage-prefixed
+shards. The eval logic used a glob with a wildcard prefix
+(`*{sid}_shard.pkl`) which happens to be permissive; the training-side
+exclusion was not.
+
+**Fix.** Match the test_strain against both the full sample_id and
+the trailing underscore-separated component:
+
+```python
+sid_tail = sid.rsplit("_", 1)[-1]
+if sid in exclude_strains or sid_tail in exclude_strains:
+    continue
+```
+
+With this, `"strepto_bc2034".rsplit("_", 1)[-1] == "bc2034"` is in
+the exclusion set and the shard is correctly held out.
+
+**Impact on v6 results.** Every W1 number reported from the
+2026-05-31 v6 bilateral training run (`train_v6_bilateral_17274833`)
+was computed on data the model had been trained on. The 28 %
+improvement vs the legacy ConvPredictor remains *directionally*
+meaningful (the metric definition and corpus did change in ways
+documented in the thesis), but the absolute number cannot be cited
+as a held-out generalisation result without re-evaluating against
+shards that were actually excluded from training. Easiest path
+post-fix: take the snapshotted `best_G_step45k_snapshot.pt`, run
+`kinsim_nn evaluate` on the test_strains shards with the corrected
+`list_shards`, and report whatever number falls out. Document the
+gap from the corrected number to the published one as a thesis
+limitation.
+
+**Lesson.** Two pieces of code that look like they should agree on
+"is this shard in the test split?" can silently disagree when one
+uses set membership and the other uses fuzzy glob matching. When a
+sample-identifier appears in multiple places (YAML, filename glob,
+set membership), normalise it in exactly one place and pass the
+canonical form everywhere. The split logic needs a single source of
+truth — either the YAML carries full sample_ids (`strepto_bc2034`,
+`vega_bc2034`) explicitly, or both training and eval use the same
+helper that does the suffix-match. Either, not both.

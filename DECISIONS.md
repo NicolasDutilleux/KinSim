@@ -163,3 +163,52 @@ made the package non-installable without the legacy `kinsim/`. With
 `kinsim/` retired, the motif utilities are owned by `kinsim_NN` and
 the configuration lookups (`get_modified_base`, `get_modified_base_map`,
 `get_meth_ids`) are wired to `kinsim_nn_config.yaml`.
+
+---
+
+## 10. Future work — eukaryote / prokaryote mode preset
+
+**Status.** Not yet implemented; documented here so the design space
+is captured before it is forgotten.
+
+**The problem.** KinSim's labelling chain is configuration-driven via
+`kinsim_nn_config.yaml`. A user simulating prokaryotic data wants
+`gff` (ipdSummary + pbmotifmaker for m6A / m4C / m5C at motif sites);
+a user simulating eukaryotic data wants `jasmine_mm_ml` (5mC at CpG
+dinucleotides on a per-read basis). The two labellers are mutually
+exclusive in practice: jasmine's CNN is restricted to CpG contexts,
+while ipdSummary's m5C calls require motif-level evidence that
+bacterial m5C systems provide but eukaryotic CpG islands typically do
+not. Asking the user to assemble the right `labelers:` list by hand
+is a UX cliff.
+
+**Proposed design.** Add a top-level YAML key:
+
+```yaml
+mode: prokaryote   # one of: prokaryote, eukaryote
+```
+
+with a presets layer that, at config load time, expands this to:
+
+* `mode: prokaryote` → `labelers: [gff]`, `methylation_types`
+  keeps m6A / m4C / m5C as currently defined.
+* `mode: eukaryote` → `labelers: [jasmine_mm_ml]`, `methylation_types`
+  reduced to `{none, m5C}` with `m5C.signal_offsets = [...]` retained.
+
+The user-facing CLI gains `--mode {prokaryote,eukaryote}` on every
+subcommand that reads the config. The model itself (architecture,
+loss, training schedule) is unchanged — only the labeller selection
+and the active methylation alphabet differ.
+
+**Trade-off.** Adding the preset hides the `labelers:` list under a
+mode toggle; advanced users still need access to the raw list for
+hybrid configurations (e.g. a bacterial corpus with jasmine-confirmed
+5mC). The proposed design keeps the explicit `labelers:` key as the
+authority — `mode:` is a convenience that sets defaults the user can
+override.
+
+**Rationale.** The biology cleanly bifurcates by kingdom. Hiding the
+labeller composition behind a kingdom-level toggle reduces the
+cognitive surface for new users and makes "I'm doing eukaryote 5mC"
+a one-line YAML change. The trade-off (a level of indirection) is
+small relative to the user-facing simplification.
