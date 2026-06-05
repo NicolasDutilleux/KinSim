@@ -77,13 +77,18 @@ class AdaLNZeroBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, mlp_ratio: float = 4.0,
                  drop_rate: float = 0.0):
         super().__init__()
-        self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
         self.attn = MultiHeadSelfAttention(d_model, n_heads, drop_rate=drop_rate)
-        self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
         self.ffn = FFN(d_model, mlp_ratio=mlp_ratio, drop_rate=drop_rate)
-        self.mod = nn.Linear(d_model, 6 * d_model, bias=True)
-        nn.init.zeros_(self.mod.weight)
-        nn.init.zeros_(self.mod.bias)
+        # SiLU before the modulation Linear: matches DiT / v6 — without it
+        # the cond → (shift, scale, gate) mapping is purely linear.
+        self.mod = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(d_model, 6 * d_model, bias=True),
+        )
+        nn.init.zeros_(self.mod[1].weight)
+        nn.init.zeros_(self.mod[1].bias)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         s1, sc1, g1, s2, sc2, g2 = self.mod(c).chunk(6, dim=-1)
@@ -123,7 +128,7 @@ class TransformerGenerator(nn.Module):
         self.pos_embed = nn.Parameter(torch.randn(cfg.k, cfg.pos_embed_dim) * 0.02)
         self.z_mlp = nn.Sequential(
             nn.Linear(cfg.z_dim, cfg.d_model),
-            nn.GELU(),
+            nn.SiLU(),
             nn.Linear(cfg.d_model, cfg.d_model),
         )
         self.cond_pool_proj = nn.Linear(cfg.d_model, cfg.d_model)
@@ -131,10 +136,13 @@ class TransformerGenerator(nn.Module):
             AdaLNZeroBlock(cfg.d_model, cfg.n_heads, cfg.mlp_ratio, cfg.drop_rate)
             for _ in range(cfg.n_layers)
         ])
-        self.final_norm = nn.LayerNorm(cfg.d_model, elementwise_affine=False)
-        self.final_mod = nn.Linear(cfg.d_model, 2 * cfg.d_model, bias=True)
-        nn.init.zeros_(self.final_mod.weight)
-        nn.init.zeros_(self.final_mod.bias)
+        self.final_norm = nn.LayerNorm(cfg.d_model, elementwise_affine=False, eps=1e-6)
+        self.final_mod = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(cfg.d_model, 2 * cfg.d_model, bias=True),
+        )
+        nn.init.zeros_(self.final_mod[1].weight)
+        nn.init.zeros_(self.final_mod[1].bias)
         self.head = nn.Linear(cfg.d_model, cfg.n_channels)
         # Zero-init the head so the model starts emitting ~0 (i.e. log1p(0))
         # and learns to push values up from there.

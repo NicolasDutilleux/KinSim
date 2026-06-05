@@ -43,6 +43,14 @@ log = logging.getLogger("kinsim.train")
 
 
 def _setup_logging(level: int = logging.INFO) -> None:
+    # Force line-buffered stdout so SLURM-redirected logs appear in real
+    # time rather than in 4 KB chunks. Without this, the first ~30
+    # log lines accumulate in the kernel pipe buffer and only flush
+    # when full — making the job look hung for the first few minutes.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
     logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
