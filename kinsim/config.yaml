@@ -64,5 +64,19 @@ train:
   n_buckets: 5
   bucket_min_samples: 4
 
+  # ─── class-balanced batching (post-audit-v3 fix, 2026-06-06) ───────
+  # MultiShardDataset streams rows ~proportionally, so a 384-batch holds
+  # only ~2-3 SLOWED_m6A windows (m6A ≈ 0.65 % of the corpus) — below
+  # bucket_min_samples / tail_min_samples, so the m6A bucket is DROPPED
+  # from the per-bucket losses most steps and its signature never gets
+  # gradient. End-to-end audit (bc2034): gen m6A mean 29.4 / std 23.8 vs
+  # real 35.4 / 34.5 — collapsed to baseline → 0 motifs recovered.
+  # balanced_buckets rebuilds each batch with an equal per-bucket quota
+  # (rare buckets oversampled WITH REPLACEMENT from a rolling reservoir),
+  # so every methylation bucket exceeds min_samples every step.
+  balanced_buckets: true
+  bucket_quota: null         # null → batch_size split equally across n_buckets
+  bucket_buffer_cap: 2048    # rolling per-bucket reservoir size (bounds memory)
+
 split:
   test_strains: [bc2034, bc2045, bc2048, bc2082]

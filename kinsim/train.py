@@ -2,15 +2,20 @@
 
 Direct (non-adversarial) training of a transformer generator under
 
-    L = Energy_Distance²(real_tile, fake_tile)   bucketed by category
-        + λ_mean * L1(per-bucket means)
+    L = λ_ed   * Energy_Distance²(real_tile, fake_tile)   bucketed
+      + λ_pos  * spatial_per_position_w1(real, fake)       bucketed
+      + λ_tail * tail_quantile_loss(real, fake, p95/p99)   bucketed
 
-The latent z provides stochasticity; the per-sample correspondence
-between (cond, real_signal) drawn from the shard and (cond, fake_signal)
-emitted by the generator is what enables the bucketed match — each
-batch contains a mix of categories, and the loss is computed per
-bucket so the minority methylation buckets pull on the model with
-equal weight to the much larger baseline bucket.
+The latent z provides stochasticity. The losses are computed per bucket
+so the minority methylation buckets pull on the model with equal weight
+to the much larger baseline bucket — BUT only for buckets that reach
+``min_samples`` within the batch. Under proportional streaming a 384-row
+batch holds ~2-3 SLOWED_m6A rows (m6A ≈ 0.65 % of the corpus), below
+min_samples, so the m6A bucket was dropped from the loss every step and
+its signature never trained (audit 2026-06-06: gen m6A collapsed to
+baseline → 0 motifs). ``balanced_buckets`` (config) fixes this by
+rebuilding each batch with a fixed per-bucket quota — see
+``_bucket_balanced_batches``.
 
 Usage:
 
@@ -24,8 +29,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import sys
 import time
+from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 
@@ -154,11 +161,76 @@ def _infinite_loader(loader: DataLoader, dataset, epoch_start: int = 0):
         epoch += 1
 
 
+def _bucket_balanced_batches(loader: DataLoader, dataset, n_buckets: int,
+                             quotas: list[int], buffer_cap: int,
+                             epoch_start: int = 0):
+    """Yield batches with a fixed per-bucket quota, oversampling rare
+    methylation buckets so they always clear the losses' ``min_samples``.
+
+    The underlying ``MultiShardDataset`` streams rows ~proportionally, so
+    a 384-row batch holds only ~2-3 SLOWED_m6A windows — below
+    ``bucket_min_samples`` (4) / ``tail_min_samples`` (8). Those buckets
+    are then skipped by every per-bucket loss and their signature never
+    receives gradient. This wrapper sorts incoming rows into per-bucket
+    rolling reservoirs and emits batches that take ``quotas[b]`` rows from
+    bucket ``b`` — popping fresh rows when available, else sampling WITH
+    REPLACEMENT from the reservoir (oversampling the rare class). The two
+    abundant buckets (BASELINE, NEAR_METH) gate emission so we never spin
+    on an empty rare reservoir; the rare reservoirs keep filling with new
+    unique rows (up to ``buffer_cap``) as the stream advances, so the
+    oversampling cycles through many distinct windows rather than a
+    handful.
+    """
+    buffers = [deque(maxlen=buffer_cap) for _ in range(n_buckets)]
+    nonzero = [b for b in range(n_buckets) if quotas[b] > 0]
+    abundant = nonzero[:2]                      # buckets 0 (BASELINE), 1 (NEAR_METH)
+
+    def _ready() -> bool:
+        for b in nonzero:
+            if b in abundant:
+                if len(buffers[b]) < quotas[b]:
+                    return False
+            elif len(buffers[b]) == 0:          # rare: need ≥1 row to recycle
+                return False
+        return True
+
+    def _draw() -> list[dict]:
+        out: list[dict] = []
+        for b in nonzero:
+            q = quotas[b]
+            buf = buffers[b]
+            if len(buf) >= q:
+                out.extend(buf.popleft() for _ in range(q))
+            else:                               # rare bucket → recycle w/ replacement
+                pool = list(buf)
+                out.extend(random.choice(pool) for _ in range(q))
+        random.shuffle(out)
+        return out
+
+    epoch = epoch_start
+    while True:
+        if hasattr(dataset, "set_epoch"):
+            dataset.set_epoch(epoch)
+        for batch in loader:
+            bids = _compute_bucket_id(batch["category"], batch["parent_meth"])
+            for i in range(int(bids.shape[0])):
+                # Keep category/parent_meth as python ints (not 0-dim tensors)
+                # so the re-collate matches the dataset's original contract.
+                buffers[int(bids[i])].append({
+                    k: (int(v[i]) if k in ("category", "parent_meth") else v[i])
+                    for k, v in batch.items()
+                })
+            while _ready():
+                yield _collate(_draw())
+        epoch += 1
+
+
 def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
           resume: bool = False, device: str | None = None) -> None:
     cfg = _load_yaml(config_path)
     seed = int(cfg["train"].get("seed", 42))
     torch.manual_seed(seed)
+    random.seed(seed)          # the balanced-bucket batcher samples via `random`
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -221,7 +293,8 @@ def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
         persistent_workers=False,
         prefetch_factor=2 if num_workers > 0 else None,
     )
-    batches = _infinite_loader(loader, dataset, epoch_start=0)
+    # (the batches generator is created below, once n_buckets and the
+    # loss min_samples are known — see balanced_buckets handling.)
 
     # 5 buckets after the audit-driven per-meth refinement (see
     # _compute_bucket_id docstring): BASELINE / NEAR_METH /
@@ -233,6 +306,27 @@ def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
     lambda_tail = float(t_cfg.get("lambda_tail", 0.3))
     tail_quantiles = tuple(t_cfg.get("tail_quantiles", [0.95, 0.99]))
     tail_min_samples = int(t_cfg.get("tail_min_samples", 8))
+
+    # ----- batches generator: class-balanced (default) or proportional -----
+    batch_size = int(t_cfg["batch_size"])
+    if bool(t_cfg.get("balanced_buckets", True)):
+        bq = t_cfg.get("bucket_quota")
+        if bq is None:
+            base = batch_size // n_buckets
+            quotas = [base] * n_buckets
+            quotas[0] += batch_size - base * n_buckets       # remainder → BASELINE
+        else:
+            quotas = [int(x) for x in bq]
+        buf_cap = int(t_cfg.get("bucket_buffer_cap", 2048))
+        log.info("Class-balanced batching ON — per-bucket quota %s (buffer cap %d)",
+                 quotas, buf_cap)
+        if min(quotas[2:] or [0]) < tail_min_samples:
+            log.warning("A SLOWED bucket quota in %s is below tail_min_samples=%d "
+                        "— the tail loss may still skip it.", quotas[2:], tail_min_samples)
+        batches = _bucket_balanced_batches(loader, dataset, n_buckets, quotas, buf_cap)
+    else:
+        log.info("Class-balanced batching OFF — proportional streaming batches.")
+        batches = _infinite_loader(loader, dataset, epoch_start=0)
 
     log_every = int(t_cfg["log_every"])
     ckpt_every = int(t_cfg["checkpoint_every"])
@@ -319,14 +413,16 @@ def train(shards_dir: Path, ckpt_dir: Path, config_path: Path,
         if step % log_every == 0 and running["n"] > 0:
             now = time.time()
             steps_per_sec = running["n"] / max(now - last_log, 1e-6)
+            bk = torch.bincount(bucket, minlength=n_buckets).tolist()
             log.info(
-                "step %6d  loss=%.4f  ed=%.4f  pos_w1=%.4f  tail=%.4f  lr=%.2e  steps/s=%.1f",
+                "step %6d  loss=%.4f  ed=%.4f  pos_w1=%.4f  tail=%.4f  lr=%.2e  steps/s=%.1f  bk=%s",
                 step, running["loss"] / running["n"],
                 running["ed"] / running["n"],
                 running["pos"] / running["n"],
                 running["tail"] / running["n"],
                 base_lr * _lr_mult(step),
                 steps_per_sec,
+                bk,
             )
             running = {"ed": 0.0, "pos": 0.0, "tail": 0.0, "loss": 0.0, "n": 0}
             last_log = now

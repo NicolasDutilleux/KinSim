@@ -8,7 +8,8 @@ backbone is enough to fit the target distribution under a direct loss.
 
 Input per position (K = 21): one-hot fwd base, one-hot rev base, one-hot
 fwd methylation, one-hot rev methylation, learned positional embedding.
-Plus a per-sample latent z ∈ ℝ^64 for stochasticity.
+Plus a per-sample latent z ∈ ℝ^{z_dim} (GeneratorConfig.z_dim; default 64,
+96 in the post-audit config) for stochasticity.
 
 Output: kinetic tile (B, K, 4) = (IPD_fwd, PW_fwd, IPD_rev, PW_rev) in
 log1p(frames) space. At generation time the output is exponentiated,

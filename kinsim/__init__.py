@@ -1,8 +1,10 @@
 """kinsim — transformer generator trained with a direct distributional loss.
 
 Successor to kinsim_NN/. Same shard format and architecture family as the
-v6 generator, but the WGAN-GP critic is replaced by a sliced Wasserstein
-loss applied directly on the generator's output. No adversarial training.
+v6 generator, but the WGAN-GP critic is replaced by a direct distributional
+loss on the generator's output — bucketed energy distance + per-position
+1-D Wasserstein (sorted-L1) + a tail-quantile penalty (see kinsim/losses.py).
+No adversarial training, no critic.
 
 Why: empirically (see thesis §5.4), the v6 critic shrank the marginal W₁
 on the central channel but did not learn to discriminate on the spatial
